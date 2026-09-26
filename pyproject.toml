@@ -5,7 +5,15 @@ description = "Deterministic daemon that turns a GitHub Projects v2 board into a
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "cryptography>=46,<51",
+    "httpx>=0.28,<1",
     "pydantic>=2.11,<3",
+    "PyYAML>=6.0,<7",
+    "starlette>=1.0.1,<2",
+    "uvicorn>=0.35,<1",
+    "omnigent-client",
+    "omnigent",
+    "omnigent-ui-sdk",
 ]
 
 [project.scripts]
@@ -20,11 +28,13 @@ packages = ["src/omnigent_factory"]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28",
     "hypothesis>=6.130",
     "mypy>=1.16",
     "pytest>=8.4",
     "pytest-asyncio>=1.0",
     "ruff>=0.12",
+    "types-PyYAML>=6.0",
 ]
 
 [tool.pytest.ini_options]
@@ -67,3 +77,8 @@ warn_unreachable = true
 [[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false
+
+[tool.uv.sources]
+omnigent-client = { git = "https://github.com/omnigent-ai/omnigent.git", rev = "1c0153aa87cb7c0eff57b3a3169a4f94b5967c6d", subdirectory = "sdks/python-client" }
+omnigent = { git = "https://github.com/omnigent-ai/omnigent.git", rev = "1c0153aa87cb7c0eff57b3a3169a4f94b5967c6d" }
+omnigent-ui-sdk = { git = "https://github.com/omnigent-ai/omnigent.git", rev = "1c0153aa87cb7c0eff57b3a3169a4f94b5967c6d", subdirectory = "sdks/ui" }
