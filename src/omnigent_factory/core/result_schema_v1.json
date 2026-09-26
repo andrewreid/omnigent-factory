@@ -1,0 +1,465 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:omnigent-factory:result:v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "parcel_id",
+    "stage_session_id",
+    "dispatch_nonce",
+    "revision",
+    "result"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "parcel_id": {
+      "$ref": "#/$defs/text"
+    },
+    "stage_session_id": {
+      "$ref": "#/$defs/text"
+    },
+    "dispatch_nonce": {
+      "$ref": "#/$defs/text"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "result": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/triage"
+        },
+        {
+          "$ref": "#/$defs/plan"
+        },
+        {
+          "$ref": "#/$defs/build"
+        },
+        {
+          "$ref": "#/$defs/checkpoint"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16000
+    },
+    "texts": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "$ref": "#/$defs/text"
+      }
+    },
+    "size": {
+      "enum": [
+        "S",
+        "M",
+        "L"
+      ]
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "criterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "criterion",
+        "verification"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/text"
+        },
+        "criterion": {
+          "$ref": "#/$defs/text"
+        },
+        "verification": {
+          "$ref": "#/$defs/text"
+        }
+      }
+    },
+    "resolved_decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision_id",
+        "answer",
+        "source_event_id"
+      ],
+      "properties": {
+        "decision_id": {
+          "$ref": "#/$defs/text"
+        },
+        "answer": {
+          "$ref": "#/$defs/text"
+        },
+        "source_event_id": {
+          "$ref": "#/$defs/text"
+        }
+      }
+    },
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "goal",
+        "acceptance_criteria",
+        "non_goals",
+        "size",
+        "resolved_decisions"
+      ],
+      "properties": {
+        "goal": {
+          "$ref": "#/$defs/text"
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "$ref": "#/$defs/criterion"
+          }
+        },
+        "non_goals": {
+          "$ref": "#/$defs/texts"
+        },
+        "size": {
+          "$ref": "#/$defs/size"
+        },
+        "resolved_decisions": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "$ref": "#/$defs/resolved_decision"
+          }
+        }
+      }
+    },
+    "triage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "summary",
+        "priority",
+        "size",
+        "recommendation",
+        "duplicate_issue",
+        "labels",
+        "missing_information"
+      ],
+      "properties": {
+        "kind": {
+          "const": "triage"
+        },
+        "summary": {
+          "$ref": "#/$defs/text"
+        },
+        "priority": {
+          "enum": [
+            "P0",
+            "P1",
+            "P2",
+            "P3"
+          ]
+        },
+        "size": {
+          "$ref": "#/$defs/size"
+        },
+        "recommendation": {
+          "enum": [
+            "fix",
+            "wont_fix",
+            "duplicate",
+            "needs_info"
+          ]
+        },
+        "duplicate_issue": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "labels": {
+          "type": "array",
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          }
+        },
+        "missing_information": {
+          "$ref": "#/$defs/texts"
+        }
+      }
+    },
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "publication_kind",
+        "approach",
+        "risks",
+        "contract",
+        "open_decision_ids"
+      ],
+      "properties": {
+        "kind": {
+          "const": "plan"
+        },
+        "publication_kind": {
+          "enum": [
+            "contract",
+            "info"
+          ]
+        },
+        "approach": {
+          "$ref": "#/$defs/text"
+        },
+        "risks": {
+          "$ref": "#/$defs/texts"
+        },
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "open_decision_ids": {
+          "$ref": "#/$defs/texts"
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command",
+        "file_set",
+        "outcome",
+        "evidence"
+      ],
+      "properties": {
+        "command": {
+          "$ref": "#/$defs/text"
+        },
+        "file_set": {
+          "$ref": "#/$defs/texts"
+        },
+        "outcome": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_run"
+          ]
+        },
+        "evidence": {
+          "$ref": "#/$defs/text"
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "source",
+        "severity",
+        "disposition",
+        "evidence"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/text"
+        },
+        "source": {
+          "$ref": "#/$defs/text"
+        },
+        "severity": {
+          "enum": [
+            "BLOCKING",
+            "SHOULD_FIX",
+            "FOLLOW_UP",
+            "ADVISORY"
+          ]
+        },
+        "disposition": {
+          "enum": [
+            "fixed",
+            "follow_up",
+            "advisory",
+            "unresolved"
+          ]
+        },
+        "evidence": {
+          "$ref": "#/$defs/text"
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "implementation_vendor",
+        "review_vendor",
+        "reviewed_head",
+        "artifact_reference",
+        "artifact_sha256",
+        "accepted"
+      ],
+      "properties": {
+        "implementation_vendor": {
+          "$ref": "#/$defs/text"
+        },
+        "review_vendor": {
+          "$ref": "#/$defs/text"
+        },
+        "reviewed_head": {
+          "$ref": "#/$defs/sha"
+        },
+        "artifact_reference": {
+          "$ref": "#/$defs/text"
+        },
+        "artifact_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "accepted": {
+          "type": "boolean"
+        }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "pr_number",
+        "branch",
+        "head_sha",
+        "summary",
+        "verification",
+        "review",
+        "findings",
+        "remediation_batches_used",
+        "targeted_rechecks_used",
+        "release_readiness"
+      ],
+      "properties": {
+        "kind": {
+          "const": "build_ready"
+        },
+        "pr_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "branch": {
+          "$ref": "#/$defs/text"
+        },
+        "head_sha": {
+          "$ref": "#/$defs/sha"
+        },
+        "summary": {
+          "$ref": "#/$defs/text"
+        },
+        "verification": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "$ref": "#/$defs/verification"
+          }
+        },
+        "review": {
+          "$ref": "#/$defs/review"
+        },
+        "findings": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "$ref": "#/$defs/finding"
+          }
+        },
+        "remediation_batches_used": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "targeted_rechecks_used": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "release_readiness": {
+          "enum": [
+            "ready",
+            "needs_owner"
+          ]
+        }
+      }
+    },
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "grant_id",
+        "head_sha",
+        "done",
+        "remaining",
+        "risks",
+        "worktree_state",
+        "elicitation_id"
+      ],
+      "properties": {
+        "kind": {
+          "const": "checkpoint"
+        },
+        "grant_id": {
+          "$ref": "#/$defs/text"
+        },
+        "head_sha": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/sha"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "done": {
+          "$ref": "#/$defs/texts"
+        },
+        "remaining": {
+          "$ref": "#/$defs/texts"
+        },
+        "risks": {
+          "$ref": "#/$defs/texts"
+        },
+        "worktree_state": {
+          "$ref": "#/$defs/text"
+        },
+        "elicitation_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

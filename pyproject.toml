@@ -1,0 +1,69 @@
+[project]
+name = "omnigent-factory"
+version = "0.1.0"
+description = "Deterministic daemon that turns a GitHub Projects v2 board into an Omnigent-driven software factory"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "pydantic>=2.11,<3",
+]
+
+[project.scripts]
+omnigent-factory = "omnigent_factory.cli:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/omnigent_factory"]
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.130",
+    "mypy>=1.16",
+    "pytest>=8.4",
+    "pytest-asyncio>=1.0",
+    "ruff>=0.12",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PL", "S", "ANN", "TID"]
+ignore = [
+    "PLR0911",  # reducer handlers are explicit decision tables
+    "PLR0912",
+    "PLR0913",
+    "PLR0915",
+    "PLR2004",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "ANN", "PLC0415", "S608", "PLW0108"]
+"src/omnigent_factory/store/**" = ["S608"]
+"src/omnigent_factory/testing/**" = ["S101"]
+# Typed-JSON boundary: pydantic adapters and dataclass replace() take Any by design.
+"src/omnigent_factory/core/codec.py" = ["ANN401"]
+"src/omnigent_factory/core/reducer.py" = ["ANN401"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+packages = ["omnigent_factory"]
+mypy_path = "src"
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false

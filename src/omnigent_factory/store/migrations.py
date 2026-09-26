@@ -1,0 +1,377 @@
+"""Explicit, checksummed SQLite migrations (architecture §3.5).
+
+Each migration runs in its own ``BEGIN IMMEDIATE`` transaction together with its
+``schema_migrations`` row, so a failure rolls back completely. On open, every applied
+migration's checksum is compared with the code's; a mismatch or a database newer than the
+code refuses to open (fail closed) rather than guessing.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Migration:
+    version: int
+    name: str
+    sql: str
+
+    @property
+    def checksum(self) -> str:
+        return hashlib.sha256(self.sql.encode("utf-8")).hexdigest()
+
+
+BOOTSTRAP_SQL = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    applied_at_us INTEGER NOT NULL,
+    checksum TEXT NOT NULL
+);
+"""
+
+V1_SQL = """
+CREATE TABLE deliveries (
+    delivery_guid TEXT PRIMARY KEY,
+    app_id INTEGER,
+    installation_id INTEGER,
+    event_name TEXT NOT NULL,
+    action TEXT,
+    headers_json TEXT NOT NULL,
+    body BLOB NOT NULL,
+    body_sha256 TEXT NOT NULL,
+    source_time_us INTEGER,
+    received_at_us INTEGER NOT NULL,
+    provenance TEXT NOT NULL CHECK (provenance IN ('webhook', 'recovery')),
+    status TEXT NOT NULL
+        CHECK (status IN ('pending', 'processed', 'unresolved', 'rejected')),
+    processed_at_us INTEGER
+);
+
+CREATE TABLE delivery_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    delivery_guid TEXT NOT NULL,
+    recovery_delivery_id TEXT,
+    body BLOB,
+    body_sha256 TEXT NOT NULL,
+    received_at_us INTEGER NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('inserted', 'duplicate', 'quarantined'))
+);
+CREATE INDEX ix_delivery_attempts_guid ON delivery_attempts (delivery_guid);
+
+CREATE TABLE repositories (
+    repo_id TEXT PRIMARY KEY,
+    full_name TEXT,
+    org_id TEXT,
+    installation_id TEXT,
+    project_id TEXT,
+    config_digest TEXT,
+    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+    next_sequence INTEGER NOT NULL,
+    open_bot_prs_json TEXT NOT NULL,
+    max_building INTEGER NOT NULL,
+    max_open_bot_prs INTEGER NOT NULL,
+    updated_at_us INTEGER NOT NULL
+);
+
+CREATE TABLE parcels (
+    parcel_id TEXT PRIMARY KEY,
+    repo_id TEXT NOT NULL REFERENCES repositories (repo_id),
+    issue_number INTEGER,
+    project_item_id TEXT,
+    stage TEXT,
+    version INTEGER NOT NULL,
+    eligibility_epoch INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    revision_pending INTEGER NOT NULL,
+    current_session_id TEXT,
+    current_contract_id TEXT,
+    current_approval_id TEXT,
+    pending_authorization_id TEXT,
+    holds_json TEXT NOT NULL,
+    bot TEXT NOT NULL,
+    aggregate_json TEXT NOT NULL,
+    updated_at_us INTEGER NOT NULL,
+    UNIQUE (repo_id, issue_number),
+    UNIQUE (repo_id, project_item_id)
+);
+
+CREATE TABLE events (
+    event_id TEXT PRIMARY KEY,
+    logical_key TEXT NOT NULL UNIQUE,
+    sequence INTEGER NOT NULL UNIQUE,
+    repo_id TEXT NOT NULL,
+    parcel_id TEXT REFERENCES parcels (parcel_id),
+    delivery_guid TEXT REFERENCES deliveries (delivery_guid),
+    kind TEXT NOT NULL,
+    class TEXT NOT NULL,
+    actor_id INTEGER,
+    provenance TEXT NOT NULL,
+    source_time_us INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    accepted INTEGER NOT NULL CHECK (accepted IN (0, 1)),
+    reason TEXT NOT NULL,
+    applied_at_us INTEGER NOT NULL
+);
+CREATE INDEX ix_events_parcel ON events (parcel_id, sequence);
+
+CREATE TABLE stage_authorizations (
+    authorization_id TEXT PRIMARY KEY,
+    parcel_id TEXT NOT NULL REFERENCES parcels (parcel_id),
+    kind TEXT NOT NULL CHECK (kind IN ('triage', 'plan', 'build')),
+    generation INTEGER NOT NULL,
+    source_event_id TEXT NOT NULL REFERENCES events (event_id),
+    revision INTEGER NOT NULL,
+    eligibility_epoch INTEGER NOT NULL,
+    approval_id TEXT,
+    grant_duration_us INTEGER NOT NULL,
+    cancelled INTEGER NOT NULL CHECK (cancelled IN (0, 1)),
+    UNIQUE (parcel_id, generation),
+    UNIQUE (source_event_id, kind)
+);
+
+CREATE TABLE stage_sessions (
+    session_id TEXT PRIMARY KEY,
+    parcel_id TEXT NOT NULL REFERENCES parcels (parcel_id),
+    kind TEXT NOT NULL CHECK (kind IN ('triage', 'plan', 'build')),
+    generation INTEGER NOT NULL,
+    attempt INTEGER NOT NULL,
+    authorization_id TEXT NOT NULL REFERENCES stage_authorizations (authorization_id),
+    omnigent_root_id TEXT UNIQUE,
+    nonce TEXT NOT NULL UNIQUE,
+    lifecycle TEXT NOT NULL,
+    execution_closed INTEGER NOT NULL CHECK (execution_closed IN (0, 1)),
+    fence_mask INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    worktree TEXT,
+    branch TEXT,
+    restart_count INTEGER NOT NULL,
+    correction_count INTEGER NOT NULL,
+    UNIQUE (parcel_id, kind, generation, attempt)
+);
+-- At most one live, unfenced, open stage session per parcel (§3.5).
+CREATE UNIQUE INDEX ux_stage_sessions_open_gate ON stage_sessions (parcel_id)
+    WHERE execution_closed = 0 AND fence_mask = 0;
+
+CREATE TABLE fences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES stage_sessions (session_id),
+    kind TEXT NOT NULL CHECK (kind IN ('safety', 'stopped', 'revoked', 'checkpoint')),
+    cause_event_id TEXT NOT NULL REFERENCES events (event_id),
+    set_at_us INTEGER NOT NULL,
+    cleared_at_us INTEGER,
+    cleared_by_event_id TEXT REFERENCES events (event_id)
+);
+CREATE UNIQUE INDEX ux_fences_active ON fences (session_id, kind) WHERE cleared_at_us IS NULL;
+
+CREATE TABLE contracts (
+    contract_id TEXT PRIMARY KEY,
+    parcel_id TEXT NOT NULL REFERENCES parcels (parcel_id),
+    revision INTEGER NOT NULL,
+    canonical TEXT NOT NULL,
+    full_hash TEXT NOT NULL CHECK (length(full_hash) = 64),
+    prefix TEXT NOT NULL,
+    comment_id TEXT UNIQUE,
+    published INTEGER NOT NULL CHECK (published IN (0, 1)),
+    posted_at_us INTEGER,
+    intact INTEGER NOT NULL CHECK (intact IN (0, 1)),
+    superseded INTEGER NOT NULL CHECK (superseded IN (0, 1)),
+    source_session_id TEXT NOT NULL REFERENCES stage_sessions (session_id),
+    UNIQUE (parcel_id, revision, full_hash)
+);
+CREATE UNIQUE INDEX ux_contracts_current_publication ON contracts (parcel_id, revision)
+    WHERE published = 1 AND superseded = 0;
+
+CREATE TABLE approvals (
+    approval_id TEXT PRIMARY KEY,
+    parcel_id TEXT NOT NULL REFERENCES parcels (parcel_id),
+    kind TEXT NOT NULL CHECK (kind IN ('plan', 'skip')),
+    full_hash TEXT NOT NULL CHECK (length(full_hash) = 64),
+    contract_id TEXT REFERENCES contracts (contract_id),
+    snapshot_canonical TEXT,
+    owner_id INTEGER NOT NULL,
+    source_event_id TEXT NOT NULL UNIQUE REFERENCES events (event_id),
+    source_time_us INTEGER NOT NULL,
+    sequence INTEGER NOT NULL,
+    invalidated_reason TEXT,
+    invalidated_at_us INTEGER,
+    CHECK (
+        (kind = 'plan' AND contract_id IS NOT NULL AND snapshot_canonical IS NULL)
+        OR (kind = 'skip' AND contract_id IS NULL AND snapshot_canonical IS NOT NULL)
+    )
+);
+
+CREATE TABLE decisions (
+    decision_id TEXT PRIMARY KEY,
+    parcel_id TEXT NOT NULL REFERENCES parcels (parcel_id),
+    session_id TEXT NOT NULL REFERENCES stage_sessions (session_id),
+    elicitation_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    impact TEXT NOT NULL,
+    status TEXT NOT NULL,
+    checkpoint_prompt INTEGER NOT NULL,
+    answer TEXT,
+    answer_event_id TEXT REFERENCES events (event_id),
+    UNIQUE (session_id, elicitation_id)
+);
+
+CREATE TABLE grants (
+    grant_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES stage_sessions (session_id),
+    source_event_id TEXT NOT NULL,
+    duration_us INTEGER NOT NULL CHECK (duration_us > 0),
+    consumed_us INTEGER NOT NULL,
+    ready INTEGER NOT NULL,
+    grace_deadline_us INTEGER,
+    policy_generation INTEGER NOT NULL,
+    is_current INTEGER NOT NULL CHECK (is_current IN (0, 1)),
+    UNIQUE (source_event_id, session_id)
+);
+CREATE UNIQUE INDEX ux_grants_current ON grants (session_id) WHERE is_current = 1;
+
+CREATE TABLE session_nodes (
+    omnigent_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES stage_sessions (session_id),
+    parent_id TEXT,
+    status TEXT,
+    task_state TEXT,
+    prompt_state TEXT,
+    last_snapshot_json TEXT,
+    cursor TEXT,
+    retired_at_us INTEGER
+);
+
+CREATE TABLE activity_intervals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES stage_sessions (session_id),
+    node_id TEXT,
+    start_us INTEGER NOT NULL,
+    end_us INTEGER,
+    measurement TEXT NOT NULL CHECK (measurement IN ('measured', 'inferred', 'unknown'))
+);
+
+CREATE TABLE effects (
+    effect_id TEXT PRIMARY KEY,
+    parcel_id TEXT REFERENCES parcels (parcel_id),
+    event_id TEXT NOT NULL REFERENCES events (event_id),
+    parcel_version INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    target TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    retry_class TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL
+        CHECK (state IN ('pending', 'claimed', 'done', 'cancelled', 'unknown', 'failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_at_us INTEGER,
+    lease_epoch INTEGER,
+    claimed_by_boot TEXT,
+    remote_id TEXT,
+    outcome_reason TEXT,
+    created_at_us INTEGER NOT NULL,
+    updated_at_us INTEGER NOT NULL
+);
+CREATE INDEX ix_effects_state ON effects (state, next_at_us);
+
+CREATE TABLE dispatch_intents (
+    effect_id TEXT PRIMARY KEY REFERENCES effects (effect_id),
+    session_id TEXT NOT NULL UNIQUE REFERENCES stage_sessions (session_id),
+    nonce TEXT NOT NULL UNIQUE,
+    request_digest TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    create_state TEXT NOT NULL,
+    adopted_root_id TEXT UNIQUE
+);
+
+CREATE TABLE own_items (
+    provider TEXT NOT NULL,
+    remote_id TEXT NOT NULL,
+    effect_id TEXT UNIQUE REFERENCES effects (effect_id),
+    session_id TEXT,
+    comment_id TEXT,
+    text_digest TEXT,
+    PRIMARY KEY (provider, remote_id)
+);
+
+CREATE TABLE queue (
+    parcel_id TEXT PRIMARY KEY REFERENCES parcels (parcel_id),
+    repo_id TEXT NOT NULL REFERENCES repositories (repo_id),
+    approval_id TEXT NOT NULL UNIQUE,
+    approval_sequence INTEGER NOT NULL,
+    status TEXT NOT NULL
+        CHECK (status IN ('QUEUED', 'RESERVED', 'HELD', 'RELEASED', 'CANCELLED')),
+    reason TEXT
+);
+
+CREATE TABLE reservations (
+    reservation_id TEXT PRIMARY KEY,
+    repo_id TEXT NOT NULL REFERENCES repositories (repo_id),
+    parcel_id TEXT NOT NULL REFERENCES parcels (parcel_id),
+    kind TEXT NOT NULL CHECK (kind IN ('building', 'open_pr')),
+    episode_id TEXT NOT NULL,
+    pr_number INTEGER,
+    live INTEGER NOT NULL CHECK (live IN (0, 1))
+);
+CREATE UNIQUE INDEX ux_reservations_live ON reservations (parcel_id, kind) WHERE live = 1;
+
+CREATE TABLE pull_requests (
+    repo_id TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    parcel_id TEXT REFERENCES parcels (parcel_id),
+    branch TEXT,
+    author_id INTEGER,
+    open INTEGER NOT NULL,
+    head_sha TEXT,
+    evidence_digest TEXT,
+    remediation_batches INTEGER NOT NULL DEFAULT 0,
+    targeted_rechecks INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (repo_id, number)
+);
+
+CREATE TABLE leases (
+    parcel_id TEXT PRIMARY KEY,
+    boot_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    heartbeat_at_us INTEGER NOT NULL
+);
+
+CREATE TABLE timers (
+    timer_id TEXT PRIMARY KEY,
+    parcel_id TEXT REFERENCES parcels (parcel_id),
+    session_id TEXT,
+    grant_id TEXT,
+    kind TEXT NOT NULL,
+    deadline_us INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    fired_event_id TEXT UNIQUE
+);
+
+CREATE TABLE capabilities (
+    capability_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES stage_sessions (session_id),
+    secret_hash TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    profile TEXT NOT NULL CHECK (profile IN ('read_only', 'build')),
+    enabled INTEGER NOT NULL,
+    expires_at_us INTEGER,
+    rotated_at_us INTEGER
+);
+
+CREATE TABLE audit (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    parcel_id TEXT,
+    event_id TEXT,
+    effect_id TEXT,
+    before_digest TEXT,
+    after_digest TEXT,
+    accepted INTEGER,
+    reason TEXT NOT NULL,
+    detail_json TEXT,
+    created_at_us INTEGER NOT NULL
+);
+CREATE INDEX ix_audit_parcel ON audit (parcel_id, sequence);
+"""
+
+MIGRATIONS: tuple[Migration, ...] = (Migration(1, "initial-schema", V1_SQL),)

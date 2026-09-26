@@ -11,3 +11,4 @@ build/
 *.db
 .env
 *.pem
+.hypothesis/
