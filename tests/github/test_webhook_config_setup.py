@@ -22,6 +22,9 @@ from omnigent_factory.github.webhook import (
     resolve_project_delivery,
     verify_signature,
 )
+from omnigent_factory.ports.github import STATUS_OPTION_IDS
+
+OPTION_IDS = {stage.value: option_id for stage, option_id in STATUS_OPTION_IDS.items()}
 
 IDENTITY = DeliveryIdentity(
     app_id=900,
@@ -162,8 +165,8 @@ def project_drag(actor=114979, old="Scoped", new="Building"):
         changes={
             "field_value": {
                 "field_node_id": IDENTITY.status_field_node_id,
-                "from": {"name": old},
-                "to": {"name": new},
+                "from": {"id": OPTION_IDS.get(old, f"unknown-{old}"), "name": old},
+                "to": {"id": OPTION_IDS.get(new, f"unknown-{new}"), "name": new},
             }
         },
     )
@@ -205,7 +208,7 @@ async def resolve_drag(data, *, guid="delivery-1"):
                                     "project": {"id": IDENTITY.project_node_id},
                                     "fieldValueByName": {
                                         "name": target,
-                                        "optionId": "option-id",
+                                        "optionId": OPTION_IDS.get(target, "unknown-option"),
                                         "field": {"id": IDENTITY.status_field_node_id},
                                     },
                                 }
@@ -280,10 +283,10 @@ def test_setup_payloads_preserve_ids_and_render_native_review_rule():
     options = bundle.project_migration["update_status"]["input"]["singleSelectOptions"]
     assert {option["name"]: option.get("id") for option in options} == {
         "Inbox": "915abb46",
-        "Triaged": None,
-        "Scoped": None,
+        "Triaged": "43889573",
+        "Scoped": "3a7f779a",
         "Building": "ba3c85dd",
-        "Ready": None,
+        "Ready": "6df89cbb",
         "Done": "4980e49d",
     }
     pull_request_rule = bundle.ruleset["rules"][2]["parameters"]

@@ -63,7 +63,7 @@ class Stack:
         return path
 
     async def wire(self, path: Path, branch: str, sid: str, profile: CredentialProfile) -> str:
-        record = self.provisioner.provision(sid)
+        record = await self.provisioner.provision(sid)
         verified = self.ws.verify_worktree(path, branch)
         self.ws.configure(verified, StageWiring(sid, record.path, self.socket, REPO), BOT)
         await self.broker.execute(_intent(EffectKind.ENABLE_ISSUANCE, sid, profile.value), CTX)
@@ -199,7 +199,7 @@ async def test_worker_isolated_worktree_is_wired_through_stage_capability(stack:
 
     worker = stack.env.worktrees / "issue-9-worker"
     git("worktree", "add", "-b", f"{branch}--w1", str(worker), branch, cwd=stack.env.source)
-    stack.server.authorize_worker(
+    await stack.server.authorize_worker(
         "BUILD3", WorkerGrant("w1", worker, f"{branch}--w1", CredentialProfile.BUILD)
     )
     reply = await asyncio.to_thread(client.register_worktree, cap, "w1", worker, f"{branch}--w1")
@@ -219,7 +219,7 @@ async def test_worker_isolated_worktree_is_wired_through_stage_capability(stack:
     # Recorded but outside the owned roots still fails closed.
     outside = stack.env.home / "elsewhere"
     git("worktree", "add", "-b", f"{branch}--w2", str(outside), branch, cwd=stack.env.source)
-    stack.server.authorize_worker(
+    await stack.server.authorize_worker(
         "BUILD3", WorkerGrant("w2", outside, f"{branch}--w2", CredentialProfile.BUILD)
     )
     far = await asyncio.to_thread(client.register_worktree, cap, "w2", outside, f"{branch}--w2")

@@ -47,6 +47,30 @@ def adapter(http: httpx.AsyncClient, checks=frozenset(), **kwargs):
     )
 
 
+PARCEL_REF = IssueRef(REPO_NODE, 12, "I_1")
+
+
+def closing_refs(*issue_ids: str, repo: str = REPO_NODE, number: int = 7, cursor=None):
+    """Source-shaped ``closingIssuesReferences`` GraphQL page."""
+    return httpx.Response(
+        200,
+        json={
+            "data": {
+                "repository": {
+                    "id": REPO_NODE,
+                    "pullRequest": {
+                        "number": number,
+                        "closingIssuesReferences": {
+                            "nodes": [{"id": i, "repository": {"id": repo}} for i in issue_ids],
+                            "pageInfo": {"hasNextPage": cursor is not None, "endCursor": cursor},
+                        },
+                    },
+                }
+            }
+        },
+    )
+
+
 def effect(kind: EffectKind, effect_id="eff-1", **args):
     return EffectIntent(
         effect_id=effect_id,
@@ -84,7 +108,7 @@ async def test_fresh_issue_and_board_snapshot_verifies_identities():
                                     "project": {"id": PROJECT},
                                     "fieldValueByName": {
                                         "name": "Scoped",
-                                        "optionId": "new-option",
+                                        "optionId": "3a7f779a",
                                         "field": {"id": STATUS_FIELD},
                                     },
                                 }
@@ -150,10 +174,12 @@ async def test_pull_request_snapshot_reads_all_check_pages_and_current_reviews()
                     }
                 ],
             )
+        if path == "/graphql":
+            return closing_refs("I_other", "I_1")
         raise AssertionError(str(request.url))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        result = await adapter(http, required).pull_request(REPO_NODE, 7)
+        result = await adapter(http, required).pull_request(PARCEL_REF, 7)
     assert result.verified is True
     assert result.checks == ChecksState.GREEN
 

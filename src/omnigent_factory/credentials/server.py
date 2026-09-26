@@ -31,7 +31,7 @@ import struct
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from omnigent_factory.core.effects import CredentialProfile
 from omnigent_factory.credentials.broker import LocalCredentialBroker
@@ -72,6 +72,17 @@ class WorkerGrant:
     profile: CredentialProfile
 
 
+@runtime_checkable
+class WorkerGrantStore(Protocol):
+    """Durable daemon-recorded worker tuples (implemented by the service)."""
+
+    async def save(self, stage_session_id: str, grant: WorkerGrant) -> None: ...
+
+    async def delete(self, stage_session_id: str) -> None: ...
+
+    async def load(self) -> Mapping[str, Mapping[str, WorkerGrant]]: ...
+
+
 class StageProvisioner:
     """``CredentialProvisioner`` for the Omnigent adapter (stage capabilities)."""
 
@@ -79,8 +90,8 @@ class StageProvisioner:
         self.broker = broker
         self.server = server
 
-    def provision(self, session_id: str) -> CapabilityRecord:
-        return self.broker.provision(session_id)
+    async def provision(self, session_id: str) -> CapabilityRecord:
+        return await self.broker.provision(session_id)
 
 
 class BrokerServer:
@@ -93,8 +104,10 @@ class BrokerServer:
         identity: BotIdentity | None = None,
         helper_command: str | None = None,
         expected_uid: int | None = None,
+        grants: WorkerGrantStore | None = None,
     ) -> None:
         self.broker = broker
+        self.grants = grants
         self.socket_path = socket_path
         self.workspaces = workspaces
         self.identity = identity
@@ -103,14 +116,27 @@ class BrokerServer:
         self._workers: dict[str, dict[str, WorkerGrant]] = {}
         self._server: asyncio.base_events.Server | None = None
 
-    def authorize_worker(self, stage_session_id: str, grant: WorkerGrant) -> None:
-        """Record one exact worker tuple the daemon approved for this stage."""
+    async def authorize_worker(self, stage_session_id: str, grant: WorkerGrant) -> None:
+        """Record one exact worker tuple the daemon approved for this stage (durably)."""
         if not grant.path.is_absolute():
             raise ValueError("worker worktree path must be absolute")
+        if self.grants is not None:
+            await self.grants.save(stage_session_id, grant)
         self._workers.setdefault(stage_session_id, {})[grant.worker_id] = grant
 
-    def revoke_workers(self, stage_session_id: str) -> None:
+    async def revoke_workers(self, stage_session_id: str) -> None:
+        # Forget in memory first so a failing store can only leave a stale durable row,
+        # which restore() reloads but the stage's closed gate still refuses.
         self._workers.pop(stage_session_id, None)
+        if self.grants is not None:
+            await self.grants.delete(stage_session_id)
+
+    async def restore(self) -> None:
+        """Boot: reload recorded worker tuples. Registration still needs an open gate."""
+        if self.grants is None:
+            return
+        loaded = await self.grants.load()
+        self._workers = {stage: dict(grants) for stage, grants in loaded.items()}
 
     async def start(self) -> None:
         ensure_private_dir(self.socket_path.parent)
@@ -198,7 +224,7 @@ class BrokerServer:
             return {"ok": False, "reason": "worktree-registration-unavailable"}
         try:
             verified = await asyncio.to_thread(self.workspaces.verify_worktree, path, branch)
-            record = self.broker.provision_worker(sid, worker_id, grant.profile)
+            record = await self.broker.provision_worker(sid, worker_id, grant.profile)
             wiring = StageWiring(
                 record.session_id, record.path, self.socket_path, self.workspaces.repository
             )

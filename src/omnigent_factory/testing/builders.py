@@ -132,6 +132,8 @@ class EventFactory:
                 | ev.ReconcileDue,
             ):
                 provenance = Provenance.SCHEDULER
+            if isinstance(body, ev.InboxHoldSet | ev.InboxHoldReleased):
+                provenance = Provenance.INBOX
         if actor is None and cls == EventClass.CONTROL and provenance != Provenance.OPERATOR:
             actor = OWNER_ID
         if isinstance(evidence, str):

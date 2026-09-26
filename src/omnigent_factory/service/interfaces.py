@@ -42,7 +42,13 @@ class DeliveryProcessor(Protocol):
         ``processed``, ``unresolved`` or ``quarantined`` so the event and inbox retirement
         commit atomically. Transient failures raise an ordinary exception and are retried
         indefinitely with capped backoff. Only deterministic poison may raise
-        ``NonRetryableDelivery``; it remains work-gating until an operator releases it.
+        ``NonRetryableDelivery``; it remains work-gating until an operator releases it, and
+        a parcel-scoped park also fences and interrupts that parcel (``InboxHoldSet``).
+        A delivery whose identity cannot yet be verified is retired with
+        ``FactoryService.hold_unresolved_delivery(guid, candidate_parcel_id)``: a known
+        candidate parcel is fenced and held until the delivery is later processed.
+        A recovered delivery whose GUID is already stored is a durable no-op (the stored
+        copy wins even when GitHub re-serialised the recovered bytes).
         Returning without changing the delivery status is not completion.
         """
         ...

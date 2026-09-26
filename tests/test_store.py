@@ -36,6 +36,7 @@ from omnigent_factory.testing.builders import REPO_ID, config
 from omnigent_factory.testing.fakes import FakeClock
 from omnigent_factory.testing.harness import Harness
 
+LATEST = max(m.version for m in MIGRATIONS)
 P = "I_parcel_1"
 Q = "I_parcel_2"
 
@@ -96,7 +97,7 @@ def store_harness(store: SqliteStore, **cfg) -> StoreHarness:
 
 def test_fresh_database_is_migrated_with_required_pragmas(db):
     store = open_store(db)
-    assert store.schema_version() == 1
+    assert store.schema_version() == LATEST
     assert store.query("PRAGMA journal_mode")[0][0] == "wal"
     assert store.query("PRAGMA foreign_keys")[0][0] == 1
     assert store.query("PRAGMA synchronous")[0][0] == 2  # FULL
@@ -135,9 +136,9 @@ def test_reopen_is_idempotent_and_preserves_data(db):
     store.ensure_repository(config())
     store.close()
     store = open_store(db)
-    assert store.schema_version() == 1
+    assert store.schema_version() == LATEST
     assert store.load_admission(REPO_ID).paused  # new repositories start paused
-    assert len(store.query("SELECT * FROM schema_migrations")) == 1
+    assert len(store.query("SELECT * FROM schema_migrations")) == LATEST
     store.close()
 
 
@@ -149,7 +150,10 @@ def test_checksum_mismatch_refuses_to_open(db):
 
 
 def test_database_newer_than_code_refuses(db):
-    extra = (*MIGRATIONS, Migration(2, "future", "CREATE TABLE future_table (x INTEGER);"))
+    extra = (
+        *MIGRATIONS,
+        Migration(LATEST + 1, "future", "CREATE TABLE future_table (x INTEGER);"),
+    )
     open_store(db, migrations=extra).close()
     with pytest.raises(MigrationError, match="unknown migration"):
         open_store(db)
@@ -159,12 +163,14 @@ def test_failed_migration_rolls_back_atomically(db):
     open_store(db).close()
     bad = (
         *MIGRATIONS,
-        Migration(2, "half", "CREATE TABLE half_table (x INTEGER);\nCREATE TABLE broken ("),
+        Migration(
+            LATEST + 1, "half", "CREATE TABLE half_table (x INTEGER);\nCREATE TABLE broken ("
+        ),
     )
     with pytest.raises(sqlite3.Error):
         open_store(db, migrations=bad)
     store = open_store(db)
-    assert store.schema_version() == 1
+    assert store.schema_version() == LATEST
     names = {r[0] for r in store.query("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "half_table" not in names
     store.close()
@@ -177,8 +183,11 @@ def test_migration_fault_before_commit_rolls_back(tmp_path):
 
     with pytest.raises(Crash):
         open_store(tmp_path / "x.db", fault_hook=hook)
+    raw = sqlite3.connect(tmp_path / "x.db")
+    assert raw.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 0
+    raw.close()
     store = open_store(tmp_path / "x.db")
-    assert store.schema_version() == 1
+    assert store.schema_version() == LATEST
     store.close()
 
 

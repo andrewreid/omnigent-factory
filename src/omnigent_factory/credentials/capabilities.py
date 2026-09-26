@@ -7,6 +7,13 @@ prompts, labels, Git config or logs - the worktree config names only the file pa
 
 Provisioning a session again rotates its capability (new generation, new secret); an old
 secret stops matching immediately.
+
+Durability (T3 FOLLOW_UP): with a :class:`CapabilityStore` the hash, generation and worker
+binding of every capability are persisted before :meth:`CapabilityRegistry.provision`
+returns, and :meth:`CapabilityRegistry.restore` reloads them on boot. Generations never
+repeat, even across revocation and restart. Issuance enablement is *not* persisted: after a
+restart every capability verifies but issuance stays denied until the service re-enables
+it after rechecking the current execution gate.
 """
 
 from __future__ import annotations
@@ -19,6 +26,9 @@ import secrets
 import stat
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol, runtime_checkable
+
+from omnigent_factory.core.effects import CredentialProfile
 
 _FILE_VERSION = 1
 
@@ -40,11 +50,34 @@ class CapabilityFile:
 
 @dataclass(frozen=True, slots=True)
 class CapabilityRecord:
+    """A capability's non-secret identity. ``worker_of`` names the owning stage session
+    for a registered worker capability, whose fixed role is ``worker_profile``."""
+
     capability_id: str
     session_id: str
     secret_sha256: str
     generation: int
     path: Path
+    worker_of: str | None = None
+    worker_profile: CredentialProfile | None = None
+    revoked: bool = False
+
+
+@runtime_checkable
+class CapabilityStore(Protocol):
+    """Durable capability hashes/generations (never secrets). Implemented by the service."""
+
+    async def save(self, record: CapabilityRecord) -> None:
+        """Persist (or rotate) ``record``; generations must strictly increase."""
+        ...
+
+    async def revoke(self, session_id: str) -> None:
+        """Mark the session's capability revoked, keeping its generation."""
+        ...
+
+    async def load(self) -> tuple[CapabilityRecord, ...]:
+        """Every persisted record, revoked ones included."""
+        ...
 
 
 def secret_digest(secret: str) -> str:
@@ -103,43 +136,77 @@ def read_capability_file(path: Path) -> CapabilityFile:
 
 
 class CapabilityRegistry:
-    """In-memory hash registry plus private secret files. NOT FOR PRODUCTION AS-IS.
+    """Capability hash registry plus private secret files.
 
-    Hashes/generations live only in memory and are lost on restart. The architecture's
-    ``capabilities`` table is not exposed by the Task-1 store API; before Task 4/5
-    integration the service must persist :class:`CapabilityRecord` values (via
-    :meth:`records` / :meth:`restore` or a durable subclass), keep issuance default-deny on
-    boot and re-enable only after re-checking current gates. Construction requires
-    ``volatile_ok=True`` so the volatile form cannot be wired silently. Secrets themselves
-    are never persisted by the daemon.
+    With ``store`` every provision/revocation is persisted before it takes effect in
+    memory, and :meth:`restore` reloads the records after a restart. Without a store the
+    registry is volatile and test-only: construction then requires ``volatile_ok=True``.
+    Secrets themselves are never persisted by the daemon.
     """
 
     def __init__(
-        self, directory: Path, socket_path: Path, repository: str, *, volatile_ok: bool
+        self,
+        directory: Path,
+        socket_path: Path,
+        repository: str,
+        *,
+        store: CapabilityStore | None = None,
+        volatile_ok: bool = False,
     ) -> None:
-        if volatile_ok is not True:
+        if store is None and volatile_ok is not True:
             raise CapabilityFileError(
                 "volatile CapabilityRegistry is test-only; persist records durably"
             )
         self.directory = directory
         self.socket_path = socket_path
         self.repository = repository
+        self.store = store
         self._records: dict[str, CapabilityRecord] = {}
+        self._generations: dict[str, int] = {}
 
-    def provision(self, session_id: str) -> CapabilityRecord:
+    async def restore(self) -> tuple[CapabilityRecord, ...]:
+        """Reload persisted records (boot). Returns the live, unrevoked ones."""
+        if self.store is None:
+            return tuple(self._records.values())
+        rows = await self.store.load()
+        self._generations = {r.session_id: r.generation for r in rows}
+        self._records = {r.session_id: r for r in rows if not r.revoked}
+        return tuple(self._records.values())
+
+    async def provision(
+        self,
+        session_id: str,
+        *,
+        worker_of: str | None = None,
+        worker_profile: CredentialProfile | None = None,
+    ) -> CapabilityRecord:
         """Create (or rotate) the capability for ``session_id``."""
+        if (worker_of is None) != (worker_profile is None):
+            raise ValueError("a worker capability needs both its stage and its profile")
         ensure_private_dir(self.directory)
-        prior = self._records.get(session_id)
-        generation = prior.generation + 1 if prior is not None else 1
+        generation = self._generations.get(session_id, 0) + 1
         secret = secrets.token_urlsafe(32)
         capability_id = f"cap_{secrets.token_hex(12)}"
         path = self.directory / f"{_safe(session_id)}.cap"
+        record = CapabilityRecord(
+            capability_id,
+            session_id,
+            secret_digest(secret),
+            generation,
+            path,
+            worker_of=worker_of,
+            worker_profile=worker_profile,
+        )
+        # Durable hash first: a crash before the file write leaves an unusable (fail
+        # closed) capability that the next provision rotates; never a usable secret whose
+        # hash is lost.
+        if self.store is not None:
+            await self.store.save(record)
+        self._generations[session_id] = generation
+        self._records.pop(session_id, None)
         write_capability_file(
             path,
             CapabilityFile(capability_id, session_id, secret, self.socket_path, self.repository),
-        )
-        record = CapabilityRecord(
-            capability_id, session_id, secret_digest(secret), generation, path
         )
         self._records[session_id] = record
         return record
@@ -152,8 +219,10 @@ class CapabilityRegistry:
             return None
         return record
 
-    def revoke(self, session_id: str) -> None:
+    async def revoke(self, session_id: str) -> None:
         record = self._records.pop(session_id, None)
+        if self.store is not None and (record is not None or session_id in self._generations):
+            await self.store.revoke(session_id)
         if record is not None:
             record.path.unlink(missing_ok=True)
 
@@ -162,9 +231,6 @@ class CapabilityRegistry:
 
     def records(self) -> tuple[CapabilityRecord, ...]:
         return tuple(self._records.values())
-
-    def restore(self, records: tuple[CapabilityRecord, ...]) -> None:
-        self._records = {r.session_id: r for r in records}
 
 
 def _safe(session_id: str) -> str:

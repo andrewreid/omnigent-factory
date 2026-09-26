@@ -441,7 +441,7 @@ class OmnigentExecutionAdapter:
             )
             if spec.bind_worktree is not None and verified.path != spec.bind_worktree.resolve():
                 return self._prepared(root, ok=False, reason="bound workspace differs")
-            capability = self.provisioner.provision(spec.session_id)
+            capability = await self.provisioner.provision(spec.session_id)
             await asyncio.to_thread(self._wire, verified, spec, capability.path)
         except WorktreeError as exc:
             return self._prepared(root, ok=False, reason=f"workspace: {exc}")

@@ -6,10 +6,14 @@ Contract (architecture §3.2-§3.5):
   checksummed migrations. Autocommit connection with explicit ``BEGIN IMMEDIATE``
   transactions; a transaction is never held across network I/O.
 * :meth:`SqliteStore.append_delivery` is the durable inbox: commit before 2xx; duplicate
-  GUID + same bytes is a no-op; same GUID + different bytes is quarantined.
+  GUID + same bytes is a no-op; same GUID + different bytes is quarantined, except that a
+  GUID already stored is a no-op whenever either copy came from App-authenticated
+  recovery (GitHub may re-serialise recovered payloads, so their bytes cannot match).
 * :meth:`SqliteStore.apply_event` commits the event, new aggregate, relational
   projections, admission (queue/reservations), effect intents (outbox), dispatch intents
   and audit in **one** transaction. A duplicate logical event is a durable no-op.
+* :meth:`SqliteStore.record_effect_outcome` commits an effect's terminal/unknown state
+  together with the reducer event that reports it, so no crash can separate them.
 * The store re-checks admission caps before commit (defense in depth): a transaction that
   would raise the building or prospective-PR count above its cap is rolled back.
 * Leases carry a boot UUID and monotonically increasing epoch. A lease held by another
@@ -113,6 +117,45 @@ class StoredEffect:
     next_at_us: int | None
     lease_epoch: int | None
     remote_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class EffectOutcomeResult:
+    recorded: bool
+    applied: ApplyResult | None
+
+
+@dataclass(frozen=True, slots=True)
+class OwnSendRow:
+    effect_id: str
+    session_id: str
+    node_id: str
+    kind: str
+    text_sha256: str
+    elicitation_id: str
+    item_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityRow:
+    session_key: str
+    stage_session_id: str
+    worker_id: str | None
+    worker_profile: str | None
+    capability_id: str
+    secret_sha256: str
+    generation: int
+    path: str
+    revoked: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerGrantRow:
+    stage_session_id: str
+    worker_id: str
+    path: str
+    branch: str
+    profile: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,7 +333,8 @@ class SqliteStore:
         now = self._clock.now_utc_us()
         with self._txn() as conn:
             row = conn.execute(
-                "SELECT body_sha256 FROM deliveries WHERE delivery_guid = ?", (d.delivery_guid,)
+                "SELECT body_sha256, provenance FROM deliveries WHERE delivery_guid = ?",
+                (d.delivery_guid,),
             ).fetchone()
             if row is None:
                 conn.execute(
@@ -312,7 +356,12 @@ class SqliteStore:
                     ),
                 )
                 outcome = DeliveryOutcome.INSERTED
-            elif row["body_sha256"] == d.body_sha256:
+            elif row["body_sha256"] == d.body_sha256 or "recovery" in (
+                d.provenance,
+                row["provenance"],
+            ):
+                # A recovered copy may be GitHub's re-serialisation of the original bytes:
+                # the GUID alone identifies the delivery, and the stored copy wins.
                 outcome = DeliveryOutcome.DUPLICATE
             else:
                 outcome = DeliveryOutcome.QUARANTINED
@@ -390,98 +439,106 @@ class SqliteStore:
         When ``event.delivery_guid`` is set, that delivery is marked ``delivery_status``
         (default ``processed``) in the same transaction.
         """
+        with self._txn() as conn:
+            return self._apply_in_txn(conn, event, config, reducer, delivery_status)
+
+    def _apply_in_txn(
+        self,
+        conn: sqlite3.Connection,
+        event: Event,
+        config: TrustedConfig,
+        reducer: Reducer,
+        delivery_status: str | None,
+    ) -> ApplyResult:
         if not event.entropy:
             event = replace(event, entropy=secrets.token_hex(16))
         now = self._clock.now_utc_us()
-        with self._txn() as conn:
-            if conn.execute(
-                "SELECT 1 FROM events WHERE logical_key = ?", (event.event_id,)
-            ).fetchone():
-                existing = (
-                    self._load_parcel_row(conn, event.parcel_id)
-                    if event.parcel_id is not None
-                    else None
-                )
-                return ApplyResult(
-                    True,
-                    None,
-                    False,
-                    "duplicate",
-                    (),
-                    existing,
-                    self._load_admission(conn, event.repo_id),
-                )
-            admission = self._load_admission(conn, event.repo_id)
-            parcel: Parcel | None = None
-            if event.kind not in (EventKind.PAUSE, EventKind.UNPAUSE) or event.parcel_id:
-                if event.parcel_id is None:
-                    raise StoreError("parcel event without parcel_id")
-                parcel = self._load_parcel_row(conn, event.parcel_id) or Parcel(
-                    parcel_id=event.parcel_id,
-                    repo_id=event.repo_id,
-                    issue_number=event.issue_number,
-                )
-            old_parcel = parcel
-            result = reducer(State(parcel=parcel, admission=admission, config=config), event)
-            new = result.state
-            self._check_caps(admission, new.admission, config)
-            seq_row = conn.execute("SELECT COALESCE(MAX(sequence), 0) + 1 AS s FROM events")
-            sequence = int(seq_row.fetchone()["s"])
-            if new.parcel is not None:
-                self._write_parcel(conn, new.parcel, now)
-            self._hook("after-parcel-write")
-            conn.execute(
-                "INSERT INTO events (event_id, logical_key, sequence, repo_id, parcel_id, "
-                "delivery_guid, kind, class, actor_id, provenance, source_time_us, payload_json, "
-                "accepted, reason, applied_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                "?, ?)",
-                (
-                    event.event_id,
-                    event.event_id,
-                    sequence,
-                    event.repo_id,
-                    event.parcel_id if new.parcel is not None else None,
-                    event.delivery_guid,
-                    event.kind.value,
-                    event.event_class.value,
-                    event.actor_id,
-                    event.provenance.value,
-                    event.source_time_us,
-                    codec.event_to_json(event),
-                    int(result.audit.accepted),
-                    result.audit.reason,
-                    now,
-                ),
+        if conn.execute("SELECT 1 FROM events WHERE logical_key = ?", (event.event_id,)).fetchone():
+            existing = (
+                self._load_parcel_row(conn, event.parcel_id)
+                if event.parcel_id is not None
+                else None
             )
-            self._hook("after-event-insert")
-            if new.parcel is not None:
-                self._project(conn, old_parcel, new.parcel, event, now)
-            self._write_admission(conn, new.admission, now)
-            for effect in result.effects:
-                self._insert_effect(conn, effect, event, now)
-            self._hook("after-effects")
-            conn.execute(
-                "INSERT INTO audit (parcel_id, event_id, before_digest, after_digest, accepted, "
-                "reason, detail_json, created_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    event.parcel_id,
-                    event.event_id,
-                    _digest(codec.parcel_to_json(old_parcel)) if old_parcel else None,
-                    _digest(codec.parcel_to_json(new.parcel)) if new.parcel else None,
-                    int(result.audit.accepted),
-                    result.audit.reason,
-                    codec.dumps(
-                        {
-                            "kind": event.kind.value,
-                            "effects": [e.effect_id for e in result.effects],
-                            "dropped_effects": result.audit.dropped_effects,
-                        }
-                    ),
-                    now,
-                ),
+            return ApplyResult(
+                True,
+                None,
+                False,
+                "duplicate",
+                (),
+                existing,
+                self._load_admission(conn, event.repo_id),
             )
-            if event.delivery_guid is not None:
-                self._mark_delivery(conn, event.delivery_guid, delivery_status or "processed")
+        admission = self._load_admission(conn, event.repo_id)
+        parcel: Parcel | None = None
+        if event.kind not in (EventKind.PAUSE, EventKind.UNPAUSE) or event.parcel_id:
+            if event.parcel_id is None:
+                raise StoreError("parcel event without parcel_id")
+            parcel = self._load_parcel_row(conn, event.parcel_id) or Parcel(
+                parcel_id=event.parcel_id,
+                repo_id=event.repo_id,
+                issue_number=event.issue_number,
+            )
+        old_parcel = parcel
+        result = reducer(State(parcel=parcel, admission=admission, config=config), event)
+        new = result.state
+        self._check_caps(admission, new.admission, config)
+        seq_row = conn.execute("SELECT COALESCE(MAX(sequence), 0) + 1 AS s FROM events")
+        sequence = int(seq_row.fetchone()["s"])
+        if new.parcel is not None:
+            self._write_parcel(conn, new.parcel, now)
+        self._hook("after-parcel-write")
+        conn.execute(
+            "INSERT INTO events (event_id, logical_key, sequence, repo_id, parcel_id, "
+            "delivery_guid, kind, class, actor_id, provenance, source_time_us, payload_json, "
+            "accepted, reason, applied_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?)",
+            (
+                event.event_id,
+                event.event_id,
+                sequence,
+                event.repo_id,
+                event.parcel_id if new.parcel is not None else None,
+                event.delivery_guid,
+                event.kind.value,
+                event.event_class.value,
+                event.actor_id,
+                event.provenance.value,
+                event.source_time_us,
+                codec.event_to_json(event),
+                int(result.audit.accepted),
+                result.audit.reason,
+                now,
+            ),
+        )
+        self._hook("after-event-insert")
+        if new.parcel is not None:
+            self._project(conn, old_parcel, new.parcel, event, now)
+        self._write_admission(conn, new.admission, now)
+        for effect in result.effects:
+            self._insert_effect(conn, effect, event, now)
+        self._hook("after-effects")
+        conn.execute(
+            "INSERT INTO audit (parcel_id, event_id, before_digest, after_digest, accepted, "
+            "reason, detail_json, created_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event.parcel_id,
+                event.event_id,
+                _digest(codec.parcel_to_json(old_parcel)) if old_parcel else None,
+                _digest(codec.parcel_to_json(new.parcel)) if new.parcel else None,
+                int(result.audit.accepted),
+                result.audit.reason,
+                codec.dumps(
+                    {
+                        "kind": event.kind.value,
+                        "effects": [e.effect_id for e in result.effects],
+                        "dropped_effects": result.audit.dropped_effects,
+                    }
+                ),
+                now,
+            ),
+        )
+        if event.delivery_guid is not None:
+            self._mark_delivery(conn, event.delivery_guid, delivery_status or "processed")
         return ApplyResult(
             duplicate=False,
             sequence=sequence,
@@ -850,33 +907,99 @@ class SqliteStore:
         next_at_us: int | None = None,
     ) -> bool:
         with self._txn() as conn:
-            placeholders = ",".join("?" for _ in from_states)
-            cur = conn.execute(
-                f"UPDATE effects SET state = ?, remote_id = COALESCE(?, remote_id), "
-                f"outcome_reason = ?, next_at_us = ?, updated_at_us = ? "
-                f"WHERE effect_id = ? AND state IN ({placeholders})",
-                (
-                    state,
-                    remote_id,
-                    reason,
-                    next_at_us,
-                    self._clock.now_utc_us(),
-                    effect_id,
-                    *from_states,
-                ),
+            return self._update_effect(
+                conn,
+                effect_id,
+                state,
+                from_states=from_states,
+                remote_id=remote_id,
+                reason=reason,
+                next_at_us=next_at_us,
             )
-            if state == "done" and cur.rowcount == 1:
-                conn.execute(
-                    "UPDATE dispatch_intents SET create_state = 'done', adopted_root_id = ? "
-                    "WHERE effect_id = ?",
-                    (remote_id, effect_id),
-                )
-            elif state in ("unknown", "cancelled") and cur.rowcount == 1:
-                conn.execute(
-                    "UPDATE dispatch_intents SET create_state = ? WHERE effect_id = ?",
-                    (state, effect_id),
-                )
-            return cur.rowcount == 1
+
+    def _update_effect(
+        self,
+        conn: sqlite3.Connection,
+        effect_id: str,
+        state: str,
+        *,
+        from_states: tuple[str, ...],
+        remote_id: str | None,
+        reason: str | None,
+        next_at_us: int | None = None,
+    ) -> bool:
+        placeholders = ",".join("?" for _ in from_states)
+        cur = conn.execute(
+            f"UPDATE effects SET state = ?, remote_id = COALESCE(?, remote_id), "
+            f"outcome_reason = ?, next_at_us = ?, updated_at_us = ? "
+            f"WHERE effect_id = ? AND state IN ({placeholders})",
+            (
+                state,
+                remote_id,
+                reason,
+                next_at_us,
+                self._clock.now_utc_us(),
+                effect_id,
+                *from_states,
+            ),
+        )
+        if state == "done" and cur.rowcount == 1:
+            conn.execute(
+                "UPDATE dispatch_intents SET create_state = 'done', adopted_root_id = ? "
+                "WHERE effect_id = ?",
+                (remote_id, effect_id),
+            )
+        elif state in ("unknown", "cancelled", "failed") and cur.rowcount == 1:
+            conn.execute(
+                "UPDATE dispatch_intents SET create_state = ? WHERE effect_id = ?",
+                (state, effect_id),
+            )
+        return cur.rowcount == 1
+
+    def record_effect_outcome(
+        self,
+        effect_id: str,
+        state: str,
+        *,
+        from_states: tuple[str, ...],
+        event: Event | None,
+        config: TrustedConfig,
+        remote_id: str | None = None,
+        reason: str | None = None,
+        reducer: Reducer = transition,
+    ) -> EffectOutcomeResult:
+        """Atomically move an effect to ``state`` and apply the event reporting it.
+
+        Nothing is written unless the effect is currently in one of ``from_states``: an
+        outcome can never be recorded twice, nor an event applied for an effect another
+        path already finished. The effect update and the reducer transition (with its
+        projections, admission and new intents) commit in one transaction.
+        """
+        if state not in ("done", "failed", "cancelled", "unknown"):
+            raise StoreError(f"not an outcome state: {state}")
+        with self._txn() as conn:
+            row = conn.execute(
+                "SELECT state FROM effects WHERE effect_id = ?", (effect_id,)
+            ).fetchone()
+            if row is None or row["state"] not in from_states:
+                return EffectOutcomeResult(False, None)
+            applied = (
+                self._apply_in_txn(conn, event, config, reducer, None)
+                if event is not None
+                else None
+            )
+            self._hook("after-outcome-event")
+            updated = self._update_effect(
+                conn,
+                effect_id,
+                state,
+                from_states=from_states,
+                remote_id=remote_id,
+                reason=reason,
+            )
+            if not updated:
+                raise StoreError(f"effect {effect_id} changed state inside its transaction")
+        return EffectOutcomeResult(True, applied)
 
     def complete_effect(self, effect_id: str, *, remote_id: str | None = None) -> bool:
         return self._finish_effect(
@@ -937,6 +1060,265 @@ class SqliteStore:
                 )
                 out.append(replace(self._stored(r), state=new_state))
         return out
+
+    # ------------------------------------------------------- own-send ledger
+
+    def record_own_send(self, send: OwnSendRow) -> OwnSendRow:
+        """Durably record a send/resolve intent BEFORE its POST. First record wins.
+
+        Returns the persisted row: a replay after a crash keeps the original digest, so a
+        lost acknowledgement is always reconciled against the text actually sent first.
+        """
+        if send.kind not in ("message", "resolve"):
+            raise StoreError(f"unknown own-send kind {send.kind}")
+        with self._txn() as conn:
+            conn.execute(
+                "INSERT INTO own_sends (effect_id, session_id, node_id, kind, text_sha256, "
+                "elicitation_id, item_id, recorded_at_us) VALUES (?, ?, ?, ?, ?, ?, NULL, ?) "
+                "ON CONFLICT(effect_id) DO NOTHING",
+                (
+                    send.effect_id,
+                    send.session_id,
+                    send.node_id,
+                    send.kind,
+                    send.text_sha256,
+                    send.elicitation_id,
+                    self._clock.now_utc_us(),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM own_sends WHERE effect_id = ?", (send.effect_id,)
+            ).fetchone()
+        return _own_send(row)
+
+    def record_own_item(self, effect_id: str, item_id: str) -> bool:
+        """Bind the acknowledged/adopted item to a recorded send. Never rebinds."""
+        with self._txn() as conn:
+            row = conn.execute(
+                "SELECT item_id FROM own_sends WHERE effect_id = ?", (effect_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            if row["item_id"] is not None:
+                if row["item_id"] != item_id:
+                    raise InvariantViolation(f"own send {effect_id} is bound to another item")
+                return True
+            conn.execute(
+                "UPDATE own_sends SET item_id = ?, acknowledged_at_us = ? WHERE effect_id = ?",
+                (item_id, self._clock.now_utc_us(), effect_id),
+            )
+        return True
+
+    def own_send(self, effect_id: str) -> OwnSendRow | None:
+        row = self._conn.execute(
+            "SELECT * FROM own_sends WHERE effect_id = ?", (effect_id,)
+        ).fetchone()
+        return None if row is None else _own_send(row)
+
+    def own_item_ids(self, session_id: str) -> frozenset[str]:
+        rows = self._conn.execute(
+            "SELECT item_id FROM own_sends WHERE session_id = ? AND item_id IS NOT NULL",
+            (session_id,),
+        ).fetchall()
+        return frozenset(str(r["item_id"]) for r in rows)
+
+    # ---------------------------------------------------------- capabilities
+
+    def save_capability(self, row: CapabilityRow) -> None:
+        """Persist a (rotated) capability hash. Generations only ever increase."""
+        with self._txn() as conn:
+            prior = conn.execute(
+                "SELECT generation FROM capability_records WHERE session_key = ?",
+                (row.session_key,),
+            ).fetchone()
+            if prior is not None and int(prior["generation"]) >= row.generation:
+                raise InvariantViolation(
+                    f"capability generation for {row.session_key} must increase"
+                )
+            conn.execute(
+                "INSERT INTO capability_records (session_key, stage_session_id, worker_id, "
+                "worker_profile, capability_id, secret_sha256, generation, path, revoked, "
+                "updated_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?) "
+                "ON CONFLICT(session_key) DO UPDATE SET "
+                "stage_session_id = excluded.stage_session_id, worker_id = excluded.worker_id, "
+                "worker_profile = excluded.worker_profile, "
+                "capability_id = excluded.capability_id, "
+                "secret_sha256 = excluded.secret_sha256, generation = excluded.generation, "
+                "path = excluded.path, revoked = 0, updated_at_us = excluded.updated_at_us",
+                (
+                    row.session_key,
+                    row.stage_session_id,
+                    row.worker_id,
+                    row.worker_profile,
+                    row.capability_id,
+                    row.secret_sha256,
+                    row.generation,
+                    row.path,
+                    self._clock.now_utc_us(),
+                ),
+            )
+
+    def revoke_capability(self, session_key: str) -> None:
+        """Mark revoked; the row (and its generation) is retained."""
+        with self._txn() as conn:
+            conn.execute(
+                "UPDATE capability_records SET revoked = 1, updated_at_us = ? "
+                "WHERE session_key = ?",
+                (self._clock.now_utc_us(), session_key),
+            )
+
+    def capability_rows(self) -> list[CapabilityRow]:
+        """Every capability row, revoked ones included (for generation continuity)."""
+        rows = self._conn.execute(
+            "SELECT * FROM capability_records ORDER BY session_key"
+        ).fetchall()
+        return [
+            CapabilityRow(
+                session_key=r["session_key"],
+                stage_session_id=r["stage_session_id"],
+                worker_id=r["worker_id"],
+                worker_profile=r["worker_profile"],
+                capability_id=r["capability_id"],
+                secret_sha256=r["secret_sha256"],
+                generation=int(r["generation"]),
+                path=r["path"],
+                revoked=bool(r["revoked"]),
+            )
+            for r in rows
+        ]
+
+    # --------------------------------------------------------- worker grants
+
+    def save_worker_grant(self, row: WorkerGrantRow) -> None:
+        with self._txn() as conn:
+            conn.execute(
+                "INSERT INTO worker_grants (stage_session_id, worker_id, path, branch, profile, "
+                "recorded_at_us) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(stage_session_id, worker_id) DO UPDATE SET path = excluded.path, "
+                "branch = excluded.branch, profile = excluded.profile, "
+                "recorded_at_us = excluded.recorded_at_us",
+                (
+                    row.stage_session_id,
+                    row.worker_id,
+                    row.path,
+                    row.branch,
+                    row.profile,
+                    self._clock.now_utc_us(),
+                ),
+            )
+
+    def delete_worker_grants(self, stage_session_id: str) -> None:
+        with self._txn() as conn:
+            conn.execute(
+                "DELETE FROM worker_grants WHERE stage_session_id = ?", (stage_session_id,)
+            )
+
+    def worker_grant_rows(self) -> list[WorkerGrantRow]:
+        rows = self._conn.execute(
+            "SELECT * FROM worker_grants ORDER BY stage_session_id, worker_id"
+        ).fetchall()
+        return [
+            WorkerGrantRow(
+                r["stage_session_id"], r["worker_id"], r["path"], r["branch"], r["profile"]
+            )
+            for r in rows
+        ]
+
+    # ------------------------------------------------------ parked deliveries
+
+    def park_delivery(
+        self,
+        delivery_guid: str,
+        parcel_id: str | None,
+        *,
+        hold: Event | None = None,
+        config: TrustedConfig | None = None,
+    ) -> None:
+        """Park a poison delivery: scope row, ``rejected`` status and parcel hold, atomically.
+
+        Re-parking never narrows scope: a repository-wide park stays repository-wide.
+        """
+        with self._txn() as conn:
+            self._park(conn, delivery_guid, parcel_id)
+            self._hook("after-park-row")
+            self._mark_delivery(conn, delivery_guid, "rejected")
+            if hold is not None:
+                if config is None:
+                    raise StoreError("a parcel hold needs the trusted config")
+                self._apply_in_txn(conn, hold, config, transition, None)
+
+    def _park(self, conn: sqlite3.Connection, delivery_guid: str, parcel_id: str | None) -> None:
+        conn.execute(
+            "INSERT INTO parked_deliveries (delivery_guid, parcel_id, parked_at_us) "
+            "VALUES (?, ?, ?) ON CONFLICT(delivery_guid) DO UPDATE SET "
+            "parcel_id = CASE WHEN parked_deliveries.parcel_id = excluded.parcel_id "
+            "THEN excluded.parcel_id ELSE NULL END",
+            (delivery_guid, parcel_id, self._clock.now_utc_us()),
+        )
+
+    def release_parked_delivery(
+        self,
+        delivery_guid: str,
+        *,
+        release: Event | None = None,
+        config: TrustedConfig | None = None,
+    ) -> bool:
+        """Operator release: drop the scope row, requeue the delivery, release the hold."""
+        with self._txn() as conn:
+            cur = conn.execute(
+                "DELETE FROM parked_deliveries WHERE delivery_guid = ?", (delivery_guid,)
+            )
+            if cur.rowcount != 1:
+                return False
+            status = conn.execute(
+                "SELECT status FROM deliveries WHERE delivery_guid = ?", (delivery_guid,)
+            ).fetchone()
+            if status is not None and status["status"] == "rejected":
+                self._mark_delivery(conn, delivery_guid, "pending")
+            if release is not None:
+                if config is None:
+                    raise StoreError("a hold release needs the trusted config")
+                self._apply_in_txn(conn, release, config, transition, None)
+        return True
+
+    def parked_delivery_rows(self) -> tuple[tuple[str, str | None], ...]:
+        rows = self._conn.execute(
+            "SELECT delivery_guid, parcel_id FROM parked_deliveries ORDER BY delivery_guid"
+        ).fetchall()
+        return tuple((str(r["delivery_guid"]), r["parcel_id"]) for r in rows)
+
+    def sync_parked_deliveries(
+        self,
+        legacy: Sequence[tuple[str, str | None]] = (),
+        *,
+        holds: Sequence[Event] = (),
+        config: TrustedConfig | None = None,
+    ) -> None:
+        """Startup reconciliation, one transaction (fail closed in every direction).
+
+        * import ``legacy`` Task-4 registry entries with their scope, plus parcel holds;
+        * a ``rejected`` delivery without a scope row is parked repository-wide;
+        * a parked delivery whose row is ``pending``/``unresolved`` is re-marked rejected.
+        """
+        with self._txn() as conn:
+            for delivery_guid, parcel_id in legacy:
+                self._park(conn, delivery_guid, parcel_id)
+            for hold in holds:
+                if config is None:
+                    raise StoreError("a parcel hold needs the trusted config")
+                self._apply_in_txn(conn, hold, config, transition, None)
+            conn.execute(
+                "INSERT INTO parked_deliveries (delivery_guid, parcel_id, parked_at_us) "
+                "SELECT delivery_guid, NULL, ? FROM deliveries WHERE status = 'rejected' "
+                "AND delivery_guid NOT IN (SELECT delivery_guid FROM parked_deliveries)",
+                (self._clock.now_utc_us(),),
+            )
+            conn.execute(
+                "UPDATE deliveries SET status = 'rejected', processed_at_us = ? "
+                "WHERE status IN ('pending', 'unresolved') "
+                "AND delivery_guid IN (SELECT delivery_guid FROM parked_deliveries)",
+                (self._clock.now_utc_us(),),
+            )
 
     # --------------------------------------------------------------- leases
 
@@ -1007,6 +1389,18 @@ class SqliteStore:
     def query(self, sql: str, params: Sequence[object] = ()) -> list[sqlite3.Row]:
         """Read-only helper for diagnostics and tests."""
         return self._conn.execute(sql, tuple(params)).fetchall()
+
+
+def _own_send(r: sqlite3.Row) -> OwnSendRow:
+    return OwnSendRow(
+        effect_id=r["effect_id"],
+        session_id=r["session_id"],
+        node_id=r["node_id"],
+        kind=r["kind"],
+        text_sha256=r["text_sha256"],
+        elicitation_id=r["elicitation_id"],
+        item_id=r["item_id"],
+    )
 
 
 def _split_sql(sql: str) -> list[str]:

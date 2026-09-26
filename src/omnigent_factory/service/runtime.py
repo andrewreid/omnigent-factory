@@ -13,7 +13,13 @@ from typing import Any
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.events import Event, Provenance
-from omnigent_factory.core.types import AdmissionSnapshot, Lifecycle, Parcel, QueueStatus
+from omnigent_factory.core.types import (
+    AdmissionSnapshot,
+    InboxHoldReason,
+    Lifecycle,
+    Parcel,
+    QueueStatus,
+)
 from omnigent_factory.ports.adapter import EffectAdapter
 from omnigent_factory.ports.clock import Clock, SystemClock
 from omnigent_factory.service.config import ServiceConfig
@@ -26,7 +32,11 @@ from omnigent_factory.service.executor import (
 from omnigent_factory.service.interfaces import DeliveryProcessor, NonRetryableDelivery
 from omnigent_factory.service.locking import ProcessLock
 from omnigent_factory.service.operator import OperatorServer
-from omnigent_factory.service.parked import ParkedDeliveryRegistry
+from omnigent_factory.service.parked import (
+    ParkedDeliveries,
+    inbox_hold_event,
+    inbox_release_event,
+)
 from omnigent_factory.service.redaction import install_redaction_filter
 from omnigent_factory.store.sqlite import ApplyResult, DeliveryRecord, SqliteStore, StoredEffect
 
@@ -55,7 +65,7 @@ class FactoryService:
         self._delivery_retry_at: dict[str, float] = {}
         self._delivery_lock = asyncio.Lock()
         self._last_admission_attempt: tuple[object, ...] | None = None
-        self.parked = ParkedDeliveryRegistry(config.state_dir)
+        self.parked = ParkedDeliveries(self.db, config.state_dir, config.trusted, self.clock)
         self.executor = EffectExecutor(
             self.db,
             config.trusted,
@@ -85,10 +95,9 @@ class FactoryService:
         install_redaction_filter()
         self.process_lock.acquire()
         try:
-            self.parked.load()
             await self.db.start()
             await self.db.call(lambda store: store.ensure_repository(self.config.trusted))
-            await self._sync_parked_deliveries()
+            await self.parked.load()
             await self._adopt_terminal_claims()
             await self.db.call(lambda store: store.recover_claimed())
             unknown = await self.db.call(lambda store: store.effects_in_state("unknown"))
@@ -210,6 +219,9 @@ class FactoryService:
         failures = 0
         while not self._stop.is_set():
             try:
+                # Also retires holds left by a crash between a delivery's facts and its
+                # hold release, so it runs even while no processor is bound.
+                await self.release_resolved_inbox_holds()
                 if self.delivery_processor is None:
                     await self._wait(0.1)
                     failures = 0
@@ -219,6 +231,7 @@ class FactoryService:
                 for delivery in deliveries:
                     async with self._delivery_lock:
                         await self._process_delivery(delivery, loop_now)
+                await self.release_resolved_inbox_holds()
                 failures = 0
                 await self._wait(0.05)
             except asyncio.CancelledError:
@@ -230,27 +243,17 @@ class FactoryService:
         if self._delivery_retry_at.get(delivery.delivery_guid, 0) > loop_now:
             return
         if self.parked.contains(delivery.delivery_guid):
-            await self.db.call(
-                partial(
-                    _mark_delivery,
-                    delivery_guid=delivery.delivery_guid,
-                    status="rejected",
-                )
-            )
+            # Mirror says parked but the row is pending: complete the park atomically.
+            scope = dict(self.parked.records()).get(delivery.delivery_guid)
+            await self.parked.park(delivery.delivery_guid, scope)
             return
         if self.delivery_processor is None:
             return
         try:
             await self.delivery_processor.process(delivery)
         except NonRetryableDelivery as exc:
-            self.parked.park(delivery.delivery_guid, exc.parcel_id)
-            await self.db.call(
-                partial(
-                    _mark_delivery,
-                    delivery_guid=delivery.delivery_guid,
-                    status="rejected",
-                )
-            )
+            # Scope row, rejected status and (scoped) parcel hold commit together.
+            await self.parked.park(delivery.delivery_guid, exc.parcel_id)
             self._delivery_failures.pop(delivery.delivery_guid, None)
             self._delivery_retry_at.pop(delivery.delivery_guid, None)
             LOG.warning(
@@ -274,6 +277,79 @@ class FactoryService:
             return
         self._delivery_failures.pop(delivery.delivery_guid, None)
         self._delivery_retry_at.pop(delivery.delivery_guid, None)
+
+    async def hold_unresolved_delivery(self, delivery_guid: str, parcel_id: str | None) -> bool:
+        """Mark a delivery ``unresolved`` and, for a known candidate parcel, hold it.
+
+        T4 F-new-1: an unresolved project event (identity not yet verified, §3.3(3)) may be
+        a leftward drag or removal. When its candidate parcel is already known (the
+        content node is a parcel issue), the parcel is fenced (safety), interrupted and
+        held in the same transaction that marks the delivery. An unknown candidate cannot
+        have running work, so only the status is recorded. Returns whether a hold applied.
+        """
+        parcel = (
+            await self.db.call(partial(_load_parcel, parcel_id=parcel_id)) if parcel_id else None
+        )
+        if parcel is None or parcel_id is None:
+            await self.db.call(
+                partial(_mark_delivery, delivery_guid=delivery_guid, status="unresolved")
+            )
+            return False
+        event = inbox_hold_event(
+            self.config.trusted,
+            self.clock,
+            delivery_guid,
+            parcel_id,
+            InboxHoldReason.UNRESOLVED,
+            event_id=f"inbox-hold:{delivery_guid}:unresolved",
+        )
+        result = await self.apply_event(
+            replace(event, delivery_guid=delivery_guid), delivery_status="unresolved"
+        )
+        if result.duplicate:
+            await self.db.call(
+                partial(_mark_delivery, delivery_guid=delivery_guid, status="unresolved")
+            )
+        return True
+
+    async def release_resolved_inbox_holds(self) -> int:
+        """Retire ``unresolved`` parcel holds whose delivery has since been processed.
+
+        Runs after each delivery pass (and so after a crash between the delivery's facts
+        committing and its hold being released). Parked holds are never touched here.
+        """
+        rows = await self.db.call(
+            lambda store: store.query(
+                "SELECT parcel_id FROM parcels WHERE repo_id = ? AND holds_json LIKE ?",
+                (self.config.repo_id, '%"inbox"%'),
+            )
+        )
+        released = 0
+        for row in rows:
+            parcel_id = str(row[0])
+            parcel = await self.db.call(partial(_load_parcel, parcel_id=parcel_id))
+            if parcel is None:
+                continue
+            for hold in parcel.inbox_holds:
+                if hold.reason != InboxHoldReason.UNRESOLVED:
+                    continue
+                status = await self.db.call(
+                    partial(_delivery_status, delivery_guid=hold.delivery_guid)
+                )
+                if status != "processed":
+                    continue
+                result = await self.apply_event(
+                    inbox_release_event(
+                        self.config.trusted,
+                        self.clock,
+                        hold.delivery_guid,
+                        parcel_id,
+                        Provenance.INBOX,
+                        event_id=f"inbox-release:{hold.delivery_guid}:resolved",
+                    )
+                )
+                released += int(result.accepted)
+        return released
 
     async def _admission_loop(self) -> None:
         failures = 0
@@ -463,8 +539,7 @@ class FactoryService:
             if not self.parked.contains(delivery_guid):
                 raise ValueError("delivery is not parked")
             async with self._delivery_lock:
-                await self.db.call(partial(_release_parked_delivery, delivery_guid=delivery_guid))
-                self.parked.release(delivery_guid)
+                await self.parked.release(delivery_guid)
                 self._delivery_failures.pop(delivery_guid, None)
                 self._delivery_retry_at.pop(delivery_guid, None)
             return {"released": delivery_guid, **await self._status()}
@@ -542,25 +617,6 @@ class FactoryService:
             ],
         }
 
-    async def _sync_parked_deliveries(self) -> None:
-        rows = await self.db.call(
-            lambda store: store.query("SELECT delivery_guid, status FROM deliveries")
-        )
-        statuses = {str(row[0]): str(row[1]) for row in rows}
-        for delivery_guid, status in statuses.items():
-            if status == "rejected" and not self.parked.contains(delivery_guid):
-                self.parked.park(delivery_guid, None)
-        for delivery_guid, _ in self.parked.records():
-            persisted_status = statuses.get(delivery_guid)
-            if persisted_status not in (None, "processed", "rejected"):
-                await self.db.call(
-                    partial(
-                        _mark_delivery,
-                        delivery_guid=delivery_guid,
-                        status="rejected",
-                    )
-                )
-
     async def _wait(self, seconds: float) -> None:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._stop.wait(), seconds)
@@ -616,10 +672,9 @@ def _has_pending_delivery(store: SqliteStore) -> bool:
     return bool(store.query("SELECT 1 FROM deliveries WHERE status = 'pending' LIMIT 1"))
 
 
-def _release_parked_delivery(store: SqliteStore, *, delivery_guid: str) -> None:
+def _delivery_status(store: SqliteStore, *, delivery_guid: str) -> str | None:
     rows = store.query("SELECT status FROM deliveries WHERE delivery_guid = ?", (delivery_guid,))
-    if rows and str(rows[0][0]) == "rejected":
-        store.mark_delivery(delivery_guid, "pending")
+    return str(rows[0][0]) if rows else None
 
 
 def _admission_signature(

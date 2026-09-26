@@ -26,7 +26,17 @@ from omnigent_factory.github.webhook import (
 )
 from omnigent_factory.testing.harness import Harness
 
-from .test_adapter import BOT_ID, CTX, PROJECT, REPO_NODE, REPOSITORY, STATUS_FIELD, adapter
+from .test_adapter import (
+    BOT_ID,
+    CTX,
+    PARCEL_REF,
+    PROJECT,
+    REPO_NODE,
+    REPOSITORY,
+    STATUS_FIELD,
+    adapter,
+    closing_refs,
+)
 from .test_auth_client import private_key
 from .test_webhook_config_setup import normalize, payload, project_drag, resolve_drag
 
@@ -448,10 +458,12 @@ async def test_S4_ghost_comment_author_does_not_crash_pr_snapshot():
             return httpx.Response(200, json=[])
         if path.endswith("/comments"):
             return httpx.Response(200, json=[{"id": 1, "user": None, "body": "old"}])
+        if path == "/graphql":
+            return closing_refs("I_1")
         raise AssertionError(path)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        result = await adapter(http).pull_request(REPO_NODE, 7)
+        result = await adapter(http).pull_request(PARCEL_REF, 7)
     assert result.pr_number == 7
 
 

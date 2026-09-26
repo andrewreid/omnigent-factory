@@ -279,9 +279,9 @@ class EffectExecutor:
             ),
             "cancelled",
         )
-        if event is not None:
-            await self._apply_event(event)
-        await self._db.call(lambda store: store.cancel_effect(effect.effect_id, reason))
+        await self._record(
+            effect, "cancelled", event, from_states=("pending", "claimed"), reason=reason
+        )
 
     async def _finish(self, stored: StoredEffect, outcome: AdapterOutcome) -> None:
         effect = stored.effect
@@ -294,16 +294,9 @@ class EffectExecutor:
             if event is None and effect.kind in _ACK_EVENT_REQUIRED:
                 await self._finish(stored, AmbiguousWrite("ack-missing-required-detail"))
                 return
-            if event is not None:
-                await self._apply_event(event)
-            await self._db.call(
-                lambda store: store.complete_effect(effect.effect_id, remote_id=outcome.remote_id)
-            )
+            await self._record(effect, "done", event, remote_id=outcome.remote_id)
             return
         if isinstance(outcome, AmbiguousWrite):
-            await self._db.call(
-                lambda store: store.mark_effect_unknown(effect.effect_id, outcome.reason)
-            )
             event = self._event(
                 effect,
                 ev.EffectUnknown(
@@ -313,10 +306,32 @@ class EffectExecutor:
                 ),
                 "unknown",
             )
-            if event is not None:
-                await self._apply_event(event)
+            await self._record(effect, "unknown", event, reason=outcome.reason)
             return
         await self._retry_or_unknown(stored, outcome)
+
+    async def _record(
+        self,
+        effect: EffectIntent,
+        state: str,
+        event: Event | None,
+        *,
+        from_states: tuple[str, ...] = ("claimed",),
+        remote_id: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Effect state and the reducer event reporting it commit in one transaction."""
+        await self._db.call(
+            lambda store: store.record_effect_outcome(
+                effect.effect_id,
+                state,
+                from_states=from_states,
+                event=event,
+                config=self._config,
+                remote_id=remote_id,
+                reason=reason,
+            )
+        )
 
     async def _retry_or_unknown(
         self,
@@ -355,9 +370,7 @@ class EffectExecutor:
                 session_id=effect.preconditions.session_id,
             )
         event = self._event(effect, event_body, "failed")
-        if event is not None:
-            await self._apply_event(event)
-        await self._db.call(lambda store: store.fail_effect(effect.effect_id, outcome.reason))
+        await self._record(effect, "failed", event, reason=outcome.reason)
 
     def _ack_event(self, effect: EffectIntent, ack: Ack) -> Event | None:
         session_id = effect.preconditions.session_id or ""
@@ -412,9 +425,6 @@ class EffectExecutor:
                 correlated=True,
             )
         return self._event(effect, body, "ack") if body is not None else None
-
-    async def _apply_event(self, event: Event) -> None:
-        await self._db.call(lambda store: store.apply_event(event, self._config))
 
     async def _wait(self, seconds: float) -> None:
         with contextlib.suppress(TimeoutError):

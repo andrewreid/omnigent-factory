@@ -9,6 +9,11 @@ Issuance requires *all* of:
 4. a fresh :class:`ExecutionGate` decision from persisted state (live, authorised,
    unfenced stage session; bounded checkpoint cleanup allowance is the gate's business).
 
+After a restart, :meth:`LocalCredentialBroker.restore` reloads persisted capabilities
+and worker bindings but no issuance: every session stays denied until
+:meth:`LocalCredentialBroker.reenable_after_recheck` confirms, from the current persisted
+gate, that the stage may hold its fixed profile.
+
 Caller-requested permissions are never accepted: the profile comes from the enable effect
 and must agree with the gate. Minted tokens are checked for exactly-requested permissions
 and repository, cached per session/profile until shortly before expiry, and every request
@@ -199,21 +204,54 @@ class LocalCredentialBroker:
 
     # ------------------------------------------------------------ capability lifecycle
 
-    def provision(self, session_id: str) -> CapabilityRecord:
+    async def provision(self, session_id: str) -> CapabilityRecord:
         """Create or rotate a session's capability. Issuance stays as it was (default off)."""
-        return self.capabilities.provision(session_id)
+        return await self.capabilities.provision(session_id)
 
-    def provision_worker(
+    async def provision_worker(
         self, stage_session_id: str, worker_id: str, profile: CredentialProfile
     ) -> CapabilityRecord:
         """Capability for one daemon-recorded worker of a stage, with its own fixed role.
 
         A worker token never exceeds the stage's enabled profile, and every request still
-        passes the *stage's* issuance flag and execution gate.
+        passes the *stage's* issuance flag and execution gate. The binding is persisted
+        with the capability so it survives a restart.
         """
         key = worker_session_id(stage_session_id, worker_id)
+        record = await self.capabilities.provision(
+            key, worker_of=stage_session_id, worker_profile=profile
+        )
         self._workers[key] = WorkerBinding(key, stage_session_id, profile)
-        return self.capabilities.provision(key)
+        return record
+
+    async def restore(self) -> None:
+        """Boot: reload capabilities and worker bindings. Issuance stays default-deny."""
+        records = await self.capabilities.restore()
+        async with self._lock:
+            self._enabled.clear()
+            self._cache.clear()
+            self._workers = {
+                r.session_id: WorkerBinding(r.session_id, r.worker_of, r.worker_profile)
+                for r in records
+                if r.worker_of is not None and r.worker_profile is not None
+            }
+
+    async def reenable_after_recheck(self, session_id: str, profile: CredentialProfile) -> bool:
+        """Restore issuance for a stage only if its current persisted gate allows ``profile``.
+
+        Called by the service after boot for stages that were executing. A worker key, a
+        session without a restored capability, or any closed/mismatched gate stays denied.
+        """
+        if session_id in self._workers or self.capabilities.get(session_id) is None:
+            return False
+        decision = await self._gate.token_gate(session_id)
+        if not decision.allowed or (decision.profile is not None and decision.profile != profile):
+            self.audit.add(session_id, "reenable-refused", decision.reason or "profile")
+            return False
+        async with self._lock:
+            self._enabled[session_id] = profile
+        self.audit.add(session_id, "reenabled", profile.value)
+        return True
 
     def workers_of(self, stage_session_id: str) -> tuple[str, ...]:
         return tuple(k for k, w in self._workers.items() if w.stage_session_id == stage_session_id)
@@ -225,9 +263,9 @@ class LocalCredentialBroker:
         """Disable issuance and delete the session's (and its workers') capability files."""
         await self.disable(session_id)
         for key in self.workers_of(session_id):
-            self.capabilities.revoke(key)
+            await self.capabilities.revoke(key)
             self._workers.pop(key, None)
-        self.capabilities.revoke(session_id)
+        await self.capabilities.revoke(session_id)
 
     async def disable(self, session_id: str) -> None:
         async with self._lock:

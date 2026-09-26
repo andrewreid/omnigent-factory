@@ -55,7 +55,7 @@ def setup(tmp_path: Path):
 
 
 async def _enable(broker: LocalCredentialBroker, sid: str, profile: CredentialProfile) -> str:
-    record = broker.provision(sid)
+    record = await broker.provision(sid)
     secret = read_capability_file(record.path).secret
     outcome = await broker.execute(_intent(EffectKind.ENABLE_ISSUANCE, sid, profile.value), CTX)
     assert isinstance(outcome, Ack)
@@ -71,7 +71,7 @@ def test_broker_satisfies_port(setup) -> None:
 @pytest.mark.asyncio
 async def test_issuance_denied_by_default_even_with_valid_capability(setup) -> None:
     broker, gate, minter, _ = setup
-    record = broker.provision("S1")
+    record = await broker.provision("S1")
     gate.open("S1", CredentialProfile.BUILD)
     secret = read_capability_file(record.path).secret
     result = await broker.request_token("S1", secret, REPO)
@@ -82,7 +82,7 @@ async def test_issuance_denied_by_default_even_with_valid_capability(setup) -> N
 @pytest.mark.asyncio
 async def test_capability_file_is_private_and_secret_not_in_hash(setup, tmp_path: Path) -> None:
     broker, *_ = setup
-    record = broker.provision("S1")
+    record = await broker.provision("S1")
     assert stat.S_IMODE(record.path.stat().st_mode) == 0o600
     assert stat.S_IMODE(record.path.parent.stat().st_mode) == 0o700
     secret = read_capability_file(record.path).secret
@@ -195,7 +195,7 @@ async def test_rotation_invalidates_previous_capability(setup) -> None:
     broker, gate, _, _ = setup
     old = await _enable(broker, "S1", CredentialProfile.BUILD)
     gate.open("S1", CredentialProfile.BUILD)
-    rotated = broker.provision("S1")
+    rotated = await broker.provision("S1")
     new = read_capability_file(rotated.path).secret
     assert rotated.generation == 2
     assert await broker.request_token("S1", old, REPO) == TokenRefusal("invalid-capability")
@@ -210,7 +210,7 @@ async def test_enable_requires_provisioned_capability_and_known_profile(setup) -
     broker, *_ = setup
     missing = await broker.execute(_intent(EffectKind.ENABLE_ISSUANCE, "S9", "build"), CTX)
     assert isinstance(missing, DefinitiveFailure)
-    broker.provision("S9")
+    await broker.provision("S9")
     bogus = await broker.execute(_intent(EffectKind.ENABLE_ISSUANCE, "S9", "admin"), CTX)
     assert isinstance(bogus, DefinitiveFailure)
     assert not broker.issuance_enabled("S9")

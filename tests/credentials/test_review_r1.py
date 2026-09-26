@@ -183,7 +183,7 @@ async def test_read_only_worker_under_build_stage_gets_read_only_token(git_env: 
         cap_path = await _stage(stack, branch, "B22", CredentialProfile.BUILD)
         reviewer = git_env.worktrees / "reviewer"
         git("worktree", "add", "-b", f"{branch}--r", str(reviewer), branch, cwd=git_env.source)
-        stack.server.authorize_worker(
+        await stack.server.authorize_worker(
             "B22", WorkerGrant("r", reviewer, f"{branch}--r", CredentialProfile.READ_ONLY)
         )
         cap = read_capability_file(cap_path)
@@ -219,7 +219,7 @@ async def test_worker_profile_cannot_exceed_read_only_stage(git_env: GitEnv) -> 
     cap_path = await _stage(stack, branch, "P23", CredentialProfile.READ_ONLY)
     w = git_env.worktrees / "w23"
     git("worktree", "add", "-b", f"{branch}--w", str(w), branch, cwd=git_env.source)
-    stack.server.authorize_worker(
+    await stack.server.authorize_worker(
         "P23", WorkerGrant("w", w, f"{branch}--w", CredentialProfile.BUILD)
     )
     reply = await _dispatch_register(stack, cap_path, w, f"{branch}--w")

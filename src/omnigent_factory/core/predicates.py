@@ -26,8 +26,9 @@ def eligible(p: Parcel) -> bool:
 
 
 def dispatchable(p: Parcel) -> bool:
-    """E for dispatch: eligible and the configured project item exists (§3.3 step 4)."""
-    return p.eligible and p.in_project
+    """E for dispatch: eligible, the configured project item exists (§3.3 step 4) and no
+    durable delivery for the parcel is parked or unverified."""
+    return p.eligible and p.in_project and not p.inbox_holds
 
 
 def no_open_decisions(p: Parcel) -> bool:

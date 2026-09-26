@@ -12,6 +12,9 @@ Trust classes:
 * ``ADAPTER`` is the daemon's executor/observer: effect outcomes, session/stream
   observations, read-after-write board acknowledgements.
 * ``SCHEDULER`` is the trusted clock; ``OPERATOR`` the local protected CLI socket.
+* ``INBOX`` is the durable delivery inbox. It may only restrict (hold a parcel whose
+  delivery it could not interpret) or retire its own ``unresolved`` hold once the
+  delivery resolved; a ``parked`` hold is released only by the operator (handler check).
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ _OBSERVED = _GITHUB_OR_READ | {Provenance.ADAPTER}
 _ADAPTER = frozenset({Provenance.ADAPTER})
 _SCHEDULER = frozenset({Provenance.SCHEDULER})
 _OPERATOR = frozenset({Provenance.OPERATOR})
+_INBOX = frozenset({Provenance.INBOX})
 
 _OWNER_CONTROL = Admission(_GITHUB, ActorRule.OWNER)
 
@@ -67,6 +71,8 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.WAIVER_EDITED: Admission(_GITHUB_OR_READ),
     EventKind.APPROVAL_INVALIDATED: Admission(_OBSERVED),
     EventKind.CONTRACT_TAMPERED: Admission(_OBSERVED),
+    EventKind.INBOX_HOLD_SET: Admission(_INBOX),
+    EventKind.INBOX_HOLD_RELEASED: Admission(_INBOX | _OPERATOR),
     # GitHub observations
     EventKind.GITHUB_SNAPSHOT: Admission(frozenset({Provenance.RECONCILER, Provenance.ADAPTER})),
     # A daemon_effect_id is honoured only from ADAPTER (checked in the handler).

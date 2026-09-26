@@ -374,4 +374,71 @@ CREATE TABLE audit (
 CREATE INDEX ix_audit_parcel ON audit (parcel_id, sequence);
 """
 
-MIGRATIONS: tuple[Migration, ...] = (Migration(1, "initial-schema", V1_SQL),)
+# Task 5a durable adapter state. V1 is frozen (its checksum is verified on open).
+#
+# * own_sends: the Omnigent own-send/resolve ledger, written BEFORE each POST. V1's
+#   own_items cannot hold a pre-acknowledgement send (remote_id is part of its primary
+#   key and it has no node/kind/elicitation columns), so the ledger is keyed by effect_id
+#   with a nullable, unique item_id filled in on acknowledgement or adoption. No FK to
+#   effects: the adapter records only claimed effects, and the ledger must accept the
+#   record even if effect rows are later archived.
+# * capability_records: stage and worker capability hashes/generations (never secrets).
+#   Rows are kept after revocation so generations stay monotonic across rotations. V1's
+#   capabilities table is superseded (its FK to stage_sessions cannot hold a worker key
+#   and its profile is not known at provisioning); it was never written and is left as
+#   is. Issuance enablement is deliberately NOT stored: it is default-deny on boot.
+# * worker_grants: daemon-recorded exact (worker_id, path, branch, profile) tuples.
+# * parked_deliveries: operator-releasable parked delivery scope (NULL = repository-wide).
+#   Replaces the Task-4 side JSON registry; parking/release commit with the delivery
+#   status in one transaction. No FK so an imported legacy entry whose delivery row is
+#   missing (e.g. restored database) still fails closed.
+V2_SQL = """
+CREATE TABLE own_sends (
+    effect_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('message', 'resolve')),
+    text_sha256 TEXT NOT NULL,
+    elicitation_id TEXT NOT NULL,
+    item_id TEXT,
+    recorded_at_us INTEGER NOT NULL,
+    acknowledged_at_us INTEGER
+);
+CREATE INDEX ix_own_sends_session ON own_sends (session_id);
+CREATE UNIQUE INDEX ux_own_sends_item ON own_sends (item_id) WHERE item_id IS NOT NULL;
+
+CREATE TABLE capability_records (
+    session_key TEXT PRIMARY KEY,
+    stage_session_id TEXT NOT NULL,
+    worker_id TEXT,
+    worker_profile TEXT CHECK (worker_profile IN ('read_only', 'build')),
+    capability_id TEXT NOT NULL UNIQUE,
+    secret_sha256 TEXT NOT NULL CHECK (length(secret_sha256) = 64),
+    generation INTEGER NOT NULL CHECK (generation >= 1),
+    path TEXT NOT NULL,
+    revoked INTEGER NOT NULL CHECK (revoked IN (0, 1)),
+    updated_at_us INTEGER NOT NULL,
+    CHECK ((worker_id IS NULL) = (worker_profile IS NULL))
+);
+
+CREATE TABLE worker_grants (
+    stage_session_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    profile TEXT NOT NULL CHECK (profile IN ('read_only', 'build')),
+    recorded_at_us INTEGER NOT NULL,
+    PRIMARY KEY (stage_session_id, worker_id)
+);
+
+CREATE TABLE parked_deliveries (
+    delivery_guid TEXT PRIMARY KEY,
+    parcel_id TEXT,
+    parked_at_us INTEGER NOT NULL
+);
+"""
+
+MIGRATIONS: tuple[Migration, ...] = (
+    Migration(1, "initial-schema", V1_SQL),
+    Migration(2, "durable-adapter-state", V2_SQL),
+)

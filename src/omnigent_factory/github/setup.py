@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from omnigent_factory.ports.github import STATUS_OPTION_IDS
+
 OWNER_ID = 114979
 PROJECT_NODE_ID = "PVT_kwDOEanNes4BkJhb"
 STATUS_FIELD_NODE_ID = "PVTSSF_lADOEanNes4BkJhbzhi7I9w"
@@ -79,10 +81,10 @@ def render_project_migration(
     """
     status_options = [
         _option("Inbox", "GRAY", "Not started", "915abb46"),
-        _option("Triaged", "BLUE", "Triage requested or complete"),
-        _option("Scoped", "PURPLE", "Plan requested or awaiting approval"),
+        _option("Triaged", "BLUE", "Triage requested or complete", "43889573"),
+        _option("Scoped", "PURPLE", "Plan requested or awaiting approval", "3a7f779a"),
         _option("Building", "YELLOW", "Build queued or underway", "ba3c85dd"),
-        _option("Ready", "GREEN", "Ready for owner review and merge"),
+        _option("Ready", "GREEN", "Ready for owner review and merge", "6df89cbb"),
         _option("Done", "GREEN", "Merged / closed", "4980e49d"),
     ]
     fields = [
@@ -235,7 +237,7 @@ def validate_setup(bundle: SetupBundle) -> None:
         raise ValueError("App manifest exceeds the approved permission boundary")
     options = bundle.project_migration["update_status"]["input"]["singleSelectOptions"]
     preserved = {option.get("name"): option.get("id") for option in options if "id" in option}
-    if preserved != {"Inbox": "915abb46", "Building": "ba3c85dd", "Done": "4980e49d"}:
+    if preserved != {stage.value: option_id for stage, option_id in STATUS_OPTION_IDS.items()}:
         raise ValueError("Status migration does not preserve existing option IDs")
     bypass = bundle.ruleset.get("bypass_actors")
     if bypass != [{"actor_id": OWNER_ID, "actor_type": "User", "bypass_mode": "pull_request"}]:

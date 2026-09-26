@@ -36,6 +36,7 @@ from omnigent_factory.core.types import (
     DecisionImpact,
     FenceKind,
     Hold,
+    InboxHoldReason,
     Lifecycle,
     Parcel,
     ReservationKind,
@@ -126,6 +127,12 @@ def draw_body(data: st.DataObject, p: Parcel) -> tuple[ev.EventBody, dict[str, o
         lambda: ev.WaiverEdited(),
         lambda: ev.ApprovalInvalidated(approval_id=p.current_approval_id or "ap-x", reason="x"),
         lambda: ev.ContractTampered(contract_id=contract_id),
+        # inbox holds (parked / unverified deliveries)
+        lambda: ev.InboxHoldSet(
+            delivery_guid=d(st.sampled_from(["g1", "g2"])),
+            reason=d(st.sampled_from(list(InboxHoldReason))),
+        ),
+        lambda: ev.InboxHoldReleased(delivery_guid=d(st.sampled_from(["g1", "g2", "g-x"]))),
         # adapter
         lambda: ev.SessionCreated(
             session_id=sid, root_id=d(st.sampled_from(["r1", "r2", "r3"])), nonce=nonce
@@ -247,6 +254,9 @@ class FactoryModel(RuleBasedStateMachine):
             kw["provenance"] = Provenance.RECONCILER
         elif body.CLASS == EventClass.SAFETY:
             kw["actor"] = extras["actor"]
+        if isinstance(body, ev.InboxHoldReleased):
+            # the operator releases parked holds; the inbox releases unresolved ones
+            kw["provenance"] = data.draw(st.sampled_from([Provenance.INBOX, Provenance.OPERATOR]))
         if isinstance(body, ev.ContractPublished):
             body = ev.ContractPublished(
                 contract_id=body.contract_id,
@@ -900,6 +910,32 @@ class FactoryModel(RuleBasedStateMachine):
         old_pr = len(adm_before.live_reservations(ReservationKind.OPEN_PR))  # type: ignore[attr-defined]
         if new_pr > old_pr:
             assert adm.prospective_pr_count <= CAP_PR
+        # (Task 5a) inbox holds: set only from the inbox, released only by the matching
+        # releaser, fence the current tree on arrival and block all dispatch/work.
+        held_before = {h.delivery_guid: h.reason for h in before.inbox_holds}
+        held_after = {h.delivery_guid: h.reason for h in after.inbox_holds}
+        if held_after.keys() - held_before.keys():
+            assert event.kind == EventKind.INBOX_HOLD_SET
+            assert event.provenance == Provenance.INBOX
+            cur = before.current_session
+            if cur is not None and cur.lifecycle != Lifecycle.RETIRED:
+                s2 = after.session(cur.session_id)
+                assert s2 is not None and FenceKind.SAFETY in s2.fences
+        for guid, reason in held_before.items():
+            if guid not in held_after:
+                assert event.kind == EventKind.INBOX_HOLD_RELEASED
+                assert event.provenance == (
+                    Provenance.OPERATOR if reason == InboxHoldReason.PARKED else Provenance.INBOX
+                )
+            elif reason == InboxHoldReason.PARKED:
+                assert held_after[guid] == InboxHoldReason.PARKED  # never downgraded
+        if after.inbox_holds:
+            assert not [
+                e
+                for e in effects
+                if e.kind in WORK_BEARING_KINDS or e.kind == EffectKind.CREATE_SESSION
+            ]
+        assert (Hold.INBOX in after.holds) == bool(after.inbox_holds)
         # (16) closed vocabulary; nothing merges/closes/bypasses.
         for e in effects:
             assert e.kind in EffectKind
@@ -917,6 +953,8 @@ class FactoryModel(RuleBasedStateMachine):
                 hyp_event("ambiguous-effect-outstanding")
             if p.pending_moves:
                 hyp_event("own-board-write-pending")
+            if p.inbox_holds:
+                hyp_event("inbox-hold")
             if p.revision_pending and any(a.kind == ApprovalKind.SKIP for a in p.approvals):
                 hyp_event("revision-pending-after-waiver")
             for x in p.sessions:

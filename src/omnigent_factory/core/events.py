@@ -17,6 +17,7 @@ from typing import ClassVar
 
 from omnigent_factory.core.types import (
     DecisionImpact,
+    InboxHoldReason,
     IssueSnapshot,
     SessionKind,
     Size,
@@ -40,6 +41,7 @@ class Provenance(enum.StrEnum):
     ADAPTER = "adapter"  # effect completion / Omnigent observation
     SCHEDULER = "scheduler"  # trusted clock/timer input
     OPERATOR = "operator"  # local protected CLI socket
+    INBOX = "inbox"  # the daemon's durable delivery inbox (restrict-only holds)
 
 
 class EventKind(enum.StrEnum):
@@ -66,6 +68,8 @@ class EventKind(enum.StrEnum):
     APPROVAL_INVALIDATED = "ApprovalInvalidated"
     WAIVER_EDITED = "WaiverEdited"
     CONTRACT_TAMPERED = "ContractTampered"
+    INBOX_HOLD_SET = "InboxHoldSet"
+    INBOX_HOLD_RELEASED = "InboxHoldReleased"
     # observation: GitHub
     GITHUB_SNAPSHOT = "GitHubSnapshot"
     COLUMN_OBSERVED = "ColumnObserved"
@@ -292,6 +296,34 @@ class ContractTampered(_Body):
     KIND: ClassVar[EventKind] = EventKind.CONTRACT_TAMPERED
     CLASS: ClassVar[EventClass] = EventClass.SAFETY
     contract_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class InboxHoldSet(_Body):
+    """A durable delivery for this parcel was parked or could not be verified.
+
+    Uninterpretable input might have been a safety fact (a Stop, a leftward drag), so it
+    is treated as one: barrier, queued authority cancelled, current tree fenced (safety)
+    and interrupted, and no dispatch while the hold remains.
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.INBOX_HOLD_SET
+    CLASS: ClassVar[EventClass] = EventClass.SAFETY
+    delivery_guid: str = ""
+    reason: InboxHoldReason = InboxHoldReason.PARKED
+
+
+@dataclass(frozen=True, slots=True)
+class InboxHoldReleased(_Body):
+    """The held delivery was released (operator) or resolved (inbox).
+
+    Removes only that hold. It never clears a fence or restores authority: recovery needs
+    a fresh owner stage control, as after any safety fact.
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.INBOX_HOLD_RELEASED
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    delivery_guid: str = ""
 
 
 # ------------------------------------------------------------ observation bodies
@@ -642,6 +674,8 @@ EventBody = (
     | ApprovalInvalidated
     | WaiverEdited
     | ContractTampered
+    | InboxHoldSet
+    | InboxHoldReleased
     | GitHubSnapshot
     | ColumnObserved
     | PRObserved
@@ -701,6 +735,8 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         ApprovalInvalidated,
         WaiverEdited,
         ContractTampered,
+        InboxHoldSet,
+        InboxHoldReleased,
         GitHubSnapshot,
         ColumnObserved,
         PRObserved,
@@ -810,6 +846,8 @@ __all__ = [
     "EventKind",
     "GitHubSnapshot",
     "GraceExpired",
+    "InboxHoldReleased",
+    "InboxHoldSet",
     "ItemRemoved",
     "LeftwardMove",
     "MessageAck",

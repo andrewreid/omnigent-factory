@@ -106,9 +106,9 @@ class FakeGitHub(_ScriptedAdapter):
         return snap
 
     async def pull_request(
-        self, repo_id: str, pr_number: int
+        self, ref: IssueRef, pr_number: int
     ) -> PullRequestEvidence | RetryableReadFailure:
-        pr = self.prs.get((repo_id, pr_number))
+        pr = self.prs.get((ref.repo_id, pr_number))
         return pr if pr is not None else RetryableReadFailure("no PR scripted")
 
     async def find_contract_publication(

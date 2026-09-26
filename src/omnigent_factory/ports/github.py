@@ -24,16 +24,27 @@ webhook echo naming the effect is never an acknowledgement (``core.admission``).
 Ambiguous message/elicitation writes: report ``EffectUnknown``; resolve only with an
 executor ``MessageAck`` (issued effect, exact session, real item ID) or
 ``EffectReconciled``.
+
+Status identity (T2 F3): the Status column is read and written by *option ID*, never by
+option name. Renaming an option therefore cannot silently change a parcel's stage; an
+unknown option ID reads as "no known stage". :data:`STATUS_OPTION_IDS` preserves the live
+board's IDs (the setup renderer keeps them on migration).
+
+PR linkage (T2 F1): :meth:`GitHubReader.pull_request` receives the parcel's
+:class:`IssueRef`; ``closes_issue`` is true only when GitHub's own closing-issue
+references for that PR contain exactly this parcel's issue node.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
 from omnigent_factory.core.effects import EffectKind, RetryableReadFailure
 from omnigent_factory.core.events import ChecksState
-from omnigent_factory.core.types import IssueSnapshot
+from omnigent_factory.core.types import IssueSnapshot, Stage
 from omnigent_factory.ports.adapter import EffectAdapter
 
 GITHUB_EFFECT_KINDS = frozenset(
@@ -49,6 +60,32 @@ GITHUB_EFFECT_KINDS = frozenset(
         EffectKind.RECONCILE_PARCEL,
     }
 )
+
+
+#: Project 5 Status field node ID.
+STATUS_FIELD_NODE_ID = "PVTSSF_lADOEanNes4BkJhbzhi7I9w"
+
+#: Live Status option IDs per stage (project 5). Preserved across board migrations.
+STATUS_OPTION_IDS: Mapping[Stage, str] = MappingProxyType(
+    {
+        Stage.INBOX: "915abb46",
+        Stage.TRIAGED: "43889573",
+        Stage.SCOPED: "3a7f779a",
+        Stage.BUILDING: "ba3c85dd",
+        Stage.READY: "6df89cbb",
+        Stage.DONE: "4980e49d",
+    }
+)
+
+
+def stage_for_option(
+    option_id: object, options: Mapping[Stage, str] = STATUS_OPTION_IDS
+) -> Stage | None:
+    """The stage whose Status option has exactly ``option_id`` (names are never read)."""
+    if not isinstance(option_id, str) or not option_id:
+        return None
+    matches = [stage for stage, known in options.items() if known == option_id]
+    return matches[0] if len(matches) == 1 else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,8 +140,10 @@ class GitHubReader(Protocol):
     async def issue_snapshot(self, ref: IssueRef) -> IssueSnapshot | RetryableReadFailure: ...
 
     async def pull_request(
-        self, repo_id: str, pr_number: int
-    ) -> PullRequestEvidence | RetryableReadFailure: ...
+        self, ref: IssueRef, pr_number: int
+    ) -> PullRequestEvidence | RetryableReadFailure:
+        """Fresh PR evidence judged against the parcel issue ``ref`` (closing linkage)."""
+        ...
 
     async def find_contract_publication(
         self, ref: IssueRef, effect_id: str

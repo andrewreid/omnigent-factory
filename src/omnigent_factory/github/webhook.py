@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -20,6 +21,7 @@ from omnigent_factory.core import events as ev
 from omnigent_factory.core.events import Event, Provenance
 from omnigent_factory.core.types import MICROS_PER_HOUR, IssueSnapshot, Stage, Via, is_leftward
 from omnigent_factory.github.client import GitHubClient
+from omnigent_factory.ports.github import STATUS_OPTION_IDS, stage_for_option
 
 _COMMAND = re.compile(r"^/(?P<name>[a-z-]+)(?:\s+(?P<args>.*))?$", re.DOTALL)
 _DURATION = re.compile(r"(?:^|\s)for\s+(?P<hours>\d+)h(?:\s|$)", re.IGNORECASE)
@@ -60,6 +62,8 @@ class DeliveryIdentity:
     owner_ids: frozenset[int]
     bot_user_id: int
     automation_user_ids: frozenset[int] = frozenset()
+    #: Status option IDs per stage; columns are identified by option ID, never by name.
+    status_option_ids: Mapping[Stage, str] = STATUS_OPTION_IDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,15 +84,6 @@ def _timestamp_us(value: object, fallback: int) -> int:
         return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1e6)
     except ValueError:
         return fallback
-
-
-def _stage(value: object) -> Stage | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        return Stage(value)
-    except ValueError:
-        return None
 
 
 def _duration(args: str) -> int | None:
@@ -380,9 +375,10 @@ class DeliveryNormalizer:
             return ()
         old = field.get("from")
         new = field.get("to")
-        old_name = old.get("name") if isinstance(old, dict) else old
-        new_name = new.get("name") if isinstance(new, dict) else new
-        from_stage, to_stage = _stage(old_name), _stage(new_name)
+        # Single-select changes carry option objects; identify columns by option ID only.
+        options = self.identity.status_option_ids
+        from_stage = stage_for_option(old.get("id") if isinstance(old, dict) else None, options)
+        to_stage = stage_for_option(new.get("id") if isinstance(new, dict) else None, options)
         if actor_id == self.identity.bot_user_id:
             return (ev.ColumnObserved(stage=to_stage),)
         if is_leftward(from_stage, to_stage):
@@ -588,7 +584,7 @@ async def resolve_project_delivery(
             field = value.get("field")
             if not isinstance(field, dict) or field.get("id") != identity.status_field_node_id:
                 return _unresolved_result(unresolved, "current Status field identity changed")
-            status = _stage(value.get("name"))
+            status = stage_for_option(value.get("optionId"), identity.status_option_ids)
             if status is None:
                 return _unresolved_result(unresolved, "current Status option is unknown")
             in_project = True

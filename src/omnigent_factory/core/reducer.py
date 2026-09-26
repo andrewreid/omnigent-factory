@@ -77,6 +77,8 @@ from omnigent_factory.core.types import (
     FenceKind,
     Grant,
     Hold,
+    InboxHold,
+    InboxHoldReason,
     Lifecycle,
     Parcel,
     PendingMove,
@@ -1375,6 +1377,48 @@ def _h_item_removed(ctx: _Ctx, body: ev.ItemRemoved) -> None:
     _safety(ctx, body.KIND.value)
 
 
+def _h_inbox_hold_set(ctx: _Ctx, body: ev.InboxHoldSet) -> None:
+    """Hold the parcel on an uninterpretable delivery; treat it as a possible safety fact.
+
+    A stricter reason (``parked``) replaces a laxer one for the same delivery; the reverse
+    is refused so a parked delivery can never be downgraded to inbox-releasable.
+    """
+    if not body.delivery_guid:
+        raise Rejected("inbox-hold-without-delivery")
+    existing = next((h for h in ctx.p.inbox_holds if h.delivery_guid == body.delivery_guid), None)
+    if existing is not None:
+        if existing.reason in (body.reason, InboxHoldReason.PARKED):
+            raise Rejected("inbox-hold-already-set")
+        ctx.update(
+            inbox_holds=tuple(
+                InboxHold(h.delivery_guid, body.reason)
+                if h.delivery_guid == body.delivery_guid
+                else h
+                for h in ctx.p.inbox_holds
+            )
+        )
+        return
+    _safety(ctx, "inbox-hold")
+    ctx.update(inbox_holds=(*ctx.p.inbox_holds, InboxHold(body.delivery_guid, body.reason)))
+    ctx.hold(Hold.INBOX)
+
+
+def _h_inbox_hold_released(ctx: _Ctx, body: ev.InboxHoldReleased) -> None:
+    """Remove one inbox hold. Restores no authority and clears no fence."""
+    held = next((h for h in ctx.p.inbox_holds if h.delivery_guid == body.delivery_guid), None)
+    if held is None:
+        raise Rejected("inbox-hold-not-found")
+    releaser = (
+        ev.Provenance.OPERATOR if held.reason == InboxHoldReason.PARKED else ev.Provenance.INBOX
+    )
+    if ctx.event.provenance != releaser:
+        raise Rejected(f"inbox-hold-{held.reason.value}-release-requires-{releaser.value}")
+    remaining = tuple(h for h in ctx.p.inbox_holds if h.delivery_guid != body.delivery_guid)
+    ctx.update(inbox_holds=remaining)
+    if not remaining:
+        ctx.unhold(Hold.INBOX)
+
+
 def _invalidate(ctx: _Ctx, reason: str, *, revision_pending: bool) -> None:
     had_build = _void_approval(ctx, reason)
     if revision_pending:
@@ -1520,7 +1564,12 @@ def _h_checks_changed(ctx: _Ctx, body: ev.ChecksChanged) -> None:
         ctx.unhold(Hold.CHECKS_FAILED)
         ctx.emit(
             EffectKind.FETCH_PR_EVIDENCE,
-            args={"pr_number": r.pr_number, "head_sha": r.head_sha, "session_id": r.session_id},
+            args={
+                "pr_number": r.pr_number,
+                "head_sha": r.head_sha,
+                "session_id": r.session_id,
+                "issue_number": ctx.p.issue_number,
+            },
         )
 
 
@@ -1931,6 +1980,7 @@ def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
                 "pr_number": body.pr_number,
                 "head_sha": body.head_sha,
                 "session_id": s.session_id,
+                "issue_number": ctx.p.issue_number,
             },
         )
         if s.root_id is not None:
@@ -2189,6 +2239,8 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.APPROVAL_INVALIDATED: _h_approval_invalidated,
     EventKind.WAIVER_EDITED: _h_waiver_edited,
     EventKind.CONTRACT_TAMPERED: _h_contract_tampered,
+    EventKind.INBOX_HOLD_SET: _h_inbox_hold_set,
+    EventKind.INBOX_HOLD_RELEASED: _h_inbox_hold_released,
     EventKind.GITHUB_SNAPSHOT: _h_snapshot,
     EventKind.COLUMN_OBSERVED: _h_column_observed,
     EventKind.PR_OBSERVED: _h_pr_observed,

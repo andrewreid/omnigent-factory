@@ -30,13 +30,14 @@ from omnigent_factory.github.client import (
 )
 from omnigent_factory.ports.github import (
     GITHUB_EFFECT_KINDS,
+    STATUS_OPTION_IDS,
     ContractPublication,
     IssueRef,
     PullRequestEvidence,
+    stage_for_option,
 )
 
 _CONTRACT_FENCE = re.compile(r"```parcel-contract\s*\n(?P<body>.*?)\n```", re.DOTALL)
-_CLOSES = re.compile(r"\b(?:close[sd]?|fixe[sd]?|resolve[sd]?)\s+#\d+\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +88,7 @@ class GitHubAPIAdapter:
         self._now_us = now_us or (lambda: time.time_ns() // 1000)
         self.parcel_bindings = parcel_bindings or {}
         self.board_schema = board_schema
+        self.status_options = _status_options(board_schema)
         self.publication_renderer = publication_renderer
         if independent_reviewer_ids & (owner_ids | {bot_user_id}):
             raise ValueError("independent reviewers cannot include owners or the factory bot")
@@ -166,13 +168,8 @@ class GitHubAPIAdapter:
                 field = value.get("field")
                 if not isinstance(field, dict) or field.get("id") != self.status_field_node_id:
                     raise GitHubAPIError("Status field identity changed")
-                name = value.get("name")
-                if not isinstance(name, str):
-                    return None, True
-                try:
-                    return Stage(name), True
-                except (TypeError, ValueError):
-                    return None, True
+                # Read by option ID only: a renamed option must not change the stage.
+                return stage_for_option(value.get("optionId"), self.status_options), True
             page = items.get("pageInfo")
             if not isinstance(page, dict) or not page.get("hasNextPage"):
                 return None, False
@@ -182,9 +179,9 @@ class GitHubAPIAdapter:
             after = after_value
 
     async def pull_request(
-        self, repo_id: str, pr_number: int
+        self, ref: IssueRef, pr_number: int
     ) -> PullRequestEvidence | RetryableReadFailure:
-        if repo_id != self.repository_node_id:
+        if ref.repo_id != self.repository_node_id:
             return RetryableReadFailure("pull request repository identity mismatch")
         try:
             pr: Any = await self.client.get_json(f"/repos/{self.repository}/pulls/{pr_number}")
@@ -211,6 +208,7 @@ class GitHubAPIAdapter:
                 and disposition_marker in str(comment.get("body", ""))
                 for comment in comments
             )
+            closes_issue = await self._closes_issue(pr_number, ref.parcel_id)
             author = pr.get("user")
             return PullRequestEvidence(
                 pr_number=pr_number,
@@ -219,7 +217,7 @@ class GitHubAPIAdapter:
                 merged=bool(pr.get("merged")),
                 bot_authored=isinstance(author, dict) and author.get("id") == self.bot_user_id,
                 parcel_branch=branch.startswith(self.parcel_branch_prefix),
-                closes_issue=bool(_CLOSES.search(str(pr.get("body", "")))),
+                closes_issue=closes_issue,
                 checks=checks,
                 review_accepted=review_accepted,
                 findings_dispositioned=findings_dispositioned,
@@ -228,6 +226,59 @@ class GitHubAPIAdapter:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
         except GitHubAPIError as exc:
             return RetryableReadFailure(str(exc))
+
+    async def _closes_issue(self, pr_number: int, issue_node_id: str) -> bool:
+        """GitHub's closing references for this PR include exactly the parcel's issue.
+
+        Uses ``closingIssuesReferences`` (what "Closes #N" and the Development panel
+        produce), matched by issue node ID, so a PR closing some other issue - or text
+        naming the right number in another repository - never satisfies the linkage.
+        """
+        owner, _, name = self.repository.partition("/")
+        query = """
+        query($owner: String!, $name: String!, $number: Int!, $after: String) {
+          repository(owner: $owner, name: $name) {
+            id
+            pullRequest(number: $number) {
+              number
+              closingIssuesReferences(first: 100, after: $after) {
+                nodes { id repository { id } }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }
+        """
+        after: str | None = None
+        while True:
+            data = await self.client.graphql(
+                query, {"owner": owner, "name": name, "number": pr_number, "after": after}
+            )
+            repository = data.get("repository")
+            if not isinstance(repository, dict) or repository.get("id") != self.repository_node_id:
+                raise GitHubAPIError("pull request repository identity changed")
+            pull = repository.get("pullRequest")
+            if not isinstance(pull, dict) or pull.get("number") != pr_number:
+                raise GitHubAPIError("pull request closing references were unavailable")
+            refs = pull.get("closingIssuesReferences")
+            nodes = refs.get("nodes") if isinstance(refs, dict) else None
+            if not isinstance(nodes, list):
+                raise GitHubAPIError("closing issue references were malformed")
+            for node in nodes:
+                if (
+                    isinstance(node, dict)
+                    and node.get("id") == issue_node_id
+                    and isinstance(node.get("repository"), dict)
+                    and node["repository"].get("id") == self.repository_node_id
+                ):
+                    return True
+            page = refs.get("pageInfo") if isinstance(refs, dict) else None
+            if not isinstance(page, dict) or not page.get("hasNextPage"):
+                return False
+            cursor = page.get("endCursor")
+            if not isinstance(cursor, str):
+                raise GitHubAPIError("closing references pagination cursor was missing")
+            after = cursor
 
     async def _checks_state(self, head_sha: str) -> ChecksState:
         seen: dict[tuple[str, int], str] = {}
@@ -337,7 +388,10 @@ class GitHubAPIAdapter:
                 number = effect.args.get("pr_number")
                 if not isinstance(number, int):
                     return DefinitiveFailure("FETCH_PR_EVIDENCE requires pr_number")
-                evidence = await self.pull_request(self.repository_node_id, number)
+                ref = self._issue_ref(effect)
+                if ref is None:
+                    return DefinitiveFailure("FETCH_PR_EVIDENCE requires the parcel issue")
+                evidence = await self.pull_request(ref, number)
                 if isinstance(evidence, RetryableReadFailure):
                     return evidence
                 detail = asdict(evidence)
@@ -538,6 +592,15 @@ class GitHubAPIAdapter:
             return AmbiguousWrite("project item mutation omitted item id")
         return Ack(item_id)
 
+    def _issue_ref(self, effect: EffectIntent) -> IssueRef | None:
+        issue_number = effect.args.get("issue_number")
+        binding = self._binding(effect)
+        if not isinstance(issue_number, int) and binding is not None:
+            issue_number = binding.issue_number
+        if not isinstance(issue_number, int) or effect.parcel_id is None:
+            return None
+        return IssueRef(self.repository_node_id, issue_number, effect.parcel_id)
+
     def _binding(self, effect: EffectIntent) -> ParcelBinding | None:
         if effect.parcel_id is None:
             return None
@@ -571,3 +634,16 @@ class GitHubAPIAdapter:
             return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1e6)
         except ValueError:
             return 0
+
+
+def _status_options(schema: BoardSchema | None) -> dict[Stage, str]:
+    """Stage -> Status option ID, from the persisted board schema or the live defaults."""
+    if schema is None:
+        return dict(STATUS_OPTION_IDS)
+    options: dict[Stage, str] = {}
+    for name, option_id in schema.status_options.items():
+        try:
+            options[Stage(name)] = option_id
+        except ValueError:
+            continue
+    return options

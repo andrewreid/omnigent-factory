@@ -93,10 +93,9 @@ class MemoryOwnItemLedger:
     """In-process ledger. NOT FOR PRODUCTION.
 
     Pre-POST send/resolve intents are lost on restart, so an ambiguous write could not be
-    reconciled after a daemon crash. Production needs a durable ledger (a reviewed
-    Task-1 store follow-up or a documented mapping onto effect rows) - a Task 4/5
-    integration prerequisite. Construction requires ``volatile_ok=True`` so this cannot
-    be wired silently.
+    reconciled after a daemon crash. Production uses the store-backed
+    :class:`omnigent_factory.service.durable.StoreOwnItemLedger` (``own_sends`` table).
+    Construction requires ``volatile_ok=True`` so this cannot be wired silently.
     """
 
     def __init__(self, *, volatile_ok: bool) -> None:
@@ -131,4 +130,6 @@ class MemoryOwnItemLedger:
 
 @runtime_checkable
 class CredentialProvisioner(Protocol):
-    def provision(self, session_id: str) -> CapabilityRecord: ...
+    async def provision(self, session_id: str) -> CapabilityRecord:
+        """Create or rotate the stage capability, durably recorded before returning."""
+        ...

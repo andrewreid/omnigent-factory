@@ -167,6 +167,23 @@ class Hold(enum.StrEnum):
     PR_CLOSED = "pr_closed"
     EXTERNAL_ACTIVITY = "external_activity"
     APPROVAL_VOIDED = "approval_voided"
+    #: A durable inbox delivery for this parcel is parked or not yet identity-verified.
+    INBOX = "inbox"
+
+
+class InboxHoldReason(enum.StrEnum):
+    """Why an inbox delivery holds its parcel (see ``Parcel.inbox_holds``)."""
+
+    #: Deterministic poison: only the local operator may release it.
+    PARKED = "parked"
+    #: Identity not yet verified (§3.3(3)): released by the inbox once it resolves.
+    UNRESOLVED = "unresolved"
+
+
+@dataclass(frozen=True, slots=True)
+class InboxHold:
+    delivery_guid: str
+    reason: InboxHoldReason
 
 
 BLOCKING_HOLDS = frozenset(
@@ -177,6 +194,7 @@ BLOCKING_HOLDS = frozenset(
         Hold.PREPARE_FAILED,
         Hold.PUBLICATION_FAILED,
         Hold.RESTART_EXHAUSTED,
+        Hold.INBOX,
     }
 )
 
@@ -471,6 +489,9 @@ class Parcel:
     #: Work-bearing effects this reducer issued, as (effect_id, session_id): an
     #: acknowledgement must name one of these exactly.
     sent_effects: tuple[tuple[str, str], ...] = ()
+    #: Inbox deliveries that could not be interpreted for this parcel. While any is
+    #: present the parcel is not dispatchable; releasing one restores no authority.
+    inbox_holds: tuple[InboxHold, ...] = ()
     applied_event_ids: frozenset[str] = frozenset()
 
     def session(self, session_id: str | None) -> StageSession | None:

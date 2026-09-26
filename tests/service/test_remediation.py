@@ -22,7 +22,6 @@ from omnigent_factory.core.types import AdmissionSnapshot, FenceKind, Parcel, Si
 from omnigent_factory.service.config import ServiceConfig
 from omnigent_factory.service.executor import EffectExecutor, ParcelSerializers
 from omnigent_factory.service.interfaces import DeliveryProcessor, NonRetryableDelivery
-from omnigent_factory.service.parked import ParkedDeliveryRegistry
 from omnigent_factory.service.runtime import FactoryService, _admission_signature
 from omnigent_factory.store.sqlite import DeliveryRecord, SqliteStore
 from omnigent_factory.testing.builders import (
@@ -368,10 +367,10 @@ async def test_parked_delivery_scopes_work_gate_reports_health_and_requires_rele
         }
         status = await service.operator_command("status", {})
         assert status["parked_deliveries"] == 1
-        reloaded = ParkedDeliveryRegistry(config.state_dir)
-        reloaded.load()
-        assert reloaded.blocks("P-parked")
-        assert not reloaded.blocks("P-open")
+        rows = await service.db.call(lambda store: store.parked_delivery_rows())
+        assert rows == (("bad-owner", "P-parked"),)
+        held = await service.db.call(lambda store: store.load_parcel("P-parked"))
+        assert held is not None and [h.delivery_guid for h in held.inbox_holds] == ["bad-owner"]
 
         parked_factory = await start_triage(service, "P-parked")
         await start_triage(service, "P-open", issue_number=2)
