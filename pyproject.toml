@@ -42,6 +42,9 @@ testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
+# starlette.testclient on httpx is deprecated upstream in favour of "httpx2"; the tests
+# keep TestClient (it drives the app lifespan) until that migration is worth doing.
+filterwarnings = ["ignore:Using `httpx` with `starlette.testclient` is deprecated"]
 
 [tool.ruff]
 line-length = 100

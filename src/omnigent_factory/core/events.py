@@ -401,6 +401,7 @@ class ReadinessEvidence(_Body):
     head_sha: str = ""
     verified: bool = False
     remediation_exhausted: bool = False
+    checks_summary: str = ""
 
 
 @dataclass(frozen=True, slots=True)

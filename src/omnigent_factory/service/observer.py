@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Mapping
+from functools import partial
 from typing import Any, cast
 
 from omnigent_factory.core import events as ev
@@ -29,6 +30,7 @@ from omnigent_factory.omnigent.rest import OmnigentReadError
 from omnigent_factory.ports.clock import Clock
 from omnigent_factory.service.directory import ServiceDispatchDirectory
 from omnigent_factory.service.runtime import FactoryService
+from omnigent_factory.store.sqlite import SqliteStore
 
 LOG = logging.getLogger(__name__)
 
@@ -241,6 +243,11 @@ class OmnigentObserver:
             text = _assistant_text(item)
             if text is None or "FACTORY_RESULT_V1" not in text:
                 continue
+            event_id = f"result:{session.root_id}:{item_id}"
+            if await self.service.db.call(partial(_has_event, event_id=event_id)):
+                # Applied before a restart: never re-parse, re-log or re-save it.
+                self._seen_items.add(item_id)
+                continue
             expected = Correlation(
                 parcel.parcel_id,
                 session.session_id,
@@ -284,7 +291,7 @@ class OmnigentObserver:
             else:
                 await self.directory.save_result(session.session_id, item_id, parsed)
                 body = _candidate(session.root_id, parsed)
-            await self._apply(parcel, body, f"result:{session.root_id}:{item_id}")
+            await self._apply(parcel, body, event_id)
             self._seen_items.add(item_id)
 
     async def _apply(self, parcel: Parcel, body: ev.EventBody, event_id: str) -> None:
@@ -393,3 +400,7 @@ def _default_result_kind(stage: str) -> ResultKind:
         "plan": ResultKind.PLAN,
         "build": ResultKind.BUILD_READY,
     }[stage]
+
+
+def _has_event(store: SqliteStore, *, event_id: str) -> bool:
+    return store.has_event(event_id)

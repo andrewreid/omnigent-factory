@@ -109,6 +109,7 @@ class PullRequestEvidence:
     checks: ChecksState  # automated required checks, human-review-gate excluded
     review_accepted: bool  # independent opposite-vendor review of this head chain
     findings_dispositioned: bool
+    checks_summary: str = ""
 
     @property
     def verified(self) -> bool:

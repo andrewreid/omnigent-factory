@@ -55,6 +55,8 @@ class ServiceConfig(BaseModel):
     app_private_key_file: Path | None = None
     webhook_secret_file: Path | None = None
     omnigent_token_file: Path | None = None
+    #: The owner's Omnigent CLI credential store (refreshable login); preferred when set.
+    omnigent_cli_store: Path | None = None
     omnigent_base_url: str = "https://omnigent.reid.ee"
     omnigent_host_id: str | None = None
     omnigent_host_name: str = "coder"
@@ -273,6 +275,7 @@ def load_config(path: str | Path) -> ServiceConfig:
         "app_private_key_file",
         "webhook_secret_file",
         "omnigent_token_file",
+        "omnigent_cli_store",
         "source_clone",
         "worktree_root",
         "runtime_dir",

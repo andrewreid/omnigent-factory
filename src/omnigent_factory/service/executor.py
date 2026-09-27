@@ -25,6 +25,7 @@ from omnigent_factory.core.effects import (
 from omnigent_factory.core.events import Event, Provenance
 from omnigent_factory.core.preconditions import effect_still_valid
 from omnigent_factory.core.types import IssueSnapshot, Stage, TrustedConfig
+from omnigent_factory.omnigent.adapter import ELICITATION_NOT_PENDING
 from omnigent_factory.omnigent.outcomes import observations
 from omnigent_factory.ports.adapter import EffectAdapter
 from omnigent_factory.ports.clock import Clock
@@ -431,6 +432,16 @@ class EffectExecutor:
             )
         elif effect.kind == EffectKind.PREPARE_SESSION:
             event_body = ev.Prepared(session_id=effect.preconditions.session_id or "", ok=False)
+        elif (
+            effect.kind == EffectKind.RESOLVE_ELICITATION
+            and outcome.reason == ELICITATION_NOT_PENDING
+        ):
+            # Same mapping as omnigent.outcomes: the prompt is gone (answered/cancelled in
+            # Omnigent), which closes the decision instead of an audit-only cancellation.
+            event_body = ev.ElicitationGone(
+                session_id=effect.preconditions.session_id or "",
+                elicitation_id=str(effect.args.get("elicitation_id") or ""),
+            )
         else:
             event_body = ev.EffectCancelled(
                 effect_id=effect.effect_id,
@@ -499,6 +510,7 @@ class EffectExecutor:
                 head_sha=str(effect.args.get("head_sha", "")),
                 verified=bool(detail.get("verified")),
                 remediation_exhausted=bool(detail.get("remediation_exhausted", False)),
+                checks_summary=str(detail.get("checks_summary") or "")[:200],
             )
         elif effect.kind == EffectKind.RESOLVE_ELICITATION:
             body = ev.ElicitationResolved(
@@ -529,6 +541,7 @@ class EffectExecutor:
                     title=str(detail.get("title") or ""),
                     body=(str(detail["body"]) if isinstance(detail.get("body"), str) else None),
                     read_at_us=_json_int(detail.get("read_at_us"), 0),
+                    bot=str(detail["bot"]) if isinstance(detail.get("bot"), str) else None,
                 ),
             )
         elif effect.kind == EffectKind.RECONCILE_SESSION:

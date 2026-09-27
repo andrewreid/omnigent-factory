@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -64,6 +65,13 @@ def build_parser() -> argparse.ArgumentParser:
     note.add_argument("--message")
     note.add_argument("--message-file", type=Path)
     _config_arg(resume)
+    cleanup = sub.add_parser(
+        "cleanup",
+        help="remove a finished parcel's factory worktree and local branch (factory clone only)",
+    )
+    cleanup.add_argument("parcel")
+    cleanup.add_argument("--merged", action="store_true", help="the parcel's PR is merged")
+    _config_arg(cleanup)
     rerender = sub.add_parser(
         "rerender-comment",
         help="re-render a published comment in place, found by its effect marker",
@@ -90,16 +98,28 @@ def _load(args: argparse.Namespace) -> tuple[Path, ServiceConfig]:
     return path, load_config(path)
 
 
-def _operator(config: ServiceConfig, command: str, args: Mapping[str, object] | None = None) -> int:
-    try:
-        # Re-rendering reads, edits and re-verifies a GitHub comment: allow more time.
-        timeout = 60.0 if command == "rerender-comment" else 5.0
-        result = asyncio.run(
-            operator_request(config.operator_socket, command, args, timeout_seconds=timeout)
-        )
-    except (ConnectionError, FileNotFoundError) as exc:
-        print(f"operator socket unavailable: {exc}", file=sys.stderr)
-        return 2
+def _operator(
+    config: ServiceConfig,
+    command: str,
+    args: Mapping[str, object] | None = None,
+    *,
+    startup_wait_seconds: float = 20.0,
+) -> int:
+    # Re-rendering reads, edits and re-verifies a GitHub comment: allow more time.
+    timeout = 60.0 if command in ("rerender-comment", "cleanup") else 5.0
+    deadline = time.monotonic() + startup_wait_seconds
+    while True:
+        try:
+            result = asyncio.run(
+                operator_request(config.operator_socket, command, args, timeout_seconds=timeout)
+            )
+            break
+        except (ConnectionError, FileNotFoundError) as exc:
+            # The socket appears a few seconds after a (re)start: wait briefly for it.
+            if time.monotonic() >= deadline:
+                print(f"operator socket unavailable: {exc}", file=sys.stderr)
+                return 2
+            time.sleep(0.5)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result.get("ok", False) else 1
 
@@ -137,6 +157,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             else args.message_file.read_text(encoding="utf-8")
         )
         return _operator(config, "resume", {"parcel": args.parcel, "message": message})
+    if args.command == "cleanup":
+        return _operator(config, "cleanup", {"parcel": args.parcel, "merged": args.merged})
     if args.command == "rerender-comment":
         return _operator(config, "rerender-comment", {"effect": args.effect})
     if args.command == "retry-effect":

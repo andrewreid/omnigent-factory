@@ -38,6 +38,7 @@ def snapshot(
     read_at_us: int = T0,
     repo_matches: bool = True,
     identity_resolved: bool = True,
+    bot: str | None = None,
 ) -> IssueSnapshot:
     return IssueSnapshot(
         open=open,
@@ -49,6 +50,7 @@ def snapshot(
         title=title,
         body=body,
         read_at_us=read_at_us,
+        bot=bot,
     )
 
 

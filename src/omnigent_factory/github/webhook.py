@@ -413,6 +413,8 @@ class DeliveryNormalizer:
         number = payload.get("number")
         head = pr.get("head")
         sha = head.get("sha") if isinstance(head, dict) else ""
+        ref = head.get("ref") if isinstance(head, dict) else None
+        head_ref = ref if isinstance(ref, str) else ""
         author = pr.get("user")
         return (
             ev.PRObserved(
@@ -422,6 +424,7 @@ class DeliveryNormalizer:
                 merged=bool(pr.get("merged")),
                 bot_authored=isinstance(author, dict)
                 and author.get("id") == self.identity.bot_user_id,
+                parcel_branch=head_ref.startswith("factory/issue-"),
             ),
         )
 

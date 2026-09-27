@@ -31,9 +31,10 @@ from omnigent_factory.github.config import FactoryConfig
 from omnigent_factory.github.webhook import DeliveryIdentity, DeliveryNormalizer
 from omnigent_factory.omnigent.adapter import OmnigentConfig, OmnigentExecutionAdapter
 from omnigent_factory.omnigent.policies import PolicyError
-from omnigent_factory.omnigent.rest import FileTokenAuth, OmnigentReadError, OmnigentRest
+from omnigent_factory.omnigent.rest import OmnigentReadError, OmnigentRest
 from omnigent_factory.ports.clock import SystemClock
 from omnigent_factory.ports.github import IssueRef
+from omnigent_factory.service.cleanup import CleanupAdapter, WorkspaceCleaner
 from omnigent_factory.service.config import ConfigError, ServiceConfig
 from omnigent_factory.service.credentials import AppInstallationTokenMinter, StoreExecutionGate
 from omnigent_factory.service.directory import (
@@ -54,6 +55,7 @@ from omnigent_factory.service.github_delivery import (
 )
 from omnigent_factory.service.locking import ProcessLock
 from omnigent_factory.service.observer import OmnigentObserver
+from omnigent_factory.service.omnigent_auth import log_expiry, omnigent_auth
 from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.service.tokens import DaemonTokenProvider
 
@@ -191,6 +193,7 @@ async def build_production(
 ) -> ProductionComposition:
     """Build every real adapter used by ``serve``; network I/O is config preflight only."""
     _require_production_config(config)
+    log_expiry(config)
     config.prepare_private_directories()
     process_lock = ProcessLock(config.state_dir)
     process_lock.acquire()
@@ -310,7 +313,7 @@ async def build_production(
     )
     omnigent = OmnigentRest(
         config.omnigent_base_url,
-        auth=FileTokenAuth(config.resolved_omnigent_token_file),
+        auth=omnigent_auth(config),
         transport=omnigent_transport,
     )
     omnigent_adapter = OmnigentExecutionAdapter(
@@ -352,8 +355,10 @@ async def build_production(
         omnigent_adapter=omnigent_adapter,
     )
     service.comment_rerenderer = github.rerender_comment
+    cleaner = WorkspaceCleaner(directory, workspaces, config.worktree_root)
+    service.workspace_cleaner = cleaner
     service.bind_integrations(
-        adapters=(github, recording_omnigent, broker),
+        adapters=(github, recording_omnigent, broker, CleanupAdapter(cleaner)),
         delivery_processor=GitHubDeliveryProcessor(service, normalizer, github, clock),
         managed=(runtime,),
     )
@@ -400,11 +405,10 @@ def _apply_repository_config(config: ServiceConfig, repo: FactoryConfig) -> Serv
 
 
 def _require_production_config(config: ServiceConfig) -> None:
-    for path in (
-        config.resolved_app_private_key_file,
-        config.resolved_webhook_secret_file,
-        config.resolved_omnigent_token_file,
-    ):
+    required = [config.resolved_app_private_key_file, config.resolved_webhook_secret_file]
+    if config.omnigent_cli_store is None:
+        required.append(config.resolved_omnigent_token_file)
+    for path in required:
         _private_file(path)
     _required(config.repository_database_id, "repository_database_id")
     _required(config.organization_id, "organization_id")

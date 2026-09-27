@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import ipaddress
 import json
 import os
@@ -17,10 +18,11 @@ import httpx
 
 from omnigent_factory.github.auth import AppAuthenticator, InstallationTokenService
 from omnigent_factory.github.client import GitHubClient
-from omnigent_factory.omnigent.rest import FileTokenAuth, OmnigentReadError, OmnigentRest
+from omnigent_factory.omnigent.rest import OmnigentReadError, OmnigentRest
 from omnigent_factory.ports.credentials import TokenRefusal
 from omnigent_factory.service.composition import _private_file
 from omnigent_factory.service.config import ServiceConfig
+from omnigent_factory.service.omnigent_auth import expiry, expiry_message, omnigent_auth
 
 
 @dataclass(slots=True)
@@ -29,9 +31,15 @@ class DoctorReport:
     checks: dict[str, str] = field(default_factory=dict)
     resolved: dict[str, str | int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    #: Advisory findings; never change ``ok``.
+    warnings: list[str] = field(default_factory=list)
 
     def pass_check(self, name: str, detail: str = "ok") -> None:
         self.checks[name] = detail
+
+    def warn(self, name: str, detail: str) -> None:
+        self.checks[name] = f"warning: {detail}"
+        self.warnings.append(f"{name}: {detail}")
 
     def fail(self, name: str, detail: str) -> None:
         self.ok = False
@@ -53,7 +61,8 @@ async def run_doctor(
     try:
         key = _private_file(config.resolved_app_private_key_file)
         _private_file(config.resolved_webhook_secret_file)
-        _private_file(config.resolved_omnigent_token_file)
+        if config.omnigent_cli_store is None:
+            _private_file(config.resolved_omnigent_token_file)
         if config.app_env.exists():
             _private_file(config.app_env)
         report.pass_check("secrets", "all required files are owned by this user and mode 0600")
@@ -64,7 +73,7 @@ async def run_doctor(
     github_http = httpx.AsyncClient(transport=github_transport, timeout=15.0)
     omnigent = OmnigentRest(
         config.omnigent_base_url,
-        auth=FileTokenAuth(config.resolved_omnigent_token_file),
+        auth=omnigent_auth(config),
         transport=omnigent_transport,
     )
     tokens: InstallationTokenService | None = None
@@ -100,6 +109,7 @@ async def run_doctor(
         await omnigent.aclose()
         await github_http.aclose()
 
+    _check_login_expiry(config, report)
     await asyncio.to_thread(_check_clone, config, report)
     _check_socket(config, report)
     await asyncio.to_thread(_check_bind, config, report)
@@ -182,6 +192,58 @@ async def _check_project(config: ServiceConfig, client: GitHubClient, report: Do
     report.pass_check("github_project", "project and live field/option IDs match")
 
 
+def _check_login_expiry(config: ServiceConfig, report: DoctorReport) -> None:
+    found = expiry_message(config)
+    info = expiry(config)
+    if found is None:
+        detail = "no expiry known" if info is None or info.expires_at is None else "ok"
+        if info is not None:
+            detail = f"{info.source}{', refreshable' if info.refreshable else ''}: {detail}"
+        report.pass_check("omnigent_login", detail)
+        return
+    level, message = found
+    if level == "error":
+        report.fail("omnigent_login", message)
+    else:
+        report.warn("omnigent_login", message)
+
+
+async def _check_server_version(rest: OmnigentRest, report: DoctorReport) -> None:
+    """Warn (never fail) when the server differs from the pinned client version.
+
+    The server exposes only its package version (``/api/version``), not a commit, so a
+    same-version build from another commit cannot be detected here.
+    """
+    try:
+        body = await rest.get_json("/api/version")
+    except OmnigentReadError as exc:
+        report.warn("omnigent_version", f"server version unreadable: {exc.reason}")
+        return
+    server = body.get("version") if isinstance(body, dict) else None
+    try:
+        pinned = importlib.metadata.version("omnigent")
+    except importlib.metadata.PackageNotFoundError:
+        pinned = None
+    commit = _pinned_commit()
+    if not isinstance(server, str) or pinned is None:
+        report.warn("omnigent_version", f"cannot compare server={server!r} pinned={pinned!r}")
+    elif server != pinned:
+        report.warn(
+            "omnigent_version",
+            f"server {server} differs from the pinned client {pinned} (commit {commit})",
+        )
+    else:
+        report.pass_check("omnigent_version", f"{server} (pinned commit {commit})")
+
+
+def _pinned_commit() -> str:
+    try:
+        from omnigent import _build_info  # noqa: PLC0415
+    except ImportError:
+        return "unknown"
+    return str(getattr(_build_info, "COMMIT_SHA", "unknown"))[:12]
+
+
 async def _check_omnigent(config: ServiceConfig, rest: OmnigentRest, report: DoctorReport) -> None:
     try:
         reached = False
@@ -208,6 +270,7 @@ async def _check_omnigent(config: ServiceConfig, rest: OmnigentRest, report: Doc
             report.pass_check(f"omnigent_{singular}", resolved)
         if reached:
             report.pass_check("omnigent_reachable", "authenticated API reads succeeded")
+            await _check_server_version(rest, report)
     except OmnigentReadError as exc:
         report.fail("omnigent_auth", exc.reason)
 

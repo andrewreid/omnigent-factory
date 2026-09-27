@@ -129,6 +129,10 @@ class ServiceDispatchDirectory:
                 return str(data["workspace"])
         return None
 
+    def dispatch_snapshot(self, session_id: str) -> dict[str, Any] | None:
+        """The persisted dispatch snapshot (branch, workspace, template) of a session."""
+        return self._read(self.root / f"{_safe(session_id)}.json")
+
     async def record_create(self, session_id: str, ack: Ack) -> None:
         path = self.root / f"{_safe(session_id)}.json"
         data = self._read(path)
@@ -451,10 +455,18 @@ class PublicationRenderer:
             link = self._stage_link(parcel, contract.source_session_id)
             return render_contract_comment(parcel, contract, plan, self.config, link)
         if effect.kind == EffectKind.PUBLISH_REPORT and effect.args.get("report") == "ready":
-            text = (
-                f"Factory: PR #{effect.args.get('pr_number')} at "
-                f"`{effect.args.get('head_sha')}` passed readiness checks and is Ready "
-                "for the owner's merge decision."
+            build = (
+                self.directory.latest_result(parcel.readiness.session_id)
+                if parcel.readiness is not None
+                else None
+            )
+            record = build.get("factory_result") if isinstance(build, dict) else None
+            result = record.get("result") if isinstance(record, dict) else None
+            text = _ready_text(
+                effect.args,
+                result if isinstance(result, dict) else None,
+                parcel.readiness.checks_summary if parcel.readiness is not None else "",
+                self.config.repository,
             )
         elif effect.kind in {EffectKind.PUBLISH_TRIAGE, EffectKind.PUBLISH_REPORT}:
             body = self._stored_result(effect)
@@ -535,6 +547,46 @@ def omnigent_link(base_url: str, session_id: str | None) -> str | None:
 
 def _text_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _ready_text(
+    args: Mapping[str, Any],
+    result: dict[str, Any] | None,
+    checks_summary: str,
+    repository: str,
+) -> str:
+    """Ready report: what changed, CI, the cross-vendor review, findings and next step."""
+    number = args.get("pr_number")
+    head = str(args.get("head_sha") or "")
+    url = f"https://github.com/{repository}/pull/{number}"
+    lines = [f"### Factory: PR #{number} is Ready", ""]
+    if result is not None and result.get("head_sha") == head and result.get("summary"):
+        lines += [" ".join(str(result["summary"]).split())[:1200], ""]
+    lines.append(f"**PR:** {url} (head `{head[:12]}`)")
+    lines.append(f"**CI:** {checks_summary or 'required checks green'}")
+    review = result.get("review") if result is not None else None
+    if isinstance(review, dict):
+        lines.append(
+            f"**Cross-vendor review:** {review.get('implementation_vendor')} → "
+            f"{review.get('review_vendor')}: "
+            f"{'clean' if review.get('accepted') is True else 'not accepted'}"
+            f" at `{str(review.get('reviewed_head') or '')[:12]}`"
+        )
+    findings = result.get("findings") if result is not None else None
+    if isinstance(findings, list) and findings:
+        lines += ["", "**Findings and outcomes:**"]
+        for f in findings[:20]:
+            if not isinstance(f, dict):
+                continue
+            note = " ".join(str(f.get("evidence") or "").split())[:300]
+            lines.append(
+                f"- `{f.get('id')}` {f.get('severity')} ({f.get('source')}): "
+                f"{f.get('disposition')}" + (f" — {note}" if note else "")
+            )
+    else:
+        lines.append("**Findings:** none reported")
+    lines += ["", f"**Next:** review and merge PR #{number}."]
+    return "\n".join(lines)
 
 
 def _authority(parcel: Parcel) -> tuple[str, str]:

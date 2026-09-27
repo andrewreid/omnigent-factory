@@ -237,7 +237,8 @@ class _ParcelDB:
         self.service = service
 
     async def call(self, operation: Any) -> Any:
-        del operation
+        if getattr(operation, "func", None) is not None:  # functools.partial store probes
+            return False  # e.g. "already applied?": nothing is in this fake store
         return self.service.parcel
 
 

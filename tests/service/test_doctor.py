@@ -152,6 +152,7 @@ guidance: {triage: Triage safely., engineering: Build safely.}
                 "has_more": False,
             },
             "/v1/projects": {"object": "list", "data": [{"id": "project-1", "name": "Timesheets"}]},
+            "/api/version": {"version": "0.0.0-other"},  # drift is a warning, never a failure
         }
         return httpx.Response(200, json=values[request.url.path])
 
@@ -164,6 +165,9 @@ guidance: {triage: Triage safely., engineering: Build safely.}
     after = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
 
     assert report.ok, report.errors
+    assert any(
+        w.startswith("omnigent_version: server 0.0.0-other differs") for w in report.warnings
+    )
     assert report.resolved["omnigent_host_id"] == "host-1"
     assert report.resolved["omnigent_project_id"] == "project-1"
     assert report.resolved["repository_database_id"] == 123

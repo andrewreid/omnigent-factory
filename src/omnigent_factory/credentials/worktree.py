@@ -521,6 +521,55 @@ class Workspaces:
         )
         return proc.returncode == 0
 
+    # ------------------------------------------------------------ cleanup
+
+    def worktrees(self) -> list[tuple[Path, str | None]]:
+        """(path, branch) of every linked worktree of the dedicated clone."""
+        out = self._git(["worktree", "list", "--porcelain"], self.source_clone)
+        rows: list[tuple[Path, str | None]] = []
+        current: Path | None = None
+        branch: str | None = None
+        for line in [*out.splitlines(), ""]:
+            if line.startswith("worktree "):
+                current, branch = Path(line[len("worktree ") :]).resolve(), None
+            elif line.startswith("branch refs/heads/"):
+                branch = line[len("branch refs/heads/") :]
+            elif not line and current is not None:
+                if current != self.source_clone:
+                    rows.append((current, branch))
+                current, branch = None, None
+        return rows
+
+    def is_clean(self, path: Path) -> bool:
+        """No modified tracked files and no untracked (non-ignored) files."""
+        return self._git(["status", "--porcelain"], path) == ""
+
+    def branch_tip(self, branch: str) -> str | None:
+        proc = _run(
+            ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+            self.source_clone,
+            check=False,
+            git=self.git,
+            env=self.inspection_env,
+        )
+        return proc.stdout.strip() or None
+
+    def remove_worktree(self, path: Path, *, force: bool) -> None:
+        """Remove one linked worktree of the dedicated clone (never the clone itself)."""
+        resolved = path.resolve()
+        if resolved == self.source_clone or all(resolved != p for p, _ in self.worktrees()):
+            raise WorktreeError("not a linked worktree of the dedicated clone")
+        args = ["worktree", "remove", *(["--force"] if force else []), str(resolved)]
+        self._git(args, self.source_clone)
+
+    def delete_branch(self, branch: str) -> None:
+        """Delete a local factory branch of the dedicated clone that no worktree uses."""
+        if not branch.startswith("factory/"):
+            raise WorktreeError("only factory branches may be deleted")
+        if any(b == branch for _, b in self.worktrees()):
+            raise WorktreeError("branch is checked out in a worktree")
+        self._git(["branch", "-D", branch], self.source_clone)
+
     def wiring_of(self, path: Path) -> StageWiring | None:
         def get(key: str) -> str | None:
             proc = _run(

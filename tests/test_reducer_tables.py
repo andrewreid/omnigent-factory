@@ -1435,14 +1435,27 @@ def test_D12_reconcile_closes_legacy_stale_decisions_and_resumes_the_build():
     assert bot.args == {"bot": "Working"}
 
 
-def test_D13_reconcile_reasserts_bot_to_correct_board_drift():
+def test_D13_bot_is_written_only_when_the_board_differs():
+    """No churn: reconcile writes Bot only when a fresh read shows a different value."""
     h = Harness()
     h.to_building()
-    r = h.send(P, ev.ReconcileDue())
-    [bot] = Harness.of(r, EffectKind.SET_BOT)  # adapter adopts when the board matches
-    assert bot.args == {"bot": h.p().bot.value} == {"bot": "Working"}
-    again = h.send(P, ev.ReconcileDue())
-    assert Harness.of(again, EffectKind.SET_BOT)  # every cycle, so owner edits revert
+    assert not Harness.of(h.send(P, ev.ReconcileDue()), EffectKind.SET_BOT)
+    f = h.f()
+    same = h.apply(
+        f.make(
+            ev.GitHubSnapshot(),
+            evidence=snapshot(read_at_us=f.now, bot="Working", stage=Stage.BUILDING),
+        )
+    )
+    assert not Harness.of(same, EffectKind.SET_BOT)
+    drift = h.apply(
+        f.make(
+            ev.GitHubSnapshot(),
+            evidence=snapshot(read_at_us=f.now, bot="Needs you", stage=Stage.BUILDING),
+        )
+    )
+    [bot] = Harness.of(drift, EffectKind.SET_BOT)  # the owner (or GitHub) changed it
+    assert bot.args == {"bot": "Working"}
 
 
 def test_D14_finished_session_orphans_its_open_decisions():

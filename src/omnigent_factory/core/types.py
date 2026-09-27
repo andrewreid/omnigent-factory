@@ -273,6 +273,8 @@ class IssueSnapshot:
     title: str
     body: str | None
     read_at_us: int
+    #: The board's current Bot value (display name) when read; None when not read.
+    bot: str | None = None
 
     @property
     def eligible(self) -> bool:
@@ -412,6 +414,8 @@ class Readiness:
     head_sha: str
     verified: bool = False
     ready: bool = False
+    #: Human summary of CI at verification, e.g. "17 checks: 13 success, 4 skipped".
+    checks_summary: str = ""
 
 
 @dataclass(frozen=True, slots=True)

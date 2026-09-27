@@ -46,6 +46,8 @@ class EffectKind(enum.StrEnum):
     # local credentials
     DISABLE_ISSUANCE = "disable_issuance"
     ENABLE_ISSUANCE = "enable_issuance"
+    # local workspace (factory-owned clone only)
+    CLEANUP_WORKSPACE = "cleanup_workspace"
     # scheduler
     ARM_TIMER = "arm_timer"
     WAKE_SCHEDULER = "wake_scheduler"

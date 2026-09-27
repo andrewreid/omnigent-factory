@@ -153,6 +153,7 @@ async def test_pr_682_as_live_is_verified_without_owner_approval():
     assert outcome.detail["findings_dispositioned"] is True
     assert outcome.detail["review_accepted"] is True
     assert outcome.detail["verified"] is True
+    assert outcome.detail["checks_summary"] == "17 checks: 13 success, 4 skipped"
 
 
 @pytest.mark.asyncio

@@ -26,6 +26,7 @@ from omnigent_factory.core.types import (
     Lifecycle,
     Parcel,
     QueueStatus,
+    Stage,
 )
 from omnigent_factory.ports.adapter import EffectAdapter
 from omnigent_factory.ports.clock import Clock, SystemClock
@@ -93,6 +94,8 @@ class FactoryService:
         self.delivery_processor = delivery_processor
         #: Operator ``rerender-comment``: edits a published comment in place (composition).
         self.comment_rerenderer: Callable[[EffectIntent], Awaitable[AdapterOutcome]] | None = None
+        #: Operator ``cleanup``: finished-parcel worktree/branch removal (composition).
+        self.workspace_cleaner: Any = None
         self._fatal_exit = fatal_exit
         self._fatal_reason: str | None = None
         self._delivery_failures: dict[str, int] = {}
@@ -689,6 +692,19 @@ class FactoryService:
                 raise ValueError(f"resume refused: {result.reason}")
             LOG.info("operator resumed parcel=%s", parcel_id)
             return {"resumed": parcel_id, **await self._explain(parcel_id)}
+        if command == "cleanup":
+            parcel_id = str(args.get("parcel", ""))
+            parcel = await self.db.call(partial(_load_parcel, parcel_id=parcel_id))
+            if parcel is None:
+                raise ValueError("unknown parcel")
+            if parcel.eligible and parcel.stage not in (Stage.READY, Stage.DONE):
+                raise ValueError("parcel is not finished (Ready/Done or closed)")
+            if self.workspace_cleaner is None:
+                raise ValueError("workspace cleanup is not wired")
+            detail = await self.workspace_cleaner.cleanup(
+                parcel_id, merged=bool(args.get("merged"))
+            )
+            return {"cleaned": parcel_id, **detail}
         if command == "rerender-comment":
             effect_id = str(args.get("effect", ""))
             stored = await self.db.call(lambda store: store.get_effect(effect_id))

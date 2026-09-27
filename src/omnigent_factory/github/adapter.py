@@ -119,6 +119,7 @@ class GitHubAPIAdapter:
         self.triage_fields = triage_fields
         #: Molly's reported opposite-vendor review of the effect's PR head (service-side).
         self.cross_vendor_review = cross_vendor_review
+        self._last_checks_summary = ""
         if independent_reviewer_ids & (owner_ids | {bot_user_id}):
             raise ValueError("independent reviewers cannot include owners or the factory bot")
         self.independent_reviewer_ids = independent_reviewer_ids
@@ -135,7 +136,7 @@ class GitHubAPIAdapter:
             )
             if not isinstance(issue, dict) or issue.get("node_id") != ref.parcel_id:
                 return RetryableReadFailure("issue identity did not match requested parcel")
-            stage, in_project = await self._project_stage(ref.parcel_id)
+            stage, in_project, bot = await self._project_stage(ref.parcel_id)
             assignees = issue.get("assignees")
             human_assigned = not isinstance(assignees, list) or any(
                 not isinstance(user, dict) or user.get("type") != "Bot" for user in assignees
@@ -150,13 +151,15 @@ class GitHubAPIAdapter:
                 title=str(issue.get("title", "")),
                 body=issue.get("body") if isinstance(issue.get("body"), str) else None,
                 read_at_us=self._now_us(),
+                bot=bot,
             )
         except RateLimited as exc:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
         except GitHubAPIError as exc:
             return RetryableReadFailure(str(exc))
 
-    async def _project_stage(self, parcel_id: str) -> tuple[Stage | None, bool]:
+    async def _project_stage(self, parcel_id: str) -> tuple[Stage | None, bool, str | None]:
+        """(stage by Status option ID, in project, current Bot display value or None)."""
         query = """
         query($id: ID!, $after: String) {
           node(id: $id) { ... on Issue {
@@ -167,6 +170,9 @@ class GitHubAPIAdapter:
                   optionId
                   field { ... on ProjectV2SingleSelectField { id } }
                 }
+              }
+              bot: fieldValueByName(name: "Bot") {
+                ... on ProjectV2ItemFieldSingleSelectValue { optionId }
               } }
               pageInfo { hasNextPage endCursor }
             }
@@ -189,23 +195,32 @@ class GitHubAPIAdapter:
                 project = item.get("project")
                 if not isinstance(project, dict) or project.get("id") != self.project_node_id:
                     continue
+                bot = self._bot_name(item.get("bot"))
                 value = item.get("fieldValueByName")
                 if value is None:
-                    return None, True
+                    return None, True, bot
                 if not isinstance(value, dict):
                     raise GitHubAPIError("Status field value was malformed")
                 field = value.get("field")
                 if not isinstance(field, dict) or field.get("id") != self.status_field_node_id:
                     raise GitHubAPIError("Status field identity changed")
                 # Read by option ID only: a renamed option must not change the stage.
-                return stage_for_option(value.get("optionId"), self.status_options), True
+                return stage_for_option(value.get("optionId"), self.status_options), True, bot
             page = items.get("pageInfo")
             if not isinstance(page, dict) or not page.get("hasNextPage"):
-                return None, False
+                return None, False, None
             after_value = page.get("endCursor")
             if not isinstance(after_value, str):
                 raise GitHubAPIError("projectItems pagination cursor was missing")
             after = after_value
+
+    def _bot_name(self, value: object) -> str | None:
+        """Bot display value for an option ID, by the persisted schema (never by name)."""
+        if self.board_schema is None or not isinstance(value, dict):
+            return None
+        option = value.get("optionId")
+        names = [n for n, o in self.board_schema.bot_options.items() if o == option]
+        return names[0] if len(names) == 1 else None
 
     async def pull_request(
         self, ref: IssueRef, pr_number: int, *, cross_vendor_review: bool = False
@@ -253,6 +268,7 @@ class GitHubAPIAdapter:
                 checks=checks,
                 review_accepted=review_accepted,
                 findings_dispositioned=findings_dispositioned,
+                checks_summary=self._last_checks_summary,
             )
         except RateLimited as exc:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
@@ -323,6 +339,7 @@ class GitHubAPIAdapter:
         means not ready; any failure means failed. "No configuration" is never FAILED.
         """
         runs: list[tuple[str, int | None, str]] = []  # (name, app id, state)
+        labels: list[str] = []  # conclusion-level labels for the human summary
         page = 1
         while True:
             result: Any = await self.client.get_json(
@@ -343,6 +360,12 @@ class GitHubAPIAdapter:
                         _run_state(run.get("status"), run.get("conclusion")),
                     )
                 )
+                conclusion = run.get("conclusion")
+                labels.append(
+                    str(conclusion)
+                    if run.get("status") == "completed" and isinstance(conclusion, str)
+                    else "pending"
+                )
             if len(batch) < 100:
                 break
             page += 1
@@ -353,6 +376,8 @@ class GitHubAPIAdapter:
         for status in statuses if isinstance(statuses, list) else []:
             if isinstance(status, dict) and isinstance(status.get("context"), str):
                 runs.append((str(status["context"]), None, _status_state(status.get("state"))))
+                labels.append(str(status.get("state") or "pending"))
+        self._last_checks_summary = _checks_summary(labels)
         required: set[tuple[str, int | None]] = set(self.required_checks)
         if not required and base_ref is not None:
             required = await self._derived_required_checks(base_ref)
@@ -1096,3 +1121,14 @@ def _checks_from(states: list[str]) -> ChecksState:
     if combined == "failed":
         return ChecksState.FAILED
     return ChecksState.PENDING if combined == "pending" else ChecksState.GREEN
+
+
+def _checks_summary(labels: list[str]) -> str:
+    """E.g. "17 checks: 13 success, 4 skipped" (counts by conclusion)."""
+    if not labels:
+        return "no checks reported"
+    counts: dict[str, int] = {}
+    for label in labels:
+        counts[label] = counts.get(label, 0) + 1
+    parts = ", ".join(f"{n} {label}" for label, n in sorted(counts.items(), key=lambda x: -x[1]))
+    return f"{len(labels)} checks: {parts}"

@@ -164,6 +164,7 @@ _DEFAULT_RETRY: dict[EffectKind, RetryClass] = {
     EffectKind.REPLACE_COST_POLICY: RetryClass.ADOPTABLE_WRITE,
     EffectKind.DISABLE_ISSUANCE: RetryClass.LOCAL_IDEMPOTENT,
     EffectKind.ENABLE_ISSUANCE: RetryClass.LOCAL_IDEMPOTENT,
+    EffectKind.CLEANUP_WORKSPACE: RetryClass.LOCAL_IDEMPOTENT,
     EffectKind.ARM_TIMER: RetryClass.LOCAL_IDEMPOTENT,
     EffectKind.WAKE_SCHEDULER: RetryClass.LOCAL_IDEMPOTENT,
 }
@@ -1385,6 +1386,12 @@ def _h_ineligible(
 ) -> None:
     ctx.update(eligible=False)
     _safety(ctx, body.KIND.value)
+    if isinstance(body, ev.Closed):
+        ctx.emit(
+            EffectKind.CLEANUP_WORKSPACE,
+            args={"merged": False},
+            dedupe=f"cleanup:{ctx.p.parcel_id}:closed:{ctx.event.event_id}",
+        )
 
 
 def _h_item_removed(ctx: _Ctx, body: ev.ItemRemoved) -> None:
@@ -1488,9 +1495,20 @@ def _h_contract_tampered(ctx: _Ctx, body: ev.ContractTampered) -> None:
 
 
 def _h_snapshot(ctx: _Ctx, body: ev.GitHubSnapshot) -> None:
-    if ctx.event.evidence is None:
+    evidence = ctx.event.evidence
+    if evidence is None:
         raise Rejected("snapshot-without-evidence")
     _ = body
+    # Drift correction from a fresh read: write Bot only when the board shows another
+    # value than the derived one (a change in this event is written by the projection).
+    derived = project_bot(ctx.p)
+    if (
+        evidence.bot is not None
+        and ctx.p.in_project
+        and derived == ctx.p.bot
+        and evidence.bot != derived.value
+    ):
+        ctx.emit(EffectKind.SET_BOT, args={"bot": derived.value})
 
 
 def _h_column_observed(ctx: _Ctx, body: ev.ColumnObserved) -> None:
@@ -1538,6 +1556,14 @@ def _h_pr_observed(ctx: _Ctx, body: ev.PRObserved) -> None:
             _invalidate_ready(ctx, "head-drift")
         return
     _release_pr(ctx, body.pr_number)
+    if body.merged:
+        # Finished: once its sessions have settled, remove the factory worktree/branch.
+        ctx.emit(
+            EffectKind.CLEANUP_WORKSPACE,
+            args={"merged": True, "pr_number": body.pr_number},
+            dedupe=f"cleanup:{ctx.p.parcel_id}:merged",
+        )
+        return
     if not body.merged:
         ready = ctx.p.readiness
         if (
@@ -1628,7 +1654,7 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
         _invalidate_ready(ctx, "remediation-exhausted")
         return
     ctx.unhold(Hold.READINESS_FAILED, Hold.CHECKS_FAILED)
-    ctx.update(readiness=replace(r, verified=True))
+    ctx.update(readiness=replace(r, verified=True, checks_summary=body.checks_summary[:200]))
 
 
 def _h_contract_published(ctx: _Ctx, body: ev.ContractPublished) -> None:
@@ -2382,11 +2408,7 @@ def _h_reconcile_due(ctx: _Ctx, body: ev.ReconcileDue) -> None:
         _ensure_issuance(ctx, cur)  # restart with the gate closed: re-enable once it opens
     # Correct drift: the board's Bot field is re-asserted from derived state each cycle
     # (the adapter adopts without writing when it already matches).
-    ctx.update(bot=project_bot(ctx.p))
-    if ctx.p.in_project:
-        ctx.emit(
-            EffectKind.SET_BOT, args={"bot": ctx.p.bot.value}, dedupe=f"bot:{ctx.event.event_id}"
-        )
+    # Bot drift is corrected by the RECONCILE_PARCEL read (see ``_h_snapshot``).
 
 
 # ================================================================== dispatch

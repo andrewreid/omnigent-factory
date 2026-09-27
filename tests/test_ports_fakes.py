@@ -31,6 +31,7 @@ from omnigent_factory.ports.credentials import (
 from omnigent_factory.ports.github import GITHUB_EFFECT_KINDS, GitHubAdapter, IssueRef
 from omnigent_factory.ports.omnigent import OMNIGENT_EFFECT_KINDS, OmnigentAdapter
 from omnigent_factory.ports.scheduler import SCHEDULER_EFFECT_KINDS
+from omnigent_factory.ports.workspace import WORKSPACE_EFFECT_KINDS
 from omnigent_factory.testing.builders import EventFactory, snapshot
 from omnigent_factory.testing.fakes import (
     FakeClock,
@@ -54,6 +55,7 @@ def test_effect_kinds_partitioned_across_adapters():
         OMNIGENT_EFFECT_KINDS,
         CREDENTIAL_EFFECT_KINDS,
         SCHEDULER_EFFECT_KINDS,
+        WORKSPACE_EFFECT_KINDS,
     ]
     union = frozenset().union(*groups)
     assert union == frozenset(EffectKind)
