@@ -6,6 +6,7 @@ import json
 import httpx
 import pytest
 
+from omnigent_factory.core.contract_view import parcel_marker, render_contract_section
 from omnigent_factory.core.effects import (
     Ack,
     AmbiguousWrite,
@@ -49,6 +50,10 @@ def adapter(http: httpx.AsyncClient, checks=frozenset(), **kwargs):
 
 
 PARCEL_REF = IssueRef(REPO_NODE, 12, "I_1")
+GOAL_X = '{"goal":"x"}'
+RENDERED_EMPTY = (
+    f"{parcel_marker(12, hashlib.sha256(b'{}').hexdigest()[:12])}\n{render_contract_section('{}')}"
+)
 
 
 def closing_refs(*issue_ids: str, repo: str = REPO_NODE, number: int = 7, cursor=None):
@@ -368,7 +373,7 @@ async def test_reducer_shaped_contract_publication_uses_binding_and_renderer():
         result = await adapter(
             http,
             parcel_bindings={"I_1": ParcelBinding(12, "PVTI_1")},
-            publication_renderer=lambda _: "```parcel-contract\n{}\n```",
+            publication_renderer=lambda _: RENDERED_EMPTY,
         ).execute(
             effect(
                 EffectKind.PUBLISH_CONTRACT,
@@ -378,7 +383,8 @@ async def test_reducer_shaped_contract_publication_uses_binding_and_renderer():
             CTX,
         )
     assert result == Ack("55", {"verified": True, "posted_at_us": 1_767_225_600_000_000})
-    assert posted == ("```parcel-contract\n{}\n```\n\n<!-- omnigent-factory effect=eff-1 -->")
+    assert posted == f"{RENDERED_EMPTY}\n\n<!-- omnigent-factory effect=eff-1 -->"
+    assert "parcel-contract" not in posted  # no JSON is published
 
 
 @pytest.mark.asyncio
@@ -423,7 +429,8 @@ async def test_contract_publication_adopts_exact_bot_fence():
                     "user": {"id": BOT_ID},
                     "created_at": "2026-01-01T00:00:00Z",
                     "body": (
-                        '```parcel-contract\n{"goal":"x"}\n```\n'
+                        f"{parcel_marker(12, 'a' * 12)}\nintro\n"
+                        f"{render_contract_section(GOAL_X)}\n"
                         "<!-- omnigent-factory effect=pub-1 -->"
                     ),
                 }
@@ -435,5 +442,6 @@ async def test_contract_publication_adopts_exact_bot_fence():
             IssueRef(REPO_NODE, 12, "I_1"), "pub-1"
         )
     assert result is not None
-    assert result.canonical == '{"goal":"x"}'
+    assert result.contract_section == render_contract_section(GOAL_X)
+    assert result.marker_hash == "a" * 12
     assert result.author_is_bot is True

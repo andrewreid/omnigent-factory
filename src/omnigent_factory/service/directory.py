@@ -7,11 +7,18 @@ import json
 import os
 import re
 import secrets
+from collections.abc import Mapping
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
 from omnigent_factory.core.codec import parcel_from_json
+from omnigent_factory.core.contract_view import (
+    ContractViewError,
+    escape_inline,
+    parcel_marker,
+    render_contract_section,
+)
 from omnigent_factory.core.effects import (
     Ack,
     AdapterOutcome,
@@ -20,7 +27,13 @@ from omnigent_factory.core.effects import (
     ExecutionContext,
 )
 from omnigent_factory.core.protocol import ParsedResult
-from omnigent_factory.core.types import ApprovalKind, Parcel, SessionKind, StageSession
+from omnigent_factory.core.types import (
+    ApprovalKind,
+    Contract,
+    Parcel,
+    SessionKind,
+    StageSession,
+)
 from omnigent_factory.github.adapter import ParcelBinding, TriageFields
 from omnigent_factory.omnigent.directory import FormValue, StageSpec
 from omnigent_factory.ports.adapter import EffectAdapter
@@ -256,6 +269,23 @@ class ServiceDispatchDirectory:
             return None
         return str(data.get("stage") or "stage"), tuple(str(e) for e in data["errors"])
 
+    def plan_result_for(self, session_id: str, canonical: str) -> dict[str, Any] | None:
+        """The accepted plan result whose canonical contract is exactly ``canonical``."""
+        prefix = f"{_safe(session_id)}-"
+        if not self.results.is_dir():
+            return None
+        for path in sorted(self.results.glob(f"{prefix}*.json")):
+            if path.name in (f"{prefix}latest.json", f"{prefix}rejected.json"):
+                continue
+            data = self._read(path)
+            if data is None or data.get("contract_canonical") != canonical:
+                continue
+            record = data.get("factory_result")
+            body = record.get("result") if isinstance(record, dict) else None
+            if isinstance(body, dict):
+                return body
+        return None
+
     def latest_result(self, session_id: str) -> dict[str, Any] | None:
         return self._read(self.results / f"{_safe(session_id)}-latest.json")
 
@@ -379,17 +409,8 @@ class PublicationRenderer:
             contract = parcel.contract(str(effect.args.get("contract_id") or ""))
             if contract is None:
                 return None
-            text = (
-                f"<!-- factory-parcel v1 issue={parcel.issue_number or 0} "
-                f"hash={contract.prefix} -->\n"
-                f"```parcel-contract\n{contract.canonical}\n```"
-            )
-            # Canonical bytes are hash-bound to approval: never rewrite or truncate them.
-            # An oversized contract is refused before any POST (parsing already rejects it).
-            blocked = _credential_block(text, self.config)
-            if blocked is not None:
-                return blocked
-            return text if len(text) <= _CANONICAL_PUBLICATION_LIMIT else None
+            plan = self.directory.plan_result_for(contract.source_session_id, contract.canonical)
+            return render_contract_comment(parcel, contract, plan, self.config)
         if effect.kind == EffectKind.PUBLISH_REPORT and effect.args.get("report") == "ready":
             text = (
                 f"Factory: PR #{effect.args.get('pr_number')} at "
@@ -403,7 +424,7 @@ class PublicationRenderer:
             text = _public_result(body)
         elif effect.kind == EffectKind.POST_COMMENT:
             template = str(effect.args.get("template") or "status")
-            text = f"Factory status: {template.replace('-', ' ')}."
+            text = _status_text(template, effect.args)
             rejection = (
                 self.directory.latest_rejection(str(effect.args.get("session_id") or ""))
                 if template == "result-invalid"
@@ -434,6 +455,133 @@ def _authority(parcel: Parcel) -> tuple[str, str]:
     if contract is None:
         return "", "missing"
     return contract.canonical, contract.full_hash
+
+
+def render_contract_comment(
+    parcel: Parcel, contract: Contract, plan: dict[str, Any] | None, config: ServiceConfig
+) -> str | None:
+    """Readable plan comment: parcel marker, deterministic contract section, context.
+
+    The contract section is :func:`render_contract_section` of the stored canonical bytes
+    (hash-bound, never neutralised or truncated afterwards). Approach and risks are the
+    agent's free-form context, shown outside the approved section, neutralised and
+    truncated to fit. An unrenderable or oversized contract section is refused.
+    """
+    try:
+        section = render_contract_section(contract.canonical)
+    except ContractViewError:
+        return None
+    heading = (
+        f"{parcel_marker(parcel.issue_number or 0, contract.prefix)}\n"
+        f"### Plan for #{parcel.issue_number or 0} (size {contract.size.value})"
+        f" · hash `{contract.prefix}`\n\n"
+        "The approved contract is the section below; approving binds to exactly this text "
+        f"(hash `{contract.prefix}`)."
+    )
+    respond = (
+        "**How to respond:** drag the card to Building to approve this exact plan (or "
+        f"comment `/approve {contract.prefix}`), or reply with feedback for a revision."
+    )
+    open_ids = [d.decision_id for d in parcel.open_decisions]
+    if open_ids:
+        respond = (
+            "**Open decisions** (answer in Omnigent or `/decide <id> <answer>`; approval "
+            "waits for them):\n\n"
+            + "\n".join(f"- `{escape_inline(i)}`" for i in open_ids)
+            + "\n\n"
+            + respond
+        )
+    blocked = _credential_block(
+        contract.canonical + "\n" + json.dumps(plan or {}, ensure_ascii=False), config
+    )
+    if blocked is not None:
+        return blocked
+    fixed = len(heading) + len(section) + len(respond) + 64
+    if fixed > _CANONICAL_PUBLICATION_LIMIT:
+        return None
+    context = _neutralise(_plan_context(plan))
+    budget = min(_CANONICAL_PUBLICATION_LIMIT - fixed, 30_000)
+    if len(context) > budget:
+        note = "\n\n[context truncated]"
+        context = context[: max(budget - len(note), 0)].rstrip() + note
+    parts = (
+        [heading, section, "---", context, respond]
+        if context
+        else [
+            heading,
+            section,
+            "---",
+            respond,
+        ]
+    )
+    return "\n\n".join(parts)
+
+
+def _plan_context(plan: dict[str, Any] | None) -> str:
+    if plan is None:
+        return ""
+    lines = ["#### Context (not part of the approved contract)"]
+    if plan.get("approach"):
+        lines += ["", "**Approach**", "", str(plan["approach"]).strip()]
+    risks = _bullets(plan.get("risks"))
+    if risks:
+        lines += ["", "**Risks**", "", risks]
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+_STATUS_TEXT = {
+    "checkpoint": "Factory checkpoint: the granted time is used up and Molly is wrapping up. "
+    "Comment `/continue` (optionally with a duration, e.g. `/continue 2h`) to grant more.",
+    "queued": "Factory: approval recorded; the build is queued behind earlier approvals.",
+    "approval-acknowledged": "Factory: approval recorded; the build starts when capacity allows.",
+    "stopped": "Factory: stopped by the owner. Nothing runs until a new stage control.",
+    "rework-unsupported": "Factory: rework on a Ready parcel is not supported yet.",
+    "approval-invalidated": "Factory: the approval is no longer valid ({reason}). "
+    "Approve the current plan again to continue.",
+    "pr-closed-unmerged": "Factory: PR #{pr_number} was closed without merging; "
+    "the parcel needs an owner decision.",
+    "ready-invalidated": "Factory: the parcel is no longer Ready ({reason}).",
+    "create-rejected": "Factory: Omnigent refused to create the session ({reason}); "
+    "the parcel is Blocked.",
+    "adoption-ambiguous": "Factory: could not tell which Omnigent session is ours "
+    "({matches} matches); the parcel is Blocked for operator review.",
+    "decision": "Factory: Molly needs a decision (`{decision_id}`, impact {impact}). "
+    "Answer it in Omnigent or comment `/decide {decision_id} <answer>`.",
+    "decision-resolved-externally": "Factory: decision `{decision_id}` was resolved "
+    "outside the factory.",
+    "result-invalid": "Factory status: the stage result was invalid; the parcel is Blocked.",
+    "stop-unverified": "Factory: a stop could not be verified; the parcel is Blocked until "
+    "the session tree is confirmed idle.",
+    "restart-exhausted": "Factory: the session stopped and could not be restarted "
+    "automatically; the parcel is Blocked.",
+    "queue-entry-invalid": "Factory: a queued build was dropped because its approval is "
+    "no longer valid.",
+    "control-rejected": "Factory: that command was not accepted ({reason}).",
+}
+
+
+def _status_text(template: str, args: Mapping[str, Any]) -> str:
+    fallback = f"Factory status: {template.replace('-', ' ')}."
+    pattern = _STATUS_TEXT.get(template)
+    if pattern is None:
+        return fallback
+    values = {key: str(value).replace("_", " ") for key, value in args.items()}
+    values.update({key: str(value) for key, value in args.items() if key.endswith("_id")})
+    try:
+        return pattern.format(**values)
+    except (KeyError, IndexError, ValueError):
+        return fallback
+
+
+def _neutralise(text: str) -> str:
+    """Model text published as the bot: no mentions, fences or hidden HTML comments.
+
+    A fence could mimic the canonical ``parcel-contract`` block and an HTML comment could
+    mimic an effect marker, so both are broken while staying legible.
+    """
+    text = re.sub(r"(?<![\w@])@(?=[A-Za-z0-9])", "@\u200b", text)
+    text = text.replace("```", "`\u200b``").replace("~~~", "~\u200b~~")
+    return text.replace("<!--", "&lt;!--")
 
 
 def _error_list(errors: tuple[str, ...]) -> str:
@@ -510,7 +658,7 @@ def _safe_publication(text: str, config: ServiceConfig) -> str:
         return blocked
     # GitHub expands mentions even when their text originated in an untrusted issue.
     # Break the trigger while retaining legible attribution, then bound bot output.
-    text = re.sub(r"(?<![\w@])@(?=[A-Za-z0-9])", "@\u200b", text)
+    text = _neutralise(text)
     limit = 8_000
     if len(text) > limit:
         text = text[: limit - 30].rstrip() + "\n\n[factory output truncated]"

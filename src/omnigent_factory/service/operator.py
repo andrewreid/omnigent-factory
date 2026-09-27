@@ -58,6 +58,10 @@ class OperatorServer:
             response.setdefault("ok", True)
         except Exception as exc:
             response = {"ok": False, "error": type(exc).__name__}
+            if type(exc) is ValueError:
+                # Plain ValueErrors are daemon-authored refusals; parser subclasses such as
+                # JSONDecodeError stay type-only (they can describe request bytes).
+                response["message"] = str(exc)[:500]
         try:
             writer.write(json.dumps(response, sort_keys=True).encode() + b"\n")
             await writer.drain()

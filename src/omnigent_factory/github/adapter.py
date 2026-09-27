@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import hashlib
 import inspect
 import logging
-import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any
 
+from omnigent_factory.core.contract_view import extract_contract_section, marker_hash
 from omnigent_factory.core.effects import (
     Ack,
     AdapterOutcome,
@@ -40,8 +39,6 @@ from omnigent_factory.ports.github import (
     PullRequestEvidence,
     stage_for_option,
 )
-
-_CONTRACT_FENCE = re.compile(r"```parcel-contract\s*\n(?P<body>.*?)\n```", re.DOTALL)
 
 LOG = logging.getLogger(__name__)
 
@@ -384,11 +381,11 @@ class GitHubAPIAdapter:
                 if not author_is_bot:
                     continue
                 body = str(comment.get("body", ""))
-                match = _CONTRACT_FENCE.search(body)
                 return ContractPublication(
                     comment_id=str(comment.get("id", "")),
                     author_is_bot=True,
-                    canonical=None if match is None else match.group("body"),
+                    contract_section=extract_contract_section(body),
+                    marker_hash=marker_hash(body),
                     posted_at_us=self._parse_time_us(comment.get("created_at")),
                 )
             return None
@@ -483,7 +480,7 @@ class GitHubAPIAdapter:
                 publication = await self.find_contract_publication(ref, effect.effect_id)
                 if isinstance(publication, RetryableReadFailure):
                     return publication
-                if publication is None or not _publication_matches(effect, publication):
+                if publication is None or not _publication_matches(effect, publication, text):
                     return AmbiguousWrite("contract comment exists but exact bytes are unverified")
                 return Ack(
                     adopted,
@@ -515,7 +512,7 @@ class GitHubAPIAdapter:
             publication = await self.find_contract_publication(ref, effect.effect_id)
             if isinstance(publication, RetryableReadFailure):
                 return publication
-            if publication is None or not _publication_matches(effect, publication):
+            if publication is None or not _publication_matches(effect, publication, text):
                 return AmbiguousWrite("contract comment posted but exact bytes are unverified")
             return Ack(
                 str(comment_id),
@@ -662,6 +659,46 @@ class GitHubAPIAdapter:
                 }
             },
         )
+
+    async def rerender_comment(self, effect: EffectIntent) -> AdapterOutcome:
+        """Operator: re-render a published comment in place, found by its effect marker.
+
+        Edits the one bot comment carrying this effect's marker (never posts a second
+        one). A contract comment must verify afterwards exactly as at publication.
+        """
+        if effect.kind not in _COMMENT_KINDS:
+            return DefinitiveFailure("only comment effects can be re-rendered")
+        ref = await self._issue_ref(effect, require_parcel=False)
+        text = effect.args.get("body")
+        if text is None:
+            text = await self._render_publication(effect)
+        if ref is None or not isinstance(text, str):
+            return DefinitiveFailure("could not resolve the issue or render the comment")
+        try:
+            found = await self._find_marked_comment(ref, effect.effect_id)
+            if isinstance(found, RetryableReadFailure):
+                return found
+            if found is None:
+                return DefinitiveFailure("no bot comment carries this effect marker")
+            await self.client.request(
+                "PATCH",
+                f"/repos/{self.repository}/issues/comments/{found}",
+                json_body={"body": f"{text}\n\n{self._effect_marker(effect.effect_id)}"},
+                expected=frozenset({200}),
+            )
+            if effect.kind == EffectKind.PUBLISH_CONTRACT:
+                publication = await self.find_contract_publication(ref, effect.effect_id)
+                if isinstance(publication, RetryableReadFailure):
+                    return publication
+                if not _publication_matches(effect, publication, text):
+                    return AmbiguousWrite("re-rendered contract comment did not verify")
+        except AmbiguousRequest as exc:
+            return AmbiguousWrite(str(exc))
+        except RateLimited as exc:
+            return RetryableReadFailure(str(exc), exc.retry_after_us)
+        except GitHubAPIError as exc:
+            return DefinitiveFailure(str(exc))
+        return Ack(found, {"rerendered": True, "issue_number": ref.issue_number})
 
     async def _find_marked_comment(
         self, ref: IssueRef, effect_id: str
@@ -867,8 +904,33 @@ def _status_options(schema: BoardSchema | None) -> dict[Stage, str]:
     return options
 
 
-def _publication_matches(effect: EffectIntent, publication: ContractPublication | None) -> bool:
-    expected = effect.args.get("full_hash")
-    if publication is None or publication.canonical is None or not isinstance(expected, str):
+_COMMENT_KINDS = frozenset(
+    {
+        EffectKind.POST_COMMENT,
+        EffectKind.PUBLISH_CONTRACT,
+        EffectKind.PUBLISH_TRIAGE,
+        EffectKind.PUBLISH_REPORT,
+    }
+)
+
+
+def _publication_matches(
+    effect: EffectIntent, publication: ContractPublication | None, rendered: str
+) -> bool:
+    """The posted comment shows exactly the stored contract's section under its hash.
+
+    ``rendered`` is the daemon's own rendering of the stored contract (trusted); the
+    posted section must equal its section byte-for-byte and the parcel marker must carry
+    the prefix of the effect's full hash.
+    """
+    full_hash = effect.args.get("full_hash")
+    if publication is None or not isinstance(full_hash, str):
         return False
-    return hashlib.sha256(publication.canonical.encode("utf-8")).hexdigest() == expected
+    expected = extract_contract_section(rendered)
+    return (
+        expected is not None
+        and publication.contract_section == expected
+        and publication.marker_hash is not None
+        and len(publication.marker_hash) >= 12
+        and full_hash.startswith(publication.marker_hash)
+    )

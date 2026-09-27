@@ -4,9 +4,10 @@ Contract normalization: schema-validate the contract object, then recursively no
 every string (CRLF/CR → LF; trailing horizontal whitespace trimmed per line; leading
 whitespace, Unicode code points and list order retained). Serialize as UTF-8 JSON with
 sorted object keys and no insignificant whitespace. Non-finite numbers and duplicate keys
-are rejected. The exact canonical bytes are posted inside the ``parcel-contract`` fence and
-hashed with SHA-256; the full digest is persisted, 12-character prefixes are display
-handles only and must resolve uniquely.
+are rejected. The exact canonical bytes are hashed with SHA-256 and stored; the plan
+comment shows their deterministic markdown rendering (``core.contract_view``), not JSON.
+The full digest is persisted, 12-character prefixes are display handles only and must
+resolve uniquely.
 
 Waiver normalization applies the same encoding to exactly ``{"title": ..., "body": ...}``
 with a null body mapped to ``""``.

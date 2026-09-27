@@ -55,6 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retry.add_argument("effect")
     _config_arg(retry)
+    rerender = sub.add_parser(
+        "rerender-comment",
+        help="re-render a published comment in place, found by its effect marker",
+    )
+    rerender.add_argument("effect")
+    _config_arg(rerender)
 
     setup = sub.add_parser("setup", help="render or validate owner-applied setup artifacts")
     setup_sub = setup.add_subparsers(dest="setup_command", required=True)
@@ -77,7 +83,11 @@ def _load(args: argparse.Namespace) -> tuple[Path, ServiceConfig]:
 
 def _operator(config: ServiceConfig, command: str, args: Mapping[str, object] | None = None) -> int:
     try:
-        result = asyncio.run(operator_request(config.operator_socket, command, args))
+        # Re-rendering reads, edits and re-verifies a GitHub comment: allow more time.
+        timeout = 60.0 if command == "rerender-comment" else 5.0
+        result = asyncio.run(
+            operator_request(config.operator_socket, command, args, timeout_seconds=timeout)
+        )
     except (ConnectionError, FileNotFoundError) as exc:
         print(f"operator socket unavailable: {exc}", file=sys.stderr)
         return 2
@@ -111,6 +121,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _operator(config, "explain", {"parcel": args.parcel})
     if args.command == "release-delivery":
         return _operator(config, "release-delivery", {"delivery": args.delivery})
+    if args.command == "rerender-comment":
+        return _operator(config, "rerender-comment", {"effect": args.effect})
     if args.command == "retry-effect":
         return _operator(config, "retry-effect", {"effect": args.effect})
     renderer = OperationsRenderer(config_path)

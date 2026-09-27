@@ -125,11 +125,16 @@ class PullRequestEvidence:
 
 @dataclass(frozen=True, slots=True)
 class ContractPublication:
-    """A bot comment found by marker, with the exact contract bytes it contains."""
+    """A bot comment found by effect marker: its rendered contract section and hash marker.
+
+    Nothing is parsed back as JSON; the section is compared with the deterministic
+    rendering of the stored contract (``core.contract_view``).
+    """
 
     comment_id: str
     author_is_bot: bool
-    canonical: str | None
+    contract_section: str | None
+    marker_hash: str | None
     posted_at_us: int
 
 

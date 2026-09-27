@@ -315,6 +315,7 @@ async def build_production(
         github_http=github_http,
         omnigent=omnigent,
     )
+    service.comment_rerenderer = github.rerender_comment
     service.bind_integrations(
         adapters=(github, recording_omnigent, broker),
         delivery_processor=GitHubDeliveryProcessor(service, normalizer, github, clock),

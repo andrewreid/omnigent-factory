@@ -6,13 +6,13 @@ import asyncio
 import contextlib
 import logging
 import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import replace
 from functools import partial
 from typing import Any
 
 from omnigent_factory.core import events as ev
-from omnigent_factory.core.effects import EffectKind
+from omnigent_factory.core.effects import Ack, AdapterOutcome, EffectIntent, EffectKind
 from omnigent_factory.core.events import Event, Provenance
 from omnigent_factory.core.types import (
     AdmissionSnapshot,
@@ -49,6 +49,16 @@ LOG = logging.getLogger(__name__)
 
 #: Effects an operator may requeue: comment publications adopt their effect marker, and
 #: their ack (PublicationAcked) clears the reducer's pending/failed/unknown state.
+#: Completed comment publications an operator may re-render in place (same marker).
+RERENDERABLE_KINDS = frozenset(
+    {
+        EffectKind.PUBLISH_CONTRACT.value,
+        EffectKind.PUBLISH_TRIAGE.value,
+        EffectKind.PUBLISH_REPORT.value,
+        EffectKind.POST_COMMENT.value,
+    }
+)
+
 RETRYABLE_PUBLICATION_KINDS = frozenset(
     {
         EffectKind.PUBLISH_TRIAGE.value,
@@ -75,6 +85,8 @@ class FactoryService:
         self.serializers = ParcelSerializers()
         self.process_lock = process_lock or ProcessLock(config.state_dir)
         self.delivery_processor = delivery_processor
+        #: Operator ``rerender-comment``: edits a published comment in place (composition).
+        self.comment_rerenderer: Callable[[EffectIntent], Awaitable[AdapterOutcome]] | None = None
         self._fatal_exit = fatal_exit
         self._fatal_reason: str | None = None
         self._delivery_failures: dict[str, int] = {}
@@ -628,6 +640,29 @@ class FactoryService:
             return await self._explain(parcel_id)
         if command == "recovery":
             return await self._recovery()
+        if command == "rerender-comment":
+            effect_id = str(args.get("effect", ""))
+            stored = await self.db.call(lambda store: store.get_effect(effect_id))
+            if stored is None or stored.state != "done":
+                raise ValueError("effect is not a completed publication")
+            if stored.effect.kind.value not in RERENDERABLE_KINDS:
+                raise ValueError("effect is not a comment publication")
+            if self.comment_rerenderer is None:
+                raise ValueError("comment re-rendering is not wired")
+            outcome = await self.comment_rerenderer(stored.effect)
+            if not isinstance(outcome, Ack):
+                LOG.warning(
+                    "operator re-render failed effect_id=%s outcome=%s",
+                    effect_id,
+                    type(outcome).__name__,
+                )
+                raise ValueError(f"re-render failed: {getattr(outcome, 'reason', outcome)}")
+            LOG.info(
+                "operator re-rendered comment effect_id=%s comment=%s",
+                effect_id,
+                outcome.remote_id,
+            )
+            return {"rerendered": effect_id, "comment_id": outcome.remote_id}
         if command == "retry-effect":
             effect_id = str(args.get("effect", ""))
             if not effect_id:

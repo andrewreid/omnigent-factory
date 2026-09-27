@@ -12,6 +12,7 @@ import pytest
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.canonical import canonical_contract
+from omnigent_factory.core.contract_view import render_contract_section
 from omnigent_factory.core.effects import (
     Ack,
     DefinitiveFailure,
@@ -428,10 +429,13 @@ async def test_contract_is_published_byte_exact_and_verifies(
     assert isinstance(outcome, Ack) and outcome.detail["verified"] is True
     assert server.posts == 1
     posted = server.comments[0]["body"]
-    assert f"```parcel-contract\n{canonical}\n```" in posted
-    assert "\u200b" not in posted and "[factory output truncated]" not in posted
+    # The hash-bound section is exactly the deterministic rendering of the stored
+    # contract (mentions escaped by the renderer itself), never truncated; no JSON.
+    assert render_contract_section(canonical) in posted
+    assert "parcel-contract" not in posted and "[factory output truncated]" not in posted
     digest = hashlib.sha256(canonical.encode()).hexdigest()
     assert digest == effect.args["full_hash"]
+    assert f"hash={digest[:12]} -->" in posted
 
 
 @pytest.mark.asyncio
