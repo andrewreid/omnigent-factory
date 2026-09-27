@@ -961,7 +961,9 @@ def test_D05_uncorrelated_resolution_grants_nothing():
     r = h.send(P, ev.ElicitationResolved(session_id=d.session_id, elicitation_id=d.elicitation_id))
     closed = h.p().decision(d.decision_id)
     assert closed.status == DecisionStatus.RESOLVED_IN_OMNIGENT and closed.externally_resolved
-    assert not work(r) and closed.answer is None
+    # No answer relay or new authority: only the session's existing credential re-enabled.
+    assert [e.kind for e in work(r)] == [EffectKind.ENABLE_ISSUANCE]
+    assert closed.answer is None
     assert h.p().bot == BotState.WORKING
 
 

@@ -140,6 +140,8 @@ async def test_correction_message_and_blocked_comment_carry_the_errors(
         )
         assert message is not None and f"- {details[0]}" in message
         assert "fixing exactly these errors" in message
+        # Expected types are quoted (#677: `done` was sent as a string, not a list).
+        assert '{"kind":"blocked","reason":str,"done":[str]}' in message
 
         comment = await PublicationRenderer(directory, service_config)(
             effect(EffectKind.POST_COMMENT, template="result-invalid", session_id=sid)

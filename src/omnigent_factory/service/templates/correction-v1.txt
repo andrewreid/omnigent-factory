@@ -2,6 +2,9 @@ Your final response did not contain one valid FACTORY_RESULT_V1 block matching t
 session. Validation errors:
 {errors}
 
+Expected result shapes for this stage (str = string, [x] = list of x):
+{shapes}
+
 Resend the result once, fixing exactly these errors, using the same parcel/session/nonce/
 revision and the strict factory result v1 schema. Do no additional task work. This is the only automatic
 format-correction request.

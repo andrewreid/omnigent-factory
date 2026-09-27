@@ -26,7 +26,7 @@ from omnigent_factory.core.effects import (
     EffectKind,
     ExecutionContext,
 )
-from omnigent_factory.core.protocol import ParsedResult
+from omnigent_factory.core.protocol import ParsedResult, result_shapes
 from omnigent_factory.core.types import (
     ApprovalKind,
     Contract,
@@ -167,7 +167,9 @@ class ServiceDispatchDirectory:
         if purpose == "correction":
             rejection = self.latest_rejection(sid)
             errors = rejection[1] if rejection is not None else ("no details recorded",)
-            return _template("correction-v1.txt").format(errors=_error_list(errors))
+            return _template("correction-v1.txt").format(
+                errors=_error_list(errors), shapes=result_shapes(spec.kind.value)
+            )
         if purpose == "checkpoint_cleanup":
             return _template("checkpoint-v1.txt").format(
                 grant_id=spec.grant_id,

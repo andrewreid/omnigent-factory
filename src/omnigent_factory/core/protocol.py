@@ -178,6 +178,39 @@ MAX_ERROR_DETAIL_CHARS = 200
 _RESULT_KINDS = frozenset({"triage", "plan", "build_ready", "checkpoint", "blocked"})
 
 
+#: Compact field types per result kind, quoted in the format-correction message.
+RESULT_SHAPES: dict[str, str] = {
+    "triage": '{"kind":"triage","summary":str,"priority":"P0|P1|P2|P3","size":"S|M|L",'
+    '"recommendation":"fix|wont_fix|duplicate|needs_info","duplicate_issue":int|null,'
+    '"labels":[str],"missing_information":[str]}',
+    "plan": '{"kind":"plan","publication_kind":"contract|info","approach":str,"risks":[str],'
+    '"contract":{"goal":str,"acceptance_criteria":[{"id":str,"criterion":str,'
+    '"verification":str}],"non_goals":[str],"size":"S|M|L","resolved_decisions":'
+    '[{"decision_id":str,"answer":str,"source_event_id":str}]},"open_decision_ids":[str]}',
+    "build_ready": '{"kind":"build_ready","pr_number":int>=1,"branch":str,"head_sha":sha40,'
+    '"summary":str,"verification":[{"command":str,"file_set":[str],'
+    '"outcome":"passed|failed|not_run","evidence":str}],"review":{"implementation_vendor":str,'
+    '"review_vendor":str,"reviewed_head":sha40,"artifact_reference":str,'
+    '"artifact_sha256":sha256,"accepted":bool},"findings":[{"id":str,"source":str,'
+    '"severity":str,"disposition":str,"evidence":str}],"remediation_batches_used":0|1,'
+    '"targeted_rechecks_used":0|1,"release_readiness":"ready|needs_owner"}',
+    "checkpoint": '{"kind":"checkpoint","grant_id":str,"head_sha":sha40|null,"done":[str],'
+    '"remaining":[str],"risks":[str],"worktree_state":str,"elicitation_id":str|null}',
+    "blocked": '{"kind":"blocked","reason":str,"done":[str]}',
+}
+_STAGE_KINDS = {
+    "triage": ("triage", "blocked"),
+    "plan": ("plan", "blocked"),
+    "build": ("build_ready", "plan", "checkpoint", "blocked"),
+}
+
+
+def result_shapes(stage: str) -> str:
+    """The result shapes a stage may return, one per line."""
+    kinds = _STAGE_KINDS.get(stage, tuple(RESULT_SHAPES))
+    return "\n".join(f"- {RESULT_SHAPES[k]}" for k in kinds)
+
+
 def validation_details(exc: ValidationError) -> tuple[str, ...]:
     """``loc: msg`` per error, without input values; discriminator tags dropped."""
     lines: list[str] = []

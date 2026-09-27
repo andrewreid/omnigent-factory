@@ -1981,7 +1981,8 @@ def _resume_after_prompt(ctx: _Ctx, d: Decision) -> None:
         or any(o.session_id == s.session_id for o in ctx.p.open_decisions)
     ):
         return
-    ctx.put_session(replace(s, lifecycle=Lifecycle.ACTIVE, wait_reason=None))
+    s = ctx.put_session(replace(s, lifecycle=Lifecycle.ACTIVE, wait_reason=None))
+    _ensure_issuance(ctx, s)
 
 
 def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
@@ -2301,6 +2302,23 @@ def _h_retry_due(ctx: _Ctx, body: ev.RetryDue) -> None:
     _ = body  # timers never approve, decide or reset an allowance
 
 
+def _ensure_issuance(ctx: _Ctx, s: StageSession) -> None:
+    """Re-enable the session's fixed-profile credential whenever its gate is open.
+
+    The broker is default-deny after every restart and only re-checks at boot; a gate
+    that reopens later (answered question, stale decision closed, operator resume) would
+    otherwise leave a working session unable to push. Idempotent in the broker, and the
+    effect's own precondition re-checks ``work_allowed`` at execution.
+    """
+    if (
+        s.session_id == ctx.p.current_session_id
+        and s.prepared
+        and s.lifecycle in _RESUMABLE
+        and work_allowed(ctx.p, s)
+    ):
+        ctx.emit(EffectKind.ENABLE_ISSUANCE, session=s, args={"profile": profile_for(s.kind).value})
+
+
 def _close_stale_decisions(ctx: _Ctx) -> None:
     """Self-heal records left open by earlier versions: prompts already gone or answered
     in Omnigent, or belonging to sessions that have ended."""
@@ -2340,6 +2358,7 @@ def _h_operator_resume(ctx: _Ctx, body: ev.OperatorResume) -> None:
         s = ctx.put_session(replace(s, lifecycle=Lifecycle.ACTIVE, wait_reason=None))
     if not work_allowed(ctx.p, s):
         raise Rejected("work-not-allowed")
+    _ensure_issuance(ctx, s)  # before the note: the session will need its credential
     ctx.emit(
         EffectKind.SEND_MESSAGE,
         session=s,
@@ -2351,6 +2370,9 @@ def _h_reconcile_due(ctx: _Ctx, body: ev.ReconcileDue) -> None:
     _ = body
     ctx.emit(EffectKind.RECONCILE_PARCEL)
     _close_stale_decisions(ctx)
+    cur = ctx.p.current_session
+    if cur is not None and not any(e.kind == EffectKind.ENABLE_ISSUANCE for e in ctx.effects):
+        _ensure_issuance(ctx, cur)  # restart with the gate closed: re-enable once it opens
     # Correct drift: the board's Bot field is re-asserted from derived state each cycle
     # (the adapter adopts without writing when it already matches).
     ctx.update(bot=project_bot(ctx.p))
