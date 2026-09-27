@@ -130,7 +130,9 @@ class ParkedDeliveries:
     def records(self) -> tuple[tuple[str, str | None], ...]:
         return tuple(sorted(self._items.items()))
 
-    async def park(self, delivery_guid: str, parcel_id: str | None) -> None:
+    async def park(
+        self, delivery_guid: str, parcel_id: str | None, *, reason: str | None = None
+    ) -> None:
         prior = self._items.get(delivery_guid, parcel_id)
         # Mirror first: never less restrictive than the database, even mid-commit.
         self._items[delivery_guid] = parcel_id if prior == parcel_id else None
@@ -145,7 +147,7 @@ class ParkedDeliveries:
         try:
             await self._db.call(
                 lambda store: store.park_delivery(
-                    delivery_guid, parcel_id, hold=hold, config=config
+                    delivery_guid, parcel_id, hold=hold, config=config, reason=reason
                 )
             )
         finally:

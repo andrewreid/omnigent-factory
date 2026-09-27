@@ -325,7 +325,13 @@ async def test_processor_outage_is_bounded_and_never_logs_secret(
         recovery = await service.operator_command("recovery", {})
         deliveries = recovery["deliveries"]
         assert isinstance(deliveries, list)
-        assert {"delivery_guid": "poison", "status": "parked", "parcel": None} in deliveries
+        assert {
+            "delivery_guid": "poison",
+            "status": "parked",
+            "parcel": None,
+            "reason": "authorization=[REDACTED]",  # the stored reason is redacted too
+        } in deliveries
+        assert "poison-secret-token" not in str(recovery)
         await start_triage(service, "P-global-park")
         await asyncio.sleep(0.1)
         assert omnigent.executed(EffectKind.CREATE_SESSION) == []

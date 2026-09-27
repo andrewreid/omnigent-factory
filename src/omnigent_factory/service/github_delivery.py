@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -100,7 +101,12 @@ class GitHubDeliveryProcessor:
                 provenance=provenance,
             )
         except (ValueError, WebhookError) as exc:
-            raise NonRetryableDelivery("persisted delivery is invalid") from exc
+            if delivery.event_name not in SAFETY_EVENTS:
+                # Informational (PR/check/workflow/review): reconcile and the PR fetch
+                # poll that state anyway, so an unreadable one never halts the factory.
+                await self._ignore(delivery, f"unreadable {delivery.event_name}: {exc}")
+                return
+            raise NonRetryableDelivery(f"unreadable {delivery.event_name}: {exc}") from exc
 
         content_id = normalized.unresolved_content_node_id
         if content_id is not None:
@@ -167,8 +173,22 @@ class GitHubDeliveryProcessor:
             )
             return
 
-        event = await self._freshen(normalized.events[0])
+        event = await self._freshen(normalized.events[0], delivery)
+        if event is None:
+            await self._ignore(delivery, "PR/check event for no known parcel")
+            return
         await self.service.apply_event(event, delivery_status="processed")
+
+    async def _ignore(self, delivery: DeliveryRecord, reason: str) -> None:
+        LOG.info(
+            "delivery ignored delivery_guid=%s event=%s reason=%s",
+            delivery.delivery_guid,
+            delivery.event_name,
+            reason[:300],
+        )
+        await self.service.db.call(
+            lambda store: store.mark_delivery(delivery.delivery_guid, "processed")
+        )
 
     async def _set_aside(
         self, delivery_guid: str, content_id: str, reason: str, retry_after_us: int | None
@@ -180,11 +200,12 @@ class GitHubDeliveryProcessor:
             delivery_guid, content_id, retry_after_us=retry_after_us
         )
 
-    async def _freshen(self, event: Event) -> Event:
+    async def _freshen(self, event: Event, delivery: DeliveryRecord) -> Event | None:
+        """Scope and freshen the event; ``None`` when a PR/check event maps to no parcel."""
         if event.parcel_id is None:
-            parcel_id = await self._parcel_for_pr(event)
+            parcel_id = await self._parcel_for_pr(event, delivery)
             if parcel_id is None:
-                raise NonRetryableDelivery("delivery cannot be linked to a parcel")
+                return None
             event = replace(event, parcel_id=parcel_id)
         if event.issue_number is None:
             parcel = await self.service.db.call(
@@ -201,15 +222,64 @@ class GitHubDeliveryProcessor:
             return replace(event, evidence=snapshot)
         raise RuntimeError("fresh GitHub evidence is temporarily unavailable")
 
-    async def _parcel_for_pr(self, event: Event) -> str | None:
+    async def _parcel_for_pr(self, event: Event, delivery: DeliveryRecord) -> str | None:
+        """Parcel of a PR/check/review event: its recorded PR number, else the factory
+        head branch ``factory/issue-<N>`` of the parcel's issue (before the PR is known)."""
+        repo_id = self.service.config.repo_id
         number = getattr(event.body, "pr_number", None)
-        if not isinstance(number, int) or number <= 0:
+        if isinstance(number, int) and number > 0:
+            rows = await self.service.db.call(
+                lambda store: store.query(
+                    "SELECT parcel_id FROM parcels WHERE repo_id = ? AND "
+                    "json_extract(aggregate_json, '$.parcel.pr_number') = ?",
+                    (repo_id, number),
+                )
+            )
+            if len(rows) == 1:
+                return str(rows[0][0])
+        issue = issue_for_branch(head_branch(delivery.event_name, delivery.body))
+        if issue is None:
             return None
         rows = await self.service.db.call(
             lambda store: store.query(
                 "SELECT parcel_id FROM parcels WHERE repo_id = ? AND "
-                "json_extract(aggregate_json, '$.parcel.pr_number') = ?",
-                (self.service.config.repo_id, number),
+                "json_extract(aggregate_json, '$.parcel.issue_number') = ?",
+                (repo_id, issue),
             )
         )
         return str(rows[0][0]) if len(rows) == 1 else None
+
+
+#: Events that can carry owner controls or safety facts. Only these may be parked when
+#: unreadable; everything else is informational and ignored with a log line.
+SAFETY_EVENTS = frozenset({"issues", "issue_comment", "projects_v2_item"})
+
+_FACTORY_BRANCH = re.compile(r"factory/issue-([1-9][0-9]{0,9})")
+
+
+def head_branch(event_name: str, body: bytes) -> str | None:
+    """Head branch named by a pull_request / review / check_suite / workflow_run payload."""
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    for key in ("pull_request", "check_suite", "workflow_run", "check_run"):
+        item = payload.get(key)
+        if not isinstance(item, dict):
+            continue
+        head = item.get("head")
+        if isinstance(head, dict) and isinstance(head.get("ref"), str):
+            return str(head["ref"])
+        if isinstance(item.get("head_branch"), str):
+            return str(item["head_branch"])
+        suite = item.get("check_suite")
+        if isinstance(suite, dict) and isinstance(suite.get("head_branch"), str):
+            return str(suite["head_branch"])
+    return None
+
+
+def issue_for_branch(branch: str | None) -> int | None:
+    match = _FACTORY_BRANCH.fullmatch(branch or "")
+    return int(match.group(1)) if match else None

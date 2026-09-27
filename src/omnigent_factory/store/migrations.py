@@ -445,8 +445,14 @@ ALTER TABLE deliveries ADD COLUMN resolution_attempts INTEGER NOT NULL DEFAULT 0
 ALTER TABLE deliveries ADD COLUMN resolution_retry_at_us INTEGER;
 """
 
+# Pilot: a parked delivery records why it was parked (daemon-authored text, no body).
+V4_SQL = """
+ALTER TABLE parked_deliveries ADD COLUMN reason TEXT;
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
     Migration(3, "delivery-resolution-backoff", V3_SQL),
+    Migration(4, "parked-delivery-reason", V4_SQL),
 )

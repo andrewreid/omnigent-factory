@@ -42,7 +42,7 @@ from omnigent_factory.service.parked import (
     inbox_hold_event,
     inbox_release_event,
 )
-from omnigent_factory.service.redaction import install_redaction_filter
+from omnigent_factory.service.redaction import install_redaction_filter, redact_text
 from omnigent_factory.store.sqlite import ApplyResult, DeliveryRecord, SqliteStore, StoredEffect
 
 LOG = logging.getLogger(__name__)
@@ -308,13 +308,16 @@ class FactoryService:
             await self.delivery_processor.process(delivery)
         except NonRetryableDelivery as exc:
             # Scope row, rejected status and (scoped) parcel hold commit together.
-            await self.parked.park(delivery.delivery_guid, exc.parcel_id)
+            reason = redact_text(str(exc))[:500]  # stored and returned: never a secret
+            await self.parked.park(delivery.delivery_guid, exc.parcel_id, reason=reason)
             self._delivery_failures.pop(delivery.delivery_guid, None)
             self._delivery_retry_at.pop(delivery.delivery_guid, None)
             LOG.warning(
-                "delivery parked delivery_guid=%s scoped=%s",
+                "delivery parked delivery_guid=%s event=%s scoped=%s reason=%s",
                 delivery.delivery_guid,
+                delivery.event_name,
                 exc.parcel_id is not None,
+                reason,
             )
         except Exception:
             attempts = self._delivery_failures.get(delivery.delivery_guid, 0) + 1
@@ -764,6 +767,12 @@ class FactoryService:
             )
         )
         parked_by_guid = dict(self.parked.records())
+        reasons = {
+            str(row[0]): row[1]
+            for row in await self.db.call(
+                lambda store: store.query("SELECT delivery_guid, reason FROM parked_deliveries")
+            )
+        }
         return {
             "effects": effects,
             "pending_deliveries": [delivery.delivery_guid for delivery in pending_deliveries],
@@ -772,6 +781,7 @@ class FactoryService:
                     "delivery_guid": str(row[0]),
                     "status": "parked" if str(row[0]) in parked_by_guid else str(row[1]),
                     "parcel": parked_by_guid.get(str(row[0])),
+                    "reason": reasons.get(str(row[0])),
                 }
                 for row in delivery_rows
             ],

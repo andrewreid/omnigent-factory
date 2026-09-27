@@ -1286,6 +1286,7 @@ class SqliteStore:
         *,
         hold: Event | None = None,
         config: TrustedConfig | None = None,
+        reason: str | None = None,
     ) -> None:
         """Park a poison delivery: scope row, ``rejected`` status and parcel hold, atomically.
 
@@ -1293,6 +1294,11 @@ class SqliteStore:
         """
         with self._txn() as conn:
             self._park(conn, delivery_guid, parcel_id)
+            if reason is not None:
+                conn.execute(
+                    "UPDATE parked_deliveries SET reason = ? WHERE delivery_guid = ?",
+                    (reason, delivery_guid),
+                )
             self._hook("after-park-row")
             self._mark_delivery(conn, delivery_guid, "rejected")
             if hold is not None:
