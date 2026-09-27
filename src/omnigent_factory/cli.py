@@ -103,11 +103,12 @@ def _operator(
     command: str,
     args: Mapping[str, object] | None = None,
     *,
-    startup_wait_seconds: float = 20.0,
+    startup_wait_seconds: float = 90.0,
 ) -> int:
     # Re-rendering reads, edits and re-verifies a GitHub comment: allow more time.
     timeout = 60.0 if command in ("rerender-comment", "cleanup") else 5.0
     deadline = time.monotonic() + startup_wait_seconds
+    waiting = False
     while True:
         try:
             result = asyncio.run(
@@ -115,10 +116,14 @@ def _operator(
             )
             break
         except (ConnectionError, FileNotFoundError) as exc:
-            # The socket appears a few seconds after a (re)start: wait briefly for it.
+            # The socket opens once startup reconcile finishes (tens of seconds after a
+            # restart with live sessions): wait for it.
             if time.monotonic() >= deadline:
                 print(f"operator socket unavailable: {exc}", file=sys.stderr)
                 return 2
+            if not waiting:
+                print("waiting for the daemon to finish starting...", file=sys.stderr)
+                waiting = True
             time.sleep(0.5)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result.get("ok", False) else 1

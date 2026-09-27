@@ -39,8 +39,9 @@ For a longer randomized search: `HYPOTHESIS_PROFILE=thorough uv run pytest -q te
 ## Operations
 
 The daemon runs as the systemd user unit `omnigent-factory`. Every operator command
-talks to it over its local socket and takes `--config <path>` (omitted below). Right
-after a restart the CLI waits up to 20 s for the socket instead of failing.
+talks to it over its local socket and takes `--config <path>` (omitted below). The socket
+opens once startup reconcile finishes (tens of seconds with live sessions); the CLI
+waits up to 90 s for it instead of failing.
 
 | Command | What it does |
 |---|---|

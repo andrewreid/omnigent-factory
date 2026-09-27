@@ -281,7 +281,9 @@ def test_cli_waits_for_the_operator_socket_after_a_restart(service_config, monke
     monkeypatch.setattr(cli, "operator_request", request)
     monkeypatch.setattr(cli.time, "sleep", lambda _: None)
     assert cli._operator(service_config, "status") == 0
-    assert len(attempts) == 3 and '"ready": true' in capsys.readouterr().out
+    out = capsys.readouterr()
+    assert len(attempts) == 3 and '"ready": true' in out.out
+    assert out.err.count("waiting for the daemon") == 1
 
 
 # ------------------------------------------------------------------ 8. observer noise
