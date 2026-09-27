@@ -12,6 +12,7 @@ The daemon computes hashes/timestamps itself; model-provided values never overri
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Annotated, Literal
@@ -148,7 +149,36 @@ class FactoryResult(_Strict):
 
 
 class ResultError(ValueError):
-    """The final response does not carry a valid factory result."""
+    """The final response does not carry a valid factory result.
+
+    ``details`` are compact ``location: message`` lines safe to show the agent and the
+    owner: field locations and validator messages only, never the rejected input values.
+    """
+
+    def __init__(self, message: str, details: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.details = details or (message,)
+
+
+#: Bounds for error details relayed to the agent or published in a status comment.
+MAX_ERROR_DETAILS = 10
+MAX_ERROR_DETAIL_CHARS = 200
+_RESULT_KINDS = frozenset({"triage", "plan", "build_ready", "checkpoint"})
+
+
+def validation_details(exc: ValidationError) -> tuple[str, ...]:
+    """``loc: msg`` per error, without input values; discriminator tags dropped."""
+    lines: list[str] = []
+    for error in exc.errors(include_input=False, include_url=False, include_context=False):
+        loc = [str(part) for part in error["loc"]]
+        if len(loc) > 1 and loc[0] == "result" and loc[1] in _RESULT_KINDS:
+            del loc[1]
+        line = f"{'.'.join(loc) or '(root)'}: {error['msg']}"
+        lines.append(line[:MAX_ERROR_DETAIL_CHARS])
+    extra = len(lines) - MAX_ERROR_DETAILS
+    if extra > 0:
+        lines = [*lines[:MAX_ERROR_DETAILS], f"... and {extra} more"]
+    return tuple(lines)
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,10 +238,21 @@ def parse_factory_result(final_text: str, expected: Correlation) -> ParsedResult
     if len(raw.encode("utf-8")) > MAX_RESULT_BYTES:
         raise ResultError("result exceeds 128 KiB")
     try:
+        json.loads(raw)
+    except json.JSONDecodeError as exc:
+        detail = f"invalid JSON: {exc.msg} at line {exc.lineno} column {exc.colno}"
+        if len(raw) - exc.pos <= 8:
+            detail += " (near the end: a closing brace or bracket is probably missing)"
+        raise ResultError(detail, (detail,)) from exc
+    try:
         data = parse_json_strict(raw)
+    except CanonicalizationError as exc:
+        raise ResultError(str(exc)[:MAX_ERROR_DETAIL_CHARS]) from exc
+    try:
         result = FactoryResult.model_validate(data)
-    except (CanonicalizationError, ValidationError) as exc:
-        raise ResultError(f"schema: {exc}") from exc
+    except ValidationError as exc:
+        details = validation_details(exc)
+        raise ResultError("schema: " + "; ".join(details), details) from exc
     for value in (result.parcel_id, result.stage_session_id, result.dispatch_nonce):
         if len(value) > MAX_ID_CHARS:
             raise ResultError("identifier too long")

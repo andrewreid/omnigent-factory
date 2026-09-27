@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -27,6 +28,8 @@ from omnigent_factory.omnigent.rest import OmnigentReadError
 from omnigent_factory.ports.clock import Clock
 from omnigent_factory.service.directory import ServiceDispatchDirectory
 from omnigent_factory.service.runtime import FactoryService
+
+LOG = logging.getLogger(__name__)
 
 
 class OmnigentObserver:
@@ -252,7 +255,19 @@ class OmnigentObserver:
             )
             try:
                 parsed = parse_factory_result(text, expected)
-            except ResultError:
+            except ResultError as exc:
+                LOG.warning(
+                    "result rejected parcel=%s session=%s stage=%s errors=%s",
+                    parcel.parcel_id,
+                    session.session_id,
+                    session.kind.value,
+                    "; ".join(exc.details),
+                )
+                # Persist before the event: the correction message and the Blocked status
+                # comment render these details.
+                await self.directory.save_rejection(
+                    session.session_id, item_id, session.kind.value, exc.details
+                )
                 result_kind = (
                     ResultKind.CHECKPOINT
                     if expected.in_checkpoint

@@ -15,6 +15,16 @@ out-of-scope choices require a native owner decision.
 
 Repository guidance: {guidance}
 
+Field rules (strict schema: use exactly the keys shown, no others):
+- head_sha / reviewed_head: 40-hex commit ids; artifact_sha256: 64-hex digest.
+- verification: at least one {{"command","file_set","outcome","evidence"}}; outcome is
+  passed, failed or not_run.
+- findings: each {{"id","source","severity","disposition","evidence"}}; severity BLOCKING,
+  SHOULD_FIX, FOLLOW_UP or ADVISORY; disposition fixed, follow_up or advisory (never
+  unresolved in a ready result).
+- remediation_batches_used / targeted_rechecks_used: 0 or 1; release_readiness ready or
+  needs_owner.
+
 Return a concise report plus exactly one strict result block:
 FACTORY_RESULT_V1
 ```factory-result

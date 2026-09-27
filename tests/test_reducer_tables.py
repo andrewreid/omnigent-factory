@@ -1366,3 +1366,28 @@ def test_B07f_owner_plan_command_resumes_after_refused_prepare():
     assert EffectKind.CREATE_SESSION in kinds(r)
     assert p.current_session.kind == SessionKind.PLAN
     assert [x.kind for x in p.sessions].count(SessionKind.TRIAGE) == 1  # triage not re-run
+
+
+def test_B07g_owner_plan_command_resumes_after_result_invalid():
+    """Resume path when a plan result stays invalid after the one correction: ``/plan``."""
+    h = Harness()
+    h.triage()
+    h.send(P, ev.RequestPlan(via=Via.DRAG))
+    s = h.create_ok()
+    bad = result_candidate(s.session_id, s.root_id, s.revision, ev.ResultKind.PLAN)
+    first = h.send(P, replace(bad, valid=False))
+    assert [e.args.get("purpose") for e in Harness.of(first, EffectKind.SEND_MESSAGE)] == [
+        MessagePurpose.CORRECTION.value
+    ]
+    h.send(P, replace(bad, valid=False), event_id="result:second")
+    assert Hold.RESULT_INVALID in h.p().holds and h.p().bot == BotState.BLOCKED
+    r = h.send(P, ev.RequestPlan(via=Via.COMMAND))
+    assert r.audit.accepted, r.audit.reason
+    assert Hold.RESULT_INVALID not in h.p().holds
+    assert EffectKind.INTERRUPT_TREE in kinds(r)  # the stale plan tree is drained first
+    after = h.quiesce(P, s.session_id)
+    p = h.p()
+    assert EffectKind.CREATE_SESSION in kinds(after)
+    assert p.current_session.session_id != s.session_id
+    assert p.current_session.kind == SessionKind.PLAN
+    assert [x.kind for x in p.sessions].count(SessionKind.TRIAGE) == 1

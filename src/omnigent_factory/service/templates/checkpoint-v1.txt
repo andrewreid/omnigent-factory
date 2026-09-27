@@ -7,6 +7,10 @@ done/remaining/risks and the worktree state, then stop and wait. Do not expand s
 open another remediation loop, merge, or infer continuation from text. `/continue` is
 interpreted only by the daemon.
 
+Field rules (strict schema: use exactly the keys shown, no others): done, remaining and
+risks are lists of strings; head_sha is a 40-hex commit id or null; worktree_state is a
+short string; elicitation_id is null unless a native prompt is open.
+
 Return exactly one strict checkpoint result block after a brief status:
 FACTORY_RESULT_V1
 ```factory-result

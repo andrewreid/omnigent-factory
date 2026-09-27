@@ -323,14 +323,23 @@ async def test_invalid_checkpoint_result_is_recorded_as_checkpoint(
             ]
 
     adapter = SimpleNamespace(rest=Rest())
+    rejections: list[tuple[object, ...]] = []
+
+    async def save_rejection(*args: object) -> None:
+        rejections.append(args)
+
     observer = OmnigentObserver(
         service,  # type: ignore[arg-type]
         adapter,  # type: ignore[arg-type]
-        SimpleNamespace(),  # type: ignore[arg-type]
+        SimpleNamespace(save_rejection=save_rejection),  # type: ignore[arg-type]
         FakeClock(),
         interval_seconds=1,
     )
     await observer._results(parcel)
+    # The validation errors are persisted for the correction message and status comment.
+    [(sid, item, stage, details)] = rejections
+    assert (sid, item, stage) == (session.session_id, "bad-result", "triage")
+    assert details == ("expected exactly one factory-result fence",)
     [candidate] = [
         event.body for event in service.events if isinstance(event.body, ev.ResultCandidate)
     ]

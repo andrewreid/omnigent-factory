@@ -154,7 +154,9 @@ class ServiceDispatchDirectory:
             _atomic_json(self.root / f"{_safe(sid)}.json", snapshot)
         purpose = str(effect.args.get("purpose") or "first")
         if purpose == "correction":
-            return _template("correction-v1.txt")
+            rejection = self.latest_rejection(sid)
+            errors = rejection[1] if rejection is not None else ("no details recorded",)
+            return _template("correction-v1.txt").format(errors=_error_list(errors))
         if purpose == "checkpoint_cleanup":
             return _template("checkpoint-v1.txt").format(
                 grant_id=spec.grant_id,
@@ -240,6 +242,19 @@ class ServiceDispatchDirectory:
         }
         self._write_once(self.results / f"{_safe(session_id)}-{_safe(item_id)}.json", payload)
         _atomic_json(self.results / f"{_safe(session_id)}-latest.json", payload)
+
+    async def save_rejection(
+        self, session_id: str, item_id: str, stage: str, details: tuple[str, ...]
+    ) -> None:
+        """Validation errors of a rejected result (locations/messages only, no input)."""
+        payload: dict[str, object] = {"item_id": item_id, "stage": stage, "errors": list(details)}
+        _atomic_json(self.results / f"{_safe(session_id)}-rejected.json", payload)
+
+    def latest_rejection(self, session_id: str) -> tuple[str, tuple[str, ...]] | None:
+        data = self._read(self.results / f"{_safe(session_id)}-rejected.json")
+        if data is None or not isinstance(data.get("errors"), list):
+            return None
+        return str(data.get("stage") or "stage"), tuple(str(e) for e in data["errors"])
 
     def latest_result(self, session_id: str) -> dict[str, Any] | None:
         return self._read(self.results / f"{_safe(session_id)}-latest.json")
@@ -389,6 +404,22 @@ class PublicationRenderer:
         elif effect.kind == EffectKind.POST_COMMENT:
             template = str(effect.args.get("template") or "status")
             text = f"Factory status: {template.replace('-', ' ')}."
+            rejection = (
+                self.directory.latest_rejection(str(effect.args.get("session_id") or ""))
+                if template == "result-invalid"
+                else None
+            )
+            if rejection is not None:
+                stage, errors = rejection
+                hint = (
+                    f"\n\nComment `/{stage}` to start a fresh {stage} session."
+                    if stage in ("triage", "plan")
+                    else ""
+                )
+                text = (
+                    f"Factory status: the {stage} result failed validation and the "
+                    f"parcel is Blocked.\n\n{_error_list(errors[:5])}{hint}"
+                )
         else:
             return None
         return _safe_publication(text, self.config)
@@ -403,6 +434,12 @@ def _authority(parcel: Parcel) -> tuple[str, str]:
     if contract is None:
         return "", "missing"
     return contract.canonical, contract.full_hash
+
+
+def _error_list(errors: tuple[str, ...]) -> str:
+    """Bounded bullet list of validation errors (``loc: msg``; no rejected input)."""
+    text = "\n".join(f"- {error}" for error in errors)
+    return text if len(text) <= 2_000 else text[:1_970].rstrip() + "\n- ... (truncated)"
 
 
 def _bullets(items: object) -> str:
