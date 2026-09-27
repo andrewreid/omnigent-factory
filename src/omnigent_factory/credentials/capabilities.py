@@ -229,6 +229,23 @@ class CapabilityRegistry:
     def get(self, session_id: str) -> CapabilityRecord | None:
         return self._records.get(session_id)
 
+    def usable(self, session_id: str) -> bool:
+        """Whether the restored record still has its exact private runtime secret file."""
+        record = self._records.get(session_id)
+        if record is None:
+            return False
+        try:
+            value = read_capability_file(record.path)
+        except CapabilityFileError:
+            return False
+        return (
+            value.capability_id == record.capability_id
+            and value.session_id == session_id
+            and value.socket_path == self.socket_path
+            and value.repository == self.repository
+            and hmac.compare_digest(record.secret_sha256, secret_digest(value.secret))
+        )
+
     def records(self) -> tuple[CapabilityRecord, ...]:
         return tuple(self._records.values())
 

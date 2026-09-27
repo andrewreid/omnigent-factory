@@ -145,4 +145,30 @@ class InstallationTokenService:
             )
         except ValueError:
             return TokenRefusal("installation token expiry was malformed")
+        returned_permissions = data.get("permissions")
+        if not isinstance(returned_permissions, dict):
+            return TokenRefusal("installation token response omitted permission scope")
+        if returned_permissions != dict(permissions):
+            return TokenRefusal("installation token permissions differ from the requested scope")
+        returned_repositories = data.get("repositories")
+        if not isinstance(returned_repositories, list):
+            return TokenRefusal("installation token response omitted repository scope")
+        names = {item.get("full_name") for item in returned_repositories if isinstance(item, dict)}
+        if names != {self.repository}:
+            return TokenRefusal("installation token repository scope differs from request")
         return TokenGrant(token, profile, self.repository, expiry_us)
+
+    async def revoke(self, token: str) -> bool:
+        """Best-effort revocation of a cached installation token."""
+        try:
+            response = await self.client.delete(
+                f"{self.api_url}/installation/token",
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": f"Bearer {token}",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+        except httpx.HTTPError:
+            return False
+        return response.status_code == 204

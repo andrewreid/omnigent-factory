@@ -382,7 +382,9 @@ class SqliteStore:
     def pending_deliveries(self) -> list[DeliveryRecord]:
         rows = self._conn.execute(
             "SELECT * FROM deliveries WHERE status IN ('pending', 'unresolved') "
-            "ORDER BY received_at_us, delivery_guid"
+            "AND (resolution_retry_at_us IS NULL OR resolution_retry_at_us <= ?) "
+            "ORDER BY received_at_us, delivery_guid",
+            (self._clock.now_utc_us(),),
         ).fetchall()
         return [
             DeliveryRecord(
@@ -402,6 +404,31 @@ class SqliteStore:
     def mark_delivery(self, delivery_guid: str, status: str) -> None:
         with self._txn() as conn:
             self._mark_delivery(conn, delivery_guid, status)
+
+    def defer_delivery_resolution(
+        self, delivery_guid: str, retry_at_us: int, *, max_attempts: int
+    ) -> bool:
+        """Persist one resolution attempt; return true once the retry cap is reached.
+
+        Exhaustion never retires the delivery: it stays ``unresolved`` with no retry time
+        so the caller parks it (and a crash before parking simply re-parks it).
+        """
+        with self._txn() as conn:
+            row = conn.execute(
+                "SELECT resolution_attempts FROM deliveries WHERE delivery_guid = ?",
+                (delivery_guid,),
+            ).fetchone()
+            if row is None:
+                raise StoreError(f"unknown delivery {delivery_guid}")
+            attempts = int(row["resolution_attempts"]) + 1
+            exhausted = attempts >= max_attempts
+            conn.execute(
+                "UPDATE deliveries SET resolution_attempts = ?, resolution_retry_at_us = ?, "
+                "status = 'unresolved' WHERE delivery_guid = ? "
+                "AND status IN ('pending', 'unresolved')",
+                (attempts, None if exhausted else retry_at_us, delivery_guid),
+            )
+        return exhausted
 
     def _mark_delivery(self, conn: sqlite3.Connection, guid: str, status: str) -> None:
         cur = conn.execute(
@@ -1275,6 +1302,12 @@ class SqliteStore:
             ).fetchone()
             if status is not None and status["status"] == "rejected":
                 self._mark_delivery(conn, delivery_guid, "pending")
+            # The operator's release grants a fresh bounded resolution budget.
+            conn.execute(
+                "UPDATE deliveries SET resolution_attempts = 0, resolution_retry_at_us = NULL "
+                "WHERE delivery_guid = ?",
+                (delivery_guid,),
+            )
             if release is not None:
                 if config is None:
                     raise StoreError("a hold release needs the trusted config")

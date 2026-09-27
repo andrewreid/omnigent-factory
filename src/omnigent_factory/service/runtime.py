@@ -29,7 +29,11 @@ from omnigent_factory.service.executor import (
     LocalSchedulerAdapter,
     ParcelSerializers,
 )
-from omnigent_factory.service.interfaces import DeliveryProcessor, NonRetryableDelivery
+from omnigent_factory.service.interfaces import (
+    DeliveryProcessor,
+    ManagedRuntime,
+    NonRetryableDelivery,
+)
 from omnigent_factory.service.locking import ProcessLock
 from omnigent_factory.service.operator import OperatorServer
 from omnigent_factory.service.parked import (
@@ -52,12 +56,13 @@ class FactoryService:
         delivery_processor: DeliveryProcessor | None = None,
         clock: Clock | None = None,
         fatal_exit: Callable[[int], object] | None = None,
+        process_lock: ProcessLock | None = None,
     ) -> None:
         self.config = config
         self.clock = clock or SystemClock()
         self.db = StoreWorker(config.database_path, self.clock)
         self.serializers = ParcelSerializers()
-        self.process_lock = ProcessLock(config.state_dir)
+        self.process_lock = process_lock or ProcessLock(config.state_dir)
         self.delivery_processor = delivery_processor
         self._fatal_exit = fatal_exit
         self._fatal_reason: str | None = None
@@ -89,6 +94,23 @@ class FactoryService:
         self.accepting_admission = False
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
+        self._managed: list[ManagedRuntime] = []
+
+    def bind_integrations(
+        self,
+        *,
+        adapters: Iterable[EffectAdapter] = (),
+        delivery_processor: DeliveryProcessor | None = None,
+        managed: Iterable[ManagedRuntime] = (),
+    ) -> None:
+        """Complete production wiring after constructing service-backed adapters."""
+        if self.ready or self._tasks:
+            raise RuntimeError("integrations must be bound before service start")
+        for adapter in adapters:
+            self.executor.install(adapter)
+        if delivery_processor is not None:
+            self.delivery_processor = delivery_processor
+        self._managed.extend(managed)
 
     async def start(self) -> None:
         self.config.prepare_private_directories()
@@ -102,6 +124,8 @@ class FactoryService:
             await self.db.call(lambda store: store.recover_claimed())
             unknown = await self.db.call(lambda store: store.effects_in_state("unknown"))
             await self._recover_outbox(unknown)
+            for managed in self._managed:
+                await managed.start()
             await self.operator.start()
             self.accepting_admission = True
             self._tasks = [
@@ -139,12 +163,18 @@ class FactoryService:
         self._tasks.clear()
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self.operator.close(), self.config.shutdown_timeout_seconds)
+        for managed in reversed(self._managed):
+            with contextlib.suppress(Exception):
+                await managed.close()
         await self.db.close()
         self.process_lock.close()
 
     async def _cleanup_start_failure(self) -> None:
         with contextlib.suppress(Exception):
             await self.operator.close()
+        for managed in reversed(self._managed):
+            with contextlib.suppress(Exception):
+                await managed.close()
         with contextlib.suppress(Exception):
             await self.db.close()
         self.process_lock.close()
@@ -196,8 +226,10 @@ class FactoryService:
                 await self.db.call(partial(_cancel_effect, effect_id=effect_id))
 
     async def health(self) -> dict[str, object]:
-        if self._fatal_reason is not None or (
-            not self._stop.is_set() and any(task.done() for task in self._tasks)
+        if (
+            self._fatal_reason is not None
+            or (not self._stop.is_set() and any(task.done() for task in self._tasks))
+            or any(not managed.healthy() for managed in self._managed)
         ):
             return {"status": "unhealthy", "reason": self._fatal_reason or "task-stopped"}
         if not self.ready:
@@ -310,6 +342,59 @@ class FactoryService:
             await self.db.call(
                 partial(_mark_delivery, delivery_guid=delivery_guid, status="unresolved")
             )
+        return True
+
+    async def ignore_delivery(self, delivery_guid: str) -> None:
+        """Retire a verified Project delivery proven foreign or proven to carry no change."""
+        await self.db.call(partial(_mark_delivery, delivery_guid=delivery_guid, status="processed"))
+
+    async def defer_unresolved_delivery(
+        self,
+        delivery_guid: str,
+        candidate_parcel_id: str | None,
+        *,
+        retry_after_us: int | None = None,
+    ) -> bool:
+        """Durably back off an inconclusive Project lookup and cap all future reads.
+
+        The delivery is never retired here. Once the cap is reached it is parked: scoped
+        to (and holding) the candidate parcel when one exists, otherwise repository-wide,
+        until the operator releases it. Returns whether it was parked.
+        """
+        rows = await self.db.call(
+            lambda store: store.query(
+                "SELECT resolution_attempts FROM deliveries WHERE delivery_guid = ?",
+                (delivery_guid,),
+            )
+        )
+        attempts = int(rows[0][0]) if rows else 0
+        delay_us = int(
+            self.config.delivery_resolution_backoff_seconds * (2 ** min(attempts, 8)) * 1_000_000
+        )
+        retry_at_us = self.clock.now_utc_us() + max(delay_us, retry_after_us or 0)
+        exhausted = await self.db.call(
+            lambda store: store.defer_delivery_resolution(
+                delivery_guid,
+                retry_at_us,
+                max_attempts=self.config.delivery_resolution_max_attempts,
+            )
+        )
+        if not exhausted:
+            return False
+        parcel = (
+            await self.db.call(partial(_load_parcel, parcel_id=candidate_parcel_id))
+            if candidate_parcel_id
+            else None
+        )
+        scope = candidate_parcel_id if parcel is not None else None
+        await self.parked.park(delivery_guid, scope)
+        self._delivery_failures.pop(delivery_guid, None)
+        self._delivery_retry_at.pop(delivery_guid, None)
+        LOG.warning(
+            "unresolved project delivery parked delivery_guid=%s scoped=%s",
+            delivery_guid,
+            scope is not None,
+        )
         return True
 
     async def release_resolved_inbox_holds(self) -> int:
@@ -542,7 +627,7 @@ class FactoryService:
                 await self.parked.release(delivery_guid)
                 self._delivery_failures.pop(delivery_guid, None)
                 self._delivery_retry_at.pop(delivery_guid, None)
-            return {"released": delivery_guid, **await self._status()}
+                return {"released": delivery_guid, **await self._status()}
         raise ValueError("unknown command")
 
     async def _status(self) -> dict[str, object]:
@@ -636,6 +721,17 @@ class FactoryService:
         self.accepting_admission = False
         self._fatal_reason = f"{task.get_name()}-stopped"
         LOG.error("background task stopped task=%s", task.get_name())
+        if self._fatal_exit is not None:
+            self._fatal_exit(1)
+
+    def managed_task_failed(self, name: str) -> None:
+        """Escalate a supervised integration task through the daemon fatal policy."""
+        if self._stop.is_set():
+            return
+        self.ready = False
+        self.accepting_admission = False
+        self._fatal_reason = f"{name}-stopped"
+        LOG.error("managed background task stopped task=%s", name)
         if self._fatal_exit is not None:
             self._fatal_exit(1)
 

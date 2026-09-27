@@ -88,10 +88,15 @@ def test_setup_renderer_is_non_applying_and_documents_private_ingress(
 ):
     renderer = OperationsRenderer(tmp_path / "config.toml")
     artifacts = renderer.render(service_config)
-    assert set(artifacts) == {"omnigent-factory.service", "INGRESS.md"}
+    assert set(artifacts) == {
+        "omnigent-factory.service",
+        "INGRESS.md",
+        "config.example.toml",
+    }
     assert "127.0.0.1:8787" in artifacts["INGRESS.md"]
     assert "POST /webhooks/github" in artifacts["INGRESS.md"]
     assert "UMask=0077" in artifacts["omnigent-factory.service"]
+    assert "github_app_id = 5085812" in artifacts["config.example.toml"]
     assert renderer.validate(service_config) == ()
 
 

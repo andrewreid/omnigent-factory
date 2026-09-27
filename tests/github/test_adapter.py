@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import httpx
@@ -347,7 +348,19 @@ async def test_reducer_shaped_contract_publication_uses_binding_and_renderer():
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal posted
         if request.method == "GET":
-            return httpx.Response(200, json=[])
+            if posted is None:
+                return httpx.Response(200, json=[])
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 55,
+                        "body": posted,
+                        "user": {"id": BOT_ID},
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ],
+            )
         posted = json.loads(request.content)["body"]
         return httpx.Response(201, json={"id": 55})
 
@@ -357,10 +370,14 @@ async def test_reducer_shaped_contract_publication_uses_binding_and_renderer():
             parcel_bindings={"I_1": ParcelBinding(12, "PVTI_1")},
             publication_renderer=lambda _: "```parcel-contract\n{}\n```",
         ).execute(
-            effect(EffectKind.PUBLISH_CONTRACT, contract_id="c1", full_hash="abc"),
+            effect(
+                EffectKind.PUBLISH_CONTRACT,
+                contract_id="c1",
+                full_hash=hashlib.sha256(b"{}").hexdigest(),
+            ),
             CTX,
         )
-    assert result == Ack("55")
+    assert result == Ack("55", {"verified": True, "posted_at_us": 1_767_225_600_000_000})
     assert posted == ("```parcel-contract\n{}\n```\n\n<!-- omnigent-factory effect=eff-1 -->")
 
 

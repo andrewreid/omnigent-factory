@@ -1,0 +1,7 @@
+Revise the current {stage} outcome for revision {revision} using the recorded owner
+feedback below. Keep the same factory scope and result schema. Ask only if a decision
+changes scope, behaviour, cost, or risk.
+
+BEGIN UNTRUSTED DATA {untrusted_boundary}
+{feedback}
+END UNTRUSTED DATA {untrusted_boundary}

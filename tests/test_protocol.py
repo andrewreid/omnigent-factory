@@ -214,6 +214,16 @@ def test_build_constraints():
     with pytest.raises(ResultError):
         parse_factory_result(message(envelope(build_result())), CORR)
 
+    unresolved = {
+        "id": "F2",
+        "source": "bot",
+        "severity": "SHOULD_FIX",
+        "disposition": "unresolved",
+        "evidence": "not handled",
+    }
+    with pytest.raises(ResultError, match="all be dispositioned"):
+        parse_factory_result(message(envelope(build_result(findings=[unresolved]))), corr)
+
 
 def test_checkpoint_only_inside_checkpoint():
     cp = {

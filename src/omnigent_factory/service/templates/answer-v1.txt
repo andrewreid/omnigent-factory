@@ -1,0 +1,6 @@
+The owner answered decision {decision_id}. Apply only that recorded answer to the current
+stage and continue within the existing authority.
+
+--- recorded answer ---
+{answer}
+--- end answer ---

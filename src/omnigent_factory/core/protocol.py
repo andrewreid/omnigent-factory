@@ -27,6 +27,10 @@ from omnigent_factory.core.canonical import (
 SENTINEL = "FACTORY_RESULT_V1"
 MAX_RESULT_BYTES = 128 * 1024
 MAX_ID_CHARS = 128
+#: The canonical contract is published verbatim in one GitHub issue comment (65,536
+#: characters maximum) together with its header, fence and effect marker, and its hash
+#: binds approval. A contract that cannot be published whole is an invalid result.
+MAX_CONTRACT_CHARS = 60_000
 
 Text = Annotated[str, StringConstraints(min_length=1, max_length=16000)]
 Texts = Annotated[list[Text], Field(max_length=100)]
@@ -246,10 +250,14 @@ def parse_factory_result(final_text: str, expected: Correlation) -> ParsedResult
             contract_bytes = canonical_contract(r.contract.model_dump(mode="json"))
         except CanonicalizationError as exc:
             raise ResultError(str(exc)) from exc
+        if len(contract_bytes.decode("utf-8")) > MAX_CONTRACT_CHARS:
+            raise ResultError("contract exceeds the publishable comment size")
     else:
         if expected.stage != "build":
             raise ResultError("build result from non-build stage")
         _check_ids([f.id for f in r.findings], "finding")
+        if any(f.disposition == "unresolved" for f in r.findings):
+            raise ResultError("build-ready findings must all be dispositioned")
         if r.review.implementation_vendor == r.review.review_vendor:
             raise ResultError("independent review must use the opposite vendor")
     return ParsedResult(result=result, contract_canonical=contract_bytes)

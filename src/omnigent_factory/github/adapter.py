@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any
@@ -73,7 +75,8 @@ class GitHubAPIAdapter:
         now_us: Callable[[], int] | None = None,
         parcel_bindings: Mapping[str, ParcelBinding] | None = None,
         board_schema: BoardSchema | None = None,
-        publication_renderer: Callable[[EffectIntent], str | None] | None = None,
+        publication_renderer: Callable[[EffectIntent], str | Awaitable[str | None] | None]
+        | None = None,
         independent_reviewer_ids: frozenset[int] = frozenset(),
         owner_ids: frozenset[int] = frozenset(),
     ) -> None:
@@ -448,7 +451,7 @@ class GitHubAPIAdapter:
         if issue_number is None and binding is not None:
             issue_number = binding.issue_number
         if text is None:
-            text = self._render_publication(effect)
+            text = await self._render_publication(effect)
         if not isinstance(issue_number, int) or not isinstance(text, str):
             return DefinitiveFailure("comment effect could not resolve issue or rendered body")
         ref = IssueRef(self.repository_node_id, issue_number, effect.parcel_id or "")
@@ -456,6 +459,20 @@ class GitHubAPIAdapter:
         if isinstance(adopted, RetryableReadFailure):
             return adopted
         if adopted is not None:
+            if effect.kind == EffectKind.PUBLISH_CONTRACT:
+                publication = await self.find_contract_publication(ref, effect.effect_id)
+                if isinstance(publication, RetryableReadFailure):
+                    return publication
+                if publication is None or not _publication_matches(effect, publication):
+                    return AmbiguousWrite("contract comment exists but exact bytes are unverified")
+                return Ack(
+                    adopted,
+                    {
+                        "adopted": True,
+                        "verified": True,
+                        "posted_at_us": publication.posted_at_us,
+                    },
+                )
             return Ack(adopted, {"adopted": True})
         body = f"{text}\n\n{self._effect_marker(effect.effect_id)}"
         try:
@@ -474,6 +491,19 @@ class GitHubAPIAdapter:
         comment_id = data.get("id") if isinstance(data, dict) else None
         if not isinstance(comment_id, int):
             return AmbiguousWrite("comment response omitted id")
+        if effect.kind == EffectKind.PUBLISH_CONTRACT:
+            publication = await self.find_contract_publication(ref, effect.effect_id)
+            if isinstance(publication, RetryableReadFailure):
+                return publication
+            if publication is None or not _publication_matches(effect, publication):
+                return AmbiguousWrite("contract comment posted but exact bytes are unverified")
+            return Ack(
+                str(comment_id),
+                {
+                    "verified": True,
+                    "posted_at_us": publication.posted_at_us,
+                },
+            )
         return Ack(str(comment_id))
 
     async def _find_marked_comment(
@@ -509,6 +539,8 @@ class GitHubAPIAdapter:
         binding = self._binding(effect)
         if item_id is None and binding is not None:
             item_id = binding.project_item_id
+        if item_id is None and effect.parcel_id is not None:
+            item_id = await self._project_item_id(effect.parcel_id)
         if self.board_schema is not None and field_id is None:
             if effect.kind == EffectKind.MOVE_CARD:
                 field_id = self.board_schema.status_field_id
@@ -551,6 +583,43 @@ class GitHubAPIAdapter:
         if observed != option_id:
             return AmbiguousWrite("board write did not read back at the requested option id")
         return Ack(str(item_id), {"option_id": str(option_id)})
+
+    async def _project_item_id(self, parcel_id: str) -> str | None:
+        query = """
+        query($id: ID!, $after: String) { node(id: $id) { ... on Issue {
+          projectItems(first: 100, after: $after) {
+            nodes { id project { id } }
+            pageInfo { hasNextPage endCursor }
+          }
+        } } }
+        """
+        after: str | None = None
+        while True:
+            data = await self.client.graphql(query, {"id": parcel_id, "after": after})
+            node = data.get("node")
+            items = node.get("projectItems") if isinstance(node, dict) else None
+            nodes = items.get("nodes") if isinstance(items, dict) else None
+            if not isinstance(nodes, list):
+                raise GitHubAPIError("issue projectItems nodes were malformed")
+            matches = [
+                item.get("id")
+                for item in nodes
+                if isinstance(item, dict)
+                and isinstance(item.get("project"), dict)
+                and item["project"].get("id") == self.project_node_id
+                and isinstance(item.get("id"), str)
+            ]
+            if len(matches) > 1:
+                raise GitHubAPIError("issue has multiple items in the configured project")
+            if matches:
+                return str(matches[0])
+            page = items.get("pageInfo") if isinstance(items, dict) else None
+            if not isinstance(page, dict) or not page.get("hasNextPage"):
+                return None
+            cursor = page.get("endCursor")
+            if not isinstance(cursor, str):
+                raise GitHubAPIError("projectItems pagination cursor was missing")
+            after = cursor
 
     async def _field_option(self, item_id: str, field_id: str, field_name: str) -> str | None:
         query = """
@@ -606,9 +675,11 @@ class GitHubAPIAdapter:
             return None
         return self.parcel_bindings.get(effect.parcel_id)
 
-    def _render_publication(self, effect: EffectIntent) -> str | None:
+    async def _render_publication(self, effect: EffectIntent) -> str | None:
         if self.publication_renderer is not None:
             rendered = self.publication_renderer(effect)
+            if inspect.isawaitable(rendered):
+                rendered = await rendered
             if rendered is not None:
                 return rendered
         if effect.kind != EffectKind.POST_COMMENT:
@@ -647,3 +718,10 @@ def _status_options(schema: BoardSchema | None) -> dict[Stage, str]:
         except ValueError:
             continue
     return options
+
+
+def _publication_matches(effect: EffectIntent, publication: ContractPublication | None) -> bool:
+    expected = effect.args.get("full_hash")
+    if publication is None or publication.canonical is None or not isinstance(expected, str):
+        return False
+    return hashlib.sha256(publication.canonical.encode("utf-8")).hexdigest() == expected

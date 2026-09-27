@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+import base64
+import os
+import subprocess
+from pathlib import Path
+
+import httpx
+import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+from omnigent_factory.service.config import ServiceConfig
+from omnigent_factory.service.doctor import run_doctor
+
+
+def _secret(path: Path, value: bytes) -> None:
+    path.write_bytes(value)
+    os.chmod(path, 0o600)
+
+
+@pytest.mark.asyncio
+async def test_doctor_resolves_live_ids_and_does_not_create_local_state(tmp_path: Path):
+    secrets = tmp_path / "secrets"
+    secrets.mkdir(mode=0o700)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    _secret(secrets / "app.pem", pem)
+    _secret(secrets / "webhook_secret", b"webhook")
+    _secret(secrets / "omnigent-token", b"owner-token")
+
+    clone = tmp_path / "clone"
+    subprocess.run(("git", "init", str(clone)), check=True, capture_output=True)  # noqa: S603,S607
+    subprocess.run(  # noqa: S603
+        (  # noqa: S607
+            "git",
+            "-C",
+            str(clone),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/SA-Ambulance/timesheets.git",
+        ),
+        check=True,
+    )
+    config = ServiceConfig(
+        state_dir=tmp_path / "state",
+        secrets_dir=secrets,
+        app_env=tmp_path / "absent.env",
+        repo_id="R_NODE",
+        repository_database_id=123,
+        organization_id=456,
+        owners=frozenset({114979}),
+        source_clone=clone,
+        real_gh_path=Path("/bin/true"),
+        omnigent_host_id=None,
+        omnigent_agent_id=None,
+        omnigent_project_id=None,
+    )
+    factory_yml = b"""version: 1
+concurrency: {max_building: 1, max_open_bot_prs: 3}
+checkpoints:
+  block_hours: {S: 2, M: 4, L: 6}
+  grace_minutes: 15
+  cost_backstop_usd_per_hour: 35
+review:
+  bot_login: molly-omnigent-factory[bot]
+  approver_ids: [114979]
+  independent_reviewer_ids: []
+guidance: {triage: Triage safely., engineering: Build safely.}
+"""
+
+    revoked = 0
+
+    def github(request: httpx.Request) -> httpx.Response:
+        nonlocal revoked
+        if request.url.path.endswith("/access_tokens"):
+            requested = __import__("json").loads(request.content)
+            return httpx.Response(
+                201,
+                json={
+                    "token": "installation",
+                    "expires_at": "2030-01-01T00:00:00Z",
+                    "permissions": requested["permissions"],
+                    "repositories": [{"full_name": config.repository}],
+                },
+            )
+        if request.method == "DELETE" and request.url.path == "/installation/token":
+            revoked += 1
+            return httpx.Response(204)
+        if request.url.path == "/installation/repositories":
+            return httpx.Response(
+                200,
+                json={
+                    "total_count": 1,
+                    "repositories": [
+                        {
+                            "id": 123,
+                            "node_id": "R_NODE",
+                            "full_name": config.repository,
+                            "owner": {"id": 456},
+                        }
+                    ],
+                },
+            )
+        if request.url.path == f"/repos/{config.repository}":
+            return httpx.Response(200, json={"default_branch": "main"})
+        if request.url.path.endswith("/.github/factory.yml"):
+            return httpx.Response(
+                200,
+                json={
+                    "encoding": "base64",
+                    "content": base64.b64encode(factory_yml).decode(),
+                },
+            )
+        if request.url.path == "/graphql":
+            fields = []
+            for name, field_id, options in (
+                ("Status", config.status_field_node_id, config.status_options),
+                ("Bot", config.bot_field_node_id, config.bot_options),
+            ):
+                fields.append(
+                    {
+                        "id": field_id,
+                        "name": name,
+                        "options": [
+                            {"name": option_name, "id": option_id}
+                            for option_name, option_id in options.items()
+                        ],
+                    }
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "data": {"node": {"id": config.project_node_id, "fields": {"nodes": fields}}}
+                },
+            )
+        return httpx.Response(404)
+
+    def omnigent(request: httpx.Request) -> httpx.Response:
+        values = {
+            "/v1/hosts": [{"id": "host-1", "name": "coder"}],
+            "/v1/agents": [{"id": "agent-1", "name": "Molly"}],
+            "/v1/projects": [{"id": "project-1", "name": "Timesheets"}],
+        }
+        return httpx.Response(200, json={"data": values[request.url.path], "has_more": False})
+
+    before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+    report = await run_doctor(
+        config,
+        github_transport=httpx.MockTransport(github),
+        omnigent_transport=httpx.MockTransport(omnigent),
+    )
+    after = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+
+    assert report.ok, report.errors
+    assert report.resolved["omnigent_project_id"] == "project-1"
+    assert report.resolved["repository_database_id"] == 123
+    assert "github_token_revoke" in report.checks
+    assert revoked == 1
+    assert before == after

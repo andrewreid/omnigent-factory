@@ -75,6 +75,10 @@ class NormalizedDelivery:
     unresolved_content_node_id: str | None = None
     ignored_reason: str | None = None
     provenance: Provenance = Provenance.WEBHOOK
+    #: Set only when an authenticated lookup *proved* the project card is not a
+    #: timesheets issue (draft issue, pull request, or an issue in another repository).
+    #: Missing, failed or inconsistent data never sets it.
+    foreign_content: bool = False
 
 
 def _timestamp_us(value: object, fallback: int) -> int:
@@ -495,6 +499,12 @@ class DeliveryNormalizer:
         return f"github:{event_name}:{body.KIND.value}:{delivery_guid}"
 
 
+#: Project card content types that can never be a timesheets issue parcel.
+_FOREIGN_CONTENT_TYPES = frozenset({"DraftIssue", "PullRequest"})
+#: A fully resolved timesheets issue whose delivery changed no field the factory reads.
+NO_PROJECT_TRANSITION = "resolved project delivery has no transition"
+
+
 async def resolve_project_delivery(
     *,
     client: GitHubClient,
@@ -507,8 +517,10 @@ async def resolve_project_delivery(
     """Resolve a persisted repository-less project delivery using authenticated reads.
 
     Remote read failures propagate as typed :mod:`github.client` errors so the caller can
-    retry. Unknown nodes, wrong repositories, missing project items, or changed field
-    identities return a no-event delivery and never guess parcel authority.
+    retry. Every other no-event outcome never guesses parcel authority: only a node proven
+    to be a draft issue, pull request or issue of another repository is marked
+    ``foreign_content``; unavailable nodes, inconsistent identities, missing project items
+    or changed field identities stay inconclusive and must be set aside by the caller.
     """
     if unresolved.provenance not in {Provenance.WEBHOOK, Provenance.RECOVERY}:
         raise WebhookError("project resolution requires GitHub webhook or recovery provenance")
@@ -536,7 +548,7 @@ async def resolve_project_delivery(
 
     query = """
     query($id: ID!, $after: String) {
-      node(id: $id) { ... on Issue {
+      node(id: $id) { __typename id ... on Issue {
         id number title body state
         assignees(first: 100) { nodes { __typename } }
         repository { id databaseId nameWithOwner }
@@ -559,15 +571,30 @@ async def resolve_project_delivery(
         data = await client.graphql(query, {"id": content_id, "after": after})
         node = data.get("node")
         if not isinstance(node, dict) or node.get("id") != content_id:
-            return _unresolved_result(unresolved, "content node is unknown or not an issue")
+            return _unresolved_result(unresolved, "content node is unavailable")
+        typename = node.get("__typename")
+        if typename in _FOREIGN_CONTENT_TYPES:
+            return _unresolved_result(
+                unresolved, "content is a draft issue or pull request", foreign=True
+            )
+        if typename != "Issue":
+            return _unresolved_result(unresolved, "content node type is unconfirmed")
         repository = node.get("repository")
         identity = normalizer.identity
+        repository_id = repository.get("id") if isinstance(repository, dict) else None
+        if isinstance(repository_id, str) and repository_id not in (
+            "",
+            identity.repository_node_id,
+        ):
+            return _unresolved_result(
+                unresolved, "resolved content belongs to a different repo", foreign=True
+            )
         if not isinstance(repository, dict) or (
-            repository.get("id") != identity.repository_node_id
+            repository_id != identity.repository_node_id
             or repository.get("databaseId") != identity.repository_id
             or repository.get("nameWithOwner") != identity.repository_full_name
         ):
-            return _unresolved_result(unresolved, "resolved content belongs to a different repo")
+            return _unresolved_result(unresolved, "resolved repository identity is inconsistent")
         issue = node
         items = node.get("projectItems")
         if not isinstance(items, dict) or not isinstance(items.get("nodes"), list):
@@ -645,12 +672,14 @@ async def resolve_project_delivery(
         unresolved.event_name,
         unresolved.body_sha256,
         events,
-        ignored_reason=None if events else "resolved project delivery has no transition",
+        ignored_reason=None if events else NO_PROJECT_TRANSITION,
         provenance=unresolved.provenance,
     )
 
 
-def _unresolved_result(delivery: NormalizedDelivery, reason: str) -> NormalizedDelivery:
+def _unresolved_result(
+    delivery: NormalizedDelivery, reason: str, *, foreign: bool = False
+) -> NormalizedDelivery:
     return NormalizedDelivery(
         delivery.delivery_guid,
         delivery.event_name,
@@ -659,4 +688,5 @@ def _unresolved_result(delivery: NormalizedDelivery, reason: str) -> NormalizedD
         unresolved_content_node_id=delivery.unresolved_content_node_id,
         ignored_reason=reason,
         provenance=delivery.provenance,
+        foreign_content=foreign,
     )

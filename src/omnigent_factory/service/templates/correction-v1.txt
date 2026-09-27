@@ -1,0 +1,4 @@
+Your final response did not contain one valid FACTORY_RESULT_V1 block matching this
+session. Resend the result once, using the same parcel/session/nonce/revision and the
+strict factory result v1 schema. Do no additional task work. This is the only automatic
+format-correction request.

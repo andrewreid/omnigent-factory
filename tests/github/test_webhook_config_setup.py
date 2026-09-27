@@ -190,6 +190,7 @@ async def resolve_drag(data, *, guid="delivery-1"):
             json={
                 "data": {
                     "node": {
+                        "__typename": "Issue",
                         "id": "I_1",
                         "number": 12,
                         "title": "Task",

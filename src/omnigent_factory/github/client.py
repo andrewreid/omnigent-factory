@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import base64
 import email.utils
+import inspect
 import json
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -14,6 +15,8 @@ from typing import Any
 import httpx
 
 from omnigent_factory.github.config import FactoryConfig, parse_factory_config
+
+TokenSource = str | Callable[[], str] | Callable[[], Awaitable[str]]
 
 
 class GitHubAPIError(RuntimeError):
@@ -64,7 +67,7 @@ class GitHubClient:
     def __init__(
         self,
         client: httpx.AsyncClient,
-        token: str | Callable[[], str],
+        token: TokenSource,
         *,
         api_url: str = "https://api.github.com",
         now: Callable[[], float] = time.time,
@@ -75,8 +78,10 @@ class GitHubClient:
         self._api_origin = httpx.URL(self._api_url)
         self._now = now
 
-    def _headers(self) -> dict[str, str]:
+    async def _headers(self) -> dict[str, str]:
         token = self._token() if callable(self._token) else self._token
+        if inspect.isawaitable(token):
+            token = await token
         return {
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {token}",
@@ -96,7 +101,7 @@ class GitHubClient:
             response = await self._client.request(
                 method,
                 url,
-                headers=self._headers(),
+                headers=await self._headers(),
                 json=json_body,
             )
         except httpx.HTTPError as exc:

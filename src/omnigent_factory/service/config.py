@@ -5,11 +5,13 @@ from __future__ import annotations
 import os
 import stat
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from omnigent_factory.core.types import TrustedConfig
+from omnigent_factory.core.types import MICROS_PER_MINUTE, Size, TrustedConfig
+from omnigent_factory.ports.github import STATUS_FIELD_NODE_ID, STATUS_OPTION_IDS
 
 
 class ConfigError(RuntimeError):
@@ -26,8 +28,65 @@ class ServiceConfig(BaseModel):
     bind_port: int = Field(default=8787, ge=1, le=65535)
     repo_id: str
     owners: frozenset[int]
+    repository: str = "SA-Ambulance/timesheets"
+    repository_database_id: int | None = None
+    organization_id: int | None = None
+    project_node_id: str = "PVT_kwDOEanNes4BkJhb"
+    status_field_node_id: str = STATUS_FIELD_NODE_ID
+    status_options: dict[str, str] = Field(
+        default_factory=lambda: {stage.value: option for stage, option in STATUS_OPTION_IDS.items()}
+    )
+    bot_field_node_id: str = "PVTSSF_lADOEanNes4BkJhbzhjgMaM"
+    bot_options: dict[str, str] = Field(
+        default_factory=lambda: {
+            "Working": "18ff4a7c",
+            "Needs you": "b1767cfa",
+            "Checkpoint": "b85b9520",
+            "Blocked": "d28564d7",
+            "Idle": "cd0936de",
+        }
+    )
+    github_app_id: int = 5_085_812
+    github_installation_id: int = 165_144_097
+    github_bot_login: str = "molly-omnigent-factory[bot]"
+    github_bot_user_id: int = 334_191_208
+    github_api_url: str = "https://api.github.com"
+    app_env: Path = Field(default_factory=lambda: Path.home() / ".config/omnigent-factory/app.env")
+    app_private_key_file: Path | None = None
+    webhook_secret_file: Path | None = None
+    omnigent_token_file: Path | None = None
+    omnigent_base_url: str = "https://omnigent.reid.ee"
+    omnigent_host_id: str | None = None
+    omnigent_host_name: str = "coder"
+    omnigent_agent_id: str | None = None
+    omnigent_agent_name: str = "Molly"
+    omnigent_project_id: str | None = None
+    omnigent_project_name: str = "Timesheets"
+    source_clone: Path = Field(
+        default_factory=lambda: Path.home() / ".local/share/omnigent-factory/clones/timesheets"
+    )
+    worktree_root: Path = Field(
+        default_factory=lambda: Path.home() / ".local/share/omnigent-factory/worktrees/timesheets"
+    )
+    runtime_dir: Path | None = None
+    broker_socket_name: str = "credentials.sock"
+    wrapper_bin_dir: Path = Field(
+        default_factory=lambda: Path.home() / ".local/share/omnigent-factory/bin"
+    )
+    gh_config_dir: Path = Field(
+        default_factory=lambda: Path.home() / ".local/state/omnigent-factory/gh"
+    )
+    real_gh_path: Path = Path("/usr/bin/gh")
+    default_branch: str = "main"
+    required_checks: tuple[tuple[str, int], ...] = ()
+    independent_reviewer_ids: frozenset[int] = frozenset()
+    triage_guidance: str = "Follow repository-local instructions and minimise assumptions."
+    engineering_guidance: str = "Follow repository-local engineering and test conventions."
     max_building: int = Field(default=1, ge=1)
     max_open_bot_prs: int = Field(default=3, ge=1)
+    checkpoint_block_hours: dict[str, int] = Field(default_factory=lambda: {"S": 2, "M": 4, "L": 6})
+    checkpoint_grace_minutes: int = Field(default=15, ge=1, le=120)
+    cost_backstop_usd_per_hour: int = Field(default=35, ge=1, le=1000)
     repository_config: Path | None = None
     github_config: Path | None = None
     secrets_dir: Path = Field(
@@ -42,8 +101,11 @@ class ServiceConfig(BaseModel):
     background_failure_limit: int = Field(default=10, ge=1)
     delivery_retry_backoff_seconds: float = Field(default=1.0, gt=0)
     delivery_retry_max_backoff_seconds: float = Field(default=300.0, gt=0)
+    delivery_resolution_backoff_seconds: float = Field(default=900.0, gt=0)
+    delivery_resolution_max_attempts: int = Field(default=3, ge=1, le=20)
     operator_timeout_seconds: float = Field(default=5.0, gt=0)
     shutdown_timeout_seconds: float = Field(default=5.0, gt=0)
+    observation_interval_seconds: float = Field(default=5.0, gt=0)
 
     @field_validator("owners")
     @classmethod
@@ -52,12 +114,42 @@ class ServiceConfig(BaseModel):
             raise ValueError("owners must contain positive numeric GitHub IDs")
         return value
 
-    @field_validator("operator_socket_name")
+    @field_validator("operator_socket_name", "broker_socket_name")
     @classmethod
     def socket_is_basename(cls, value: str) -> str:
         if not value or Path(value).name != value:
-            raise ValueError("operator_socket_name must be a basename")
+            raise ValueError("socket name must be a basename")
         return value
+
+    @field_validator("omnigent_host_id", "omnigent_agent_id", "omnigent_project_id", mode="before")
+    @classmethod
+    def blank_omnigent_id_is_unset(cls, value: object) -> object:
+        return None if isinstance(value, str) and not value.strip() else value
+
+    @model_validator(mode="after")
+    def trusted_identities_are_consistent(self) -> ServiceConfig:
+        if self.github_bot_user_id in self.owners:
+            raise ValueError("the factory bot cannot be an owner")
+        if self.independent_reviewer_ids & (self.owners | {self.github_bot_user_id}):
+            raise ValueError("independent reviewers cannot include owners or the factory bot")
+        if not self.triage_guidance.strip() or not self.engineering_guidance.strip():
+            raise ValueError("repository guidance must not be blank")
+        expected = {stage.value for stage in STATUS_OPTION_IDS}
+        if set(self.status_options) != expected or len(set(self.status_options.values())) != len(
+            self.status_options
+        ):
+            raise ValueError("status_options must map every unique live Status option id")
+        expected_bots = {"Working", "Needs you", "Checkpoint", "Blocked", "Idle"}
+        if set(self.bot_options) != expected_bots or len(set(self.bot_options.values())) != len(
+            self.bot_options
+        ):
+            raise ValueError("bot_options must map every unique Bot option id")
+        if set(self.checkpoint_block_hours) != {"S", "M", "L"}:
+            raise ValueError("checkpoint_block_hours must contain S, M and L")
+        blocks = [self.checkpoint_block_hours[key] for key in ("S", "M", "L")]
+        if any(not 1 <= value <= 24 for value in blocks) or blocks != sorted(blocks):
+            raise ValueError("checkpoint block hours must be 1..24 and ordered S <= M <= L")
+        return self
 
     @property
     def database_path(self) -> Path:
@@ -65,7 +157,31 @@ class ServiceConfig(BaseModel):
 
     @property
     def operator_socket(self) -> Path:
-        return self.state_dir / self.operator_socket_name
+        return self.effective_runtime_dir / self.operator_socket_name
+
+    @property
+    def broker_socket(self) -> Path:
+        return self.effective_runtime_dir / self.broker_socket_name
+
+    @property
+    def capability_dir(self) -> Path:
+        return self.effective_runtime_dir / "capabilities"
+
+    @property
+    def effective_runtime_dir(self) -> Path:
+        return self.runtime_dir or self.state_dir / "runtime"
+
+    @property
+    def resolved_app_private_key_file(self) -> Path:
+        return self.app_private_key_file or self.secrets_dir / "app.pem"
+
+    @property
+    def resolved_webhook_secret_file(self) -> Path:
+        return self.webhook_secret_file or self.secrets_dir / "webhook_secret"
+
+    @property
+    def resolved_omnigent_token_file(self) -> Path:
+        return self.omnigent_token_file or self.secrets_dir / "omnigent-token"
 
     @property
     def trusted(self) -> TrustedConfig:
@@ -74,10 +190,14 @@ class ServiceConfig(BaseModel):
             owners=self.owners,
             max_building=self.max_building,
             max_open_bot_prs=self.max_open_bot_prs,
+            block_hours={Size(key): value for key, value in self.checkpoint_block_hours.items()},
+            grace_us=self.checkpoint_grace_minutes * MICROS_PER_MINUTE,
+            cost_usd_per_hour_micros=self.cost_backstop_usd_per_hour * 1_000_000,
         )
 
     def prepare_private_directories(self) -> None:
         _private_directory(self.state_dir, create=True)
+        _private_directory(self.effective_runtime_dir, create=True)
         _private_directory(self.secrets_dir, create=False)
         if self.secrets_dir.exists():
             for entry in self.secrets_dir.iterdir():
@@ -88,6 +208,7 @@ class ServiceConfig(BaseModel):
         for path, required in (
             (self.repository_config, False),
             (self.github_config, False),
+            (self.app_env, False),
         ):
             if path is not None and not path.is_file():
                 errors.append(f"configuration file does not exist: {path}")
@@ -100,6 +221,8 @@ class ServiceConfig(BaseModel):
                 _private_directory(self.secrets_dir, create=False)
                 for entry in self.secrets_dir.iterdir():
                     _private_secret_file(entry)
+            if self.effective_runtime_dir.exists():
+                _private_directory(self.effective_runtime_dir, create=False)
         except ConfigError as exc:
             errors.append(str(exc))
         return errors
@@ -141,9 +264,65 @@ def load_config(path: str | Path) -> ServiceConfig:
     if not isinstance(section, dict):
         raise ConfigError("configuration root must be a table")
     # Resolve configured paths relative to the configuration file, not the caller's cwd.
-    for key in ("state_dir", "repository_config", "github_config", "secrets_dir"):
+    for key in (
+        "state_dir",
+        "repository_config",
+        "github_config",
+        "secrets_dir",
+        "app_env",
+        "app_private_key_file",
+        "webhook_secret_file",
+        "omnigent_token_file",
+        "source_clone",
+        "worktree_root",
+        "runtime_dir",
+        "wrapper_bin_dir",
+        "gh_config_dir",
+        "real_gh_path",
+    ):
         value = section.get(key)
         if isinstance(value, str):
-            expanded = Path(os.path.expandvars(value)).expanduser()
+            runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+            expanded = Path(
+                os.path.expandvars(value.replace("%h", str(Path.home())).replace("%t", runtime))
+            ).expanduser()
             section[key] = expanded if expanded.is_absolute() else config_path.parent / expanded
+    env_path = section.get("app_env")
+    if env_path is None:
+        env_path = Path.home() / ".config/omnigent-factory/app.env"
+    env = load_app_env(Path(env_path))
+    aliases: Mapping[str, str] = {
+        "FACTORY_APP_ID": "github_app_id",
+        "FACTORY_INSTALLATION_ID": "github_installation_id",
+        "FACTORY_BOT_LOGIN": "github_bot_login",
+        "FACTORY_BOT_USER_ID": "github_bot_user_id",
+    }
+    for env_name, field_name in aliases.items():
+        if env_name in env and field_name not in section:
+            env_value: object = env[env_name]
+            if field_name.endswith("_id"):
+                try:
+                    env_value = int(str(env_value))
+                except ValueError as exc:
+                    raise ConfigError(f"{env_name} must be an integer") from exc
+            section[field_name] = env_value
     return ServiceConfig.model_validate(section)
+
+
+def load_app_env(path: Path) -> dict[str, str]:
+    """Read the owner's mode-0600 ``app.env`` identity file without changing process env."""
+    if not path.exists():
+        return {}
+    _private_secret_file(path)
+    values: dict[str, str] = {}
+    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        if not separator or not key or not key.replace("_", "a").isalnum():
+            raise ConfigError(f"invalid app.env entry at line {number}")
+        if key in values:
+            raise ConfigError(f"duplicate app.env key: {key}")
+        values[key] = value.strip().strip('"').strip("'")
+    return values

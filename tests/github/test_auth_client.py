@@ -42,9 +42,15 @@ async def test_installation_token_is_repo_scoped_and_profile_limited():
 
     def handler(request: httpx.Request) -> httpx.Response:
         recorded.append(request)
+        requested = json.loads(request.content)
         return httpx.Response(
             201,
-            json={"token": "opaque", "expires_at": "2030-01-01T00:00:00Z"},
+            json={
+                "token": "opaque",
+                "expires_at": "2030-01-01T00:00:00Z",
+                "permissions": requested["permissions"],
+                "repositories": [{"full_name": "SA-Ambulance/timesheets"}],
+            },
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
@@ -74,7 +80,12 @@ async def test_build_token_has_only_approved_repository_permissions():
         body = json.loads(request.content)
         return httpx.Response(
             201,
-            json={"token": "opaque", "expires_at": "2030-01-01T00:00:00Z"},
+            json={
+                "token": "opaque",
+                "expires_at": "2030-01-01T00:00:00Z",
+                "permissions": body["permissions"],
+                "repositories": [{"full_name": "SA-Ambulance/timesheets"}],
+            },
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
@@ -95,6 +106,22 @@ async def test_build_token_has_only_approved_repository_permissions():
         "pull_requests": "write",
         "statuses": "read",
     }
+
+
+@pytest.mark.asyncio
+async def test_installation_token_scope_omissions_fail_closed():
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                201, json={"token": "opaque", "expires_at": "2030-01-01T00:00:00Z"}
+            )
+        )
+    ) as http:
+        result = await InstallationTokenService(
+            http, AppAuthenticator(1, private_key()), 99, "SA-Ambulance/timesheets"
+        ).mint("SA-Ambulance/timesheets", CredentialProfile.READ_ONLY)
+    assert isinstance(result, TokenRefusal)
+    assert "omitted permission scope" in result.reason
 
 
 @pytest.mark.asyncio

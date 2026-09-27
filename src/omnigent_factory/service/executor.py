@@ -24,7 +24,8 @@ from omnigent_factory.core.effects import (
 )
 from omnigent_factory.core.events import Event, Provenance
 from omnigent_factory.core.preconditions import effect_still_valid
-from omnigent_factory.core.types import Stage, TrustedConfig
+from omnigent_factory.core.types import IssueSnapshot, Stage, TrustedConfig
+from omnigent_factory.omnigent.outcomes import observations
 from omnigent_factory.ports.adapter import EffectAdapter
 from omnigent_factory.ports.clock import Clock
 from omnigent_factory.ports.scheduler import SCHEDULER_EFFECT_KINDS
@@ -83,16 +84,23 @@ class EffectExecutor:
         self._failure_limit = failure_limit
         self._parked_blocks = parked_blocks or _never_blocks
         self._adapters: dict[EffectKind, EffectAdapter] = {}
-        for adapter in adapters:
-            for kind in adapter.handled_kinds:
-                if kind in self._adapters:
-                    raise ValueError(f"multiple adapters handle {kind.value}")
-                self._adapters[kind] = adapter
         self._queues: dict[str, asyncio.Queue[str | None]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._scheduled: set[str] = set()
         self._leases: dict[str, Lease] = {}
         self._stopping = asyncio.Event()
+        for adapter in adapters:
+            self.install(adapter)
+
+    def install(self, adapter: EffectAdapter) -> None:
+        """Bind an adapter before :meth:`run`; supports the service construction cycle."""
+        if self._workers or self._scheduled:
+            raise RuntimeError("cannot install an adapter after the executor started")
+        for kind in adapter.handled_kinds:
+            if kind in self._adapters:
+                raise ValueError(f"multiple adapters handle {kind.value}")
+        for kind in adapter.handled_kinds:
+            self._adapters[kind] = adapter
 
     async def run(self) -> None:
         failures = 0
@@ -424,6 +432,35 @@ class EffectExecutor:
                 elicitation_id=str(effect.args.get("elicitation_id", "")),
                 correlated=True,
             )
+        elif effect.kind == EffectKind.RECONCILE_PARCEL:
+            if "read_at_us" not in detail:
+                return None
+            raw_stage = detail.get("stage")
+            stage = Stage(raw_stage) if isinstance(raw_stage, str) else None
+            body = ev.GitHubSnapshot()
+            return Event(
+                event_id=f"effect:{effect.effect_id}:ack",
+                repo_id=self._config.repo_id,
+                parcel_id=effect.parcel_id,
+                source_time_us=self._clock.now_utc_us(),
+                provenance=Provenance.ADAPTER,
+                body=body,
+                evidence=IssueSnapshot(
+                    open=detail.get("open") is True,
+                    human_assigned=detail.get("human_assigned") is True,
+                    repo_matches=detail.get("repo_matches") is True,
+                    identity_resolved=detail.get("identity_resolved") is True,
+                    in_project=detail.get("in_project") is True,
+                    stage=stage,
+                    title=str(detail.get("title") or ""),
+                    body=(str(detail["body"]) if isinstance(detail.get("body"), str) else None),
+                    read_at_us=_json_int(detail.get("read_at_us"), 0),
+                ),
+            )
+        elif effect.kind == EffectKind.RECONCILE_SESSION:
+            observed = observations(effect, ack)
+            if observed:
+                body = observed[0]
         return self._event(effect, body, "ack") if body is not None else None
 
     async def _wait(self, seconds: float) -> None:

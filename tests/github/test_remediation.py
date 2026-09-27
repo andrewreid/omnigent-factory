@@ -79,6 +79,7 @@ async def test_R2_deleted_project_item_emits_item_removed_when_absent():
             json={
                 "data": {
                     "node": {
+                        "__typename": "Issue",
                         "id": "I_1",
                         "number": 12,
                         "title": "Task",
@@ -140,6 +141,7 @@ async def test_B2_repositoryless_project_delivery_resolves_by_authenticated_read
             json={
                 "data": {
                     "node": {
+                        "__typename": "Issue",
                         "id": "I_1",
                         "number": 12,
                         "title": "Task",
@@ -201,6 +203,7 @@ async def test_B2_wrong_repository_resolution_produces_no_events():
             json={
                 "data": {
                     "node": {
+                        "__typename": "Issue",
                         "id": "I_1",
                         "number": 12,
                         "repository": {
@@ -562,7 +565,16 @@ async def test_advisory_link_pagination_never_sends_token_off_host():
 @pytest.mark.asyncio
 async def test_advisory_daemon_token_is_not_labelled_read_only():
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(201, json={"token": "opaque", "expires_at": "2030-01-01T00:00:00Z"})
+        requested = json.loads(request.content)
+        return httpx.Response(
+            201,
+            json={
+                "token": "opaque",
+                "expires_at": "2030-01-01T00:00:00Z",
+                "permissions": requested["permissions"],
+                "repositories": [{"full_name": REPOSITORY}],
+            },
+        )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         grant = await InstallationTokenService(

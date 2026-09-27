@@ -46,7 +46,9 @@ class DeliveryProcessor(Protocol):
         a parcel-scoped park also fences and interrupts that parcel (``InboxHoldSet``).
         A delivery whose identity cannot yet be verified is retired with
         ``FactoryService.hold_unresolved_delivery(guid, candidate_parcel_id)``: a known
-        candidate parcel is fenced and held until the delivery is later processed.
+        candidate parcel is fenced and held until the delivery is later processed. Only a
+        card proven foreign by the lookup may be retired unapplied; an inconclusive one is
+        retried on a durable backoff and, once exhausted, parked for the operator.
         A recovered delivery whose GUID is already stored is a durable no-op (the stored
         copy wins even when GitHub re-serialised the recovered bytes).
         Returning without changing the delivery status is not completion.
@@ -70,3 +72,13 @@ class SetupRenderer(Protocol):
     def render(self, config: ServiceConfig) -> Mapping[str, str]: ...
 
     def validate(self, config: ServiceConfig) -> tuple[str, ...]: ...
+
+
+class ManagedRuntime(Protocol):
+    """A production integration whose lifetime is owned by ``FactoryService``."""
+
+    async def start(self) -> None: ...
+
+    async def close(self) -> None: ...
+
+    def healthy(self) -> bool: ...

@@ -1,0 +1,14 @@
+Checkpoint cleanup for grant {grant_id}.
+
+Outcome: leave the authorised work safely resumable and report its exact state.
+
+Stop starting new work. Settle workers, commit only already-authorised changes, report
+done/remaining/risks and the worktree state, then stop and wait. Do not expand scope,
+open another remediation loop, merge, or infer continuation from text. `/continue` is
+interpreted only by the daemon.
+
+Return exactly one strict checkpoint result block after a brief status:
+FACTORY_RESULT_V1
+```factory-result
+{{"version":1,"parcel_id":"{parcel_id}","stage_session_id":"{session_id}","dispatch_nonce":"{nonce}","revision":{revision},"result":{{"kind":"checkpoint","grant_id":"{grant_id}","head_sha":null,"done":[],"remaining":[],"risks":[],"worktree_state":"clean","elicitation_id":null}}}}
+```

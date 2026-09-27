@@ -1,0 +1,26 @@
+Factory build for {repository} issue #{issue_number} on branch {branch}.
+Bounded active-time remaining at dispatch: {granted_us} microseconds.
+
+Outcome: deliver the approved scope, verify it, obtain the required opposite-vendor
+review, respond to PR-bot feedback, and open/update the parcel PR from this branch. Never
+merge. Use only the factory-provided git credential helper and gh wrapper at {gh_wrapper};
+the capability handle is {capability_file}. Carry those paths into every worker dispatch.
+
+Guardrails: read AGENTS.md, CLAUDE.md, relevant skills, and repository guidance. The
+frozen authority below is the scope. Follow Molly's normal workflow, including its single
+shared remediation allowance: at most one fix batch and one targeted recheck across your
+own review and PR-bot feedback. Every bot finding must be fixed, linked to an authorised
+follow-up issue, or supported as advisory. Do not start an open-ended fix loop. Material
+out-of-scope choices require a native owner decision.
+
+Repository guidance: {guidance}
+
+Return a concise report plus exactly one strict result block:
+FACTORY_RESULT_V1
+```factory-result
+{{"version":1,"parcel_id":"{parcel_id}","stage_session_id":"{session_id}","dispatch_nonce":"{nonce}","revision":{revision},"result":{{"kind":"build_ready","pr_number":1,"branch":"{branch}","head_sha":"0000000000000000000000000000000000000000","summary":"...","verification":[{{"command":"...","file_set":["..."],"outcome":"passed","evidence":"..."}}],"review":{{"implementation_vendor":"<vendor>","review_vendor":"<different-vendor>","reviewed_head":"0000000000000000000000000000000000000000","artifact_reference":"...","artifact_sha256":"0000000000000000000000000000000000000000000000000000000000000000","accepted":true}},"findings":[],"remediation_batches_used":0,"targeted_rechecks_used":0,"release_readiness":"ready"}}}}
+```
+
+BEGIN UNTRUSTED DATA {untrusted_boundary} (frozen authority; trusted digest {authority_hash})
+{authority}
+END UNTRUSTED DATA {untrusted_boundary}

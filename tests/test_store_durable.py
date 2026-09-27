@@ -73,7 +73,7 @@ def test_v1_database_upgrades_to_v2_preserving_data_and_reopens(db: Path):
     v1.close()
 
     upgraded = open_store(db)
-    assert upgraded.schema_version() == LATEST == 2
+    assert upgraded.schema_version() == LATEST == 3
     names = {r[0] for r in upgraded.query("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"own_sends", "capability_records", "worker_grants", "parked_deliveries"} <= names
     assert upgraded.pending_deliveries()[0].delivery_guid == "d-1"
@@ -83,7 +83,7 @@ def test_v1_database_upgrades_to_v2_preserving_data_and_reopens(db: Path):
     assert checksums == {m.version: m.checksum for m in MIGRATIONS}
     upgraded.close()
     again = open_store(db)
-    assert again.schema_version() == 2
+    assert again.schema_version() == 3
     again.close()
 
 
@@ -94,7 +94,7 @@ def test_v2_migration_crash_rolls_back_and_retries(db: Path):
     with pytest.raises(Crash):
         open_store(db, faults)
     store = open_store(db)
-    assert store.schema_version() == 2
+    assert store.schema_version() == 3
     store.close()
 
 

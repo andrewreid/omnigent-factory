@@ -12,6 +12,8 @@ Stage handles come from the worktree's own config (``factory.capabilityFile``,
 
 from __future__ import annotations
 
+import os
+import shlex
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
@@ -55,6 +57,22 @@ def _git_config(key: str) -> str | None:
 
 
 Requester = Callable[..., BrokerReply]
+
+
+def install_git_helper(bin_dir: Path) -> Path:
+    """Install the factory helper at a stable absolute path outside repositories."""
+    bin_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target = bin_dir / "git-credential-omnigent-factory"
+    script = (
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(sys.executable)} -m "
+        'omnigent_factory.credentials.git_helper "$@"\n'
+    )
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(script, encoding="utf-8")
+    os.chmod(temporary, 0o700)
+    os.replace(temporary, target)
+    return target
 
 
 def run(

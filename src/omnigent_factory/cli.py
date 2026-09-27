@@ -15,22 +15,14 @@ import uvicorn
 from omnigent_factory import __version__
 from omnigent_factory.ports.clock import SystemClock
 from omnigent_factory.service.app import create_app
+from omnigent_factory.service.composition import build_production
 from omnigent_factory.service.config import ServiceConfig, load_config
-from omnigent_factory.service.interfaces import WebhookRejected
+from omnigent_factory.service.doctor import run_doctor
 from omnigent_factory.service.operator import operator_request
-from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.service.setup import OperationsRenderer, write_rendered
-from omnigent_factory.store.sqlite import DeliveryRecord, SqliteStore
+from omnigent_factory.store.sqlite import SqliteStore
 
 DEFAULT_CONFIG = Path.home() / ".config/omnigent-factory/config.toml"
-
-
-class IntegrationPendingVerifier:
-    """Fail closed until Task 5 wires the Task-2 signed-delivery adapter."""
-
-    async def verify(self, body: bytes, headers: Mapping[str, str]) -> DeliveryRecord:
-        del body, headers
-        raise WebhookRejected("GitHub verifier is not wired")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -100,17 +92,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     config_path, config = _load(args)
     if args.command == "serve":
-        service = FactoryService(config, fatal_exit=os._exit)
-        app = create_app(service, IntegrationPendingVerifier())
-        uvicorn.run(
-            app,
-            host=config.bind_host,
-            port=config.bind_port,
-            workers=1,
-            access_log=False,
-        )
+        asyncio.run(_serve(config))
         return 0
-    if args.command in ("status", "doctor", "pause", "unpause", "recovery"):
+    if args.command == "doctor":
+        report = asyncio.run(run_doctor(config))
+        print(json.dumps(report.as_dict(), indent=2, sort_keys=True))
+        return 0 if report.ok else 1
+    if args.command in ("status", "pause", "unpause", "recovery"):
         return _operator(config, args.command)
     if args.command == "explain":
         return _operator(config, "explain", {"parcel": args.parcel})
@@ -137,6 +125,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(content, end="" if content.endswith("\n") else "\n")
         return 0
     raise AssertionError("unhandled command")
+
+
+async def _serve(config: ServiceConfig) -> None:
+    """Build and run the complete daemon on one asyncio event loop."""
+    production = await build_production(config, fatal_exit=os._exit)
+    app = create_app(production.service, production.verifier)
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host=config.bind_host,
+            port=config.bind_port,
+            workers=1,
+            access_log=False,
+        )
+    )
+    try:
+        await server.serve()
+    finally:
+        # Lifespan normally owns shutdown; this also releases a pre-acquired lock if
+        # uvicorn fails before entering lifespan.
+        if production.service.ready or production.service._tasks:
+            await production.service.stop()
+        production.service.process_lock.close()
 
 
 if __name__ == "__main__":  # pragma: no cover
