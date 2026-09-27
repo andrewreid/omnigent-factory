@@ -1636,6 +1636,24 @@ def _h_contract_published(ctx: _Ctx, body: ev.ContractPublished) -> None:
     ctx.hold(Hold.AWAITING_OWNER)
 
 
+def _h_publication_acked(ctx: _Ctx, body: ev.PublicationAcked) -> None:
+    """A triage/report/status comment is visible: clear pending/failed publication state."""
+    if not body.comment_id:
+        raise Rejected("publication-ack-without-comment")
+    if ctx.p.unknown_effect(body.effect_id) is not None:
+        ctx.update(
+            unknown_effects=tuple(u for u in ctx.p.unknown_effects if u.effect_id != body.effect_id)
+        )
+    if body.effect_kind in _PUBLICATION_KINDS:
+        ctx.unhold(Hold.PUBLICATION_FAILED)
+    if (
+        body.effect_kind == EffectKind.PUBLISH_TRIAGE.value
+        and Hold.PUBLICATION_PENDING in ctx.p.holds
+    ):
+        ctx.unhold(Hold.PUBLICATION_PENDING)
+        ctx.hold(Hold.AWAITING_OWNER)
+
+
 def _h_session_created(ctx: _Ctx, body: ev.SessionCreated) -> None:
     s = _session(ctx, body.session_id)
     _adopt(ctx, s, body.root_id, body.nonce)
@@ -1723,6 +1741,15 @@ def _h_effect_unknown(ctx: _Ctx, body: ev.EffectUnknown) -> None:
     ctx.emit(EffectKind.RECONCILE_PARCEL, args={"effect_id": body.effect_id})
 
 
+_PUBLICATION_KINDS = frozenset(
+    {
+        EffectKind.PUBLISH_TRIAGE.value,
+        EffectKind.PUBLISH_CONTRACT.value,
+        EffectKind.PUBLISH_REPORT.value,
+    }
+)
+
+
 def _h_effect_cancelled(ctx: _Ctx, body: ev.EffectCancelled) -> None:
     if body.effect_kind == EffectKind.MOVE_CARD.value:
         move = ctx.p.pending_move(body.effect_id)
@@ -1730,7 +1757,19 @@ def _h_effect_cancelled(ctx: _Ctx, body: ev.EffectCancelled) -> None:
             raise Rejected("unknown-board-write")
         _retire_move(ctx, move, landed=False)  # never happened: reconcile the source
         return
+    if body.effect_kind in _PUBLICATION_KINDS:
+        # Publications are never precondition-cancelled (not work-bearing): this is a
+        # definitive failure. Blocked outranks Needs you; a pending triage publication
+        # stays pending so a later successful retry still hands the card to the owner.
+        ctx.hold(Hold.PUBLICATION_FAILED)
+        return
     s = ctx.p.session(body.session_id)
+    if body.failed and body.effect_kind == EffectKind.ENABLE_ISSUANCE.value and s is not None:
+        # The stage cannot get its credential: fail visibly instead of running without it.
+        ctx.hold(Hold.PREPARE_FAILED)
+        if s.lifecycle not in (Lifecycle.RETIRED, Lifecycle.FENCED, Lifecycle.DRAINING):
+            _begin_drain(ctx, s)
+        return
     if body.effect_kind != EffectKind.CREATE_SESSION.value or s is None:
         return  # audit only
     if s.root_id is not None or s.lifecycle not in (
@@ -1940,7 +1979,8 @@ def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
         if body.size is not None:
             ctx.update(size=body.size)
         ctx.emit(EffectKind.PUBLISH_TRIAGE, session=s, args={"session_id": s.session_id})
-        ctx.hold(Hold.AWAITING_OWNER)
+        # Needs you only once the owner can see the outcome (PublicationAcked).
+        ctx.hold(Hold.PUBLICATION_PENDING)
         _begin_drain(ctx, s, interrupt=False)
     elif body.result_kind == ev.ResultKind.PLAN and s.kind == SessionKind.PLAN:
         assert body.contract_canonical is not None and body.size is not None  # noqa: S101
@@ -2248,6 +2288,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.REVIEW_CHANGED: _h_review_changed,
     EventKind.READINESS_EVIDENCE: _h_readiness,
     EventKind.CONTRACT_PUBLISHED: _h_contract_published,
+    EventKind.PUBLICATION_ACKED: _h_publication_acked,
     EventKind.SESSION_CREATED: _h_session_created,
     EventKind.CREATE_REJECTED: _h_create_rejected,
     EventKind.ADOPTION_RESULT: _h_adoption_result,

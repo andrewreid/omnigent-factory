@@ -37,6 +37,7 @@ from omnigent_factory.service.directory import (
     PublicationRenderer,
     RecordingOmnigentAdapter,
     ServiceDispatchDirectory,
+    ServiceParcelResolver,
 )
 from omnigent_factory.service.durable import (
     StoreCapabilityStore,
@@ -206,6 +207,7 @@ async def build_production(
         process_lock=process_lock,
     )
     directory = ServiceDispatchDirectory(service.db, config)
+    publications = PublicationRenderer(directory, config)
     github = GitHubAPIAdapter(
         github_client,
         repository=config.repository,
@@ -221,9 +223,11 @@ async def build_production(
             config.bot_field_node_id,
             config.bot_options,
         ),
-        publication_renderer=PublicationRenderer(directory, config),
+        publication_renderer=publications,
         independent_reviewer_ids=config.independent_reviewer_ids,
         owner_ids=config.owners,
+        parcel_resolver=ServiceParcelResolver(service.db),
+        triage_fields=publications.triage_fields,
     )
     identity = DeliveryIdentity(
         app_id=config.github_app_id,
@@ -240,7 +244,7 @@ async def build_production(
     )
     normalizer = DeliveryNormalizer(identity)
 
-    workspaces = Workspaces(config.source_clone, (config.worktree_root,), config.repository)
+    workspaces = Workspaces(config.source_clone, owned_worktree_roots(config), config.repository)
     capability_store = StoreCapabilityStore(service.db)
     capabilities = CapabilityRegistry(
         config.capability_dir,
@@ -320,6 +324,17 @@ async def build_production(
         service,
         GitHubWebhookVerifier(config.resolved_webhook_secret_file, normalizer, clock),
     )
+
+
+def owned_worktree_roots(config: ServiceConfig) -> tuple[Path, ...]:
+    """Roots a stage worktree may live in.
+
+    Omnigent's JSON create (``git.branch_name`` + ``base_branch``) makes the worktree
+    beside the clone as ``<clone>-worktrees/<branch-slug>``; the configured
+    ``worktree_root`` stays accepted for bound/existing worktrees.
+    """
+    sibling = config.source_clone.with_name(f"{config.source_clone.name}-worktrees")
+    return (config.worktree_root, sibling)
 
 
 def _apply_repository_config(config: ServiceConfig, repo: FactoryConfig) -> ServiceConfig:

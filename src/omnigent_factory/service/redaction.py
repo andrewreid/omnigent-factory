@@ -56,3 +56,17 @@ def install_redaction_filter() -> SecretRedactionFilter:
                 if installed not in handler.filters:
                     handler.addFilter(installed)
     return installed
+
+
+def configure_logging(level: int = logging.INFO) -> None:
+    """Daemon logging to stderr (journald) with secret redaction on every handler."""
+    root = logging.getLogger()
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        root.addHandler(handler)
+    root.setLevel(level)
+    # Per-request HTTP client lines add noise and carry full URLs; keep them quiet.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    install_redaction_filter()

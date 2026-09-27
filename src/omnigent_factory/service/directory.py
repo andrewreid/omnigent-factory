@@ -21,6 +21,7 @@ from omnigent_factory.core.effects import (
 )
 from omnigent_factory.core.protocol import ParsedResult
 from omnigent_factory.core.types import ApprovalKind, Parcel, SessionKind, StageSession
+from omnigent_factory.github.adapter import ParcelBinding, TriageFields
 from omnigent_factory.omnigent.directory import FormValue, StageSpec
 from omnigent_factory.ports.adapter import EffectAdapter
 from omnigent_factory.service.config import ServiceConfig
@@ -313,10 +314,44 @@ class RecordingOmnigentAdapter:
         return outcome
 
 
+class ServiceParcelResolver:
+    """Supplies GitHub context (issue number) that core effect args deliberately omit."""
+
+    def __init__(self, db: StoreWorker) -> None:
+        self.db = db
+
+    async def __call__(self, parcel_id: str) -> ParcelBinding | None:
+        parcel = await self.db.call(lambda store: store.load_parcel(parcel_id))
+        if parcel is None or parcel.issue_number is None:
+            return None
+        return ParcelBinding(issue_number=parcel.issue_number)
+
+
 class PublicationRenderer:
     def __init__(self, directory: ServiceDispatchDirectory, config: ServiceConfig) -> None:
         self.directory = directory
         self.config = config
+
+    async def triage_fields(self, effect: EffectIntent) -> TriageFields | None:
+        """Priority/Size/labels of the stored triage result a PUBLISH_TRIAGE publishes."""
+        body = self._stored_result(effect)
+        if body is None or body.get("kind") != "triage":
+            return None
+        labels = body.get("labels")
+        return TriageFields(
+            priority=str(body.get("priority") or ""),
+            size=str(body.get("size") or ""),
+            labels=tuple(str(label) for label in labels) if isinstance(labels, list) else (),
+        )
+
+    def _stored_result(self, effect: EffectIntent) -> dict[str, Any] | None:
+        sid = str(effect.args.get("session_id") or effect.preconditions.session_id or "")
+        if not sid:
+            return None
+        result = self.directory.latest_result(sid)
+        record = result.get("factory_result") if result is not None else None
+        body = record.get("result") if isinstance(record, dict) else None
+        return body if isinstance(body, dict) else None
 
     async def __call__(self, effect: EffectIntent) -> str | None:
         if effect.parcel_id is None:
@@ -340,16 +375,15 @@ class PublicationRenderer:
             if blocked is not None:
                 return blocked
             return text if len(text) <= _CANONICAL_PUBLICATION_LIMIT else None
-        if effect.kind in {EffectKind.PUBLISH_TRIAGE, EffectKind.PUBLISH_REPORT}:
-            sid = str(effect.args.get("session_id") or effect.preconditions.session_id or "")
-            result = self.directory.latest_result(sid)
-            if result is None:
-                return None
-            record = result.get("factory_result")
-            if not isinstance(record, dict):
-                return None
-            body = record.get("result")
-            if not isinstance(body, dict):
+        if effect.kind == EffectKind.PUBLISH_REPORT and effect.args.get("report") == "ready":
+            text = (
+                f"Factory: PR #{effect.args.get('pr_number')} at "
+                f"`{effect.args.get('head_sha')}` passed readiness checks and is Ready "
+                "for the owner's merge decision."
+            )
+        elif effect.kind in {EffectKind.PUBLISH_TRIAGE, EffectKind.PUBLISH_REPORT}:
+            body = self._stored_result(effect)
+            if body is None:
                 return None
             text = _public_result(body)
         elif effect.kind == EffectKind.POST_COMMENT:
@@ -371,16 +405,58 @@ def _authority(parcel: Parcel) -> tuple[str, str]:
     return contract.canonical, contract.full_hash
 
 
+def _bullets(items: object) -> str:
+    return "\n".join(f"- {item}" for item in items) if isinstance(items, list) and items else ""
+
+
 def _public_result(result: dict[str, Any]) -> str:
     kind = str(result.get("kind") or "result")
     if kind == "triage":
-        return (
-            f"Factory triage: {result.get('summary', '')}\n\n"
-            f"Priority: {result.get('priority')} · Size: {result.get('size')} · "
-            f"Recommendation: {result.get('recommendation')}"
-        )
+        recommendation = str(result.get("recommendation") or "").replace("_", " ")
+        lines = [
+            "### Factory triage",
+            "",
+            str(result.get("summary", "")),
+            "",
+            f"**Recommendation:** {recommendation}",
+            f"**Priority:** {result.get('priority')} · **Size:** {result.get('size')}",
+        ]
+        if result.get("duplicate_issue"):
+            lines.append(f"**Duplicate of:** #{result.get('duplicate_issue')}")
+        labels = result.get("labels")
+        if isinstance(labels, list) and labels:
+            lines.append("**Suggested labels:** " + ", ".join(f"`{label}`" for label in labels))
+        missing = _bullets(result.get("missing_information"))
+        if missing:
+            lines += ["", "**Missing information:**", missing]
+        lines += ["", "Move the card to Scoped to request a plan, or Building to waive it."]
+        return "\n".join(lines)
+    if kind == "plan":
+        contract = result.get("contract")
+        contract = contract if isinstance(contract, dict) else {}
+        criteria = contract.get("acceptance_criteria")
+        lines = [
+            "### Factory plan (informational)",
+            "",
+            f"**Goal:** {contract.get('goal', '')}",
+            f"**Approach:** {result.get('approach', '')}",
+        ]
+        if isinstance(criteria, list) and criteria:
+            lines += ["", "**Acceptance criteria:**"]
+            lines += [
+                f"- {item.get('criterion', '')}" for item in criteria if isinstance(item, dict)
+            ]
+        risks = _bullets(result.get("risks"))
+        if risks:
+            lines += ["", "**Risks:**", risks]
+        return "\n".join(lines)
     if kind == "checkpoint":
-        return "Factory checkpoint:\n\n" + "\n".join(f"- {item}" for item in result.get("done", []))
+        lines = ["### Factory checkpoint"]
+        for title, key in (("Done", "done"), ("Remaining", "remaining"), ("Risks", "risks")):
+            section = _bullets(result.get(key))
+            if section:
+                lines += ["", f"**{title}:**", section]
+        return "\n".join(lines)
     if kind == "build_ready":
         return (
             f"Factory build report: {result.get('summary', '')}\n\n"

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import secrets
 import sqlite3
 from collections.abc import Callable, Iterator, Sequence
@@ -53,6 +54,13 @@ from omnigent_factory.core.types import (
 )
 from omnigent_factory.ports.clock import Clock
 from omnigent_factory.store.migrations import BOOTSTRAP_SQL, MIGRATIONS, Migration
+
+LOG = logging.getLogger(__name__)
+
+#: Periodic samples: logged at DEBUG unless they change the stage or Bot value.
+_QUIET_KINDS = frozenset(
+    {EventKind.ACTIVE_TIME_SAMPLE, EventKind.COST_SAMPLE, EventKind.RUNTIME_ACTIVITY}
+)
 
 Reducer = Callable[[State, Event], TransitionResult]
 FaultHook = Callable[[str], None]
@@ -566,6 +574,7 @@ class SqliteStore:
         )
         if event.delivery_guid is not None:
             self._mark_delivery(conn, event.delivery_guid, delivery_status or "processed")
+        _log_transition(event, old_parcel, new.parcel, result)
         return ApplyResult(
             duplicate=False,
             sequence=sequence,
@@ -1063,6 +1072,23 @@ class SqliteStore:
             reason=reason,
         )
 
+    def requeue_effect(self, effect_id: str, kinds: frozenset[str]) -> bool:
+        """Operator retry: a failed/unknown effect of ``kinds`` returns to ``pending``.
+
+        Only for adoptable publications, whose adapter finds an existing marked comment
+        before writing, so the retry adopts rather than duplicates.
+        """
+        placeholders = ",".join("?" for _ in kinds)
+        with self._txn() as conn:
+            cur = conn.execute(
+                f"UPDATE effects SET state = 'pending', attempts = 0, next_at_us = NULL, "
+                f"outcome_reason = 'operator-retry', updated_at_us = ? "
+                f"WHERE effect_id = ? AND state IN ('failed', 'unknown') "
+                f"AND kind IN ({placeholders})",
+                (self._clock.now_utc_us(), effect_id, *sorted(kinds)),
+            )
+            return cur.rowcount == 1
+
     def recover_claimed(self) -> list[StoredEffect]:
         """On startup: claimed-but-unfinished effects become ``unknown`` (never re-sent).
 
@@ -1450,3 +1476,32 @@ def _split_sql(sql: str) -> list[str]:
     if "".join(buf).strip():
         statements.append("\n".join(buf))
     return statements
+
+
+def _log_transition(
+    event: Event, old: Parcel | None, new: Parcel | None, result: TransitionResult
+) -> None:
+    """One line per applied event: stage/Bot movement, reason and emitted effects."""
+    before = (old.stage, old.bot) if old is not None else (None, None)
+    after = (new.stage, new.bot) if new is not None else (None, None)
+    quiet = event.kind in _QUIET_KINDS and result.audit.accepted and before == after
+    LOG.log(
+        logging.DEBUG if quiet else logging.INFO,
+        "parcel transition kind=%s parcel=%s issue=%s accepted=%s reason=%s "
+        "stage=%s->%s bot=%s->%s effects=%s",
+        event.kind.value,
+        event.parcel_id,
+        new.issue_number if new is not None else None,
+        result.audit.accepted,
+        result.audit.reason,
+        _value(before[0]),
+        _value(after[0]),
+        _value(before[1]),
+        _value(after[1]),
+        ",".join(e.kind.value for e in result.effects) or "-",
+    )
+
+
+def _value(item: object) -> object:
+    value = getattr(item, "value", None)
+    return item if value is None else value

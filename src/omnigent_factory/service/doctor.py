@@ -11,6 +11,7 @@ import stat
 import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -189,7 +190,7 @@ async def _check_omnigent(config: ServiceConfig, rest: OmnigentRest, report: Doc
             ("agent", "/v1/agents", config.omnigent_agent_id, config.omnigent_agent_name),
             ("project", "/v1/projects", config.omnigent_project_id, config.omnigent_project_name),
         ):
-            rows = await rest.paginate(path)
+            rows = await _identity_rows(rest, path)
             reached = True
             matches = [
                 row
@@ -209,6 +210,30 @@ async def _check_omnigent(config: ServiceConfig, rest: OmnigentRest, report: Doc
             report.pass_check("omnigent_reachable", "authenticated API reads succeeded")
     except OmnigentReadError as exc:
         report.fail("omnigent_auth", exc.reason)
+
+
+async def _identity_rows(rest: OmnigentRest, path: str) -> list[dict[str, Any]]:
+    """Rows keyed by ``id``, accepting both live list shapes.
+
+    ``/v1/agents`` and ``/v1/projects`` return the cursor envelope ``{data, has_more}``;
+    the live ``/v1/hosts`` returns ``{hosts: [...]}`` with rows keyed by ``host_id``.
+    """
+    body = await rest.get_json(path)
+    if "data" in body:
+        rows = await rest.paginate(path) if body.get("has_more") else body["data"]
+    else:
+        rows = body.get(path.rsplit("/", 1)[-1])
+    if not isinstance(rows, list):
+        raise OmnigentReadError(f"GET {path}: missing row list")
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if "id" not in row and "host_id" in row:
+            normalized.append({**row, "id": row["host_id"]})
+        else:
+            normalized.append(row)
+    return normalized
 
 
 def _check_clone(config: ServiceConfig, report: DoctorReport) -> None:

@@ -158,6 +158,8 @@ class Hold(enum.StrEnum):
     CREATE_REJECTED = "create_rejected"
     PREPARE_FAILED = "prepare_failed"
     PUBLICATION_FAILED = "publication_failed"
+    #: A stage result is accepted but its GitHub publication has not landed yet.
+    PUBLICATION_PENDING = "publication_pending"
     RESTART_EXHAUSTED = "restart_exhausted"
     CHECKS_FAILED = "checks_failed"
     READINESS_FAILED = "readiness_failed"
@@ -229,6 +231,7 @@ CONTROL_CLEARED_HOLDS = frozenset(
         Hold.UNSUPPORTED_REWORK,
         Hold.PR_CLOSED,
         Hold.APPROVAL_VOIDED,
+        Hold.PUBLICATION_PENDING,
     }
 )
 

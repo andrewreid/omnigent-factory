@@ -142,12 +142,18 @@ guidance: {triage: Triage safely., engineering: Build safely.}
         return httpx.Response(404)
 
     def omnigent(request: httpx.Request) -> httpx.Response:
+        # Shapes observed on the live server (2026-09-27): hosts is a bare
+        # ``{hosts: [...]}`` keyed by ``host_id``; projects has no ``has_more``.
         values = {
-            "/v1/hosts": [{"id": "host-1", "name": "coder"}],
-            "/v1/agents": [{"id": "agent-1", "name": "Molly"}],
-            "/v1/projects": [{"id": "project-1", "name": "Timesheets"}],
+            "/v1/hosts": {"hosts": [{"host_id": "host-1", "name": "coder", "status": "online"}]},
+            "/v1/agents": {
+                "object": "list",
+                "data": [{"id": "agent-1", "name": "Molly"}],
+                "has_more": False,
+            },
+            "/v1/projects": {"object": "list", "data": [{"id": "project-1", "name": "Timesheets"}]},
         }
-        return httpx.Response(200, json={"data": values[request.url.path], "has_more": False})
+        return httpx.Response(200, json=values[request.url.path])
 
     before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
     report = await run_doctor(
@@ -158,6 +164,7 @@ guidance: {triage: Triage safely., engineering: Build safely.}
     after = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
 
     assert report.ok, report.errors
+    assert report.resolved["omnigent_host_id"] == "host-1"
     assert report.resolved["omnigent_project_id"] == "project-1"
     assert report.resolved["repository_database_id"] == 123
     assert "github_token_revoke" in report.checks

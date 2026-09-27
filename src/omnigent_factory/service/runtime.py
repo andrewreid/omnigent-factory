@@ -12,6 +12,7 @@ from functools import partial
 from typing import Any
 
 from omnigent_factory.core import events as ev
+from omnigent_factory.core.effects import EffectKind
 from omnigent_factory.core.events import Event, Provenance
 from omnigent_factory.core.types import (
     AdmissionSnapshot,
@@ -45,6 +46,16 @@ from omnigent_factory.service.redaction import install_redaction_filter
 from omnigent_factory.store.sqlite import ApplyResult, DeliveryRecord, SqliteStore, StoredEffect
 
 LOG = logging.getLogger(__name__)
+
+#: Effects an operator may requeue: comment publications adopt their effect marker, and
+#: their ack (PublicationAcked) clears the reducer's pending/failed/unknown state.
+RETRYABLE_PUBLICATION_KINDS = frozenset(
+    {
+        EffectKind.PUBLISH_TRIAGE.value,
+        EffectKind.PUBLISH_REPORT.value,
+        EffectKind.POST_COMMENT.value,
+    }
+)
 
 
 class FactoryService:
@@ -617,6 +628,17 @@ class FactoryService:
             return await self._explain(parcel_id)
         if command == "recovery":
             return await self._recovery()
+        if command == "retry-effect":
+            effect_id = str(args.get("effect", ""))
+            if not effect_id:
+                raise ValueError("effect is required")
+            requeued = await self.db.call(
+                lambda store: store.requeue_effect(effect_id, RETRYABLE_PUBLICATION_KINDS)
+            )
+            if not requeued:
+                raise ValueError("effect is not a failed/unknown publication")
+            LOG.info("operator requeued effect effect_id=%s", effect_id)
+            return {"requeued": effect_id, **await self._status()}
         if command == "release-delivery":
             delivery_guid = str(args.get("delivery", ""))
             if not delivery_guid:

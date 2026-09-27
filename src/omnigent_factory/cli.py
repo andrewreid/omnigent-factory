@@ -19,6 +19,7 @@ from omnigent_factory.service.composition import build_production
 from omnigent_factory.service.config import ServiceConfig, load_config
 from omnigent_factory.service.doctor import run_doctor
 from omnigent_factory.service.operator import operator_request
+from omnigent_factory.service.redaction import configure_logging
 from omnigent_factory.service.setup import OperationsRenderer, write_rendered
 from omnigent_factory.store.sqlite import SqliteStore
 
@@ -48,6 +49,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     release.add_argument("delivery")
     _config_arg(release)
+    retry = sub.add_parser(
+        "retry-effect",
+        help="requeue a failed/unknown triage/report/status publication (adopts, no duplicate)",
+    )
+    retry.add_argument("effect")
+    _config_arg(retry)
 
     setup = sub.add_parser("setup", help="render or validate owner-applied setup artifacts")
     setup_sub = setup.add_subparsers(dest="setup_command", required=True)
@@ -104,6 +111,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _operator(config, "explain", {"parcel": args.parcel})
     if args.command == "release-delivery":
         return _operator(config, "release-delivery", {"delivery": args.delivery})
+    if args.command == "retry-effect":
+        return _operator(config, "retry-effect", {"effect": args.effect})
     renderer = OperationsRenderer(config_path)
     if args.command == "setup" and args.setup_command == "validate":
         errors = renderer.validate(config)
@@ -129,6 +138,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 async def _serve(config: ServiceConfig) -> None:
     """Build and run the complete daemon on one asyncio event loop."""
+    configure_logging()
     production = await build_production(config, fatal_exit=os._exit)
     app = create_app(production.service, production.verifier)
     server = uvicorn.Server(

@@ -241,6 +241,13 @@ class EffectExecutor:
             parcel_version=parcel.version if parcel is not None else 0,
             attempt=claimed.attempts,
         )
+        LOG.info(
+            "effect start kind=%s effect_id=%s parcel=%s attempt=%s",
+            effect.kind.value,
+            effect.effect_id,
+            effect.parcel_id,
+            claimed.attempts,
+        )
         try:
             outcome = await adapter.execute(effect, ctx)
         except Exception:
@@ -278,6 +285,13 @@ class EffectExecutor:
 
     async def _cancel(self, stored: StoredEffect, reason: str) -> None:
         effect = stored.effect
+        LOG.warning(
+            "effect cancelled kind=%s effect_id=%s parcel=%s reason=%s",
+            effect.kind.value,
+            effect.effect_id,
+            effect.parcel_id,
+            reason,
+        )
         event = self._event(
             effect,
             ev.EffectCancelled(
@@ -302,9 +316,17 @@ class EffectExecutor:
             if event is None and effect.kind in _ACK_EVENT_REQUIRED:
                 await self._finish(stored, AmbiguousWrite("ack-missing-required-detail"))
                 return
+            _log_ack(effect, outcome)
             await self._record(effect, "done", event, remote_id=outcome.remote_id)
             return
         if isinstance(outcome, AmbiguousWrite):
+            LOG.warning(
+                "effect outcome unknown kind=%s effect_id=%s parcel=%s reason=%s",
+                effect.kind.value,
+                effect.effect_id,
+                effect.parcel_id,
+                outcome.reason,
+            )
             event = self._event(
                 effect,
                 ev.EffectUnknown(
@@ -350,20 +372,53 @@ class EffectExecutor:
     ) -> None:
         effect = stored.effect
         if isinstance(outcome, RetryableReadFailure):
-            if not no_external_call and effect.retry_class not in (
-                RetryClass.READ,
-                RetryClass.LOCAL_IDEMPOTENT,
+            adoptable = effect.retry_class == RetryClass.ADOPTABLE_WRITE
+            if adoptable and not no_external_call and stored.attempts >= _ADOPTABLE_RETRY_LIMIT:
+                # Proven-not-written every time: stop retrying and surface it as Blocked.
+                await self._retry_or_unknown(
+                    stored, DefinitiveFailure(f"retries exhausted: {outcome.reason}")
+                )
+                return
+            if (
+                not no_external_call
+                and not adoptable
+                and effect.retry_class
+                not in (
+                    RetryClass.READ,
+                    RetryClass.LOCAL_IDEMPOTENT,
+                )
             ):
                 await self._finish(stored, AmbiguousWrite("write-returned-retryable-failure"))
                 return
-            delay = outcome.retry_after_us if outcome.retry_after_us is not None else 1_000_000
+            if outcome.retry_after_us is not None:
+                delay = outcome.retry_after_us
+            elif adoptable:
+                # An adoptable write re-checks its marker/current value before writing.
+                delay = min(2 ** max(stored.attempts, 1), 300) * 1_000_000
+            else:
+                delay = 1_000_000
             retry_at = self._clock.now_utc_us() + max(delay, 1)
+            LOG.warning(
+                "effect retry scheduled kind=%s effect_id=%s parcel=%s attempt=%s reason=%s",
+                effect.kind.value,
+                effect.effect_id,
+                effect.parcel_id,
+                stored.attempts,
+                outcome.reason,
+            )
             await self._db.call(
                 lambda store: store.fail_effect(
                     effect.effect_id, outcome.reason, retry_at_us=retry_at
                 )
             )
             return
+        LOG.warning(
+            "effect failed kind=%s effect_id=%s parcel=%s reason=%s",
+            effect.kind.value,
+            effect.effect_id,
+            effect.parcel_id,
+            outcome.reason,
+        )
         event_body: ev.EventBody
         if effect.kind == EffectKind.CREATE_SESSION:
             event_body = ev.CreateRejected(
@@ -376,6 +431,7 @@ class EffectExecutor:
                 effect_id=effect.effect_id,
                 effect_kind=effect.kind.value,
                 session_id=effect.preconditions.session_id,
+                failed=True,
             )
         event = self._event(effect, event_body, "failed")
         await self._record(effect, "failed", event, reason=outcome.reason)
@@ -391,7 +447,20 @@ class EffectExecutor:
                 nonce=str(effect.args.get("nonce", "")),
             )
         elif effect.kind == EffectKind.PREPARE_SESSION:
-            body = ev.Prepared(session_id=session_id, ok=True)
+            # The adapter reports a refused preparation as an Ack with ok=false (no
+            # capability was provisioned): fail closed unless success is explicit.
+            body = ev.Prepared(
+                session_id=session_id,
+                ok=detail.get("ok") is True,
+                unexpected_turn=detail.get("unexpected_turn") is True,
+            )
+        elif effect.kind in _PUBLICATION_ACK_KINDS and ack.remote_id:
+            body = ev.PublicationAcked(
+                effect_id=effect.effect_id,
+                effect_kind=effect.kind.value,
+                session_id=effect.preconditions.session_id,
+                comment_id=ack.remote_id,
+            )
         elif effect.kind == EffectKind.SEND_MESSAGE and ack.remote_id:
             body = ev.MessageAck(
                 session_id=session_id, effect_id=effect.effect_id, item_id=ack.remote_id
@@ -490,10 +559,48 @@ _ACK_EVENT_REQUIRED = frozenset(
         EffectKind.MOVE_CARD,
         EffectKind.SEND_MESSAGE,
         EffectKind.PUBLISH_CONTRACT,
+        EffectKind.PUBLISH_TRIAGE,
+        EffectKind.PUBLISH_REPORT,
         EffectKind.SCAN_TREE,
         EffectKind.FETCH_PR_EVIDENCE,
     }
 )
+
+#: Comment effects whose ack tells the reducer the owner can now see the outcome.
+_PUBLICATION_ACK_KINDS = frozenset(
+    {EffectKind.PUBLISH_TRIAGE, EffectKind.PUBLISH_REPORT, EffectKind.POST_COMMENT}
+)
+
+#: Attempts (claims) before a proven-not-written adoptable write is reported failed.
+_ADOPTABLE_RETRY_LIMIT = 5
+
+
+def _log_ack(effect: EffectIntent, ack: Ack) -> None:
+    detail = ack.detail
+    if effect.kind == EffectKind.PREPARE_SESSION and detail.get("ok") is not True:
+        LOG.warning(
+            "effect refused kind=%s effect_id=%s parcel=%s reason=%s",
+            effect.kind.value,
+            effect.effect_id,
+            effect.parcel_id,
+            detail.get("reason"),
+        )
+        return
+    if effect.kind == EffectKind.CREATE_SESSION:
+        LOG.info(
+            "session created session=%s root=%s parcel=%s stage=%s",
+            effect.preconditions.session_id,
+            ack.remote_id,
+            effect.parcel_id,
+            effect.args.get("stage"),
+        )
+    LOG.info(
+        "effect done kind=%s effect_id=%s parcel=%s remote_id=%s",
+        effect.kind.value,
+        effect.effect_id,
+        effect.parcel_id,
+        ack.remote_id,
+    )
 
 
 def _inbox_gated(effect: EffectIntent) -> bool:

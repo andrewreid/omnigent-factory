@@ -78,6 +78,12 @@ class _ScriptedAdapter:
         queue = self._scripts[effect.kind]
         if queue:
             return queue.popleft()
+        if effect.kind == EffectKind.PREPARE_SESSION:
+            # Mirror the real adapter's contract: success is an explicit ``ok``.
+            return Ack(
+                remote_id=f"{effect.kind.value}-{next(self._ids)}",
+                detail={"ok": True, "unexpected_turn": False},
+            )
         return Ack(remote_id=f"{effect.kind.value}-{next(self._ids)}")
 
     async def execute(self, effect: EffectIntent, ctx: ExecutionContext) -> AdapterOutcome:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -19,6 +20,7 @@ from omnigent_factory.core.effects import (
     EffectIntent,
     EffectKind,
     ExecutionContext,
+    JsonValue,
     RetryableReadFailure,
 )
 from omnigent_factory.core.events import ChecksState
@@ -41,6 +43,11 @@ from omnigent_factory.ports.github import (
 
 _CONTRACT_FENCE = re.compile(r"```parcel-contract\s*\n(?P<body>.*?)\n```", re.DOTALL)
 
+LOG = logging.getLogger(__name__)
+
+#: Project fields a triage result may fill (design §B: only while the owner left them unset).
+TRIAGE_FIELDS = ("Priority", "Size")
+
 
 @dataclass(frozen=True, slots=True)
 class ParcelBinding:
@@ -48,6 +55,19 @@ class ParcelBinding:
 
     issue_number: int
     project_item_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TriageFields:
+    """Board values and informational labels from an accepted triage result."""
+
+    priority: str
+    size: str
+    labels: tuple[str, ...] = ()
+
+
+ParcelResolver = Callable[[str], Awaitable[ParcelBinding | None]]
+TriageFieldSource = Callable[[EffectIntent], Awaitable[TriageFields | None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +99,8 @@ class GitHubAPIAdapter:
         | None = None,
         independent_reviewer_ids: frozenset[int] = frozenset(),
         owner_ids: frozenset[int] = frozenset(),
+        parcel_resolver: ParcelResolver | None = None,
+        triage_fields: TriageFieldSource | None = None,
     ) -> None:
         self.client = client
         self.repository = repository
@@ -93,6 +115,10 @@ class GitHubAPIAdapter:
         self.board_schema = board_schema
         self.status_options = _status_options(board_schema)
         self.publication_renderer = publication_renderer
+        # Core effect args carry no GitHub resource IDs: the service resolves the
+        # parcel's issue from persisted state (static bindings are a test seam).
+        self.parcel_resolver = parcel_resolver
+        self.triage_fields = triage_fields
         if independent_reviewer_ids & (owner_ids | {bot_user_id}):
             raise ValueError("independent reviewers cannot include owners or the factory bot")
         self.independent_reviewer_ids = independent_reviewer_ids
@@ -391,7 +417,7 @@ class GitHubAPIAdapter:
                 number = effect.args.get("pr_number")
                 if not isinstance(number, int):
                     return DefinitiveFailure("FETCH_PR_EVIDENCE requires pr_number")
-                ref = self._issue_ref(effect)
+                ref = await self._issue_ref(effect)
                 if ref is None:
                     return DefinitiveFailure("FETCH_PR_EVIDENCE requires the parcel issue")
                 evidence = await self.pull_request(ref, number)
@@ -401,16 +427,11 @@ class GitHubAPIAdapter:
                 detail["checks"] = evidence.checks.value
                 return Ack(str(number), detail)
             if effect.kind == EffectKind.RECONCILE_PARCEL:
-                issue_number = effect.args.get("issue_number")
-                binding = self._binding(effect)
-                if issue_number is None and binding is not None:
-                    issue_number = binding.issue_number
-                parcel_id = effect.parcel_id
-                if not isinstance(issue_number, int) or parcel_id is None:
+                ref = await self._issue_ref(effect)
+                if ref is None:
                     return DefinitiveFailure("RECONCILE_PARCEL requires parcel and issue number")
-                snapshot = await self.issue_snapshot(
-                    IssueRef(self.repository_node_id, issue_number, parcel_id)
-                )
+                parcel_id = ref.parcel_id
+                snapshot = await self.issue_snapshot(ref)
                 if isinstance(snapshot, RetryableReadFailure):
                     return snapshot
                 detail = asdict(snapshot)
@@ -445,16 +466,15 @@ class GitHubAPIAdapter:
         return DefinitiveFailure("unreachable GitHub effect dispatch")
 
     async def _post_comment(self, effect: EffectIntent) -> AdapterOutcome:
-        issue_number = effect.args.get("issue_number")
+        ref = await self._issue_ref(effect, require_parcel=False)
         text = effect.args.get("body")
-        binding = self._binding(effect)
-        if issue_number is None and binding is not None:
-            issue_number = binding.issue_number
         if text is None:
             text = await self._render_publication(effect)
-        if not isinstance(issue_number, int) or not isinstance(text, str):
-            return DefinitiveFailure("comment effect could not resolve issue or rendered body")
-        ref = IssueRef(self.repository_node_id, issue_number, effect.parcel_id or "")
+        if ref is None:
+            return DefinitiveFailure("comment effect could not resolve the parcel issue")
+        if not isinstance(text, str):
+            return DefinitiveFailure("comment effect could not render its body")
+        issue_number = ref.issue_number
         adopted = await self._find_marked_comment(ref, effect.effect_id)
         if isinstance(adopted, RetryableReadFailure):
             return adopted
@@ -473,7 +493,7 @@ class GitHubAPIAdapter:
                         "posted_at_us": publication.posted_at_us,
                     },
                 )
-            return Ack(adopted, {"adopted": True})
+            return await self._after_comment(effect, ref, adopted, {"adopted": True})
         body = f"{text}\n\n{self._effect_marker(effect.effect_id)}"
         try:
             response = await self.client.request(
@@ -504,7 +524,144 @@ class GitHubAPIAdapter:
                     "posted_at_us": publication.posted_at_us,
                 },
             )
-        return Ack(str(comment_id))
+        return await self._after_comment(effect, ref, str(comment_id), {})
+
+    async def _after_comment(
+        self,
+        effect: EffectIntent,
+        ref: IssueRef,
+        comment_id: str,
+        detail: dict[str, JsonValue],
+    ) -> AdapterOutcome:
+        """Triage also fills unset Priority/Size and adds existing informational labels.
+
+        Runs after the comment exists (created or adopted by marker), so a retry never
+        duplicates the comment; every step below is idempotent. Transient failures retry
+        the whole effect; a GitHub refusal is logged and does not undo the publication.
+        """
+        if effect.kind != EffectKind.PUBLISH_TRIAGE or self.triage_fields is None:
+            return Ack(comment_id, detail)
+        fields = await self.triage_fields(effect)
+        if fields is None:
+            return Ack(comment_id, detail)
+        try:
+            detail["fields"] = await self._apply_triage_fields(ref, fields)
+            detail["labels"] = list(await self._apply_triage_labels(ref, fields))
+        except RateLimited as exc:
+            return RetryableReadFailure(str(exc), exc.retry_after_us)
+        except GitHubRejected as exc:
+            if exc.status_code >= 500:
+                return RetryableReadFailure(str(exc))
+            LOG.warning(
+                "triage fields/labels refused issue=%s status=%s", ref.issue_number, exc.status_code
+            )
+            detail["fields_error"] = f"HTTP {exc.status_code}"
+        except (GitHubAPIError, AmbiguousRequest) as exc:
+            return RetryableReadFailure(f"triage fields/labels incomplete: {exc}")
+        return Ack(comment_id, detail)
+
+    async def _apply_triage_fields(
+        self, ref: IssueRef, fields: TriageFields
+    ) -> dict[str, JsonValue]:
+        item_id = await self._project_item_id(ref.parcel_id)
+        if item_id is None:
+            return {}
+        schema = await self._single_select_fields(TRIAGE_FIELDS)
+        applied: dict[str, JsonValue] = {}
+        for name, value in (("Priority", fields.priority), ("Size", fields.size)):
+            field = schema.get(name)
+            option_id = field[1].get(value) if field is not None else None
+            if field is None or option_id is None:
+                applied[name] = "unavailable"
+                continue
+            current = await self._field_option(item_id, field[0], name)
+            if current == option_id:
+                applied[name] = value
+                continue
+            if current is not None:
+                # The owner (or an earlier triage) already chose: never overwrite it.
+                applied[name] = "kept"
+                continue
+            await self._set_single_select(item_id, field[0], option_id)
+            applied[name] = value
+        return applied
+
+    async def _apply_triage_labels(self, ref: IssueRef, fields: TriageFields) -> tuple[str, ...]:
+        wanted = {
+            label.casefold()
+            for label in fields.labels
+            if not label.casefold().startswith("factory:")
+        }
+        if not wanted:
+            return ()
+        existing = await self.client.paginate(f"/repos/{self.repository}/labels?per_page=100")
+        names = tuple(
+            sorted(
+                str(label["name"])
+                for label in existing
+                if isinstance(label, dict)
+                and isinstance(label.get("name"), str)
+                and label["name"].casefold() in wanted
+            )
+        )
+        if names:
+            await self.client.request(
+                "POST",
+                f"/repos/{self.repository}/issues/{ref.issue_number}/labels",
+                json_body={"labels": list(names)},
+                expected=frozenset({200}),
+            )
+        return names
+
+    async def _single_select_fields(
+        self, names: tuple[str, ...]
+    ) -> dict[str, tuple[str, dict[str, str]]]:
+        query = """
+        query($id: ID!) { node(id: $id) { ... on ProjectV2 { fields(first: 100) {
+          nodes { ... on ProjectV2SingleSelectField { id name options { id name } } }
+        } } } }
+        """
+        data = await self.client.graphql(query, {"id": self.project_node_id})
+        node = data.get("node")
+        container = node.get("fields") if isinstance(node, dict) else None
+        rows = container.get("nodes") if isinstance(container, dict) else None
+        if not isinstance(rows, list):
+            raise GitHubAPIError("project fields were unavailable")
+        found: dict[str, tuple[str, dict[str, str]]] = {}
+        for row in rows:
+            if not isinstance(row, dict) or row.get("name") not in names:
+                continue
+            field_id = row.get("id")
+            options = row.get("options")
+            if not isinstance(field_id, str) or not isinstance(options, list):
+                continue
+            found[str(row["name"])] = (
+                field_id,
+                {
+                    str(option["name"]): str(option["id"])
+                    for option in options
+                    if isinstance(option, dict) and "name" in option and "id" in option
+                },
+            )
+        return found
+
+    async def _set_single_select(self, item_id: str, field_id: str, option_id: str) -> None:
+        mutation = """
+        mutation($input: UpdateProjectV2ItemFieldValueInput!) {
+          updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
+        }
+        """
+        await self.client.graphql(
+            mutation,
+            {
+                "input": {
+                    "projectId": self.project_node_id,
+                    "itemId": item_id,
+                    "fieldId": field_id,
+                    "value": {"singleSelectOptionId": option_id},
+                }
+            },
+        )
 
     async def _find_marked_comment(
         self, ref: IssueRef, effect_id: str
@@ -536,7 +693,7 @@ class GitHubAPIAdapter:
         option_id = effect.args.get("option_id")
         expected_option_id = effect.args.get("expected_option_id")
         field_name = effect.args.get("field_name", "Status")
-        binding = self._binding(effect)
+        binding = await self._binding(effect)
         if item_id is None and binding is not None:
             item_id = binding.project_item_id
         if item_id is None and effect.parcel_id is not None:
@@ -563,22 +720,7 @@ class GitHubAPIAdapter:
             return Ack(str(item_id), {"adopted": True, "option_id": str(option_id)})
         if expected_option_id is not None and current != expected_option_id:
             return DefinitiveFailure("board field changed since the effect source snapshot")
-        mutation = """
-        mutation($input: UpdateProjectV2ItemFieldValueInput!) {
-          updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
-        }
-        """
-        await self.client.graphql(
-            mutation,
-            {
-                "input": {
-                    "projectId": self.project_node_id,
-                    "itemId": item_id,
-                    "fieldId": field_id,
-                    "value": {"singleSelectOptionId": option_id},
-                }
-            },
-        )
+        await self._set_single_select(str(item_id), str(field_id), str(option_id))
         observed = await self._field_option(str(item_id), str(field_id), field_name)
         if observed != option_id:
             return AmbiguousWrite("board write did not read back at the requested option id")
@@ -661,19 +803,24 @@ class GitHubAPIAdapter:
             return AmbiguousWrite("project item mutation omitted item id")
         return Ack(item_id)
 
-    def _issue_ref(self, effect: EffectIntent) -> IssueRef | None:
+    async def _issue_ref(
+        self, effect: EffectIntent, *, require_parcel: bool = True
+    ) -> IssueRef | None:
         issue_number = effect.args.get("issue_number")
-        binding = self._binding(effect)
-        if not isinstance(issue_number, int) and binding is not None:
-            issue_number = binding.issue_number
-        if not isinstance(issue_number, int) or effect.parcel_id is None:
+        if not isinstance(issue_number, int):
+            binding = await self._binding(effect)
+            issue_number = binding.issue_number if binding is not None else None
+        if not isinstance(issue_number, int) or (require_parcel and effect.parcel_id is None):
             return None
-        return IssueRef(self.repository_node_id, issue_number, effect.parcel_id)
+        return IssueRef(self.repository_node_id, issue_number, effect.parcel_id or "")
 
-    def _binding(self, effect: EffectIntent) -> ParcelBinding | None:
+    async def _binding(self, effect: EffectIntent) -> ParcelBinding | None:
         if effect.parcel_id is None:
             return None
-        return self.parcel_bindings.get(effect.parcel_id)
+        static = self.parcel_bindings.get(effect.parcel_id)
+        if static is not None or self.parcel_resolver is None:
+            return static
+        return await self.parcel_resolver(effect.parcel_id)
 
     async def _render_publication(self, effect: EffectIntent) -> str | None:
         if self.publication_renderer is not None:

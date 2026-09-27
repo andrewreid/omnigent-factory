@@ -82,6 +82,7 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.REVIEW_CHANGED: Admission(_OBSERVED),
     EventKind.READINESS_EVIDENCE: Admission(_ADAPTER),
     EventKind.CONTRACT_PUBLISHED: Admission(_ADAPTER),
+    EventKind.PUBLICATION_ACKED: Admission(_ADAPTER),
     # daemon effect outcomes and Omnigent observations: executor/observer only
     EventKind.SESSION_CREATED: Admission(_ADAPTER),
     EventKind.CREATE_REJECTED: Admission(_ADAPTER),

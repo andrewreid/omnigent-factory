@@ -432,9 +432,96 @@ def test_B07_triage_final_publishes_and_retires_after_quiescence():
         P, result_candidate(s.session_id, s.root_id, s.revision, ev.ResultKind.TRIAGE, size=Size.L)
     )
     assert EffectKind.PUBLISH_TRIAGE in kinds(r) and h.p().size == Size.L
-    assert h.p().bot == BotState.NEEDS_YOU
+    # Not Needs you until the owner can actually see the triage outcome.
+    assert h.p().bot != BotState.NEEDS_YOU
     h.quiesce(P, s.session_id)
     assert h.p().session(s.session_id).lifecycle == Lifecycle.RETIRED
+    [pub] = Harness.of(r, EffectKind.PUBLISH_TRIAGE)
+    h.send(
+        P,
+        ev.PublicationAcked(
+            effect_id=pub.effect_id,
+            effect_kind=pub.kind.value,
+            session_id=s.session_id,
+            comment_id="c-1",
+        ),
+    )
+    assert h.p().bot == BotState.NEEDS_YOU
+
+
+@pytest.mark.parametrize(
+    "kind", [EffectKind.PUBLISH_TRIAGE, EffectKind.PUBLISH_CONTRACT, EffectKind.PUBLISH_REPORT]
+)
+def test_B07b_failed_publication_is_blocked_not_needs_you(kind):
+    """Pilot bug 3: a definitively failed publication left the card at Needs you."""
+    h = Harness()
+    h.triage()
+    h.send(P, ev.EffectCancelled(effect_id="ef_failed", effect_kind=kind.value))
+    p = h.p()
+    assert Hold.PUBLICATION_FAILED in p.holds and p.bot == BotState.BLOCKED
+    # A later successful publication (operator retry) clears it.
+    h.send(
+        P,
+        ev.PublicationAcked(
+            effect_id="ef_failed", effect_kind=EffectKind.PUBLISH_TRIAGE.value, comment_id="c"
+        ),
+    )
+    assert Hold.PUBLICATION_FAILED not in h.p().holds
+
+
+def test_B07c_failed_triage_publication_never_reports_needs_you():
+    h = Harness()
+    h.eligible()
+    h.send(P, ev.RequestTriage())
+    s = h.create_ok()
+    r = h.send(
+        P, result_candidate(s.session_id, s.root_id, s.revision, ev.ResultKind.TRIAGE, size=Size.S)
+    )
+    [pub] = Harness.of(r, EffectKind.PUBLISH_TRIAGE)
+    h.send(
+        P,
+        ev.EffectCancelled(
+            effect_id=pub.effect_id, effect_kind=pub.kind.value, session_id=s.session_id
+        ),
+    )
+    h.quiesce(P, s.session_id)
+    assert h.p().bot == BotState.BLOCKED
+
+
+def test_B07d_enable_issuance_failure_blocks_the_stage():
+    """Pilot bug 4: a stage ran on without its credential after enable failed."""
+    h = Harness()
+    h.eligible()
+    h.send(P, ev.RequestTriage())
+    s = h.create_ok()
+    h.send(
+        P,
+        ev.EffectCancelled(
+            effect_id="ef_enable",
+            effect_kind=EffectKind.ENABLE_ISSUANCE.value,
+            session_id=s.session_id,
+            failed=True,
+        ),
+    )
+    p = h.p()
+    assert Hold.PREPARE_FAILED in p.holds and p.bot == BotState.BLOCKED
+    assert p.session(s.session_id).lifecycle == Lifecycle.DRAINING
+
+
+def test_B07e_precondition_cancelled_enable_is_not_a_failure():
+    h = Harness()
+    h.eligible()
+    h.send(P, ev.RequestTriage())
+    s = h.create_ok()
+    h.send(
+        P,
+        ev.EffectCancelled(
+            effect_id="ef_enable",
+            effect_kind=EffectKind.ENABLE_ISSUANCE.value,
+            session_id=s.session_id,
+        ),
+    )
+    assert Hold.PREPARE_FAILED not in h.p().holds
 
 
 def test_B08_waiver_build_info_plan_is_informational():

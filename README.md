@@ -35,3 +35,18 @@ For a longer randomized search: `HYPOTHESIS_PROFILE=thorough uv run pytest -q te
 | `src/omnigent_factory/testing/` | In-memory fakes and a fake clock, fixture builders, and a multi-parcel reducer harness with scripted flows. |
 | `src/omnigent_factory/cli.py` | `omnigent-factory` entry point (currently `version` and `db init`). |
 | `tests/` | Canonicalization goldens, protocol parsing, every transition-table row and rejecting default, Hypothesis stateful invariants, named traces, and store migration/crash/lease/cap tests. |
+
+## Operations
+
+The daemon logs one line per webhook, parcel transition, effect start/outcome and
+created session to stderr (journald under systemd), with secret redaction.
+
+A triage/report/status publication that failed definitively leaves the card at
+`Bot: Blocked`. After fixing the cause, requeue that exact effect; the retry finds an
+existing comment by its effect marker before posting, so it never duplicates it and
+never starts a new session:
+
+```sh
+omnigent-factory recovery                    # lists failed/unknown effects
+omnigent-factory retry-effect <effect_id>    # publish_triage/publish_report/post_comment only
+```

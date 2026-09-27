@@ -78,6 +78,7 @@ class EventKind(enum.StrEnum):
     REVIEW_CHANGED = "ReviewChanged"
     READINESS_EVIDENCE = "ReadinessEvidence"
     CONTRACT_PUBLISHED = "ContractPublished"
+    PUBLICATION_ACKED = "PublicationAcked"
     # observation: Omnigent / effects
     SESSION_CREATED = "SessionCreated"
     CREATE_REJECTED = "CreateRejected"
@@ -403,6 +404,18 @@ class ContractPublished(_Body):
 
 
 @dataclass(frozen=True, slots=True)
+class PublicationAcked(_Body):
+    """A triage/report/status comment was created or adopted by its effect marker."""
+
+    KIND: ClassVar[EventKind] = EventKind.PUBLICATION_ACKED
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    effect_id: str = ""
+    effect_kind: str = ""
+    session_id: str | None = None
+    comment_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class SessionCreated(_Body):
     """Create acknowledged, or exactly one verified adoption of the recorded tuple."""
 
@@ -448,13 +461,15 @@ class EffectUnknown(_Body):
 
 @dataclass(frozen=True, slots=True)
 class EffectCancelled(_Body):
-    """The executor cancelled an intent before any external call (stale precondition)."""
+    """The intent will not run: a stale precondition before any external call, or
+    (``failed``) a definitive adapter failure that proved nothing happened."""
 
     KIND: ClassVar[EventKind] = EventKind.EFFECT_CANCELLED
     CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
     effect_id: str = ""
     effect_kind: str = ""
     session_id: str | None = None
+    failed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -683,6 +698,7 @@ EventBody = (
     | ReviewChanged
     | ReadinessEvidence
     | ContractPublished
+    | PublicationAcked
     | SessionCreated
     | CreateRejected
     | AdoptionResult
@@ -744,6 +760,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         ReviewChanged,
         ReadinessEvidence,
         ContractPublished,
+        PublicationAcked,
         SessionCreated,
         CreateRejected,
         AdoptionResult,
@@ -858,6 +875,7 @@ __all__ = [
     "PolicyReady",
     "Prepared",
     "Provenance",
+    "PublicationAcked",
     "PublicationKind",
     "ReadinessEvidence",
     "ReconcileDue",

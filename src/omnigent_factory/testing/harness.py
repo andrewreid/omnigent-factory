@@ -127,11 +127,21 @@ class Harness:
         self.send(pid, ev.RequestTriage(via=Via.DRAG))
         s = self.create_ok(pid)
         assert s.root_id is not None
-        self.send(
+        r = self.send(
             pid,
             result_candidate(s.session_id, s.root_id, s.revision, ev.ResultKind.TRIAGE, size=size),
         )
         self.quiesce(pid, s.session_id)
+        for publish in self.of(r, EffectKind.PUBLISH_TRIAGE):
+            self.send(
+                pid,
+                ev.PublicationAcked(
+                    effect_id=publish.effect_id,
+                    effect_kind=publish.kind.value,
+                    session_id=s.session_id,
+                    comment_id=f"c-{publish.effect_id}",
+                ),
+            )
         return s
 
     def plan_published(self, pid: str = "I_parcel_1", *, goal: str = "Ship it") -> StageSession:
