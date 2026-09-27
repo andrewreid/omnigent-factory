@@ -16,9 +16,11 @@ from omnigent_factory.core.types import (
     Parcel,
     QueueEntry,
     QueueStatus,
+    Stage,
     TrustedConfig,
 )
 
+_SETTLED = frozenset({Lifecycle.RETIRED, Lifecycle.FENCED})
 _WORKING = frozenset(
     {
         Lifecycle.INTENT,
@@ -31,9 +33,19 @@ _WORKING = frozenset(
 )
 
 
+def finished(p: Parcel) -> bool:
+    """Closed/merged (no longer eligible) or on the Done column, with every stage session
+    settled: nothing is left for the bot to do, so leftover holds no longer apply."""
+    return (p.stage == Stage.DONE or not p.eligible) and all(
+        s.lifecycle in _SETTLED for s in p.sessions
+    )
+
+
 def project_bot(p: Parcel) -> BotState:
     cur = p.current_session
     lifecycles = {s.lifecycle for s in p.sessions}
+    if finished(p) and not p.unknown_effects:
+        return BotState.IDLE
     if (
         p.holds & BLOCKING_HOLDS
         or p.unknown_effects
