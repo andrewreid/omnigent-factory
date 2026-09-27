@@ -61,6 +61,7 @@ ADMISSION: dict[EventKind, Admission] = {
     # operator
     EventKind.PAUSE: Admission(_OPERATOR),
     EventKind.UNPAUSE: Admission(_OPERATOR),
+    EventKind.OPERATOR_RESUME: Admission(_OPERATOR),
     # safety facts: any actor, GitHub input or a daemon read (they only restrict)
     EventKind.LEFTWARD_MOVE: Admission(_GITHUB_OR_READ),
     EventKind.ASSIGNED_HUMAN: Admission(_GITHUB_OR_READ),

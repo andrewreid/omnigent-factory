@@ -41,6 +41,9 @@
         },
         {
           "$ref": "#/$defs/checkpoint"
+        },
+        {
+          "$ref": "#/$defs/blocked"
         }
       ]
     }
@@ -458,6 +461,26 @@
             "null"
           ],
           "minLength": 1
+        }
+      }
+    },
+    "blocked": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "reason",
+        "done"
+      ],
+      "properties": {
+        "kind": {
+          "const": "blocked"
+        },
+        "reason": {
+          "$ref": "#/$defs/text"
+        },
+        "done": {
+          "$ref": "#/$defs/texts"
         }
       }
     }

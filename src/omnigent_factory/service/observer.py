@@ -11,6 +11,7 @@ from typing import Any, cast
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.events import Event, Provenance, PublicationKind, ResultKind
 from omnigent_factory.core.protocol import (
+    BlockedResult,
     BuildResult,
     CheckpointResult,
     Correlation,
@@ -374,6 +375,14 @@ def _candidate(root_id: str, parsed: ParsedResult) -> ev.ResultCandidate:
             revision=envelope.revision,
             valid=True,
             result_kind=ResultKind.CHECKPOINT,
+        )
+    if isinstance(result, BlockedResult):
+        return ev.ResultCandidate(
+            session_id=envelope.stage_session_id,
+            root_id=root_id,
+            revision=envelope.revision,
+            valid=True,
+            result_kind=ResultKind.BLOCKED,
         )
     raise AssertionError("unreachable result model")
 

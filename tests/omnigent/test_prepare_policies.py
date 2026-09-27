@@ -54,7 +54,9 @@ async def test_prepare_wires_worktree_and_attaches_verified_policies(git_env: Gi
     rows = {p["name"]: p for p in rig.server.policies[root]}
     gh = rows["factory-github"]["factory_params"]
     assert gh["write_repos"] == [REPO] and gh["write_branches"] == ["factory/issue-42-g1"]
-    assert gh["deny_force_push"] and gh["deny_tag_push"] and not gh["allow_destructive"]
+    # MCP surface only (the shell surface ASKed); force-push to the parcel branch is fine.
+    assert gh["shell_tools"] == [] and gh["read_all"] is True
+    assert not gh["deny_force_push"] and gh["deny_tag_push"] and not gh["allow_destructive"]
     assert rows["factory-github"]["handler"] == pol.GITHUB_HANDLER
     cost = rows["factory-cost-grant-0001"]
     assert cost["handler"] == pol.COST_HANDLER and cost["type"] == "python"
@@ -260,3 +262,26 @@ async def test_operator_cel_must_compile_and_is_attached_in_addition(git_env: Gi
     assert rows["factory-cel"]["factory_params"]["expression"] == pol.factory_cel_expression()
     assert rows["factory-cel-operator"]["handler"] == pol.CEL_HANDLER
     assert rows["factory-cel-operator"]["factory_params"]["expression"] == '{"result": "ALLOW"}'
+
+
+async def test_boot_upgrades_a_live_sessions_old_factory_policies_in_place(
+    git_env: GitEnv,
+) -> None:
+    """#677: sessions prepared before the liberal-policy change keep the ASKing shell
+    surface; boot replaces the daemon-owned static policies without touching cost."""
+    rig = make_rig(git_env)
+    root = await _created(rig)
+    out = await rig.adapter.execute(intent(EffectKind.PREPARE_SESSION, root_id=root), CTX)
+    assert isinstance(out, Ack) and out.detail["ok"] is True
+    rows = rig.server.policies[root]
+    github = next(r for r in rows if r["name"] == "factory-github")
+    github["factory_params"] = {**github["factory_params"], "read_all": False}
+    github["factory_params"].pop("shell_tools")  # pre-change parameters
+    cost_before = [r for r in rows if r["name"].startswith(pol.COST_PREFIX)]
+    assert await rig.adapter.upgrade_static_policies("S1") is True
+    after = rig.server.policies[root]
+    upgraded = next(r for r in after if r["name"] == "factory-github")
+    assert upgraded["factory_params"]["shell_tools"] == []
+    assert [r for r in after if r["name"].startswith(pol.COST_PREFIX)] == cost_before
+    assert sorted(r["name"] for r in after).count("factory-github") == 1
+    assert await rig.adapter.upgrade_static_policies("S1") is False  # idempotent

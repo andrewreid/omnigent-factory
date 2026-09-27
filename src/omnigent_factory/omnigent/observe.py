@@ -18,6 +18,7 @@ Missing prompts: a persisted open prompt absent from a *complete* scan is
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -43,6 +44,38 @@ def _texts(payload: object) -> list[str]:
     return []
 
 
+#: Bounds and redaction for the prompt description relayed into GitHub.
+_SUMMARY_CHARS = 300
+_SECRETISH = re.compile(
+    r"(gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,}"
+    r"|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{8,}"
+    r"|(?i:token|secret|password|passwd|api[_-]?key)\s*[=:]\s*\S+)"
+)
+
+
+def elicitation_summary(params: Mapping[str, Any]) -> str:
+    """Short, redacted description of a prompt: its message, else tool + argument preview.
+
+    Pinned shapes: policy asks carry ``policy_name`` and ``message``; harness permission
+    cards carry ``message`` ("<harness> wants to use **Tool**") and ``content_preview``.
+    """
+    parts: list[str] = []
+    policy = params.get("policy_name")
+    message = params.get("message")
+    preview = params.get("content_preview")
+    if isinstance(policy, str) and policy:
+        parts.append(f"{policy}:")
+    if isinstance(message, str) and message.strip():
+        parts.append(message)
+    if isinstance(preview, str) and preview.strip() and preview not in (message or ""):
+        parts.append(f"({preview})")
+    text = " ".join(" ".join(parts).split())
+    text = _SECRETISH.sub("[redacted]", text)
+    if len(text) > _SUMMARY_CHARS:
+        text = text[: _SUMMARY_CHARS - 1].rstrip() + "…"
+    return text
+
+
 @dataclass
 class StreamNormalizer:
     """Normalizes one stage tree's stream/snapshot observations.
@@ -61,7 +94,9 @@ class StreamNormalizer:
     new_nodes: set[str] = field(default_factory=set)
     statuses: dict[str, str] = field(default_factory=dict)
 
-    def _opened(self, elicitation_id: str, params: Mapping[str, Any]) -> list[ev.EventBody]:
+    def _opened(
+        self, elicitation_id: str, params: Mapping[str, Any], node_id: str | None = None
+    ) -> list[ev.EventBody]:
         if elicitation_id in self.seen_elicitations:
             return []
         self.seen_elicitations.add(elicitation_id)
@@ -71,6 +106,8 @@ class StreamNormalizer:
                 elicitation_id=elicitation_id,
                 impact=DecisionImpact.UNKNOWN,
                 cost_ask=is_cost_ask(params.get("policy_name")),
+                summary=elicitation_summary(params),
+                node_id=node_id,
             )
         ]
 
@@ -90,7 +127,7 @@ class StreamNormalizer:
         if kind == "response.elicitation_request":
             eid = event.get("elicitation_id")
             params = as_map(event.get("params"))
-            return self._opened(eid, params) if isinstance(eid, str) else []
+            return self._opened(eid, params, node_id) if isinstance(eid, str) else []
         if kind == "response.elicitation_resolved":
             eid = event.get("elicitation_id")
             if not isinstance(eid, str):
@@ -131,8 +168,8 @@ class StreamNormalizer:
         out: list[ev.EventBody] = []
         owned = obs.owned_elicitations()  # deduplicated by the true owning session
         present = set(owned)
-        for eid, (_owner, event) in owned.items():
-            out.extend(self._opened(eid, as_map(event.get("params"))))
+        for eid, (owner, event) in owned.items():
+            out.extend(self._opened(eid, as_map(event.get("params")), owner))
         if obs.complete:
             out.extend(
                 ev.ElicitationGone(session_id=self.session_id, elicitation_id=eid)

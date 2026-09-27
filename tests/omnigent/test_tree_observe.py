@@ -209,9 +209,16 @@ async def test_ask_distinction_cost_vs_policy_vs_agent_question() -> None:
     cost = n.on_event(ROOT, elicitation("e_cost", policy_name="factory-cost-grant-0002"))
     gh = n.on_event("conv_c", elicitation("e_gh", policy_name="factory-github"))
     ask = n.on_event("conv_c", elicitation("e_q"))
-    assert cost == [ev.ElicitationOpened("S1", "e_cost", DecisionImpact.UNKNOWN, cost_ask=True)]
-    assert gh == [ev.ElicitationOpened("S1", "e_gh", DecisionImpact.UNKNOWN, cost_ask=False)]
-    assert ask == [ev.ElicitationOpened("S1", "e_q", DecisionImpact.UNKNOWN, cost_ask=False)]
+    unknown = DecisionImpact.UNKNOWN
+    assert cost == [
+        ev.ElicitationOpened(
+            "S1", "e_cost", unknown, True, "factory-cost-grant-0002: Question?", ROOT
+        )
+    ]
+    assert gh == [
+        ev.ElicitationOpened("S1", "e_gh", unknown, False, "factory-github: Question?", "conv_c")
+    ]
+    assert ask == [ev.ElicitationOpened("S1", "e_q", unknown, False, "Question?", "conv_c")]
     # "waiting" status alone is async work, not a question.
     assert n.on_event(ROOT, {"type": "session.status", "status": "waiting"}) == [
         ev.RuntimeActivity(session_id="S1", busy=False)
@@ -229,7 +236,9 @@ async def test_no_replay_after_reconnect_snapshot() -> None:
     )
     snap = TreeObservation(ROOT, True, {ROOT: node})
     out = n.on_snapshot(snap, open_elicitations={"e_live"})
-    assert out == [ev.ElicitationOpened("S1", "e_new", DecisionImpact.UNKNOWN, cost_ask=False)]
+    assert out == [
+        ev.ElicitationOpened("S1", "e_new", DecisionImpact.UNKNOWN, False, "Question?", ROOT)
+    ]
     assert n.on_snapshot(snap, open_elicitations={"e_live", "e_new"}) == []
 
 
@@ -305,7 +314,7 @@ async def test_drain_stream_parses_sse_and_reports_gap() -> None:
     assert result.gap  # EOF: reconnect + snapshot before trusting state
     assert result.events == (
         ev.RuntimeActivity(session_id="S1", busy=True),
-        ev.ElicitationOpened("S1", "e_s", DecisionImpact.UNKNOWN, cost_ask=False),
+        ev.ElicitationOpened("S1", "e_s", DecisionImpact.UNKNOWN, False, "Question?", ROOT),
     )
     assert n.new_nodes == {"conv_new"}
 
@@ -385,3 +394,20 @@ async def test_stream_gap_and_restart_widen_only_the_upper_bound() -> None:
     assert est.lower_us == 20 * MIN
     assert est.upper_us == 20 * MIN + 3 * MIN  # outage overlaps the gap window: union
     assert t.sample().consumed_us == est.upper_us  # conservative sample
+
+
+async def test_elicitation_summary_is_redacted_and_bounded() -> None:
+    from omnigent_factory.omnigent.observe import elicitation_summary
+
+    text = elicitation_summary(
+        {
+            "policy_name": "claude_sdk_permission",
+            "message": "Claude wants to use **Bash**",
+            "content_preview": 'Bash({"command": "curl -H \'Authorization: Bearer abcdefghijkl\' '
+            + "x" * 500
+            + ' ghp_abcdefghijklmnopqrstuv"})',
+        }
+    )
+    assert text.startswith("claude_sdk_permission: Claude wants to use **Bash** (Bash(")
+    assert "abcdefghijkl" not in text and "ghp_" not in text and "[redacted]" in text
+    assert len(text) <= 300

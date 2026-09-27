@@ -134,8 +134,20 @@ class CheckpointResult(_Strict):
     elicitation_id: Annotated[str, StringConstraints(min_length=1)] | None
 
 
+class BlockedResult(_Strict):
+    """The agent could not finish (a tool, credential or permission refused) and says so.
+
+    Honest failure instead of invented values: the daemon shows Blocked with ``reason``.
+    """
+
+    kind: Literal["blocked"]
+    reason: Text
+    done: Texts
+
+
 StageResult = Annotated[
-    TriageResult | PlanResult | BuildResult | CheckpointResult, Field(discriminator="kind")
+    TriageResult | PlanResult | BuildResult | CheckpointResult | BlockedResult,
+    Field(discriminator="kind"),
 ]
 
 
@@ -163,7 +175,7 @@ class ResultError(ValueError):
 #: Bounds for error details relayed to the agent or published in a status comment.
 MAX_ERROR_DETAILS = 10
 MAX_ERROR_DETAIL_CHARS = 200
-_RESULT_KINDS = frozenset({"triage", "plan", "build_ready", "checkpoint"})
+_RESULT_KINDS = frozenset({"triage", "plan", "build_ready", "checkpoint", "blocked"})
 
 
 def validation_details(exc: ValidationError) -> tuple[str, ...]:
@@ -265,7 +277,9 @@ def parse_factory_result(final_text: str, expected: Correlation) -> ParsedResult
         raise ResultError("correlation mismatch")
     r = result.result
     contract_bytes: bytes | None = None
-    if isinstance(r, CheckpointResult):
+    if isinstance(r, BlockedResult):
+        pass  # any stage may report that it could not finish
+    elif isinstance(r, CheckpointResult):
         if not expected.in_checkpoint:
             raise ResultError("checkpoint result outside checkpoint")
     elif isinstance(r, TriageResult):

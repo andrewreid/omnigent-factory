@@ -55,6 +55,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retry.add_argument("effect")
     _config_arg(retry)
+    resume = sub.add_parser(
+        "resume",
+        help="re-open a parcel's existing stage session and send it one operator note",
+    )
+    resume.add_argument("parcel")
+    note = resume.add_mutually_exclusive_group(required=True)
+    note.add_argument("--message")
+    note.add_argument("--message-file", type=Path)
+    _config_arg(resume)
     rerender = sub.add_parser(
         "rerender-comment",
         help="re-render a published comment in place, found by its effect marker",
@@ -121,6 +130,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _operator(config, "explain", {"parcel": args.parcel})
     if args.command == "release-delivery":
         return _operator(config, "release-delivery", {"delivery": args.delivery})
+    if args.command == "resume":
+        message = (
+            args.message
+            if args.message is not None
+            else args.message_file.read_text(encoding="utf-8")
+        )
+        return _operator(config, "resume", {"parcel": args.parcel, "message": message})
     if args.command == "rerender-comment":
         return _operator(config, "rerender-comment", {"effect": args.effect})
     if args.command == "retry-effect":

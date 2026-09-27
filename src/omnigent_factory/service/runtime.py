@@ -640,6 +640,24 @@ class FactoryService:
             return await self._explain(parcel_id)
         if command == "recovery":
             return await self._recovery()
+        if command == "resume":
+            parcel_id = str(args.get("parcel", ""))
+            text = str(args.get("message", ""))
+            if not parcel_id or not text.strip():
+                raise ValueError("parcel and message are required")
+            event = Event(
+                event_id=f"operator:resume:{uuid.uuid4()}",
+                repo_id=self.config.repo_id,
+                parcel_id=parcel_id,
+                source_time_us=self.clock.now_utc_us(),
+                provenance=Provenance.OPERATOR,
+                body=ev.OperatorResume(text=text),
+            )
+            result = await self.apply_event(event)
+            if not result.accepted:
+                raise ValueError(f"resume refused: {result.reason}")
+            LOG.info("operator resumed parcel=%s", parcel_id)
+            return {"resumed": parcel_id, **await self._explain(parcel_id)}
         if command == "rerender-comment":
             effect_id = str(args.get("effect", ""))
             stored = await self.db.call(lambda store: store.get_effect(effect_id))

@@ -479,6 +479,36 @@ class OmnigentExecutionAdapter:
             verified, wiring, self.identity, helper_command=self.helper_command
         )
 
+    async def upgrade_static_policies(self, session_id: str) -> bool:
+        """Boot: bring a live session's factory-owned static policies to the current version.
+
+        ``factory-github`` / ``factory-cel`` are deterministic and daemon-owned; a session
+        prepared by an older daemon keeps its old parameters (e.g. the shell surface that
+        raised human prompts) and would fail the next policy verification. A same-name
+        policy with other parameters is replaced; cost generations are untouched.
+        Returns whether anything changed. Raises :class:`PolicyError` on failure.
+        """
+        spec = await self.directory.stage_spec(session_id)
+        if spec is None or spec.root_id is None:
+            return False
+        root = spec.root_id
+        changed = False
+        rows = await pol.list_session_policies(self.rest, root)
+        for wanted in self._static_policies(spec):
+            same = [r for r in rows if r.get("name") == wanted.name]
+            if any(wanted.matches(r) for r in same):
+                continue
+            for row in same:
+                if isinstance(row.get("id"), str):
+                    await pol.delete_policy(self.rest, root, str(row["id"]))
+            await pol.ensure_policy(self.rest, root, wanted)
+            changed = True
+        rows = await pol.list_session_policies(self.rest, root)
+        for wanted in self._static_policies(spec):
+            if not any(wanted.matches(r) for r in rows):
+                raise pol.PolicyError(f"policy {wanted.name} upgrade unverified")
+        return changed
+
     def _static_policies(self, spec: StageSpec) -> tuple[pol.PolicySpec, ...]:
         return (pol.github_policy(spec.kind, self.config.repository, spec.branch), *self._cel)
 

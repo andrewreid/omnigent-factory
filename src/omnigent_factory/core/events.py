@@ -58,6 +58,7 @@ class EventKind(enum.StrEnum):
     REQUEST_REWORK = "RequestRework"
     PAUSE = "Pause"
     UNPAUSE = "Unpause"
+    OPERATOR_RESUME = "OperatorResume"
     # safety
     LEFTWARD_MOVE = "LeftwardMove"
     ASSIGNED_HUMAN = "AssignedHuman"
@@ -113,6 +114,7 @@ class ResultKind(enum.StrEnum):
     PLAN = "plan"
     BUILD_READY = "build_ready"
     CHECKPOINT = "checkpoint"
+    BLOCKED = "blocked"
 
 
 class PublicationKind(enum.StrEnum):
@@ -224,6 +226,16 @@ class RequestRework(_Body):
 class Pause(_Body):
     KIND: ClassVar[EventKind] = EventKind.PAUSE
     CLASS: ClassVar[EventClass] = EventClass.CONTROL
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorResume(_Body):
+    """Local operator: re-open an existing stage session after a stale block and send it
+    one note. Creates no authority, approval or grant; the gate must hold on its own."""
+
+    KIND: ClassVar[EventKind] = EventKind.OPERATOR_RESUME
+    CLASS: ClassVar[EventClass] = EventClass.CONTROL
+    text: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -533,6 +545,10 @@ class ElicitationOpened(_Body):
     elicitation_id: str = ""
     impact: DecisionImpact = DecisionImpact.UNKNOWN
     cost_ask: bool = False
+    #: Sanitised, truncated description of what is asked (prompt text / tool + args).
+    summary: str = ""
+    #: Omnigent session (root or child) that holds the pending prompt.
+    node_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -679,6 +695,7 @@ EventBody = (
     | Stop
     | RequestRework
     | Pause
+    | OperatorResume
     | Unpause
     | LeftwardMove
     | AssignedHuman
@@ -741,6 +758,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         Stop,
         RequestRework,
         Pause,
+        OperatorResume,
         Unpause,
         LeftwardMove,
         AssignedHuman,
@@ -868,6 +886,7 @@ __all__ = [
     "ItemRemoved",
     "LeftwardMove",
     "MessageAck",
+    "OperatorResume",
     "OwnerDirectOmnigentMessage",
     "PRObserved",
     "Pause",

@@ -160,6 +160,8 @@ class Hold(enum.StrEnum):
     PUBLICATION_FAILED = "publication_failed"
     #: A stage result is accepted but its GitHub publication has not landed yet.
     PUBLICATION_PENDING = "publication_pending"
+    #: The agent reported it could not finish (``blocked`` result); owner/operator acts.
+    AGENT_BLOCKED = "agent_blocked"
     RESTART_EXHAUSTED = "restart_exhausted"
     CHECKS_FAILED = "checks_failed"
     READINESS_FAILED = "readiness_failed"
@@ -197,6 +199,7 @@ BLOCKING_HOLDS = frozenset(
         Hold.PUBLICATION_FAILED,
         Hold.RESTART_EXHAUSTED,
         Hold.INBOX,
+        Hold.AGENT_BLOCKED,
     }
 )
 
@@ -232,6 +235,7 @@ CONTROL_CLEARED_HOLDS = frozenset(
         Hold.PR_CLOSED,
         Hold.APPROVAL_VOIDED,
         Hold.PUBLICATION_PENDING,
+        Hold.AGENT_BLOCKED,
     }
 )
 
@@ -242,6 +246,8 @@ class DecisionStatus(enum.StrEnum):
     RELAYED = "relayed"
     ORPHANED = "orphaned"
     CANCELLED = "cancelled"
+    #: Answered, cancelled or gone in Omnigent itself (not via the factory): closed.
+    RESOLVED_IN_OMNIGENT = "resolved_in_omnigent"
 
 
 class DecisionImpact(enum.StrEnum):

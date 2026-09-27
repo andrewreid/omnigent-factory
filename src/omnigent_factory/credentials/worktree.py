@@ -28,6 +28,7 @@ for the origin URL must be exactly ``[factory helper]`` (:meth:`Workspaces.effec
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
@@ -38,6 +39,25 @@ from dataclasses import dataclass
 from pathlib import Path
 
 GITHUB_HTTPS = "https://github.com/"
+
+#: Claude Code tools pre-approved in factory worktrees (bare names match every use).
+HARNESS_ALLOW_RULES = (
+    "Bash",
+    "Read",
+    "Edit",
+    "MultiEdit",
+    "Write",
+    "Glob",
+    "Grep",
+    "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
+    "Skill",
+    "ToolSearch",
+    "TodoWrite",
+    "Task",
+    "mcp__omnigent",
+)
 
 
 class WorktreeError(RuntimeError):
@@ -156,6 +176,8 @@ class Workspaces:
         *,
         git: str = "git",
         runner_config_env: Mapping[str, str] | None = None,
+        push_guard_dir: Path | None = None,
+        harness_settings: bool = False,
     ) -> None:
         declared = dict(runner_config_env or {})
         if config_selectors(declared) != declared:
@@ -166,6 +188,10 @@ class Workspaces:
         self.owned_roots = tuple(r.resolve() for r in owned_roots)
         self.repository = repository
         self.git = git
+        #: ``core.hooksPath`` for wired worktrees (the parcel-branch ``pre-push`` guard).
+        self.push_guard_dir = push_guard_dir
+        #: Write worktree-scoped Claude Code allow rules (never committed; see below).
+        self.harness_settings = harness_settings
 
     @property
     def remote_url(self) -> str:
@@ -432,9 +458,68 @@ class Workspaces:
         cfg("factory.capabilityFile", str(wiring.capability_file))
         cfg("factory.socket", str(wiring.socket_path))
         cfg("factory.repository", wiring.repository)
+        cfg("factory.branch", verified.branch)
+        if self.push_guard_dir is not None:
+            cfg("core.hooksPath", str(self.push_guard_dir))
+        if self.harness_settings:
+            self.write_harness_settings(path)
         self.check_transport(path)
         self._generic_resets_hold(path)
         self._check_helper_chain(path, helper)
+
+    def write_harness_settings(self, path: Path) -> bool:
+        """Worktree-scoped Claude Code allow rules so factory sessions never stop on a
+        harness permission prompt for normal work (owner direction 2026-09-27).
+
+        Written to ``<worktree>/.claude/settings.local.json`` only after Git confirms the
+        file is ignored (it is added to the dedicated clone's ``info/exclude`` if needed),
+        so it can never be committed. Omnigent's session policies still apply: allow rules
+        skip Claude's own prompt, not Omnigent's PreToolUse/TOOL_CALL policy hooks.
+        Returns whether the file was written.
+        """
+        rel = ".claude/settings.local.json"
+        if not self._ignored(path, rel):
+            exclude = self.common_dir(path) / "info" / "exclude"
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+            if f"/{rel}" not in existing.splitlines():
+                with exclude.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        ("" if existing.endswith("\n") or not existing else "\n") + f"/{rel}\n"
+                    )
+            if not self._ignored(path, rel):
+                return False
+        target = path / rel
+        current: dict[str, object] = {}
+        if target.is_file():
+            try:
+                loaded = json.loads(target.read_text(encoding="utf-8"))
+                current = loaded if isinstance(loaded, dict) else {}
+            except ValueError:
+                current = {}
+        permissions = current.get("permissions")
+        permissions = dict(permissions) if isinstance(permissions, dict) else {}
+        allow = [a for a in permissions.get("allow", []) if isinstance(a, str)]
+        dirs = [d for d in permissions.get("additionalDirectories", []) if isinstance(d, str)]
+        for rule in HARNESS_ALLOW_RULES:
+            if rule not in allow:
+                allow.append(rule)
+        for extra in (str(self.common_dir(path)), tempfile.gettempdir()):
+            if extra not in dirs:
+                dirs.append(extra)
+        permissions.update(allow=allow, additionalDirectories=dirs)
+        current["permissions"] = permissions
+        target.parent.mkdir(exist_ok=True)
+        tmp = target.with_suffix(".tmp")
+        tmp.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, target)
+        return True
+
+    def _ignored(self, path: Path, rel: str) -> bool:
+        proc = _run(
+            ["check-ignore", "-q", rel], path, check=False, git=self.git, env=self.inspection_env
+        )
+        return proc.returncode == 0
 
     def wiring_of(self, path: Path) -> StageWiring | None:
         def get(key: str) -> str | None:

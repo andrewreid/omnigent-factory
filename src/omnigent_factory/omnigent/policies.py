@@ -93,24 +93,39 @@ def cost_policy(generation: int, threshold_usd: float) -> PolicySpec:
 
 
 def github_policy(kind: SessionKind, repository: str, branch: str) -> PolicySpec:
-    """Build writes only its parcel branch; triage/plan write nothing (§5.2)."""
+    """Structured GitHub MCP tools only: build writes its parcel branch; others write nothing.
+
+    Liberal posture (owner direction 2026-09-27): no factory policy may raise a human
+    prompt. The pinned builtin ASKs whenever it cannot tokenise a shell command or resolve
+    a remote alias such as ``origin`` - i.e. on ordinary ``git push`` / ``gh pr create`` and
+    on heredocs that merely mention ``gh``. Its shell surface is therefore disabled
+    (``shell_tools: []``); the MCP surface fails closed with DENY, never ASK. Shell git/gh
+    is governed by the deny-only ``factory-cel`` scan and the worktree ``pre-push`` guard.
+    """
     build = kind == SessionKind.BUILD
     return PolicySpec(
         GITHUB_NAME,
         GITHUB_HANDLER,
         {
-            "read_all": False,
-            "read_repos": [repository],
+            "read_all": True,
             "write_repos": [repository] if build else [],
             "write_branches": [branch] if build else [],
             "allow_destructive": False,
             "deny_tag_push": True,
-            "deny_force_push": True,
+            "deny_force_push": False,
+            "shell_tools": [],
         },
     )
 
 
-CEL_REASON = "Factory stages may not merge, administer the repository or push the default branch."
+CEL_REASON = (
+    "Denied by factory policy: merging, --admin or hook bypass, pushing the default "
+    "branch, repository/ruleset/branch-protection/collaborator/secret/workflow "
+    "administration, closing or deleting issues and deleting repositories are the owner's. "
+    "Everything else is allowed. If this matched text inside a message, commit body or "
+    "file content, write that text to a file and pass it by path (e.g. --body-file / -F) "
+    "and rerun the command."
+)
 
 #: MCP GitHub tools that merge or administer (matched against ``event.data.name``).
 _ADMIN_TOOLS = (
@@ -118,24 +133,65 @@ _ADMIN_TOOLS = (
     r"delete_repository|update_repository|transfer_repository|"
     r"create_or_update_ruleset|update_ruleset|delete_ruleset|"
     r"update_branch_protection|delete_branch_protection|add_collaborator|"
-    r"remove_collaborator|create_or_update_secret|delete_secret|delete_branch)"
+    r"remove_collaborator|create_or_update_secret|delete_secret|delete_branch|"
+    r"close_issue|delete_issue|lock_issue)"
 )
 #: MCP file-write tools that commit straight to a branch named in ``arguments.branch``.
 _FILE_TOOLS = r"(?i)(push_files|create_or_update_file|delete_file)"
 
+#: Argument keys that carry shell command text across harness shell tools
+#: (``sys_os_shell``/``Bash``: ``command``; Codex ``exec_command``: ``cmd``). File content
+#: written by Write/Edit tools is not scanned, so documentation may mention these commands.
+_COMMAND_KEYS = ("command", "cmd", "script")
+
+#: One shell "segment": text up to the next separator, so a match cannot straddle
+#: ``a && b`` or a new line. Scanning raw text needs no parse, so it cannot fail.
+_SEG = r"[^\n;&|]*"
+
 
 def _shell_pattern(default_branch: str) -> str:
+    """Deny-list scan over raw command text (any string argument of any tool).
+
+    Conservative substring rules, never an ASK. Branch confinement for pushes is exact in
+    the worktree ``pre-push`` guard; this scan covers what git hooks cannot see.
+    """
     branch = re.escape(default_branch)
-    return (
-        r"(?i)(\bgh\s+pr\s+merge\b"
-        r"|\bgh\s+api\b.*\bpulls/[0-9]+/merge\b"
-        r"|\bgh\s+api\b.*(/rulesets|/protection|/collaborators|/hooks|/keys|"
-        r"/actions/secrets|/environments|/transfer)"
-        r"|\bgh\s+api\b.*(-X|--method)[\s=]*(DELETE|PUT|PATCH)\b"
-        r"|\bgh\s+(repo\s+(delete|edit|rename|archive|transfer)|ruleset|secret|variable)\b"
-        r"|\bgit\s+push\b.*\s--(mirror|all|delete)\b"
-        r"|\bgit\s+push\b.*(\s|:|\+|refs/heads/)" + branch + r"(\s|$))"
-    )
+    rules = [
+        # merging and auto-merge (CLI, REST merge endpoints, GraphQL mutations)
+        r"\bgh\s+pr\s+merge\b",
+        r"/pulls/[0-9]+/merge\b",
+        r"\brepos/[^\s/]+/[^\s/]+/merges\b",
+        r"\b(mergePullRequest|enablePullRequestAutoMerge|mergeBranch)\b",
+        # admin override and hook bypass (the pre-push guard is the branch boundary)
+        r"(^|\s)--admin\b",
+        r"\bgit\b" + _SEG + r"\bpush\b" + _SEG + r"\s--no-verify\b",
+        r"(?i:hookspath)",
+        # pushing the default branch by name (belt to the guard and the ruleset)
+        r"\bgit\b"
+        + _SEG
+        + r"\bpush\b"
+        + _SEG
+        + r"(\s|:|\+|refs/heads/)"
+        + branch
+        + r"(\s|$|['\"])",
+        # repository administration through the API or CLI
+        r"\bgh\s+api\b" + _SEG + r"(rulesets|/protection\b|/collaborators\b|/hooks\b"
+        r"|/keys\b|/secrets\b|/variables\b|/environments\b|/transfer\b"
+        r"|/actions/permissions\b|/branches/[^\s/]+/rename\b"
+        r"|/actions/workflows/[^\s/]+/(enable|disable)\b)",
+        r"\bgh\s+api\b"
+        + _SEG
+        + r"(-X|--method)[\s=]*(PATCH|PUT)\b"
+        + _SEG
+        + r"\brepos/[^\s/]+/[^\s/'\"]+/?(\s|$|['\"])",
+        r"\bgh\s+api\b" + _SEG + r"(-X|--method)[\s=]*DELETE\b",
+        r"\bgh\s+(repo\s+(delete|edit|rename|archive|transfer)|ruleset|secret|variable)\b",
+        r"\bgh\s+workflow\s+(enable|disable)\b",
+        # closing / deleting issues and deleting repositories
+        r"\bgh\s+issue\s+(close|delete|transfer|lock)\b",
+        r"\bgh\s+api\b" + _SEG + r"/issues/[0-9]+\b" + _SEG + r"\bstate[\s=:]+[\"']?closed\b",
+    ]
+    return "(" + "|".join(rules) + ")"
 
 
 def _cel_string(value: str) -> str:
@@ -147,8 +203,8 @@ def factory_cel_expression(default_branch: str = "main") -> str:
 
     ``tool_call`` events carry ``data = {"name": <tool>, "arguments": {...}}``. The rule
     denies MCP merge/administration tools, MCP file writes to the default branch, and any
-    string argument (shell command text) that merges, administers or pushes the default
-    branch. Every access is type-guarded: the pinned ``cel_policy`` *abstains* (allows)
+    command argument (shell text) matching the deny list. It only ever returns DENY
+    or ALLOW. Every access is type-guarded: the pinned ``cel_policy`` *abstains* (allows)
     on an evaluation error, so an unguarded field access would fail open.
     """
     if not default_branch or any(c.isspace() for c in default_branch):
@@ -163,10 +219,22 @@ def factory_cel_expression(default_branch: str = "main") -> str:
         f"({named} && {data}.name.matches({_cel_string(_FILE_TOOLS)}) && {has_args}"
         f" && has({args}.branch) && {args}.branch == {_cel_string(default_branch)})"
     )
-    shell = (
-        f"({has_args} && {args}.exists(k, type({args}[k]) == string"
-        f" && {args}[k].matches({_cel_string(_shell_pattern(default_branch))})))"
+    pattern = _cel_string(_shell_pattern(default_branch))
+    command_key = " || ".join(f'k == "{key}"' for key in _COMMAND_KEYS)
+    # celpy evaluates a nested ``exists`` target eagerly even behind ``&&``: a list
+    # comprehension over a non-list argument raises, the pinned cel_policy then abstains
+    # and the call would be ALLOWED. Keep string and list forms in separate guarded
+    # clauses (list form keyed by ``has()``), so no argument type can make this fail open.
+    string_form = (
+        f"({has_args} && {args}.exists(k, ({command_key})"
+        f" && type({args}[k]) == string && {args}[k].matches({pattern})))"
     )
+    list_forms = [
+        f"({has_args} && has({args}.{key}) && type({args}.{key}) == list"
+        f" && {args}.{key}.exists(x, type(x) == string && x.matches({pattern})))"
+        for key in _COMMAND_KEYS
+    ]
+    shell = "(" + " || ".join([string_form, *list_forms]) + ")"
     return (
         f"({is_call}) && ({admin_tool} || {file_to_default} || {shell})"
         f' ? {{"result": "DENY", "reason": {_cel_string(CEL_REASON)}}}'

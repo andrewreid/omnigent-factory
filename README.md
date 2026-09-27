@@ -50,3 +50,13 @@ never starts a new session:
 omnigent-factory recovery                    # lists failed/unknown effects
 omnigent-factory retry-effect <effect_id>    # publish_triage/publish_report/post_comment only
 ```
+
+A parcel whose existing stage session was stopped by a stale block (a question already
+answered in Omnigent, an invalid or `blocked` result) can be resumed without a new
+session. The operator note is relayed once; no authority, approval or time is added, and
+the normal execution gate must hold:
+
+```sh
+omnigent-factory resume <parcel-node-id> --message-file note.md
+omnigent-factory rerender-comment <effect_id>   # re-render a published comment in place
+```

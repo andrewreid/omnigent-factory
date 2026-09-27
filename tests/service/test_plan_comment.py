@@ -207,10 +207,75 @@ def test_live_legacy_comment_carries_the_same_canonical_bytes():
 def test_status_comments_are_sentences_not_template_names():
     from omnigent_factory.service.directory import _status_text
 
-    assert _status_text("control-rejected", {"reason": "plan_not_allowed", "event_id": "e"}) == (
-        "Factory: that command was not accepted (plan not allowed)."
+    assert _status_text("control-rejected", {"reason": "plan-not-allowed", "event_id": "e"}) == (
+        "Factory: couldn't do that: the request was not valid now (plan not allowed)."
     )
     assert "`/decide dc_1 <answer>`" in _status_text(
         "decision", {"decision_id": "dc_1", "impact": "plan_revision"}
     )
     assert _status_text("unknown-template", {}) == "Factory status: unknown template."
+
+
+def test_refused_waiver_drag_is_explained_with_the_next_step():
+    from omnigent_factory.service.directory import _status_text
+
+    text = _status_text(
+        "control-rejected",
+        {
+            "reason": "open-decisions",
+            "control": "WaivePlan",
+            "open_decisions": "de_21ada6942c3a9806d3b15ef8",
+            "rolled_back_to": "Triaged",
+        },
+    )
+    assert text == (
+        "Factory: couldn't start building (plan waived): 1 open question(s) from an earlier "
+        "session (`de_21ada6942c3a9806d3b15ef8`). Answer in Omnigent or comment "
+        "`/decide <id> <answer>`, then try again. The card was moved back to Triaged; drag "
+        "it again when ready."
+    )
+
+
+def test_decision_relay_says_what_is_asked_and_links_the_prompt_holder(
+    service_config: ServiceConfig,
+):
+    from omnigent_factory.service.directory import PublicationRenderer
+
+    renderer = PublicationRenderer(None, service_config)  # type: ignore[arg-type]
+    effect = EffectIntent(
+        effect_id="ef_q",
+        kind=EffectKind.POST_COMMENT,
+        parcel_id=PARCEL_ID,
+        target=PARCEL_ID,
+        preconditions=Preconditions(1, 0),
+        args={
+            "template": "decision",
+            "decision_id": "de_1",
+            "summary": "Molly asks: keep the harness change or drop it?",
+            "node_id": "e724833307bb43279d8b0f76ff47bc53",
+            "root_id": "53085a291e43487cb8fa288501a95ec9",
+        },
+    )
+    text = renderer._decision_text(effect)
+    base = service_config.omnigent_base_url.rstrip("/")
+    assert "> Molly asks: keep the harness change or drop it?" in text
+    assert f"[open the prompt in Omnigent]({base}/c/e724833307bb43279d8b0f76ff47bc53)" in text
+    assert f"[stage session]({base}/c/53085a291e43487cb8fa288501a95ec9)" in text
+    assert "`/decide de_1 <answer>`" in text and "returns to Working" in text
+
+
+def test_omnigent_link_is_derived_from_config_and_rejects_odd_ids():
+    from omnigent_factory.service.directory import omnigent_link
+
+    assert omnigent_link("https://omni.example/", "abc_1-2") == "https://omni.example/c/abc_1-2"
+    assert omnigent_link("https://omni.example", "../x") is None
+    assert omnigent_link("https://omni.example", None) is None
+
+
+def test_plan_comment_link_stays_outside_the_approved_section(service_config: ServiceConfig):
+    parcel, contract = _parcel()
+    link = "https://omnigent.reid.ee/c/02ddb5c28de743ac90821c51cf2c3ae8"
+    text = render_contract_comment(parcel, contract, FIXTURE["plan_result"], service_config, link)
+    assert text is not None and f"[Open in Omnigent]({link})" in text
+    assert extract_contract_section(text) == render_contract_section(CANONICAL)
+    assert text.index(SECTION_END) < text.index(link)

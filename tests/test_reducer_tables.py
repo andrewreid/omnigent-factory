@@ -925,14 +925,33 @@ def test_D03_build_answer_changing_contract_revokes_and_replans():
     assert p.pending_authorization_id is not None and p.stage == Stage.SCOPED
 
 
-def test_D04_answer_relayed_after_prompt_disappears():
+def test_D04_prompt_gone_in_omnigent_closes_the_decision_and_resumes_work():
+    """Owner direction (#462/#677 pilot): a prompt answered in Omnigent is closed."""
     h = Harness()
     h.to_building()
     _, d = open_decision(h)
+    assert h.p().bot == BotState.NEEDS_YOU
     h.send(P, ev.ElicitationGone(session_id=d.session_id, elicitation_id=d.elicitation_id))
+    p = h.p()
+    assert p.decision(d.decision_id).status == DecisionStatus.RESOLVED_IN_OMNIGENT
+    assert not p.open_decisions and p.bot == BotState.WORKING
+    assert p.session(d.session_id).lifecycle == Lifecycle.ACTIVE
+    # Nothing is open to answer any more, so a late /decide is explained, not relayed.
     r = h.send(P, ev.Decide(answer="yes", within_contract=True))
-    [msg] = Harness.of(r, EffectKind.SEND_MESSAGE)
-    assert msg.args["purpose"] == MessagePurpose.ANSWER_RELAY.value
+    assert not r.audit.accepted and not Harness.of(r, EffectKind.SEND_MESSAGE)
+
+
+def test_D04b_answer_given_here_before_the_prompt_disappears_is_still_relayed():
+    h = Harness()
+    h.to_building()
+    _, d = open_decision(h)
+    h.send(P, ev.Decide(answer="yes", within_contract=True))
+    r = h.send(P, ev.ElicitationGone(session_id=d.session_id, elicitation_id=d.elicitation_id))
+    assert h.p().decision(d.decision_id).status in (
+        DecisionStatus.ANSWERED,
+        DecisionStatus.RELAYED,
+    )
+    assert not r.audit.accepted or h.p().decision(d.decision_id).prompt_lost
 
 
 def test_D05_uncorrelated_resolution_grants_nothing():
@@ -940,8 +959,10 @@ def test_D05_uncorrelated_resolution_grants_nothing():
     h.to_building()
     _, d = open_decision(h)
     r = h.send(P, ev.ElicitationResolved(session_id=d.session_id, elicitation_id=d.elicitation_id))
-    assert h.p().decision(d.decision_id).status == DecisionStatus.OPEN
-    assert h.p().decision(d.decision_id).externally_resolved and not work(r)
+    closed = h.p().decision(d.decision_id)
+    assert closed.status == DecisionStatus.RESOLVED_IN_OMNIGENT and closed.externally_resolved
+    assert not work(r) and closed.answer is None
+    assert h.p().bot == BotState.WORKING
 
 
 def test_D06_active_limit_enters_grace_once():
@@ -1391,3 +1412,147 @@ def test_B07g_owner_plan_command_resumes_after_result_invalid():
     assert p.current_session.session_id != s.session_id
     assert p.current_session.kind == SessionKind.PLAN
     assert [x.kind for x in p.sessions].count(SessionKind.TRIAGE) == 1
+
+
+def test_D12_reconcile_closes_legacy_stale_decisions_and_resumes_the_build():
+    """#677/#462 recovery: records left open (prompt already gone) self-heal on reconcile."""
+    h = Harness()
+    h.to_building()
+    _, d = open_decision(h)
+    p = h.p()
+    legacy = replace(p.decision(d.decision_id), prompt_lost=True)  # pre-fix Gone handling
+    h.parcels[P] = replace(
+        p, decisions=tuple(legacy if x.decision_id == d.decision_id else x for x in p.decisions)
+    )
+    assert h.p().bot == BotState.NEEDS_YOU and h.cur().lifecycle == Lifecycle.WAITING
+    r = h.send(P, ev.ReconcileDue())
+    p = h.p()
+    assert p.decision(d.decision_id).status == DecisionStatus.RESOLVED_IN_OMNIGENT
+    assert p.bot == BotState.WORKING and h.cur().lifecycle == Lifecycle.ACTIVE
+    [bot] = Harness.of(r, EffectKind.SET_BOT)
+    assert bot.args == {"bot": "Working"}
+
+
+def test_D13_reconcile_reasserts_bot_to_correct_board_drift():
+    h = Harness()
+    h.to_building()
+    r = h.send(P, ev.ReconcileDue())
+    [bot] = Harness.of(r, EffectKind.SET_BOT)  # adapter adopts when the board matches
+    assert bot.args == {"bot": h.p().bot.value} == {"bot": "Working"}
+    again = h.send(P, ev.ReconcileDue())
+    assert Harness.of(again, EffectKind.SET_BOT)  # every cycle, so owner edits revert
+
+
+def test_D14_finished_session_orphans_its_open_decisions():
+    h = Harness()
+    s = h.triage()
+    h.send(P, ev.RequestPlan(via=Via.DRAG))
+    stale = [d for d in h.p().decisions if d.session_id == s.session_id]
+    assert all(d.status != DecisionStatus.OPEN for d in stale)
+    h2 = Harness()
+    h2.eligible()
+    h2.send(P, ev.RequestTriage())
+    t = h2.create_ok()
+    _, d = open_decision(h2)
+    h2.send(P, ev.Stop())
+    h2.quiesce(P, t.session_id)
+    assert h2.p().decision(d.decision_id).status == DecisionStatus.ORPHANED
+    assert not h2.p().open_decisions
+
+
+def test_C02b_refused_waiver_drag_rolls_the_card_back_and_explains_next_step():
+    """#462: WaivePlan refused for open decisions left the card in Building, idle."""
+    h = Harness()
+    h.eligible()
+    h.send(P, ev.RequestTriage())
+    h.create_ok()
+    _, d = open_decision(h)
+    assert h.p().stage == Stage.TRIAGED
+    f = h.f()
+    r = h.apply(
+        f.make(
+            ev.WaivePlan(via=Via.DRAG),
+            evidence=snapshot(read_at_us=f.now, stage=Stage.BUILDING),
+        )
+    )
+    assert not r.audit.accepted and r.audit.reason == "open-decisions"
+    [comment] = Harness.of(r, EffectKind.POST_COMMENT)
+    assert comment.args["template"] == "control-rejected"
+    assert comment.args["open_decisions"] == d.decision_id
+    assert comment.args["rolled_back_to"] == "Triaged"
+    [move] = Harness.of(r, EffectKind.MOVE_CARD)
+    assert move.args == {"to": "Triaged", "expected_from": "Building"}
+
+
+def test_D15_677_gate_reopens_when_the_prompt_is_answered_in_omnigent():
+    """#677: elicitation opened → answered in Omnigent (Gone) → token gate must allow."""
+    from omnigent_factory.core.predicates import work_allowed
+
+    h = Harness()
+    b = h.to_building()
+    assert work_allowed(h.p(), h.cur())
+    _, d = open_decision(h, impact=DecisionImpact.UNKNOWN)
+    assert not work_allowed(h.p(), h.cur())  # an open question pauses the build
+    h.send(P, ev.ElicitationGone(session_id=b.session_id, elicitation_id=d.elicitation_id))
+    p, s = h.p(), h.cur()
+    assert not p.open_decisions and s.lifecycle == Lifecycle.ACTIVE
+    assert work_allowed(p, s)  # StoreExecutionGate.token_gate allows exactly when this holds
+
+
+def _stuck_677(h):
+    """Build with a pre-fix stale decision and a result_invalid block (live #677 shape)."""
+    b = h.to_building()
+    _, d = open_decision(h, impact=DecisionImpact.UNKNOWN)
+    p = h.p()
+    legacy = replace(p.decision(d.decision_id), prompt_lost=True)
+    h.parcels[P] = replace(
+        p,
+        decisions=tuple(legacy if x.decision_id == d.decision_id else x for x in p.decisions),
+        holds=p.holds | {Hold.RESULT_INVALID},
+    )
+    return b, d
+
+
+def test_D16_operator_resume_reopens_the_same_session_and_relays_one_note():
+    from omnigent_factory.core.predicates import work_allowed
+
+    h = Harness()
+    b, d = _stuck_677(h)
+    assert not work_allowed(h.p(), h.cur())
+    f = h.f()
+    r = h.apply(
+        f.make(
+            ev.OperatorResume(text="Publish the staged candidate."), provenance=Provenance.OPERATOR
+        )
+    )
+    assert r.audit.accepted, r.audit.reason
+    p, s = h.p(), h.cur()
+    assert s.session_id == b.session_id and not Harness.of(r, EffectKind.CREATE_SESSION)
+    assert p.decision(d.decision_id).status == DecisionStatus.RESOLVED_IN_OMNIGENT
+    assert Hold.RESULT_INVALID not in p.holds and work_allowed(p, s)
+    [msg] = Harness.of(r, EffectKind.SEND_MESSAGE)
+    assert msg.args == {"purpose": "operator_note", "text": "Publish the staged candidate."}
+    assert p.bot == BotState.WORKING
+
+
+def test_D16b_operator_resume_adds_no_authority():
+    h = Harness()
+    h.to_building()
+    f = h.f()
+    owner = h.apply(f.make(ev.OperatorResume(text="x"), provenance=Provenance.WEBHOOK))
+    assert not owner.audit.accepted  # operator provenance only
+    h.send(P, ev.Stop())
+    stopped = h.apply(f.make(ev.OperatorResume(text="x"), provenance=Provenance.OPERATOR))
+    assert not stopped.audit.accepted and not Harness.of(stopped, EffectKind.SEND_MESSAGE)
+
+
+def test_D17_blocked_result_is_an_honest_blocked_state_not_a_schema_error():
+    h = Harness()
+    b = h.to_building()
+    r = h.send(P, result_candidate(b.session_id, b.root_id, b.revision, ev.ResultKind.BLOCKED))
+    assert r.audit.accepted
+    p = h.p()
+    assert Hold.AGENT_BLOCKED in p.holds and Hold.RESULT_INVALID not in p.holds
+    assert p.bot == BotState.BLOCKED
+    [report] = Harness.of(r, EffectKind.PUBLISH_REPORT)
+    assert report.args == {"report": "blocked", "session_id": b.session_id}

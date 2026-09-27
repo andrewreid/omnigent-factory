@@ -558,8 +558,16 @@ def _finish_drain(ctx: _Ctx, s: StageSession) -> None:
         ctx.unhold(Hold.STOP_UNVERIFIED)
     if target == Lifecycle.RETIRED or s.fences & _HARD_FENCES:
         _end_build_episode(ctx, s)
+        _orphan_open_decisions(ctx, s.session_id)
     if s.restart_pending:
         _replace_after_crash(ctx, s)
+
+
+def _orphan_open_decisions(ctx: _Ctx, session_id: str) -> None:
+    """A finished (or hard-fenced) session can no longer receive answers: close its prompts."""
+    for d in ctx.p.decisions:
+        if d.session_id == session_id and d.status == DecisionStatus.OPEN:
+            ctx.put_decision(replace(d, status=DecisionStatus.ORPHANED))
 
 
 def _create_session(
@@ -1202,11 +1210,18 @@ def _h_approve_plan(ctx: _Ctx, body: ev.ApprovePlan) -> None:
 
 
 def _h_waive_plan(ctx: _Ctx, body: ev.WaivePlan) -> None:
+    # A refused drag must not leave the card in Building with nothing running: roll it
+    # back to the column it came from (design §B "guarded card rollback").
+    origin = ctx.origin_stage
+    rollback = (
+        origin if body.via == Via.DRAG and origin is not None and origin != Stage.BUILDING else None
+    )
     _control(ctx)
     snap = ctx.event.evidence
     if snap is None:
-        raise Rejected("waiver-without-fresh-snapshot", explain=True)
-    _require_eligible(ctx)
+        raise Rejected("waiver-without-fresh-snapshot", explain=True, rollback_to=rollback)
+    if not eligible(ctx.p):
+        raise Rejected("parcel-not-eligible", explain=True, rollback_to=rollback)
     canonical = canonical_issue_snapshot(snap.title, snap.body)
     digest = sha256_hex(canonical)
     a = ctx.p.current_approval
@@ -1219,12 +1234,12 @@ def _h_waive_plan(ctx: _Ctx, body: ev.WaivePlan) -> None:
         ctx.comment("approval-acknowledged", approval_id=a.approval_id)
         return
     if ctx.p.open_decisions:
-        raise Rejected("open-decisions", explain=True)
+        raise Rejected("open-decisions", explain=True, rollback_to=rollback)
     if ctx.p.revision_pending:
-        raise Rejected("revision-in-flight", explain=True)
+        raise Rejected("revision-in-flight", explain=True, rollback_to=rollback)
     stage_ok = ctx.origin_stage in (None, Stage.INBOX, Stage.TRIAGED) or body.via == Via.LABEL
     if not stage_ok or _build_blocked_by_live(ctx) or _approval_active(ctx):
-        raise Rejected("waiver-stage-invalid", explain=True)
+        raise Rejected("waiver-stage-invalid", explain=True, rollback_to=rollback)
     duration = _grant_duration(ctx, body.duration_us, Size.M)
     approval = _new_approval(ctx, ApprovalKind.SKIP, digest, snapshot=canonical.decode("utf-8"))
     _after_approval(ctx, approval, duration, body.via)
@@ -1907,6 +1922,9 @@ def _h_elicitation_opened(ctx: _Ctx, body: ev.ElicitationOpened) -> None:
         decision_id=decision.decision_id,
         impact=body.impact.value,
         contract_hash=ctx.p.current_contract.full_hash if ctx.p.current_contract else None,
+        summary=body.summary[:300],
+        node_id=body.node_id,
+        root_id=s.root_id,
     )
 
 
@@ -1924,16 +1942,46 @@ def _h_elicitation_resolved(ctx: _Ctx, body: ev.ElicitationResolved) -> None:
             raise Rejected("resolution-not-ours")
         return
     # Direct UI resolution: observation only; no approval or grant inferred.
-    ctx.put_decision(replace(d, externally_resolved=True))
-    ctx.comment("decision-resolved-externally", decision_id=d.decision_id)
+    d = replace(d, externally_resolved=True)
+    if d.status == DecisionStatus.OPEN:
+        d = replace(d, status=DecisionStatus.RESOLVED_IN_OMNIGENT)
+    ctx.put_decision(d)
+    _resume_after_prompt(ctx, d)
 
 
 def _h_elicitation_gone(ctx: _Ctx, body: ev.ElicitationGone) -> None:
     d = _find_decision(ctx, body.session_id, body.elicitation_id)
-    ctx.put_decision(replace(d, prompt_lost=True))
     s = ctx.p.session(d.session_id)
-    if s is not None and d.status == DecisionStatus.ANSWERED:
-        _relay_answers(ctx, s)
+    if d.status == DecisionStatus.ANSWERED:
+        # Answered here first: the relay still carries the owner's answer.
+        ctx.put_decision(replace(d, prompt_lost=True))
+        if s is not None:
+            _relay_answers(ctx, s)
+        return
+    d = replace(d, prompt_lost=True)
+    if d.status == DecisionStatus.OPEN:
+        # Answered/cancelled in Omnigent: nothing waits on the owner any more.
+        d = replace(d, status=DecisionStatus.RESOLVED_IN_OMNIGENT)
+    ctx.put_decision(d)
+    _resume_after_prompt(ctx, d)
+
+
+def _resume_after_prompt(ctx: _Ctx, d: Decision) -> None:
+    """A prompt answered or cancelled outside the factory no longer waits on the owner.
+
+    The decision is closed (``resolved_in_omnigent``); a session parked in
+    WAITING for decisions resumes ACTIVE once none of its prompts are still pending, so
+    the board returns to Working. No approval, grant or answer is inferred.
+    """
+    s = ctx.p.session(d.session_id)
+    if (
+        s is None
+        or s.lifecycle != Lifecycle.WAITING
+        or s.wait_reason != WaitReason.DECISION
+        or any(o.session_id == s.session_id for o in ctx.p.open_decisions)
+    ):
+        return
+    ctx.put_session(replace(s, lifecycle=Lifecycle.ACTIVE, wait_reason=None))
 
 
 def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
@@ -1953,6 +2001,7 @@ def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
         ev.ResultKind.PLAN: s.kind in (SessionKind.PLAN, SessionKind.BUILD),
         ev.ResultKind.BUILD_READY: s.kind == SessionKind.BUILD,
         ev.ResultKind.CHECKPOINT: s.lifecycle == Lifecycle.CHECKPOINT_GRACE,
+        ev.ResultKind.BLOCKED: True,
     }[body.result_kind]
     decisions_ok = True
     if body.result_kind == ev.ResultKind.PLAN and s.kind == SessionKind.PLAN:
@@ -1974,6 +2023,11 @@ def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
         decisions_ok = body.pr_number is not None and body.head_sha is not None
     if not (body.valid and kind_ok and decisions_ok):
         _malformed(ctx, s)
+        return
+    if body.result_kind == ev.ResultKind.BLOCKED:
+        # Honest "could not finish": Blocked with the agent's reason; nothing inferred.
+        ctx.hold(Hold.AGENT_BLOCKED)
+        ctx.emit(EffectKind.PUBLISH_REPORT, args={"report": "blocked", "session_id": s.session_id})
         return
     if body.result_kind == ev.ResultKind.TRIAGE:
         if body.size is not None:
@@ -2247,9 +2301,63 @@ def _h_retry_due(ctx: _Ctx, body: ev.RetryDue) -> None:
     _ = body  # timers never approve, decide or reset an allowance
 
 
+def _close_stale_decisions(ctx: _Ctx) -> None:
+    """Self-heal records left open by earlier versions: prompts already gone or answered
+    in Omnigent, or belonging to sessions that have ended."""
+    for d in ctx.p.decisions:
+        if d.status != DecisionStatus.OPEN:
+            continue
+        owner = ctx.p.session(d.session_id)
+        if d.prompt_lost or d.externally_resolved:
+            ctx.put_decision(replace(d, status=DecisionStatus.RESOLVED_IN_OMNIGENT))
+        elif owner is None or owner.lifecycle in (Lifecycle.RETIRED, Lifecycle.FENCED):
+            ctx.put_decision(replace(d, status=DecisionStatus.ORPHANED))
+    for d in ctx.p.decisions:
+        _resume_after_prompt(ctx, d)
+
+
+_RESUMABLE = frozenset({Lifecycle.ACTIVE, Lifecycle.WAITING})
+
+
+def _h_operator_resume(ctx: _Ctx, body: ev.OperatorResume) -> None:
+    """Re-open the existing current session after a stale block and relay one note.
+
+    Closes decisions already resolved in Omnigent and clears result/agent blocks, then
+    requires the ordinary execution gate (authority, approval, grant, no open decision)
+    to hold by itself: the operator adds no authority, approval or time.
+    """
+    s = ctx.p.current_session
+    if s is None or s.root_id is None:
+        raise Rejected("no-current-session")
+    if s.fences or s.lifecycle not in _RESUMABLE or s.execution_closed:
+        raise Rejected("session-not-resumable")
+    if not body.text.strip():
+        raise Rejected("empty-note")
+    _close_stale_decisions(ctx)
+    ctx.unhold(Hold.RESULT_INVALID, Hold.AGENT_BLOCKED)
+    s = _session(ctx, s.session_id)
+    if s.lifecycle == Lifecycle.WAITING and s.wait_reason == WaitReason.DECISION:
+        s = ctx.put_session(replace(s, lifecycle=Lifecycle.ACTIVE, wait_reason=None))
+    if not work_allowed(ctx.p, s):
+        raise Rejected("work-not-allowed")
+    ctx.emit(
+        EffectKind.SEND_MESSAGE,
+        session=s,
+        args={"purpose": MessagePurpose.OPERATOR_NOTE.value, "text": body.text[:8000]},
+    )
+
+
 def _h_reconcile_due(ctx: _Ctx, body: ev.ReconcileDue) -> None:
-    ctx.emit(EffectKind.RECONCILE_PARCEL)
     _ = body
+    ctx.emit(EffectKind.RECONCILE_PARCEL)
+    _close_stale_decisions(ctx)
+    # Correct drift: the board's Bot field is re-asserted from derived state each cycle
+    # (the adapter adopts without writing when it already matches).
+    ctx.update(bot=project_bot(ctx.p))
+    if ctx.p.in_project:
+        ctx.emit(
+            EffectKind.SET_BOT, args={"bot": ctx.p.bot.value}, dedupe=f"bot:{ctx.event.event_id}"
+        )
 
 
 # ================================================================== dispatch
@@ -2287,6 +2395,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.CHECKS_CHANGED: _h_checks_changed,
     EventKind.REVIEW_CHANGED: _h_review_changed,
     EventKind.READINESS_EVIDENCE: _h_readiness,
+    EventKind.OPERATOR_RESUME: _h_operator_resume,
     EventKind.CONTRACT_PUBLISHED: _h_contract_published,
     EventKind.PUBLICATION_ACKED: _h_publication_acked,
     EventKind.SESSION_CREATED: _h_session_created,
@@ -2324,7 +2433,14 @@ def _explanation(ctx: _Ctx, rejection: Rejected) -> None:
         return
     if e.actor_id is None or e.actor_id not in ctx.config.owners:
         return
-    ctx.comment("control-rejected", reason=rejection.reason, event_id=e.event_id)
+    ctx.comment(
+        "control-rejected",
+        reason=rejection.reason,
+        event_id=e.event_id,
+        control=e.kind.value,
+        open_decisions=",".join(d.decision_id for d in ctx.p.open_decisions),
+        rolled_back_to=rejection.rollback_to.value if rejection.rollback_to else None,
+    )
     if rejection.rollback_to is not None and ctx.p.stage != rejection.rollback_to:
         # The owner's drag already put the card in Building; the persisted stage is
         # unchanged, so the expected source is given explicitly. Serialised like every

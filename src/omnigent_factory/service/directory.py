@@ -158,8 +158,6 @@ class ServiceDispatchDirectory:
             return None
         template_name = str(snapshot.get("template") or "")
         template = _template(template_name)
-        if hashlib.sha256(template.encode()).hexdigest() != snapshot.get("template_sha256"):
-            return None
         boundary = snapshot.get("untrusted_boundary")
         if not isinstance(boundary, str) or not boundary:
             boundary = _new_boundary()
@@ -195,6 +193,14 @@ class ServiceDispatchDirectory:
                 feedback=_untrusted(feedback, boundary),
                 untrusted_boundary=boundary,
             )
+        if purpose == "operator_note":
+            note = str(effect.args.get("text") or "").strip()
+            if not note:
+                return None
+            return _template("operator-v1.txt").format(note=note, session_id=sid)
+        # The dispatch snapshot pins the first message's template bytes (restart-stable).
+        if hashlib.sha256(template.encode()).hexdigest() != snapshot.get("template_sha256"):
+            return None
         issue_snapshot = await self._issue_snapshot(parcel)
         common: dict[str, object] = {
             "repository": self.config.repository,
@@ -410,7 +416,8 @@ class PublicationRenderer:
             if contract is None:
                 return None
             plan = self.directory.plan_result_for(contract.source_session_id, contract.canonical)
-            return render_contract_comment(parcel, contract, plan, self.config)
+            link = self._stage_link(parcel, contract.source_session_id)
+            return render_contract_comment(parcel, contract, plan, self.config, link)
         if effect.kind == EffectKind.PUBLISH_REPORT and effect.args.get("report") == "ready":
             text = (
                 f"Factory: PR #{effect.args.get('pr_number')} at "
@@ -422,6 +429,8 @@ class PublicationRenderer:
             if body is None:
                 return None
             text = _public_result(body)
+        elif effect.kind == EffectKind.POST_COMMENT and effect.args.get("template") == "decision":
+            return _safe_publication(self._decision_text(effect), self.config)
         elif effect.kind == EffectKind.POST_COMMENT:
             template = str(effect.args.get("template") or "status")
             text = _status_text(template, effect.args)
@@ -443,7 +452,57 @@ class PublicationRenderer:
                 )
         else:
             return None
+        sid = effect.args.get("session_id") or effect.preconditions.session_id
+        if effect.args.get("report") == "ready" and parcel.readiness is not None:
+            sid = parcel.readiness.session_id
+        link = self._stage_link(parcel, str(sid) if sid else None)
+        if link is not None:
+            text = f"{text}\n\n[Open in Omnigent]({link})"
         return _safe_publication(text, self.config)
+
+    def _stage_link(self, parcel: Parcel, session_id: str | None) -> str | None:
+        """Deeplink to the stage's root Omnigent session (the named one, else current)."""
+        session = parcel.session(session_id) if session_id else parcel.current_session
+        if session is None:
+            session = parcel.current_session
+        return omnigent_link(self.config.omnigent_base_url, session.root_id if session else None)
+
+    def _decision_text(self, effect: EffectIntent) -> str:
+        """What Molly is asking, where to answer it, and the ``/decide`` fallback."""
+        args = effect.args
+        decision_id = str(args.get("decision_id") or "")
+        summary = str(args.get("summary") or "").strip()
+        node = omnigent_link(self.config.omnigent_base_url, _text_or_none(args.get("node_id")))
+        root = omnigent_link(self.config.omnigent_base_url, _text_or_none(args.get("root_id")))
+        lines = [f"**Factory: Molly is waiting for an answer** (decision `{decision_id}`)."]
+        if summary:
+            lines += ["", f"> {summary}"]
+        where: list[str] = []
+        if node is not None:
+            where.append(f"[open the prompt in Omnigent]({node})")
+        if root is not None and root != node:
+            where.append(f"[stage session]({root})")
+        answer = "Answer it in Omnigent" + (f" ({', '.join(where)})" if where else "")
+        lines += [
+            "",
+            f"{answer}, or comment `/decide {decision_id} <answer>`. The card returns to "
+            "Working once the prompt is answered.",
+        ]
+        return "\n".join(lines)
+
+
+_OMNIGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+def omnigent_link(base_url: str, session_id: str | None) -> str | None:
+    """``{omnigent_base_url}/c/{session_id}``: Omnigent's share link (normal Omnigent auth)."""
+    if not session_id or _OMNIGENT_ID.fullmatch(session_id) is None:
+        return None
+    return f"{base_url.rstrip('/')}/c/{session_id}"
+
+
+def _text_or_none(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 def _authority(parcel: Parcel) -> tuple[str, str]:
@@ -458,7 +517,11 @@ def _authority(parcel: Parcel) -> tuple[str, str]:
 
 
 def render_contract_comment(
-    parcel: Parcel, contract: Contract, plan: dict[str, Any] | None, config: ServiceConfig
+    parcel: Parcel,
+    contract: Contract,
+    plan: dict[str, Any] | None,
+    config: ServiceConfig,
+    session_link: str | None = None,
 ) -> str | None:
     """Readable plan comment: parcel marker, deterministic contract section, context.
 
@@ -482,6 +545,9 @@ def render_contract_comment(
         "**How to respond:** drag the card to Building to approve this exact plan (or "
         f"comment `/approve {contract.prefix}`), or reply with feedback for a revision."
     )
+    if session_link is not None:
+        # Outside the hash-bound section: the link never affects the approval target.
+        respond += f"\n\n[Open in Omnigent]({session_link})"
     open_ids = [d.decision_id for d in parcel.open_decisions]
     if open_ids:
         respond = (
@@ -560,7 +626,55 @@ _STATUS_TEXT = {
 }
 
 
+_CONTROL_NAMES = {
+    "WaivePlan": "start building (plan waived)",
+    "ApprovePlan": "approve the plan",
+    "RequestPlan": "start a plan",
+    "RequestReplan": "start a replan",
+    "RequestTriage": "start triage",
+    "Continue": "continue",
+    "Decide": "record that answer",
+}
+_REFUSAL_REASONS = {
+    "open-decisions": "{n} open question(s) from an earlier session ({ids}). Answer in "
+    "Omnigent or comment `/decide <id> <answer>`, then try again.",
+    "revision-in-flight": "a plan revision is still in progress; wait for the updated plan.",
+    "waiver-stage-invalid": "the card can skip the plan only from Inbox or Triaged, and not "
+    "while another build or approval is active.",
+    "approval-stage-invalid": "approval is only possible from Scoped while no build is live.",
+    "plan-not-approvable": "the current plan is not approvable yet (open decisions or a "
+    "pending revision).",
+    "no-published-contract": "there is no published plan to approve.",
+    "hash-does-not-identify-latest": "that hash does not identify the latest plan.",
+    "decision-not-open": "that decision is not open (it may already be answered in Omnigent).",
+    "decision-ambiguous": "more than one question is open; name it with `/decide <id> <answer>`.",
+    "parcel-not-eligible": "the issue is not eligible (closed, assigned to a person, or not "
+    "on the board).",
+    "not-at-checkpoint": "nothing is waiting at a checkpoint.",
+}
+
+
+def _refusal_text(args: Mapping[str, Any]) -> str:
+    """A refused owner control in plain language, with the next step and any card rollback."""
+    control = _CONTROL_NAMES.get(str(args.get("control") or ""), "do that")
+    reason = str(args.get("reason") or "")
+    ids = [i for i in str(args.get("open_decisions") or "").split(",") if i]
+    pattern = _REFUSAL_REASONS.get(reason)
+    why = (
+        pattern.format(n=len(ids), ids=", ".join(f"`{i}`" for i in ids) or "none recorded")
+        if pattern is not None
+        else f"the request was not valid now ({reason.replace('-', ' ')})."
+    )
+    text = f"Factory: couldn't {control}: {why}"
+    rolled = args.get("rolled_back_to")
+    if isinstance(rolled, str) and rolled:
+        text += f" The card was moved back to {rolled}; drag it again when ready."
+    return text
+
+
 def _status_text(template: str, args: Mapping[str, Any]) -> str:
+    if template == "control-rejected":
+        return _refusal_text(args)
     fallback = f"Factory status: {template.replace('-', ' ')}."
     pattern = _STATUS_TEXT.get(template)
     if pattern is None:
@@ -634,6 +748,21 @@ def _public_result(result: dict[str, Any]) -> str:
         risks = _bullets(result.get("risks"))
         if risks:
             lines += ["", "**Risks:**", risks]
+        return "\n".join(lines)
+    if kind == "blocked":
+        lines = [
+            "### Factory: Molly stopped and needs the owner",
+            "",
+            f"> {' '.join(str(result.get('reason', '')).split())}",
+        ]
+        done = _bullets(result.get("done"))
+        if done:
+            lines += ["", "**Done so far:**", done]
+        lines += [
+            "",
+            "The card is Blocked. Fix the cause, then resume this session "
+            "(`omnigent-factory resume <parcel> --message ...`) or give a new stage control.",
+        ]
         return "\n".join(lines)
     if kind == "checkpoint":
         lines = ["### Factory checkpoint"]

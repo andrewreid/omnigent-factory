@@ -69,6 +69,8 @@ class MessagePurpose(enum.StrEnum):
     CHECKPOINT_CLEANUP = "checkpoint_cleanup"
     CONTINUATION = "continuation"
     ANSWER_RELAY = "answer_relay"
+    #: One local-operator note to an existing session (``OperatorResume``).
+    OPERATOR_NOTE = "operator_note"
 
 
 class RetryClass(enum.StrEnum):

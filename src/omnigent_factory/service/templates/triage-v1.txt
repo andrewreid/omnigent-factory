@@ -17,6 +17,10 @@ Field rules (strict schema: use exactly the keys shown, no others):
 - labels: existing informational repository labels only (never factory:*); list of strings.
 - missing_information: list of strings, usually [].
 
+If you cannot finish (a tool, credential or permission refuses), do not invent values:
+return {{"kind":"blocked","reason":"<what failed and what is staged>","done":["..."]}} as
+the result instead.
+
 Return a short explanation followed by exactly this labelled result form, populated to the
 strict factory result v1 schema:
 FACTORY_RESULT_V1

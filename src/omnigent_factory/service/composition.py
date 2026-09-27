@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import stat
 from collections.abc import Callable
@@ -15,11 +16,12 @@ import httpx
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.codec import parcel_from_json
 from omnigent_factory.core.events import Event, Provenance
-from omnigent_factory.core.types import IssueSnapshot, Parcel
+from omnigent_factory.core.types import IssueSnapshot, Lifecycle, Parcel
 from omnigent_factory.credentials.broker import LocalCredentialBroker
 from omnigent_factory.credentials.capabilities import CapabilityRegistry
 from omnigent_factory.credentials.gh_wrapper import install_gh_wrapper
 from omnigent_factory.credentials.git_helper import install_git_helper
+from omnigent_factory.credentials.push_guard import install_push_guard
 from omnigent_factory.credentials.server import BrokerServer, StageProvisioner
 from omnigent_factory.credentials.worktree import BotIdentity, Workspaces
 from omnigent_factory.github.adapter import BoardSchema, GitHubAPIAdapter
@@ -28,7 +30,8 @@ from omnigent_factory.github.client import GitHubClient
 from omnigent_factory.github.config import FactoryConfig
 from omnigent_factory.github.webhook import DeliveryIdentity, DeliveryNormalizer
 from omnigent_factory.omnigent.adapter import OmnigentConfig, OmnigentExecutionAdapter
-from omnigent_factory.omnigent.rest import FileTokenAuth, OmnigentRest
+from omnigent_factory.omnigent.policies import PolicyError
+from omnigent_factory.omnigent.rest import FileTokenAuth, OmnigentReadError, OmnigentRest
 from omnigent_factory.ports.clock import SystemClock
 from omnigent_factory.ports.github import IssueRef
 from omnigent_factory.service.config import ConfigError, ServiceConfig
@@ -54,6 +57,8 @@ from omnigent_factory.service.observer import OmnigentObserver
 from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.service.tokens import DaemonTokenProvider
 
+LOG = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True, slots=True)
 class ProductionComposition:
@@ -78,6 +83,7 @@ class ProductionRuntime:
         config: ServiceConfig,
         github_http: httpx.AsyncClient,
         omnigent: OmnigentRest,
+        omnigent_adapter: OmnigentExecutionAdapter,
     ) -> None:
         self.service = service
         self.broker = broker
@@ -88,10 +94,12 @@ class ProductionRuntime:
         self.config = config
         self.github_http = github_http
         self.omnigent = omnigent
+        self.omnigent_adapter = omnigent_adapter
         self._started = False
 
     async def start(self) -> None:
         helper = install_git_helper(self.config.wrapper_bin_dir)
+        install_push_guard(push_guard_dir(self.config))
         install_gh_wrapper(
             self.config.wrapper_bin_dir, self.config.real_gh_path, self.config.gh_config_dir
         )
@@ -110,6 +118,7 @@ class ProductionRuntime:
             session = parcel.current_session
             if session is not None and not self.broker.capabilities.usable(session.session_id):
                 await self.broker.provision(session.session_id)
+        await self._upgrade_live_policies(parcels)
         await reenable_issuance_after_boot(self.broker, parcels)
         await self.broker_server.start()
         await self.observer.start()
@@ -118,6 +127,25 @@ class ProductionRuntime:
         if self.broker_server.helper_command != f"!{helper}":
             raise RuntimeError("credential helper installation path changed during boot")
         self._started = True
+
+    async def _upgrade_live_policies(self, parcels: list[Parcel]) -> None:
+        """Live sessions get the current factory policies (no human prompts), in place."""
+        for parcel in parcels:
+            session = parcel.current_session
+            if (
+                session is None
+                or session.root_id is None
+                or not session.prepared
+                or session.lifecycle in (Lifecycle.RETIRED, Lifecycle.FENCED)
+            ):
+                continue
+            try:
+                changed = await self.omnigent_adapter.upgrade_static_policies(session.session_id)
+            except (PolicyError, OmnigentReadError) as exc:
+                LOG.warning("policy upgrade failed session=%s reason=%s", session.session_id, exc)
+                continue
+            if changed:
+                LOG.info("policies upgraded session=%s", session.session_id)
 
     async def _github_reconcile(self) -> frozenset[str]:
         observed: set[str] = set()
@@ -244,7 +272,13 @@ async def build_production(
     )
     normalizer = DeliveryNormalizer(identity)
 
-    workspaces = Workspaces(config.source_clone, owned_worktree_roots(config), config.repository)
+    workspaces = Workspaces(
+        config.source_clone,
+        owned_worktree_roots(config),
+        config.repository,
+        push_guard_dir=push_guard_dir(config),
+        harness_settings=True,
+    )
     capability_store = StoreCapabilityStore(service.db)
     capabilities = CapabilityRegistry(
         config.capability_dir,
@@ -314,6 +348,7 @@ async def build_production(
         config=config,
         github_http=github_http,
         omnigent=omnigent,
+        omnigent_adapter=omnigent_adapter,
     )
     service.comment_rerenderer = github.rerender_comment
     service.bind_integrations(
@@ -325,6 +360,11 @@ async def build_production(
         service,
         GitHubWebhookVerifier(config.resolved_webhook_secret_file, normalizer, clock),
     )
+
+
+def push_guard_dir(config: ServiceConfig) -> Path:
+    """Daemon-owned ``core.hooksPath`` for factory worktrees (parcel-branch push guard)."""
+    return config.wrapper_bin_dir.parent / "hooks"
 
 
 def owned_worktree_roots(config: ServiceConfig) -> tuple[Path, ...]:

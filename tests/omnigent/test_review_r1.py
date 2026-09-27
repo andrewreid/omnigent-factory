@@ -5,14 +5,12 @@ from __future__ import annotations
 
 import pytest
 
-from omnigent_factory.core import events as ev
 from omnigent_factory.core.effects import (
     Ack,
     DefinitiveFailure,
     EffectKind,
     RetryableReadFailure,
 )
-from omnigent_factory.core.types import DecisionImpact
 from omnigent_factory.omnigent import policies as pol
 from omnigent_factory.omnigent.activity import ActivityTracker
 from omnigent_factory.omnigent.observe import StreamNormalizer
@@ -85,9 +83,9 @@ async def test_running_root_with_mirrored_prompt_stays_busy_and_productive(
     rig.clock.advance(60_000_000)
     assert tracker.estimate().lower_us == 60_000_000  # root keeps accruing time
     normalizer = StreamNormalizer("S1", ROOT)
-    assert normalizer.on_snapshot(obs) == [  # deduplicated by the true owner
-        ev.ElicitationOpened("S1", "elicit_c", DecisionImpact.UNKNOWN, cost_ask=False)
-    ]
+    [opened] = normalizer.on_snapshot(obs)  # deduplicated by the true owner
+    assert (opened.session_id, opened.elicitation_id, opened.cost_ask) == ("S1", "elicit_c", False)
+    assert opened.node_id == CHILD  # the child holds the prompt: the deeplink targets it
 
 
 # ------------------------------------------------------------ 3. adoption tuple

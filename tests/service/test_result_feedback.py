@@ -149,3 +149,68 @@ async def test_correction_message_and_blocked_comment_carry_the_errors(
         assert "Expecting ',' delimiter" in comment and "`/plan`" in comment
     finally:
         await service.stop()
+
+
+def test_blocked_result_parses_for_any_stage_and_pr_zero_is_still_invalid():
+    body = {
+        "version": 1,
+        "parcel_id": MOLLY.parcel_id,
+        "stage_session_id": MOLLY.stage_session_id,
+        "dispatch_nonce": MOLLY.dispatch_nonce,
+        "revision": 3,
+        "result": {
+            "kind": "blocked",
+            "reason": "broker refused: core-work-gate-closed; candidate staged as tree ce3388c",
+            "done": ["3 files, 20 tests", "Codex review: no findings"],
+        },
+    }
+    for stage in ("triage", "plan", "build"):
+        corr = Correlation(MOLLY.parcel_id, MOLLY.stage_session_id, MOLLY.dispatch_nonce, 3, stage)
+        parsed = parse_factory_result(
+            f"FACTORY_RESULT_V1\n```factory-result\n{json.dumps(body)}\n```\n", corr
+        )
+        assert parsed.result.result.kind == "blocked"
+    from omnigent_factory.service.directory import _public_result
+
+    text = _public_result(body["result"])
+    assert "> broker refused: core-work-gate-closed" in text and "Codex review" in text
+
+
+@pytest.mark.asyncio
+async def test_operator_note_renders_for_an_existing_session(service_config: ServiceConfig):
+    service = FactoryService(
+        service_config,
+        adapters=(FakeGitHub(), FakeOmnigent(), FakeCredentialBroker()),
+        clock=FakeClock(),
+    )
+    await service.start()
+    try:
+        await service.operator_command("unpause", {})
+        factory = EventFactory("P-note", issue_number=677)
+        await service.apply_event(
+            factory.make(ev.GitHubSnapshot(), evidence=snapshot(read_at_us=factory.now))
+        )
+        await service.apply_event(factory.make(ev.RequestTriage(via=Via.DRAG)))
+
+        async def created() -> bool:
+            parcel = await service.db.call(lambda store: store.load_parcel("P-note"))
+            return bool(parcel and parcel.current_session and parcel.current_session.root_id)
+
+        await eventually(created)
+        parcel = await service.db.call(lambda store: store.load_parcel("P-note"))
+        sid = parcel.current_session.session_id
+        directory = ServiceDispatchDirectory(service.db, service_config)
+        text = await directory.message_text(
+            EffectIntent(
+                effect_id="ef_note",
+                kind=EffectKind.SEND_MESSAGE,
+                parcel_id="P-note",
+                target=sid,
+                preconditions=Preconditions(1, 0, session_id=sid),
+                args={"purpose": "operator_note", "text": "Publish the staged candidate."},
+            )
+        )
+        assert text is not None and "Publish the staged candidate." in text
+        assert "does\nnot widen your approved scope" in text
+    finally:
+        await service.stop()
