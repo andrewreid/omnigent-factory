@@ -1348,3 +1348,21 @@ def test_totality_every_state_and_event_kind(scenario):
                 EffectKind.SET_BOT,
             }
             assert after.sessions == before.sessions and after.approvals == before.approvals
+
+
+def test_B07f_owner_plan_command_resumes_after_refused_prepare():
+    """Resume path for a Scoped parcel Blocked by prepare_failed: an owner ``/plan``."""
+    h = Harness()
+    h.triage()
+    h.send(P, ev.RequestPlan(via=Via.DRAG))
+    s = h.cur()
+    h.send(P, ev.SessionCreated(session_id=s.session_id, root_id="root-x", nonce=s.nonce))
+    h.send(P, ev.Prepared(session_id=s.session_id, ok=False))
+    h.quiesce(P, s.session_id)
+    assert h.p().bot == BotState.BLOCKED and Hold.PREPARE_FAILED in h.p().holds
+    r = h.send(P, ev.RequestPlan(via=Via.COMMAND))
+    p = h.p()
+    assert r.audit.accepted and Hold.PREPARE_FAILED not in p.holds
+    assert EffectKind.CREATE_SESSION in kinds(r)
+    assert p.current_session.kind == SessionKind.PLAN
+    assert [x.kind for x in p.sessions].count(SessionKind.TRIAGE) == 1  # triage not re-run

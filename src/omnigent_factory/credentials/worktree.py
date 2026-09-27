@@ -16,7 +16,14 @@ Wiring a worktree sets, in that worktree's config only:
 What cannot be reset per worktree fails closed (:meth:`Workspaces.check_transport`,
 before and after wiring): any ``insteadOf``/``pushInsteadOf`` rewrite matching the origin
 URL, effective fetch/push URLs other than the exact credential-free HTTPS URL, any
-non-exact push URL, URL-specific extra headers and URL-specific credential helpers.
+non-exact push URL and URL-specific extra headers.
+
+Credential helpers are judged by their *effective* chain, not by presence: Git applies
+every ``credential.helper`` and matching ``credential.<url>.helper`` in configuration
+order (system, global, local, worktree) and an empty value resets the list. The owner's
+standard ``gh auth setup-git`` entries (``credential.https://github.com.helper``) come
+before the worktree's reset and are cleared by it. After wiring, the chain Git would use
+for the origin URL must be exactly ``[factory helper]`` (:meth:`Workspaces.effective_helpers`).
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -281,8 +289,11 @@ class Workspaces:
         * effective fetch/push URLs after all rewriting, and every configured push URL,
           equal exactly the credential-free HTTPS URL;
         * no URL-specific ``http.<url>.extraHeader`` with a value (a helper cannot
-          override an inherited Authorization header), and the generic list ends reset;
-        * no URL-specific ``credential.<url>.helper`` that could answer instead of ours.
+          override an inherited Authorization header), and the generic list ends reset.
+
+        Credential helpers are checked after wiring as an effective chain (see
+        :meth:`effective_helpers`); an inherited URL-specific helper is not a bypass
+        when the worktree's reset clears it.
         """
         self.check_config_environment()
         want = self.remote_url
@@ -300,9 +311,70 @@ class Workspaces:
         for key, value in self._config_entries(path, r"^http\..+\.extraheader$"):
             if value:
                 raise WorktreeError(f"URL-specific extra header would bypass the helper: {key}")
-        for key, value in self._config_entries(path, r"^credential\..+\.helper$"):
-            if value:
-                raise WorktreeError(f"URL-specific credential helper is configured: {key}")
+
+    def effective_helpers(self, path: Path) -> list[str]:
+        """The credential helpers Git would run for the origin URL inside ``path``.
+
+        Mirrors Git's credential config application (every matching entry in config
+        order; an empty value resets the list). URL matching is delegated to Git's own
+        ``--get-urlmatch`` against a one-entry probe file, so wildcards, paths and
+        normalisation follow Git exactly.
+        """
+        proc = _run(
+            ["config", "-z", "--get-regexp", r"^credential\.(.+\.)?helper$"],
+            path,
+            check=False,
+            git=self.git,
+            env=self.inspection_env,
+        )
+        if proc.returncode not in (0, 1):
+            raise WorktreeError("credential helper configuration is unreadable")
+        chain: list[str] = []
+        for record in proc.stdout.split("\0"):
+            if not record:
+                continue
+            key, separator, value = record.partition("\n")
+            if not separator:
+                raise WorktreeError(f"credential helper without a value: {key}")
+            if key.lower() != "credential.helper" and not self._helper_url_matches(
+                path, key[len("credential.") : -len(".helper")]
+            ):
+                continue
+            chain = [] if value == "" else [*chain, value]
+        return chain
+
+    def _helper_url_matches(self, path: Path, pattern: str) -> bool:
+        if any(char in pattern for char in '"\\\n'):
+            raise WorktreeError(f"unverifiable credential URL pattern: {pattern!r}")
+        with tempfile.TemporaryDirectory(prefix="factory-urlmatch-") as tmp:
+            probe = Path(tmp) / "probe"
+            probe.write_text(f'[credential "{pattern}"]\n\thelper = probe\n', encoding="utf-8")
+            proc = _run(
+                [
+                    "config",
+                    "--file",
+                    str(probe),
+                    "--get-urlmatch",
+                    "credential.helper",
+                    self.remote_url,
+                ],
+                path,
+                check=False,
+                git=self.git,
+                env=self.inspection_env,
+            )
+        if proc.returncode not in (0, 1):
+            raise WorktreeError(f"cannot evaluate credential URL pattern: {pattern!r}")
+        return proc.returncode == 0 and proc.stdout.strip() == "probe"
+
+    def _check_helper_chain(self, path: Path, helper: str) -> None:
+        chain = self.effective_helpers(path)
+        if chain != [helper]:
+            residual = len([h for h in chain if h != helper])
+            raise WorktreeError(
+                "effective credential helpers for origin are not exactly the factory helper "
+                f"({len(chain)} configured, {residual} other)"
+            )
 
     def _generic_resets_hold(self, path: Path) -> None:
         for key in ("http.extraHeader", "credential.helper"):
@@ -362,6 +434,7 @@ class Workspaces:
         cfg("factory.repository", wiring.repository)
         self.check_transport(path)
         self._generic_resets_hold(path)
+        self._check_helper_chain(path, helper)
 
     def wiring_of(self, path: Path) -> StageWiring | None:
         def get(key: str) -> str | None:

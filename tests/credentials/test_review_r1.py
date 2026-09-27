@@ -66,7 +66,6 @@ def _git_config(*args: str, cwd: Path) -> None:
             "http.https://github.com/SA-Ambulance/.extraHeader",
             "Authorization: Bearer OWNER",
         ),
-        ("--global", "credential.https://github.com.helper", "!echo password=OWNER"),
         # Worktree-specific credential-bearing push URL.
         (
             "--worktree",
