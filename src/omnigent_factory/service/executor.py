@@ -311,10 +311,15 @@ class EffectExecutor:
             try:
                 event = self._ack_event(effect, outcome)
             except (KeyError, TypeError, ValueError):
-                await self._finish(stored, AmbiguousWrite("ack-invalid-required-detail"))
-                return
+                event, missing = None, "ack-invalid-required-detail"
+            else:
+                missing = "ack-missing-required-detail"
             if event is None and effect.kind in _ACK_EVENT_REQUIRED:
-                await self._finish(stored, AmbiguousWrite("ack-missing-required-detail"))
+                if effect.retry_class == RetryClass.READ:
+                    # A read has no side effect: fetch again rather than record ambiguity.
+                    await self._retry_or_unknown(stored, RetryableReadFailure(missing, 5_000_000))
+                else:
+                    await self._finish(stored, AmbiguousWrite(missing))
                 return
             _log_ack(effect, outcome)
             await self._record(effect, "done", event, remote_id=outcome.remote_id)

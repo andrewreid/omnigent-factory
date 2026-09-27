@@ -50,6 +50,26 @@ def adapter(http: httpx.AsyncClient, checks=frozenset(), **kwargs):
 
 
 PARCEL_REF = IssueRef(REPO_NODE, 12, "I_1")
+
+
+def no_threads() -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+        },
+    )
+
+
 GOAL_X = '{"goal":"x"}'
 RENDERED_EMPTY = (
     f"{parcel_marker(12, hashlib.sha256(b'{}').hexdigest()[:12])}\n{render_contract_section('{}')}"
@@ -155,11 +175,23 @@ async def test_pull_request_snapshot_reads_all_check_pages_and_current_reviews()
             page = request.url.params.get("page")
             if page == "1":
                 runs = [
-                    {"name": f"noise-{index}", "app": {"id": 15368}, "conclusion": "success"}
+                    {
+                        "name": f"noise-{index}",
+                        "app": {"id": 15368},
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
                     for index in range(100)
                 ]
             else:
-                runs = [{"name": "required", "app": {"id": 15368}, "conclusion": "success"}]
+                runs = [
+                    {
+                        "name": "required",
+                        "app": {"id": 15368},
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                ]
             return httpx.Response(200, json={"check_runs": runs})
         if path.endswith("/reviews"):
             return httpx.Response(
@@ -180,12 +212,16 @@ async def test_pull_request_snapshot_reads_all_check_pages_and_current_reviews()
                     }
                 ],
             )
+        if path.endswith("/status"):
+            return httpx.Response(200, json={"state": "pending", "statuses": []})
         if path == "/graphql":
+            if "reviewThreads" in json.loads(request.content)["query"]:
+                return no_threads()
             return closing_refs("I_other", "I_1")
         raise AssertionError(str(request.url))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        result = await adapter(http, required).pull_request(PARCEL_REF, 7)
+        result = await adapter(http, required).pull_request(PARCEL_REF, 7, cross_vendor_review=True)
     assert result.verified is True
     assert result.checks == ChecksState.GREEN
 

@@ -12,7 +12,13 @@ from functools import partial
 from typing import Any
 
 from omnigent_factory.core import events as ev
-from omnigent_factory.core.effects import Ack, AdapterOutcome, EffectIntent, EffectKind
+from omnigent_factory.core.effects import (
+    Ack,
+    AdapterOutcome,
+    EffectIntent,
+    EffectKind,
+    RetryClass,
+)
 from omnigent_factory.core.events import Event, Provenance
 from omnigent_factory.core.types import (
     AdmissionSnapshot,
@@ -146,6 +152,7 @@ class FactoryService:
             await self._adopt_terminal_claims()
             await self.db.call(lambda store: store.recover_claimed())
             unknown = await self.db.call(lambda store: store.effects_in_state("unknown"))
+            unknown = await self._requeue_unknown_reads(unknown)
             await self._recover_outbox(unknown)
             for managed in self._managed:
                 await managed.start()
@@ -204,6 +211,27 @@ class FactoryService:
 
     async def persist_delivery(self, delivery: DeliveryRecord) -> str:
         return await self.db.call(lambda store: store.append_delivery(delivery))
+
+    async def _requeue_unknown_reads(self, unknown: list[StoredEffect]) -> list[StoredEffect]:
+        """A read has no side effect: an ambiguous one is simply fetched again."""
+        remaining: list[StoredEffect] = []
+        for stored in unknown:
+            effect = stored.effect
+            if effect.retry_class != RetryClass.READ:
+                remaining.append(stored)
+                continue
+            requeued = await self.db.call(
+                partial(_requeue_effect, effect_id=effect.effect_id, kind=effect.kind.value)
+            )
+            if requeued:
+                LOG.info(
+                    "unknown read requeued kind=%s effect_id=%s",
+                    effect.kind.value,
+                    effect.effect_id,
+                )
+            else:
+                remaining.append(stored)
+        return remaining
 
     async def _recover_outbox(self, recovered: list[StoredEffect]) -> None:
         """Reconstruct reducer-visible ambiguity before any dispatch is enabled."""
@@ -819,6 +847,10 @@ class FactoryService:
         LOG.error("managed background task stopped task=%s", name)
         if self._fatal_exit is not None:
             self._fatal_exit(1)
+
+
+def _requeue_effect(store: SqliteStore, *, effect_id: str, kind: str) -> bool:
+    return store.requeue_effect(effect_id, frozenset({kind}))
 
 
 def _load_parcel(store: SqliteStore, *, parcel_id: str) -> Parcel | None:

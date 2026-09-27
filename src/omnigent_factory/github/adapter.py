@@ -98,6 +98,7 @@ class GitHubAPIAdapter:
         owner_ids: frozenset[int] = frozenset(),
         parcel_resolver: ParcelResolver | None = None,
         triage_fields: TriageFieldSource | None = None,
+        cross_vendor_review: Callable[[EffectIntent], Awaitable[bool]] | None = None,
     ) -> None:
         self.client = client
         self.repository = repository
@@ -116,6 +117,8 @@ class GitHubAPIAdapter:
         # parcel's issue from persisted state (static bindings are a test seam).
         self.parcel_resolver = parcel_resolver
         self.triage_fields = triage_fields
+        #: Molly's reported opposite-vendor review of the effect's PR head (service-side).
+        self.cross_vendor_review = cross_vendor_review
         if independent_reviewer_ids & (owner_ids | {bot_user_id}):
             raise ValueError("independent reviewers cannot include owners or the factory bot")
         self.independent_reviewer_ids = independent_reviewer_ids
@@ -205,8 +208,15 @@ class GitHubAPIAdapter:
             after = after_value
 
     async def pull_request(
-        self, ref: IssueRef, pr_number: int
+        self, ref: IssueRef, pr_number: int, *, cross_vendor_review: bool = False
     ) -> PullRequestEvidence | RetryableReadFailure:
+        """Fresh PR facts for readiness (owner direction: the owner's approval is NOT part
+        of Ready; the ruleset requires it at merge).
+
+        ``cross_vendor_review`` is Molly's reported opposite-vendor review of this head
+        (clean verdict, reviewer vendor differs). A GitHub approval from
+        ``independent_reviewer_ids`` is required additionally only when configured.
+        """
         if ref.repo_id != self.repository_node_id:
             return RetryableReadFailure("pull request repository identity mismatch")
         try:
@@ -218,22 +228,18 @@ class GitHubAPIAdapter:
             branch = head.get("ref") if isinstance(head, dict) else None
             if not isinstance(head_sha, str) or not isinstance(branch, str):
                 raise GitHubAPIError("pull request head was malformed")
-            checks = await self._checks_state(head_sha)
-            reviews = await self.client.paginate(
-                f"/repos/{self.repository}/pulls/{pr_number}/reviews?per_page=100"
+            base = pr.get("base")
+            base_ref = base.get("ref") if isinstance(base, dict) else None
+            checks = await self._checks_state(
+                head_sha, base_ref if isinstance(base_ref, str) else None
             )
-            review_accepted = self._review_accepted(reviews, head_sha)
-            comments = await self.client.paginate(
-                f"/repos/{self.repository}/issues/{pr_number}/comments?per_page=100"
-            )
-            disposition_marker = f"<!-- factory-findings-dispositioned head={head_sha} -->"
-            findings_dispositioned = any(
-                isinstance(comment, dict)
-                and isinstance(comment.get("user"), dict)
-                and comment["user"].get("id") == self.bot_user_id
-                and disposition_marker in str(comment.get("body", ""))
-                for comment in comments
-            )
+            review_accepted = cross_vendor_review
+            if review_accepted and self.independent_reviewer_ids:
+                reviews = await self.client.paginate(
+                    f"/repos/{self.repository}/pulls/{pr_number}/reviews?per_page=100"
+                )
+                review_accepted = self._review_accepted(reviews, head_sha)
+            findings_dispositioned = await self._bot_threads_settled(pr_number)
             closes_issue = await self._closes_issue(pr_number, ref.parcel_id)
             author = pr.get("user")
             return PullRequestEvidence(
@@ -306,36 +312,153 @@ class GitHubAPIAdapter:
                 raise GitHubAPIError("closing references pagination cursor was missing")
             after = cursor
 
-    async def _checks_state(self, head_sha: str) -> ChecksState:
-        seen: dict[tuple[str, int], str] = {}
+    async def _checks_state(self, head_sha: str, base_ref: str | None = None) -> ChecksState:
+        """CI state of ``head_sha`` for readiness.
+
+        Required set: configured ``required_checks`` if any, else derived from GitHub
+        (classic branch protection and/or rulesets on the base branch; unreadable sources
+        are skipped). With a required set, each must be present and succeeded (success,
+        neutral or skipped). With nothing required, every check run and commit status on
+        the head must have completed that way, and there must be at least one. Pending
+        means not ready; any failure means failed. "No configuration" is never FAILED.
+        """
+        runs: list[tuple[str, int | None, str]] = []  # (name, app id, state)
         page = 1
         while True:
             result: Any = await self.client.get_json(
                 f"/repos/{self.repository}/commits/{head_sha}/check-runs?per_page=100&page={page}"
             )
-            runs = result.get("check_runs") if isinstance(result, dict) else None
-            if not isinstance(runs, list):
+            batch = result.get("check_runs") if isinstance(result, dict) else None
+            if not isinstance(batch, list):
                 raise GitHubAPIError("check-runs response was malformed")
-            for run in runs:
-                if not isinstance(run, dict):
+            for run in batch:
+                if not isinstance(run, dict) or not isinstance(run.get("name"), str):
                     continue
                 app = run.get("app")
                 app_id = app.get("id") if isinstance(app, dict) else None
-                name = run.get("name")
-                if isinstance(name, str) and isinstance(app_id, int):
-                    seen[(name, app_id)] = str(run.get("conclusion") or run.get("status"))
-            if len(runs) < 100:
+                runs.append(
+                    (
+                        str(run["name"]),
+                        app_id if isinstance(app_id, int) else None,
+                        _run_state(run.get("status"), run.get("conclusion")),
+                    )
+                )
+            if len(batch) < 100:
                 break
             page += 1
-        missing = self.required_checks - seen.keys()
-        if missing:
-            return ChecksState.PENDING
-        conclusions = {seen[key] for key in self.required_checks}
-        if conclusions == {"success"}:
-            return ChecksState.GREEN
-        if conclusions & {"queued", "in_progress", "pending", "requested", "waiting"}:
-            return ChecksState.PENDING
-        return ChecksState.FAILED
+        combined: Any = await self.client.get_json(
+            f"/repos/{self.repository}/commits/{head_sha}/status"
+        )
+        statuses = combined.get("statuses") if isinstance(combined, dict) else None
+        for status in statuses if isinstance(statuses, list) else []:
+            if isinstance(status, dict) and isinstance(status.get("context"), str):
+                runs.append((str(status["context"]), None, _status_state(status.get("state"))))
+        required: set[tuple[str, int | None]] = set(self.required_checks)
+        if not required and base_ref is not None:
+            required = await self._derived_required_checks(base_ref)
+        if required:
+            states = []
+            for name, app_id in required:
+                found = [
+                    state
+                    for run_name, run_app, state in runs
+                    if run_name == name and (app_id is None or run_app in (None, app_id))
+                ]
+                states.append(_combine(found) if found else "pending")
+            return _checks_from(states)
+        return _checks_from([state for _, _, state in runs]) if runs else ChecksState.PENDING
+
+    async def _derived_required_checks(self, base_ref: str) -> set[tuple[str, int | None]]:
+        required: set[tuple[str, int | None]] = set()
+        try:
+            protection: Any = await self.client.get_json(
+                f"/repos/{self.repository}/branches/{base_ref}/protection/required_status_checks"
+            )
+            protection = protection if isinstance(protection, dict) else {}
+            for check in protection.get("checks") or []:
+                if isinstance(check, dict) and isinstance(check.get("context"), str):
+                    app = check.get("app_id")
+                    required.add((check["context"], app if isinstance(app, int) else None))
+            if not protection.get("checks"):
+                for context in protection.get("contexts") or []:
+                    if isinstance(context, str):
+                        required.add((context, None))
+        except GitHubRejected as exc:
+            if exc.status_code not in (403, 404):
+                raise
+        try:
+            rules: Any = await self.client.get_json(
+                f"/repos/{self.repository}/rules/branches/{base_ref}"
+            )
+            for rule in rules if isinstance(rules, list) else []:
+                if not isinstance(rule, dict) or rule.get("type") != "required_status_checks":
+                    continue
+                params = rule.get("parameters")
+                checks = params.get("required_status_checks") if isinstance(params, dict) else None
+                for check in checks if isinstance(checks, list) else []:
+                    if isinstance(check, dict) and isinstance(check.get("context"), str):
+                        app = check.get("integration_id")
+                        required.add((check["context"], app if isinstance(app, int) else None))
+        except GitHubRejected as exc:
+            if exc.status_code not in (403, 404):
+                raise
+        return required
+
+    async def _bot_threads_settled(self, pr_number: int) -> bool:
+        """Every review thread opened by a bot is resolved or answered by the factory bot."""
+        owner, _, name = self.repository.partition("/")
+        query = """
+        query($owner: String!, $name: String!, $number: Int!, $after: String) {
+          repository(owner: $owner, name: $name) {
+            pullRequest(number: $number) {
+              reviewThreads(first: 100, after: $after) {
+                nodes {
+                  isResolved
+                  comments(first: 50) {
+                    nodes { author { __typename ... on Bot { databaseId } } }
+                  }
+                }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }
+        """
+        after: str | None = None
+        while True:
+            data = await self.client.graphql(
+                query, {"owner": owner, "name": name, "number": pr_number, "after": after}
+            )
+            repository = data.get("repository")
+            pull = repository.get("pullRequest") if isinstance(repository, dict) else None
+            threads = pull.get("reviewThreads") if isinstance(pull, dict) else None
+            nodes = threads.get("nodes") if isinstance(threads, dict) else None
+            if not isinstance(nodes, list):
+                raise GitHubAPIError("review threads were unavailable")
+            for thread in nodes:
+                if not isinstance(thread, dict) or thread.get("isResolved") is True:
+                    continue
+                comments = thread.get("comments")
+                authors = [
+                    c.get("author") or {}
+                    for c in (comments.get("nodes") if isinstance(comments, dict) else None) or []
+                    if isinstance(c, dict)
+                ]
+                if not authors or authors[0].get("__typename") != "Bot":
+                    continue  # human threads are the owner's merge-time concern
+                answered = any(
+                    a.get("__typename") == "Bot" and a.get("databaseId") == self.bot_user_id
+                    for a in authors[1:]
+                )
+                if not answered:
+                    return False
+            page = threads.get("pageInfo") if isinstance(threads, dict) else None
+            if not isinstance(page, dict) or not page.get("hasNextPage"):
+                return True
+            cursor = page.get("endCursor")
+            if not isinstance(cursor, str):
+                raise GitHubAPIError("review threads pagination cursor was missing")
+            after = cursor
 
     def _review_accepted(self, reviews: list[Any], head_sha: str) -> bool:
         latest: dict[int, tuple[int, str, str | None]] = {}
@@ -417,11 +540,22 @@ class GitHubAPIAdapter:
                 ref = await self._issue_ref(effect)
                 if ref is None:
                     return DefinitiveFailure("FETCH_PR_EVIDENCE requires the parcel issue")
-                evidence = await self.pull_request(ref, number)
+                review = (
+                    await self.cross_vendor_review(effect)
+                    if self.cross_vendor_review is not None
+                    else False
+                )
+                evidence = await self.pull_request(ref, number, cross_vendor_review=review)
                 if isinstance(evidence, RetryableReadFailure):
                     return evidence
                 detail = asdict(evidence)
                 detail["checks"] = evidence.checks.value
+                expected_head = effect.args.get("head_sha")
+                head_matches = (
+                    not isinstance(expected_head, str) or expected_head == evidence.head_sha
+                )
+                detail["head_matches"] = head_matches
+                detail["verified"] = evidence.verified and head_matches
                 return Ack(str(number), detail)
             if effect.kind == EffectKind.RECONCILE_PARCEL:
                 ref = await self._issue_ref(effect)
@@ -934,3 +1068,31 @@ def _publication_matches(
         and len(publication.marker_hash) >= 12
         and full_hash.startswith(publication.marker_hash)
     )
+
+
+_SUCCEEDED = frozenset({"success", "neutral", "skipped"})
+
+
+def _run_state(status: object, conclusion: object) -> str:
+    if status != "completed":
+        return "pending"
+    return "ok" if conclusion in _SUCCEEDED else "failed"
+
+
+def _status_state(state: object) -> str:
+    if state == "success":
+        return "ok"
+    return "pending" if state == "pending" else "failed"
+
+
+def _combine(states: list[str]) -> str:
+    if "failed" in states:
+        return "failed"
+    return "pending" if "pending" in states else "ok"
+
+
+def _checks_from(states: list[str]) -> ChecksState:
+    combined = _combine(states)
+    if combined == "failed":
+        return ChecksState.FAILED
+    return ChecksState.PENDING if combined == "pending" else ChecksState.GREEN

@@ -1602,6 +1602,13 @@ def _h_review_changed(ctx: _Ctx, body: ev.ReviewChanged) -> None:
 
 
 def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
+    # A fresh evidence read supersedes earlier ambiguous reads (reads have no effects).
+    if any(u.kind == EffectKind.FETCH_PR_EVIDENCE.value for u in ctx.p.unknown_effects):
+        ctx.update(
+            unknown_effects=tuple(
+                u for u in ctx.p.unknown_effects if u.kind != EffectKind.FETCH_PR_EVIDENCE.value
+            )
+        )
     r = ctx.p.readiness
     if r is None or (r.session_id, r.pr_number, r.head_sha) != (
         body.session_id,

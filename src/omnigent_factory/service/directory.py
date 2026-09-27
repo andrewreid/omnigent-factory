@@ -397,6 +397,36 @@ class PublicationRenderer:
             labels=tuple(str(label) for label in labels) if isinstance(labels, list) else (),
         )
 
+    async def cross_vendor_review(self, effect: EffectIntent) -> bool:
+        """Molly's opposite-vendor review of the PR head, as reported in ``build_ready``.
+
+        Clean means: accepted verdict, reviewer vendor differs from the implementer, the
+        reviewed head is the PR head the effect verifies, no finding left unresolved.
+        """
+        body = self._stored_result(effect)
+        if body is None or body.get("kind") != "build_ready":
+            return False
+        head = effect.args.get("head_sha")
+        review = body.get("review")
+        if not isinstance(review, dict) or not isinstance(head, str):
+            return False
+        implementer = str(review.get("implementation_vendor") or "").strip().lower()
+        reviewer = str(review.get("review_vendor") or "").strip().lower()
+        findings = body.get("findings")
+        return (
+            review.get("accepted") is True
+            and bool(implementer)
+            and bool(reviewer)
+            and implementer != reviewer
+            and review.get("reviewed_head") == head
+            and body.get("head_sha") == head
+            and body.get("pr_number") == effect.args.get("pr_number")
+            and all(
+                isinstance(f, dict) and f.get("disposition") != "unresolved"
+                for f in (findings if isinstance(findings, list) else [])
+            )
+        )
+
     def _stored_result(self, effect: EffectIntent) -> dict[str, Any] | None:
         sid = str(effect.args.get("session_id") or effect.preconditions.session_id or "")
         if not sid:

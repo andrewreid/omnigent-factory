@@ -256,6 +256,7 @@ async def build_production(
         owner_ids=config.owners,
         parcel_resolver=ServiceParcelResolver(service.db),
         triage_fields=publications.triage_fields,
+        cross_vendor_review=publications.cross_vendor_review,
     )
     identity = DeliveryIdentity(
         app_id=config.github_app_id,

@@ -28,6 +28,7 @@ from .test_adapter import (
     adapter,
     closing_refs,
     effect,
+    no_threads,
 )
 from .test_webhook_config_setup import project_drag, resolve_drag
 
@@ -178,10 +179,15 @@ def pr_handler(graphql: list[httpx.Response], seen: list[dict]):
             )
         if path.endswith("/check-runs"):
             return httpx.Response(200, json={"check_runs": []})
+        if path.endswith("/status"):
+            return httpx.Response(200, json={"state": "pending", "statuses": []})
         if path.endswith("/reviews") or path.endswith("/comments"):
             return httpx.Response(200, json=[])
         if path == "/graphql":
-            seen.append(json.loads(request.content))
+            body = json.loads(request.content)
+            if "reviewThreads" in body["query"]:
+                return no_threads()
+            seen.append(body)
             return next(pages)
         raise AssertionError(path)
 
