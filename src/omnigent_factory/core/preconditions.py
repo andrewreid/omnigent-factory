@@ -15,7 +15,10 @@ from omnigent_factory.core.predicates import (
     message_uncertain,
     work_allowed,
 )
-from omnigent_factory.core.types import Lifecycle, Parcel, SessionKind
+from omnigent_factory.core.types import Hold, Lifecycle, Parcel, SessionKind, Stage
+
+#: Comments that would regress a merged/closed parcel if posted after the fact.
+_REGRESSION_COMMENTS = frozenset({"ready-invalidated", "ready-blocked", "pr-closed-unmerged"})
 
 
 def effect_still_valid(parcel: Parcel | None, effect: EffectIntent) -> str | None:
@@ -30,6 +33,10 @@ def effect_still_valid(parcel: Parcel | None, effect: EffectIntent) -> str | Non
         if s is None or s.lifecycle != Lifecycle.PREPARING or s.fences:
             return "session-not-preparing"
         return None
+    if parcel is not None and Hold.COMPLETED in parcel.holds:
+        completed = _completed_invalid(effect)
+        if completed is not None:
+            return completed
     if not effect.work_bearing:
         return None
     if parcel is None:
@@ -81,4 +88,19 @@ def _create_valid(parcel: Parcel | None, effect: EffectIntent) -> str | None:
         return "authority-cancelled"
     if not dispatchable(parcel):
         return "not-dispatchable"
+    return None
+
+
+def _completed_invalid(effect: EffectIntent) -> str | None:
+    """Re-check the terminal barrier at the call boundary: a regression queued before the
+    merge/close landed is cancelled instead of posted."""
+    if effect.work_bearing:
+        return "parcel-completed"
+    if effect.kind == EffectKind.MOVE_CARD and effect.args.get("to") != Stage.DONE.value:
+        return "parcel-completed"
+    if (
+        effect.kind == EffectKind.POST_COMMENT
+        and effect.args.get("template") in _REGRESSION_COMMENTS
+    ):
+        return "parcel-completed"
     return None

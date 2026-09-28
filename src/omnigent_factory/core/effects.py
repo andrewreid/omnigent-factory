@@ -73,6 +73,8 @@ class MessagePurpose(enum.StrEnum):
     ANSWER_RELAY = "answer_relay"
     #: One local-operator note to an existing session (``OperatorResume``).
     OPERATOR_NOTE = "operator_note"
+    #: One wake after fresh current-head evidence shows a failure the build can fix.
+    READINESS_WAKE = "readiness_wake"
 
 
 class RetryClass(enum.StrEnum):

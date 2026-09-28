@@ -452,9 +452,11 @@ class DeliveryNormalizer:
         if not isinstance(source, dict):
             return ()
         prs = source.get("pull_requests")
-        if not isinstance(prs, list) or not prs or not isinstance(prs[0], dict):
+        if not isinstance(prs, list):
             return ()
-        number = prs[0].get("number")
+        # One suite is only a hint (the reducer re-reads the aggregate): with no or
+        # several PRs, the parcel is resolved from the factory head branch (number 0).
+        number = prs[0].get("number") if len(prs) == 1 and isinstance(prs[0], dict) else 0
         head_sha = source.get("head_sha")
         conclusion = source.get("conclusion")
         if conclusion == "success":

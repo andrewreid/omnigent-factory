@@ -402,6 +402,16 @@ class ReadinessEvidence(_Body):
     verified: bool = False
     remediation_exhausted: bool = False
     checks_summary: str = ""
+    #: The PR head GitHub reported (``head_sha`` is the head the read was asked about).
+    observed_head_sha: str = ""
+    #: Current-head check state; None for reads recorded before it was carried.
+    checks: ChecksState | None = None
+    findings_open: bool = False
+    review_accepted: bool = True
+    pr_open: bool = True
+    merged: bool = False
+    #: GitHub's closingIssuesReferences of the PR include the parcel's issue.
+    closes_issue: bool = True
 
 
 @dataclass(frozen=True, slots=True)

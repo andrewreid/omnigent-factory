@@ -1119,7 +1119,9 @@ def test_E01_E02_build_ready_to_ready():
     assert p.bot == BotState.IDLE
 
 
-def test_E03_checks_failure_needs_owner_no_repair_loop():
+def test_E03_checks_webhook_is_a_hint_for_a_fresh_read_no_repair_loop():
+    """One failed suite is not the aggregate: it re-reads the PR; a failed read while the
+    build tree is still busy waits (no hold, no work) until the build is idle."""
     h = Harness()
     b = h.to_building()
     h.send(
@@ -1134,8 +1136,18 @@ def test_E03_checks_failure_needs_owner_no_repair_loop():
         ),
     )
     r = h.send(P, ev.ChecksChanged(pr_number=7, head_sha=HEAD, state=ev.ChecksState.FAILED))
-    assert Hold.CHECKS_FAILED in h.p().holds and not work(r)
-    assert h.p().bot == BotState.NEEDS_YOU
+    assert kinds(r).count(EffectKind.FETCH_PR_EVIDENCE) == 1 and not work(r)
+    assert Hold.CHECKS_FAILED not in h.p().holds
+    r = h.send(
+        P,
+        ev.ReadinessEvidence(
+            session_id=b.session_id,
+            pr_number=7,
+            head_sha=HEAD,
+            checks=ev.ChecksState.FAILED,
+        ),
+    )
+    assert not work(r) and not h.p().holds & {Hold.CHECKS_FAILED, Hold.READINESS_FAILED}
 
 
 def test_E04_remediation_exhausted_blocks_ready():
@@ -1181,9 +1193,8 @@ def test_E05_owner_ready_to_building_is_unsupported_rework():
     "body",
     [
         ev.ReviewChanged(pr_number=7, head_sha=HEAD, changes_requested=True),
-        ev.ChecksChanged(pr_number=7, head_sha="b" * 40, state=ev.ChecksState.GREEN),
         ev.ChecksChanged(pr_number=7, head_sha=HEAD, state=ev.ChecksState.FAILED),
-        ev.PRObserved(pr_number=7, head_sha="c" * 40, bot_authored=True, parcel_branch=True),
+        # A new head is re-evaluated in Ready, not rework (tests/test_readiness_repairs.py).
     ],
 )
 def test_E06_ready_invalidated_by_observation_without_new_episode(body):
@@ -1191,6 +1202,20 @@ def test_E06_ready_invalidated_by_observation_without_new_episode(body):
     h.to_building()
     h.build_ready()
     r = h.send(P, body)
+    if not isinstance(body, ev.ReviewChanged):
+        # Check/PR webhooks are hints: a fresh read decides (and supplies the real head).
+        assert h.p().stage == Stage.READY and not work(r)
+        [fetch] = [e for e in r.effects if e.kind == EffectKind.FETCH_PR_EVIDENCE]
+        r = h.send(
+            P,
+            ev.ReadinessEvidence(
+                session_id=str(fetch.args["session_id"]),
+                pr_number=7,
+                head_sha=HEAD,
+                observed_head_sha=body.head_sha,
+                checks=getattr(body, "state", ev.ChecksState.GREEN),
+            ),
+        )
     p = h.p()
     assert p.stage == Stage.BUILDING and Hold.REWORK_CONTROL_REQUIRED in p.holds
     assert not work(r) and EffectKind.CREATE_SESSION not in kinds(r)

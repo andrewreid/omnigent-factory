@@ -199,6 +199,13 @@ class ServiceDispatchDirectory:
                 feedback=_untrusted(feedback, boundary),
                 untrusted_boundary=boundary,
             )
+        if purpose == "readiness_wake":
+            return _template("readiness-wake-v1.txt").format(
+                pr_number=int(str(effect.args.get("pr_number") or 0)),
+                head_sha=str(effect.args.get("head_sha") or ""),
+                reason=str(effect.args.get("reason") or "")[:500],
+                session_id=sid,
+            )
         if purpose == "operator_note":
             note = str(effect.args.get("text") or "").strip()
             if not note:
@@ -410,7 +417,9 @@ class PublicationRenderer:
         body = self._stored_result(effect)
         if body is None or body.get("kind") != "build_ready":
             return False
-        head = effect.args.get("head_sha")
+        # The head the accepted review attested; the GitHub read decides whether it
+        # still covers a newer PR head (base-branch sync only).
+        head = effect.args.get("reviewed_head") or effect.args.get("head_sha")
         review = body.get("review")
         if not isinstance(review, dict) or not isinstance(head, str):
             return False
@@ -691,6 +700,8 @@ _STATUS_TEXT = {
     "pr-closed-unmerged": "Factory: PR #{pr_number} was closed without merging; "
     "the parcel needs an owner decision.",
     "ready-invalidated": "Factory: the parcel is no longer Ready ({reason}).",
+    "ready-blocked": "Factory: PR #{pr_number} at `{head_sha}` is not Ready: {reason}. "
+    "No automatic fix attempt remains; the parcel needs an owner decision.",
     "create-rejected": "Factory: Omnigent refused to create the session ({reason}); "
     "the parcel is Blocked.",
     "adoption-ambiguous": "Factory: could not tell which Omnigent session is ours "

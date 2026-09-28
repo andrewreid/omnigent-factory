@@ -12,6 +12,7 @@ from omnigent_factory.core.types import (
     AdmissionSnapshot,
     BotState,
     FenceKind,
+    Hold,
     Lifecycle,
     Parcel,
     QueueEntry,
@@ -64,6 +65,13 @@ def project_bot(p: Parcel) -> BotState:
         return BotState.CHECKPOINT
     if p.open_decisions or p.holds & NEEDS_YOU_HOLDS:
         return BotState.NEEDS_YOU
+    if (
+        p.stage == Stage.READY
+        and p.readiness is not None
+        and not p.readiness.ready
+        and Hold.COMPLETED not in p.holds
+    ):
+        return BotState.WORKING  # in Ready, waiting on a new head's or re-run's checks
     # A safety/stop drain is never Idle until the tree is observed quiescent.
     if lifecycles & _WORKING:
         return BotState.WORKING

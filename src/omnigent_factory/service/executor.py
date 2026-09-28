@@ -511,6 +511,14 @@ class EffectExecutor:
                 verified=bool(detail.get("verified")),
                 remediation_exhausted=bool(detail.get("remediation_exhausted", False)),
                 checks_summary=str(detail.get("checks_summary") or "")[:200],
+                # Carry the head GitHub actually reported, not the one the read asked about.
+                observed_head_sha=str(detail.get("head_sha") or ""),
+                checks=_checks_state(detail.get("checks")),
+                findings_open=detail.get("findings_dispositioned") is False,
+                review_accepted=detail.get("review_accepted") is not False,
+                pr_open=detail.get("open") is not False,
+                merged=detail.get("merged") is True,
+                closes_issue=detail.get("closes_issue") is not False,
             )
         elif effect.kind == EffectKind.RESOLVE_ELICITATION:
             body = ev.ElicitationResolved(
@@ -565,6 +573,13 @@ class EffectExecutor:
             provenance=Provenance.ADAPTER,
             body=body,
         )
+
+
+def _checks_state(value: object) -> ev.ChecksState | None:
+    try:
+        return ev.ChecksState(str(value)) if value is not None else None
+    except ValueError:
+        return None
 
 
 def _json_int(value: object, default: int) -> int:

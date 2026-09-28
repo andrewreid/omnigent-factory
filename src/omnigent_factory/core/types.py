@@ -173,6 +173,9 @@ class Hold(enum.StrEnum):
     APPROVAL_VOIDED = "approval_voided"
     #: A durable inbox delivery for this parcel is parked or not yet identity-verified.
     INBOX = "inbox"
+    #: Terminal: the linked PR merged or the issue closed. Late checks, heads, reviews and
+    #: readiness reads are audit only; only a fresh owner stage control starts again.
+    COMPLETED = "completed"
 
 
 class InboxHoldReason(enum.StrEnum):
@@ -236,6 +239,7 @@ CONTROL_CLEARED_HOLDS = frozenset(
         Hold.APPROVAL_VOIDED,
         Hold.PUBLICATION_PENDING,
         Hold.AGENT_BLOCKED,
+        Hold.COMPLETED,
     }
 )
 
@@ -386,6 +390,8 @@ class StageSession:
     prepared: bool = False
     own_items: tuple[str, ...] = ()
     report_published: bool = False
+    #: The reducer last emitted ENABLE_ISSUANCE for this session (reconcile skips a repeat).
+    issuance_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,6 +422,8 @@ class Readiness:
     ready: bool = False
     #: Human summary of CI at verification, e.g. "17 checks: 13 success, 4 skipped".
     checks_summary: str = ""
+    #: The head the agent's accepted review attested ("" = ``head_sha``, older records).
+    reviewed_head: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -492,6 +500,8 @@ class Parcel:
     decisions: tuple[Decision, ...] = ()
     holds: frozenset[Hold] = frozenset()
     readiness: Readiness | None = None
+    #: Readiness fix wakes sent to the build session for the current approval (at most 1).
+    readiness_wakes: int = 0
     pr_number: int | None = None
     bot: BotState = BotState.IDLE
     #: The in-flight daemon board write: at most one per parcel (serialised).

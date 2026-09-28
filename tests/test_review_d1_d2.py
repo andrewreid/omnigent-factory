@@ -87,7 +87,9 @@ def ready(h: Harness):
             verified=True,
             remediation_exhausted=True,
         ),
-        lambda b: ev.ChecksChanged(pr_number=7, head_sha=HEAD, state=ev.ChecksState.PENDING),
+        lambda b: ev.ReadinessEvidence(
+            session_id=b.session_id, pr_number=7, head_sha=HEAD, checks=ev.ChecksState.FAILED
+        ),
         lambda b: ev.PRObserved(
             pr_number=7,
             head_sha=HEAD,
@@ -97,7 +99,7 @@ def ready(h: Harness):
             parcel_branch=True,
         ),
     ],
-    ids=["D2-unverified", "remediation-exhausted", "checks-pending", "pr-closed-unmerged"],
+    ids=["D2-unverified", "remediation-exhausted", "checks-failed", "pr-closed-unmerged"],
 )
 def test_D2_evidence_falsifying_a_ready_precondition_invalidates_ready(body_for):
     h = Harness()

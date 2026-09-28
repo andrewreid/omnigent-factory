@@ -179,6 +179,7 @@ class _Ctx:
         self.admission: AdmissionSnapshot = state.admission
         self._parcel = state.parcel
         self.effects: list[EffectIntent] = []
+        self.effects_dropped: list[EffectIntent] = []
         self._ordinal = 0
         self._ids = 0
         self.before_version = state.parcel.version if state.parcel else None
@@ -307,6 +308,18 @@ class _Ctx:
             dedupe_key=dedupe or effect_id,
         )
         self.effects.append(effect)
+        if kind in (EffectKind.ENABLE_ISSUANCE, EffectKind.DISABLE_ISSUANCE) and session:
+            current = self.p.session(session.session_id)
+            if current is not None:
+                enabled = kind == EffectKind.ENABLE_ISSUANCE
+                self.update(
+                    sessions=tuple(
+                        replace(x, issuance_enabled=enabled)
+                        if x.session_id == current.session_id
+                        else x
+                        for x in self.p.sessions
+                    )
+                )
         if (
             kind in (EffectKind.SEND_MESSAGE, EffectKind.RESOLVE_ELICITATION)
             and session is not None
@@ -691,6 +704,8 @@ def _apply_evidence(ctx: _Ctx) -> None:
         _safety(ctx, "ineligible-snapshot")
     elif was_in_project and not snap.in_project:
         _safety(ctx, "project-item-missing")
+    if not snap.open and Hold.COMPLETED not in ctx.p.holds:
+        _complete(ctx)  # a fresh read of a closed issue is terminal even if the webhook was lost
     # Safety before control: the column in any fresh read (control envelopes included)
     # is reconciled first; a leftward observation advances the barrier, so the control
     # that carried it is then rejected as not fresh. Explicit move events carry their
@@ -853,6 +868,8 @@ def _maybe_start_prepared(ctx: _Ctx) -> None:
 def _maybe_ready(ctx: _Ctx) -> None:
     r = ctx.p.readiness
     if r is None or r.ready or not r.verified or ctx.p.stage != Stage.BUILDING:
+        return
+    if _completed(ctx):
         return
     s = ctx.p.session(r.session_id)
     if s is None or s.session_id != ctx.p.current_session_id:
@@ -1055,6 +1072,7 @@ def _build_blocked_by_live(ctx: _Ctx) -> bool:
 
 def _after_approval(ctx: _Ctx, approval: Approval, duration_us: int, via: Via) -> None:
     ctx.unhold(*CONTROL_CLEARED_HOLDS)
+    ctx.update(readiness_wakes=0)  # a new approved deliverable gets its own wake
     _cancel_pending(ctx)
     _move(ctx, Stage.BUILDING, via)
     _enqueue_build(ctx, approval, duration_us)
@@ -1085,9 +1103,53 @@ def _stopped_recovery(ctx: _Ctx) -> bool:
     )
 
 
+def _equivalent_run_in_flight(ctx: _Ctx, kind: SessionKind) -> bool:
+    """An owner request for ``kind`` would duplicate the run already pending or running.
+
+    Equivalent: same stage, same eligibility epoch (no stop/safety barrier since), not
+    cancelled, and not yet published (a plan whose contract the owner can see is
+    finished work, so a later /plan is a deliberate new run). Card drag plus a /plan a
+    minute later attach to the one run instead of interrupting and restarting it.
+    """
+    p = ctx.p
+    if p.holds & CONTROL_CLEARED_HOLDS:
+        return False  # the control has something to clear (stuck, stopped, invalid result)
+    pending = p.authorization(p.pending_authorization_id)
+    if pending is not None:
+        return (
+            pending.kind == kind
+            and not pending.cancelled
+            and pending.eligibility_epoch == p.eligibility_epoch
+        )
+    cur = p.current_session
+    if cur is None or cur.kind != kind or cur.fences or cur.execution_closed:
+        return False
+    auth = p.authorization(cur.authorization_id)
+    if auth is None or auth.cancelled or auth.eligibility_epoch != p.eligibility_epoch:
+        return False
+    if cur.lifecycle == Lifecycle.WAITING:
+        if cur.wait_reason == WaitReason.PLAN_APPROVAL:
+            # The plan is done but its contract is not yet visible to the owner: the
+            # publication is still part of this run (also after a restart).
+            return any(
+                c.source_session_id == cur.session_id and not c.published and c.intact
+                for c in p.contracts
+            )
+        return cur.wait_reason == WaitReason.DECISION
+    return cur.lifecycle in (
+        Lifecycle.INTENT,
+        Lifecycle.CREATING,
+        Lifecycle.PREPARING,
+        Lifecycle.ACTIVE,
+    )
+
+
 def _h_request_triage(ctx: _Ctx, body: ev.RequestTriage) -> None:
     _control(ctx)
     _require_eligible(ctx)
+    if ctx.origin_stage == Stage.TRIAGED and _equivalent_run_in_flight(ctx, SessionKind.TRIAGE):
+        # Attach to the running triage: audited, no new authority, interrupt or restart.
+        raise Rejected("equivalent-run-in-flight")
     in_list = ctx.origin_stage in _TRIAGE_STAGES and not _approval_active(ctx)
     if not (in_list or _stopped_recovery(ctx)):
         raise Rejected("triage-not-allowed-from-stage", explain=True)
@@ -1113,6 +1175,13 @@ def _plan_control(ctx: _Ctx, via: Via | None) -> None:
     stage = ctx.origin_stage
     if stage in _NO_RECOVERY_STAGES:
         raise Rejected("rework-requires-phase4-control", explain=True)
+    if (
+        ctx.event.kind == EventKind.REQUEST_PLAN
+        and stage == Stage.SCOPED
+        and _equivalent_run_in_flight(ctx, SessionKind.PLAN)
+    ):
+        # Attach to the running plan: audited, no new revision, authority or interrupt.
+        raise Rejected("equivalent-run-in-flight")
     if stage == Stage.BUILDING or not _stage_controllable(ctx.p) or _approval_active(ctx):
         _replan(ctx, via)
         return
@@ -1387,6 +1456,7 @@ def _h_ineligible(
     ctx.update(eligible=False)
     _safety(ctx, body.KIND.value)
     if isinstance(body, ev.Closed):
+        _complete(ctx)
         ctx.emit(
             EffectKind.CLEANUP_WORKSPACE,
             args={"merged": False},
@@ -1527,6 +1597,43 @@ def _h_column_observed(ctx: _Ctx, body: ev.ColumnObserved) -> None:
     _observe_stage(ctx, body.stage)
 
 
+def _completed(ctx: _Ctx) -> bool:
+    return Hold.COMPLETED in ctx.p.holds
+
+
+def _complete(ctx: _Ctx) -> None:
+    """Merged PR or closed issue: terminal before any readiness or stage transition.
+
+    Drops a queued board write, drains live work and records the barrier; later checks,
+    heads, reviews and evidence reads are audit only (never Building, never a comment).
+    """
+    ctx.hold(Hold.COMPLETED)
+    ctx.unhold(Hold.CHECKS_FAILED, Hold.READINESS_FAILED, Hold.REWORK_CONTROL_REQUIRED)
+    _drop_queued_move(ctx)
+    _cancel_pending(ctx)
+    cur = ctx.p.current_session
+    if cur is not None and not settled(cur) and cur.lifecycle != Lifecycle.DRAINING:
+        _begin_drain(ctx, cur)
+
+
+def _merged(ctx: _Ctx, pr_number: int) -> None:
+    """The linked PR merged: terminal even if the issue stays open (no closing reference).
+
+    The open-PR slot is released and live build work drains, which frees the building
+    slot once the tree is quiescent.
+    """
+    if _completed(ctx):
+        return
+    _release_pr(ctx, pr_number)
+    _complete(ctx)
+    # Finished: once its sessions have settled, remove the factory worktree/branch.
+    ctx.emit(
+        EffectKind.CLEANUP_WORKSPACE,
+        args={"merged": True, "pr_number": pr_number},
+        dedupe=f"cleanup:{ctx.p.parcel_id}:merged",
+    )
+
+
 def _h_pr_observed(ctx: _Ctx, body: ev.PRObserved) -> None:
     prs = set(ctx.admission.open_bot_prs)
     if body.bot_authored:
@@ -1552,32 +1659,38 @@ def _h_pr_observed(ctx: _Ctx, body: ev.PRObserved) -> None:
             ),
         )
         r = ctx.p.readiness
-        if ctx.p.stage == Stage.READY and r is not None and r.head_sha != body.head_sha:
-            _invalidate_ready(ctx, "head-drift")
+        if (
+            not _completed(ctx)
+            and r is not None
+            and r.pr_number == body.pr_number
+            and body.head_sha
+            and r.head_sha != body.head_sha
+        ):
+            # A push (agent or owner merge-from-main) is a hint: a fresh read establishes
+            # the current head, so a late old-head webhook can never roll it back.
+            _fetch_evidence(ctx, r)
         return
     _release_pr(ctx, body.pr_number)
     if body.merged:
-        # Finished: once its sessions have settled, remove the factory worktree/branch.
-        ctx.emit(
-            EffectKind.CLEANUP_WORKSPACE,
-            args={"merged": True, "pr_number": body.pr_number},
-            dedupe=f"cleanup:{ctx.p.parcel_id}:merged",
-        )
+        _merged(ctx, body.pr_number)
         return
-    if not body.merged:
-        ready = ctx.p.readiness
-        if (
-            ctx.p.stage == Stage.READY
-            and ready is not None
-            and ready.ready
-            and (ready.pr_number == body.pr_number)
-        ):
-            _invalidate_ready(ctx, "pr-closed-unmerged")
-        ctx.hold(Hold.PR_CLOSED)
-        ctx.comment("pr-closed-unmerged", pr_number=body.pr_number)
+    if _completed(ctx):
+        return
+    ready = ctx.p.readiness
+    if (
+        ctx.p.stage == Stage.READY
+        and ready is not None
+        and (ready.ready or _refreshing(ctx))
+        and (ready.pr_number == body.pr_number)
+    ):
+        _invalidate_ready(ctx, "pr-closed-unmerged")
+    ctx.hold(Hold.PR_CLOSED)
+    ctx.comment("pr-closed-unmerged", pr_number=body.pr_number)
 
 
 def _invalidate_ready(ctx: _Ctx, reason: str) -> None:
+    if _completed(ctx):
+        return  # merged/closed wins over any late negative evidence
     r = ctx.p.readiness
     if r is not None:
         ctx.update(readiness=replace(r, ready=False, verified=False))
@@ -1586,44 +1699,50 @@ def _invalidate_ready(ctx: _Ctx, reason: str) -> None:
     ctx.comment("ready-invalidated", reason=reason)
 
 
-def _h_checks_changed(ctx: _Ctx, body: ev.ChecksChanged) -> None:
+def _fetch_evidence(ctx: _Ctx, r: Readiness) -> None:
+    """A fresh read of the linked PR: actual head, current checks, review and findings."""
+    ctx.emit(
+        EffectKind.FETCH_PR_EVIDENCE,
+        args={
+            "pr_number": r.pr_number,
+            "head_sha": r.head_sha,
+            "reviewed_head": r.reviewed_head or r.head_sha,
+            "session_id": r.session_id,
+            "issue_number": ctx.p.issue_number,
+        },
+    )
+
+
+def _readiness_for(ctx: _Ctx, pr_number: int, unknown: str) -> Readiness:
+    """The readiness record a PR/check/review observation refers to (0 = unnamed PR)."""
+    if _completed(ctx):
+        raise Rejected("parcel-completed")
     r = ctx.p.readiness
-    if r is None or r.pr_number != body.pr_number:
-        raise Rejected("checks-for-unknown-pr")
+    if r is None or pr_number not in (0, r.pr_number):
+        # Before build_ready (or the PR link) is recorded: build_ready always issues a
+        # fresh read, which covers this observation, so nothing is lost by not acting.
+        raise Rejected(unknown)
+    return r
+
+
+def _h_checks_changed(ctx: _Ctx, body: ev.ChecksChanged) -> None:
+    """A check-suite/workflow webhook is one suite on some head, not the aggregate: it
+    only triggers a fresh current-head read, which alone decides readiness."""
+    r = _readiness_for(ctx, body.pr_number, "checks-before-readiness-recorded")
     if ctx.p.stage == Stage.READY and r.ready:
-        # Missing/pending/failed is not success: any non-green state falsifies Ready.
-        if body.head_sha != r.head_sha or body.state != ev.ChecksState.GREEN:
-            _invalidate_ready(ctx, "checks-or-head-changed")
+        if body.head_sha == r.head_sha and body.state == ev.ChecksState.GREEN:
+            return
+    elif r.verified and body.head_sha == r.head_sha and body.state == ev.ChecksState.GREEN:
         return
-    if body.head_sha != r.head_sha:
-        raise Rejected("checks-for-stale-head")
-    if body.state == ev.ChecksState.FAILED:
-        # Phases 0-3: saved evidence and Needs you; no automatic repair loop.
-        ctx.hold(Hold.CHECKS_FAILED)
-        return
-    if body.state == ev.ChecksState.GREEN:
-        ctx.unhold(Hold.CHECKS_FAILED)
-        ctx.emit(
-            EffectKind.FETCH_PR_EVIDENCE,
-            args={
-                "pr_number": r.pr_number,
-                "head_sha": r.head_sha,
-                "session_id": r.session_id,
-                "issue_number": ctx.p.issue_number,
-            },
-        )
+    _fetch_evidence(ctx, r)
 
 
 def _h_review_changed(ctx: _Ctx, body: ev.ReviewChanged) -> None:
-    r = ctx.p.readiness
-    if r is None or r.pr_number != body.pr_number:
-        raise Rejected("review-for-unknown-pr")
-    if (
-        ctx.p.stage == Stage.READY
-        and r.ready
-        and (body.changes_requested or body.head_sha != r.head_sha)
-    ):
-        _invalidate_ready(ctx, "review-changed")
+    r = _readiness_for(ctx, body.pr_number, "review-for-unknown-pr")
+    if ctx.p.stage == Stage.READY and body.changes_requested:
+        _invalidate_ready(ctx, "review-changed")  # the owner asks for rework
+    elif body.head_sha and body.head_sha != r.head_sha:
+        _fetch_evidence(ctx, r)  # e.g. an approval of a newer head: re-read, never rework
     # Otherwise an observation only: a review never authorizes a new work episode.
 
 
@@ -1635,6 +1754,8 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
                 u for u in ctx.p.unknown_effects if u.kind != EffectKind.FETCH_PR_EVIDENCE.value
             )
         )
+    if _completed(ctx):
+        return  # audit only: terminal state wins over a late read
     r = ctx.p.readiness
     if r is None or (r.session_id, r.pr_number, r.head_sha) != (
         body.session_id,
@@ -1642,19 +1763,140 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
         body.head_sha,
     ):
         raise Rejected("readiness-for-stale-report")
+    if body.merged:
+        _merged(ctx, r.pr_number)
+        return
+    observed = body.observed_head_sha or body.head_sha
+    if observed != r.head_sha:
+        _head_changed(ctx, r, observed)
+        return
     if body.remediation_exhausted:
         ctx.hold(Hold.REMEDIATION_EXHAUSTED)
+    in_ready = ctx.p.stage == Stage.READY and (r.ready or _refreshing(ctx))
     if not body.verified:
         ctx.update(readiness=replace(r, verified=False))
-        ctx.hold(Hold.READINESS_FAILED)
-        if r.ready:
-            _invalidate_ready(ctx, "readiness-unverified")
+        if in_ready:
+            if body.checks == ev.ChecksState.PENDING and body.pr_open:
+                # A re-run or a new head's checks: stay in Ready, waiting (Bot Working);
+                # a later green read restores Ready with no owner action or comment.
+                ctx.update(readiness=replace(r, verified=False, ready=False))
+                return
+            ctx.hold(Hold.READINESS_FAILED)
+            reason = (
+                "readiness-unverified"
+                if body.checks is None
+                else _failure_reason(r, body, ctx.p.issue_number)
+            )
+            _invalidate_ready(ctx, reason)
+            return
+        if body.checks is None or not body.pr_open:
+            ctx.hold(Hold.READINESS_FAILED)  # legacy read or closed PR: owner decides
+            return
+        _not_ready(ctx, r, body)
         return
-    if r.ready and body.remediation_exhausted:
+    if in_ready and body.remediation_exhausted:
         _invalidate_ready(ctx, "remediation-exhausted")
         return
     ctx.unhold(Hold.READINESS_FAILED, Hold.CHECKS_FAILED)
-    ctx.update(readiness=replace(r, verified=True, checks_summary=body.checks_summary[:200]))
+    ctx.update(
+        readiness=replace(
+            r, verified=True, ready=r.ready or in_ready, checks_summary=body.checks_summary[:200]
+        )
+    )
+
+
+def _refreshing(ctx: _Ctx) -> bool:
+    """The card is in Ready while a new head or a check re-run is re-evaluated."""
+    r = ctx.p.readiness
+    return ctx.p.stage == Stage.READY and r is not None and not r.ready
+
+
+def _head_changed(ctx: _Ctx, r: Readiness, head: str) -> None:
+    """Fresh evidence shows a new PR head (agent push or owner "Update branch").
+
+    Not an owner rework instruction: the old head's failure holds are retired and the new
+    head is evaluated from a fresh read; a Ready card stays in Ready meanwhile. The
+    accepted review stays bound to ``reviewed_head``; the read accepts it for the new head
+    only when the new commits merely sync the base branch.
+    """
+    r = replace(
+        r,
+        head_sha=head,
+        reviewed_head=r.reviewed_head or r.head_sha,
+        verified=False,
+        ready=False,
+        checks_summary="",
+    )
+    ctx.update(readiness=r)
+    ctx.unhold(Hold.CHECKS_FAILED, Hold.READINESS_FAILED)
+    _fetch_evidence(ctx, r)
+
+
+def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
+    """Current-head evidence is not green: wait, wake the idle build once, or Needs you.
+
+    Pending checks are waiting, never a failure. A genuine failure (red checks, open
+    review-bot findings, no accepted review of this head) wakes the idle build session
+    once per approval, within its existing fix-batch/recheck allowance; after that the
+    owner decides with the reason recorded.
+    """
+    s = ctx.p.session(r.session_id)
+    if body.checks == ev.ChecksState.PENDING:
+        return
+    if s is not None and s.session_id == ctx.p.current_session_id and not s.fences:
+        busy = s.lifecycle == Lifecycle.ACTIVE or (
+            s.lifecycle == Lifecycle.WAITING
+            and s.wait_reason == WaitReason.CHECKS
+            and not s.quiescent
+        )
+        if busy:
+            return  # re-evaluated by the next reconcile read or a new result
+    reason = _failure_reason(r, body, ctx.p.issue_number)
+    if (
+        ctx.p.readiness_wakes < 1
+        and s is not None
+        and s.session_id == ctx.p.current_session_id
+        and s.lifecycle == Lifecycle.WAITING
+        and s.wait_reason == WaitReason.CHECKS
+        and s.quiescent
+        and not ctx.p.open_decisions
+        and approval_ok(ctx.p)
+        and dispatchable(ctx.p)
+        and work_allowed(ctx.p, s)
+    ):
+        ctx.update(readiness_wakes=ctx.p.readiness_wakes + 1)
+        s = ctx.put_session(replace(s, lifecycle=Lifecycle.ACTIVE, wait_reason=None))
+        _ensure_issuance(ctx, s)
+        ctx.emit(
+            EffectKind.SEND_MESSAGE,
+            session=s,
+            args={
+                "purpose": MessagePurpose.READINESS_WAKE.value,
+                "reason": reason,
+                "pr_number": r.pr_number,
+                "head_sha": r.head_sha,
+            },
+        )
+        return
+    if Hold.READINESS_FAILED not in ctx.p.holds:
+        ctx.hold(Hold.READINESS_FAILED)
+        ctx.comment("ready-blocked", pr_number=r.pr_number, head_sha=r.head_sha, reason=reason)
+
+
+def _failure_reason(r: Readiness, body: ev.ReadinessEvidence, issue: int | None) -> str:
+    parts = []
+    if not body.closes_issue:
+        parts.append(
+            f"PR #{r.pr_number} does not close issue #{issue} (GitHub closing references); "
+            f"its body must include `Closes #{issue}`"
+        )
+    if body.checks == ev.ChecksState.FAILED:
+        parts.append(f"required checks failed ({body.checks_summary[:120]})")
+    if body.findings_open:
+        parts.append("review-bot findings are unresolved")
+    if not body.review_accepted:
+        parts.append(f"no accepted cross-vendor review of head {r.head_sha[:12]}")
+    return "; ".join(parts) or "the PR does not meet the readiness checks"
 
 
 def _h_contract_published(ctx: _Ctx, body: ev.ContractPublished) -> None:
@@ -2098,7 +2340,11 @@ def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
         )
     elif body.result_kind == ev.ResultKind.BUILD_READY:
         assert body.pr_number is not None and body.head_sha is not None  # noqa: S101
-        ctx.update(readiness=Readiness(s.session_id, body.pr_number, body.head_sha))
+        ctx.update(
+            readiness=Readiness(
+                s.session_id, body.pr_number, body.head_sha, reviewed_head=body.head_sha
+            )
+        )
         s = ctx.put_session(
             replace(s, lifecycle=Lifecycle.WAITING, wait_reason=WaitReason.CHECKS, quiescent=False)
         )
@@ -2399,13 +2645,37 @@ def _h_operator_resume(ctx: _Ctx, body: ev.OperatorResume) -> None:
     )
 
 
+def _awaiting_evidence(ctx: _Ctx) -> bool:
+    """A linked, non-terminal PR whose readiness is not verified on its current head:
+    Building, Ready (a new head or a re-run) or Needs you, live session or not."""
+    r = ctx.p.readiness
+    return (
+        r is not None
+        and not r.verified
+        and not _completed(ctx)
+        and Hold.PR_CLOSED not in ctx.p.holds
+    )
+
+
 def _h_reconcile_due(ctx: _Ctx, body: ev.ReconcileDue) -> None:
     _ = body
     ctx.emit(EffectKind.RECONCILE_PARCEL)
     _close_stale_decisions(ctx)
     cur = ctx.p.current_session
+    if _awaiting_evidence(ctx):
+        r = ctx.p.readiness
+        assert r is not None  # noqa: S101 - checked by _awaiting_evidence
+        _fetch_evidence(ctx, r)  # catch-up read: a missed or early webhook is not lost
     if cur is not None and not any(e.kind == EffectKind.ENABLE_ISSUANCE for e in ctx.effects):
-        _ensure_issuance(ctx, cur)  # restart with the gate closed: re-enable once it opens
+        cur = ctx.p.current_session
+        assert cur is not None  # noqa: S101 - unchanged above
+        if not work_allowed(ctx.p, cur):
+            # Closed gate: forget the last enable so the gate reopening re-enables once
+            # (the broker is default-deny after a restart and only rechecks at boot).
+            if cur.issuance_enabled:
+                ctx.put_session(replace(cur, issuance_enabled=False))
+        elif not cur.issuance_enabled:
+            _ensure_issuance(ctx, cur)  # restart with the gate closed: re-enable once
     # Correct drift: the board's Bot field is re-asserted from derived state each cycle
     # (the adapter adopts without writing when it already matches).
     # Bot drift is corrected by the RECONCILE_PARCEL read (see ``_h_snapshot``).
@@ -2584,11 +2854,24 @@ def transition(state: State, event: Event) -> TransitionResult:
             if effect.work_bearing and effect_still_valid(new_parcel, effect) is not None:
                 dropped += 1
                 dropped_ids.add(effect.effect_id)
+                ctx.effects_dropped.append(effect)
                 continue
             kept.append(effect)
         ctx.effects = kept
         if dropped_ids:
             ctx.update(sent_effects=tuple(x for x in ctx.p.sent_effects if x[0] not in dropped_ids))
+            unsent = {
+                e.preconditions.session_id
+                for e in ctx.effects_dropped
+                if e.kind == EffectKind.ENABLE_ISSUANCE
+            }
+            if unsent:
+                ctx.update(
+                    sessions=tuple(
+                        replace(x, issuance_enabled=False) if x.session_id in unsent else x
+                        for x in ctx.p.sessions
+                    )
+                )
         new_parcel = replace(
             new_parcel,
             version=ctx.next_version,

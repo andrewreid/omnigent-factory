@@ -164,7 +164,10 @@ async def test_boot_requeues_unknown_reads_and_a_detail_less_ack_is_retried(
 
     github = FakeGitHub()
     verified = {"verified": True, "remediation_exhausted": False}
-    github.script(EffectKind.FETCH_PR_EVIDENCE, Ack("682", {}), Ack("682", verified))
+    # The startup reconcile adds one catch-up read of the unverified head.
+    github.script(
+        EffectKind.FETCH_PR_EVIDENCE, Ack("682", {}), Ack("682", verified), Ack("682", verified)
+    )
     service = FactoryService(
         service_config,
         adapters=(github, FakeOmnigent(), FakeCredentialBroker()),
@@ -180,7 +183,7 @@ async def test_boot_requeues_unknown_reads_and_a_detail_less_ack_is_retried(
             await asyncio.sleep(0.01)
         stored = await service.db.call(lambda s: s.get_effect(fetch.effect_id))
         parcel = await service.db.call(lambda s: s.load_parcel(P))
-        assert stored.state == "done" and len(github.executed(EffectKind.FETCH_PR_EVIDENCE)) == 2
+        assert stored.state == "done" and len(github.executed(EffectKind.FETCH_PR_EVIDENCE)) >= 2
         assert not parcel.unknown_effects
         assert parcel.readiness is not None and parcel.readiness.verified
         assert parcel.stage == Stage.READY

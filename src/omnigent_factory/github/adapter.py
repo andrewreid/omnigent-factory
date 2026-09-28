@@ -223,7 +223,12 @@ class GitHubAPIAdapter:
         return names[0] if len(names) == 1 else None
 
     async def pull_request(
-        self, ref: IssueRef, pr_number: int, *, cross_vendor_review: bool = False
+        self,
+        ref: IssueRef,
+        pr_number: int,
+        *,
+        cross_vendor_review: bool = False,
+        reviewed_head: str | None = None,
     ) -> PullRequestEvidence | RetryableReadFailure:
         """Fresh PR facts for readiness (owner direction: the owner's approval is NOT part
         of Ready; the ruleset requires it at merge).
@@ -231,6 +236,8 @@ class GitHubAPIAdapter:
         ``cross_vendor_review`` is Molly's reported opposite-vendor review of this head
         (clean verdict, reviewer vendor differs). A GitHub approval from
         ``independent_reviewer_ids`` is required additionally only when configured.
+        When it attested ``reviewed_head`` and the PR has moved on, it still counts only
+        if every newer commit merely syncs the base branch (see ``_base_sync_only``).
         """
         if ref.repo_id != self.repository_node_id:
             return RetryableReadFailure("pull request repository identity mismatch")
@@ -249,6 +256,10 @@ class GitHubAPIAdapter:
                 head_sha, base_ref if isinstance(base_ref, str) else None
             )
             review_accepted = cross_vendor_review
+            if review_accepted and reviewed_head and reviewed_head != head_sha:
+                review_accepted = isinstance(base_ref, str) and await self._base_sync_only(
+                    reviewed_head, head_sha, base_ref
+                )
             if review_accepted and self.independent_reviewer_ids:
                 reviews = await self.client.paginate(
                     f"/repos/{self.repository}/pulls/{pr_number}/reviews?per_page=100"
@@ -274,6 +285,67 @@ class GitHubAPIAdapter:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
         except GitHubAPIError as exc:
             return RetryableReadFailure(str(exc))
+
+    async def _base_sync_only(self, reviewed: str, head: str, base_ref: str) -> bool:
+        """``head`` descends from the reviewed head only through base-branch syncs.
+
+        Walks the feature first-parent chain from ``head`` back to ``reviewed``; commits
+        that arrived through a merge's other parent (the base branch's own history) are
+        not on that chain and are not judged. Each chain commit must be a merge whose
+        other parent is already on ``base_ref`` (e.g. "Update branch") or be authored by
+        an owner. Anything else (e.g. a new bot/agent commit) needs a fresh review;
+        anything unreadable counts as not a sync.
+        """
+        try:
+            compare: Any = await self.client.get_json(
+                f"/repos/{self.repository}/compare/{reviewed}...{head}"
+            )
+            if not isinstance(compare, dict):
+                return False
+            commits = compare.get("commits")
+            if (
+                compare.get("status") != "ahead"
+                or not isinstance(commits, list)
+                or compare.get("total_commits") != len(commits)
+            ):
+                return False
+            by_sha = {
+                c["sha"]: c
+                for c in commits
+                if isinstance(c, dict) and isinstance(c.get("sha"), str)
+            }
+            current = head
+            for _ in range(len(by_sha) + 1):
+                if current == reviewed:
+                    return True
+                commit = by_sha.get(current)
+                if commit is None:
+                    return False
+                raw = [p.get("sha") for p in commit.get("parents") or [] if isinstance(p, dict)]
+                parents = [p for p in raw if isinstance(p, str)]
+                if not parents or len(parents) != len(raw):
+                    return False
+                author = commit.get("author")
+                author_id = author.get("id") if isinstance(author, dict) else None
+                owner = author_id in self.owner_ids and author_id != self.bot_user_id
+                if not owner:
+                    if len(parents) < 2:
+                        return False
+                    for other in parents[1:]:
+                        on_base: Any = await self.client.get_json(
+                            f"/repos/{self.repository}/compare/{base_ref}...{other}"
+                        )
+                        if not isinstance(on_base, dict) or on_base.get("status") not in (
+                            "behind",
+                            "identical",
+                        ):
+                            return False
+                current = parents[0]
+            return False
+        except GitHubRejected as exc:
+            if exc.status_code in (404, 422):
+                return False  # e.g. a force-push rewrote history: not a base sync
+            raise
 
     async def _closes_issue(self, pr_number: int, issue_node_id: str) -> bool:
         """GitHub's closing references for this PR include exactly the parcel's issue.
@@ -337,7 +409,13 @@ class GitHubAPIAdapter:
         neutral or skipped). With nothing required, every check run and commit status on
         the head must have completed that way, and there must be at least one. Pending
         means not ready; any failure means failed. "No configuration" is never FAILED.
+
+        A required check is decided by its latest attempt (name + app, highest run ID),
+        as in GitHub's own evaluation. Without a required set, a cancelled run superseded
+        by a later run of the same check is history, not a failure; every other run
+        counts. A latest attempt that is itself cancelled still blocks.
         """
+        fetched: list[tuple[int, str, int | None, str, str]] = []  # id, name, app, state, label
         runs: list[tuple[str, int | None, str]] = []  # (name, app id, state)
         labels: list[str] = []  # conclusion-level labels for the human summary
         page = 1
@@ -353,30 +431,54 @@ class GitHubAPIAdapter:
                     continue
                 app = run.get("app")
                 app_id = app.get("id") if isinstance(app, dict) else None
-                runs.append(
+                raw_id = run.get("id")
+                conclusion = run.get("conclusion")
+                fetched.append(
                     (
+                        raw_id if isinstance(raw_id, int) else 0,
                         str(run["name"]),
                         app_id if isinstance(app_id, int) else None,
-                        _run_state(run.get("status"), run.get("conclusion")),
+                        _run_state(run.get("status"), conclusion),
+                        str(conclusion)
+                        if run.get("status") == "completed" and isinstance(conclusion, str)
+                        else "pending",
                     )
-                )
-                conclusion = run.get("conclusion")
-                labels.append(
-                    str(conclusion)
-                    if run.get("status") == "completed" and isinstance(conclusion, str)
-                    else "pending"
                 )
             if len(batch) < 100:
                 break
             page += 1
+        newest: dict[tuple[str, int | None], int] = {}
+        for run_id, name, app_id, _, _ in fetched:
+            newest[(name, app_id)] = max(run_id, newest.get((name, app_id), run_id))
+        latest: dict[tuple[str, int | None], str] = {}  # required-check view
+        for run_id, name, app_id, state, label in sorted(fetched, key=lambda r: r[0]):
+            latest[(name, app_id)] = state
+            if label == "cancelled" and run_id < newest[(name, app_id)]:
+                continue  # superseded by a later attempt of the same check
+            runs.append((name, app_id, state))
+            labels.append(label)
         combined: Any = await self.client.get_json(
             f"/repos/{self.repository}/commits/{head_sha}/status"
         )
         statuses = combined.get("statuses") if isinstance(combined, dict) else None
+        # Legacy statuses are history too: the latest per context (highest ID) decides.
+        latest_status: dict[str, tuple[int, str, str]] = {}
         for status in statuses if isinstance(statuses, list) else []:
             if isinstance(status, dict) and isinstance(status.get("context"), str):
-                runs.append((str(status["context"]), None, _status_state(status.get("state"))))
-                labels.append(str(status.get("state") or "pending"))
+                raw_id = status.get("id")
+                status_id = raw_id if isinstance(raw_id, int) else 0
+                context = str(status["context"])
+                if context not in latest_status or status_id >= latest_status[context][0]:
+                    latest_status[context] = (
+                        status_id,
+                        _status_state(status.get("state")),
+                        str(status.get("state") or "pending"),
+                    )
+        # Statuses carry no app: they can satisfy only an unpinned requirement.
+        legacy = {context: state for context, (_, state, _) in latest_status.items()}
+        for context, (_, state, label) in latest_status.items():
+            runs.append((context, None, state))
+            labels.append(label)
         self._last_checks_summary = _checks_summary(labels)
         required: set[tuple[str, int | None]] = set(self.required_checks)
         if not required and base_ref is not None:
@@ -384,11 +486,14 @@ class GitHubAPIAdapter:
         if required:
             states = []
             for name, app_id in required:
+                # A pinned requirement is satisfied only by that exact app's latest run.
                 found = [
                     state
-                    for run_name, run_app, state in runs
-                    if run_name == name and (app_id is None or run_app in (None, app_id))
+                    for (run_name, run_app), state in latest.items()
+                    if run_name == name and (app_id is None or run_app == app_id)
                 ]
+                if app_id is None and name in legacy:
+                    found.append(legacy[name])
                 states.append(_combine(found) if found else "pending")
             return _checks_from(states)
         return _checks_from([state for _, _, state in runs]) if runs else ChecksState.PENDING
@@ -570,7 +675,13 @@ class GitHubAPIAdapter:
                     if self.cross_vendor_review is not None
                     else False
                 )
-                evidence = await self.pull_request(ref, number, cross_vendor_review=review)
+                reviewed = effect.args.get("reviewed_head")
+                evidence = await self.pull_request(
+                    ref,
+                    number,
+                    cross_vendor_review=review,
+                    reviewed_head=reviewed if isinstance(reviewed, str) else None,
+                )
                 if isinstance(evidence, RetryableReadFailure):
                     return evidence
                 detail = asdict(evidence)

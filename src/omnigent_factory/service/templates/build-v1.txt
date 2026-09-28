@@ -2,7 +2,9 @@ Factory build for {repository} issue #{issue_number} on branch {branch}.
 Bounded active-time remaining at dispatch: {granted_us} microseconds.
 
 Outcome: deliver the approved scope, verify it, obtain the required opposite-vendor
-review, respond to PR-bot feedback, and open/update the parcel PR from this branch. Never
+review, respond to PR-bot feedback, and open/update the parcel PR from this branch. The PR
+body must include `Closes #{issue_number}` (Ready requires GitHub's closing reference to
+this issue). Never
 merge. Use only the factory-provided git credential helper and gh wrapper at {gh_wrapper};
 the capability handle is {capability_file}. Carry those paths into every worker dispatch.
 
