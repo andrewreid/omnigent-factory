@@ -1,0 +1,8 @@
+Factory operator note for run {run_id}. The factory has re-checked this run's authority and
+credentials; the note below comes from the local operator and does not widen your approved
+scope.
+
+{note}
+
+When done, submit the stage outcome with factory_submit_result (or kind "blocked" with the
+reason if something still refuses). factory_get_status shows the current state.

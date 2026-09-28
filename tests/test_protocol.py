@@ -1,4 +1,4 @@
-"""Frozen result protocol v1 parsing and cross-record constraints (§7.1-§7.2)."""
+"""Result schema v1 validation and cross-record constraints (§7.2)."""
 
 from __future__ import annotations
 
@@ -13,8 +13,7 @@ from omnigent_factory.core.protocol import (
     MAX_RESULT_BYTES,
     Correlation,
     ResultError,
-    extract_result_block,
-    parse_factory_result,
+    validate_result,
 )
 from omnigent_factory.testing.builders import contract
 
@@ -86,10 +85,6 @@ def build_result(**over) -> dict:
     }
 
 
-def message(obj: object, fence: str = "```") -> str:
-    return f"Some prose.\n\nFACTORY_RESULT_V1\n{fence}factory-result\n{json.dumps(obj)}\n{fence}\n"
-
-
 def test_schema_file_is_the_architecture_schema():
     schema = json.loads(
         (Path(core_pkg.__file__).parent / "result_schema_v1.json").read_text("utf-8")
@@ -98,89 +93,63 @@ def test_schema_file_is_the_architecture_schema():
     assert set(schema["$defs"]) >= {"triage", "plan", "build", "checkpoint", "contract"}
 
 
-@pytest.mark.parametrize("fence", ["```", "~~~"])
-def test_plan_result_parses_and_canonicalizes(fence):
-    parsed = parse_factory_result(message(envelope(plan_result()), fence), CORR)
+def test_plan_result_validates_and_canonicalizes():
+    parsed = validate_result(plan_result(), CORR)
     assert parsed.contract_canonical is not None
     import hashlib
 
     assert hashlib.sha256(parsed.contract_canonical).hexdigest() == contract_digest(contract())
+    # The envelope comes from the calling run, never from the agent.
+    assert parsed.result.model_dump(exclude={"result"}) == {
+        k: v for k, v in envelope({}).items() if k != "result"
+    }
 
 
-def test_quoted_and_duplicate_blocks_are_ignored_or_rejected():
-    obj = envelope(plan_result())
-    quoted = "> FACTORY_RESULT_V1\n> ```factory-result\n> {}\n> ```\n" + message(obj)
-    assert parse_factory_result(quoted, CORR).result.revision == 3
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_strict_json(value):
     with pytest.raises(ResultError):
-        extract_result_block(message(obj) + message(obj))
-    with pytest.raises(ResultError):
-        extract_result_block("```factory-result\n{}\n```")
-    with pytest.raises(ResultError):
-        extract_result_block("FACTORY_RESULT_V1\ntext\n```factory-result\n{}\n```")
-    with pytest.raises(ResultError):
-        extract_result_block("FACTORY_RESULT_V1\n```factory-result\n{}\n")
-
-
-@pytest.mark.parametrize(
-    ("text", "why"),
-    [
-        ('{"version": 1, "version": 1}', "duplicate key"),
-        ('{"version": NaN}', "nan"),
-    ],
-)
-def test_strict_json(text, why):
-    msg = f"FACTORY_RESULT_V1\n```factory-result\n{text}\n```"
-    with pytest.raises(ResultError):
-        parse_factory_result(msg, CORR)
-    assert why
+        validate_result(plan_result(risks=[value]), CORR)
 
 
 @pytest.mark.parametrize(
     "obj",
     [
-        envelope(plan_result(), extra=1),
-        envelope(plan_result(extra=1)),
-        envelope(plan_result(), version=2),
-        envelope(plan_result(), revision=True),
-        envelope(plan_result(), revision=-1),
-        envelope({**plan_result(), "kind": "unknown"}),
-        envelope(plan_result(contract={**contract(), "size": "XL"})),
+        plan_result(extra=1),
+        {**plan_result(), "kind": "unknown"},
+        plan_result(contract={**contract(), "size": "XL"}),
+        plan_result(risks="not a list"),
+        [],
     ],
 )
 def test_schema_violations(obj):
-    with pytest.raises(ResultError):
-        parse_factory_result(message(obj), CORR)
+    with pytest.raises(ResultError) as info:
+        validate_result(obj, CORR)
+    assert info.value.details
 
 
 def test_oversized_result_rejected():
     big = plan_result(approach="x" * 16000, risks=["y" * 16000] * 9)
     with pytest.raises(ResultError):
-        parse_factory_result(message(envelope(big)), CORR)
+        validate_result(big, CORR)
     assert MAX_RESULT_BYTES == 131072
-
-
-def test_correlation_must_match():
-    for field, value in [("parcel_id", "P2"), ("dispatch_nonce", "N2"), ("revision", 2)]:
-        with pytest.raises(ResultError):
-            parse_factory_result(message(envelope(plan_result(), **{field: value})), CORR)
 
 
 def test_plan_stage_requires_contract_publication():
     with pytest.raises(ResultError):
-        parse_factory_result(message(envelope(plan_result(publication_kind="info"))), CORR)
+        validate_result(plan_result(publication_kind="info"), CORR)
 
 
 def test_build_info_plan_only_under_waiver():
-    info = envelope(plan_result(publication_kind="info"))
+    info = plan_result(publication_kind="info")
     waiver = Correlation("P1", "S1", "N1", 3, "build", waiver_build=True)
-    assert parse_factory_result(message(info), waiver).result.result.kind == "plan"
+    assert validate_result(info, waiver).result.result.kind == "plan"
     with pytest.raises(ResultError):
-        parse_factory_result(message(info), Correlation("P1", "S1", "N1", 3, "build"))
+        validate_result(info, Correlation("P1", "S1", "N1", 3, "build"))
 
 
 def test_triage_constraints():
     corr = Correlation("P1", "S1", "N1", 3, "triage")
-    assert parse_factory_result(message(envelope(triage_result())), corr)
+    assert validate_result(triage_result(), corr)
     for bad in (
         triage_result(recommendation="duplicate"),
         triage_result(duplicate_issue=5),
@@ -188,14 +157,14 @@ def test_triage_constraints():
         triage_result(labels=["a", "a"]),
     ):
         with pytest.raises(ResultError):
-            parse_factory_result(message(envelope(bad)), corr)
+            validate_result(bad, corr)
     ok_dup = triage_result(recommendation="duplicate", duplicate_issue=5)
-    assert parse_factory_result(message(envelope(ok_dup)), corr)
+    assert validate_result(ok_dup, corr)
 
 
 def test_build_constraints():
     corr = Correlation("P1", "S1", "N1", 3, "build")
-    assert parse_factory_result(message(envelope(build_result())), corr)
+    assert validate_result(build_result(), corr)
     finding = {
         "id": "F",
         "source": "bot",
@@ -210,9 +179,9 @@ def test_build_constraints():
         build_result(review={**build_result()["review"], "review_vendor": "anthropic"}),
     ):
         with pytest.raises(ResultError):
-            parse_factory_result(message(envelope(bad)), corr)
+            validate_result(bad, corr)
     with pytest.raises(ResultError):
-        parse_factory_result(message(envelope(build_result())), CORR)
+        validate_result(build_result(), CORR)
 
     unresolved = {
         "id": "F2",
@@ -222,7 +191,7 @@ def test_build_constraints():
         "evidence": "not handled",
     }
     with pytest.raises(ResultError, match="all be dispositioned"):
-        parse_factory_result(message(envelope(build_result(findings=[unresolved]))), corr)
+        validate_result(build_result(findings=[unresolved]), corr)
 
 
 def test_checkpoint_only_inside_checkpoint():
@@ -237,6 +206,6 @@ def test_checkpoint_only_inside_checkpoint():
         "elicitation_id": None,
     }
     with pytest.raises(ResultError):
-        parse_factory_result(message(envelope(cp)), Correlation("P1", "S1", "N1", 3, "build"))
+        validate_result(cp, Correlation("P1", "S1", "N1", 3, "build"))
     corr = Correlation("P1", "S1", "N1", 3, "build", in_checkpoint=True)
-    assert parse_factory_result(message(envelope(cp)), corr).contract_canonical is None
+    assert validate_result(cp, corr).contract_canonical is None

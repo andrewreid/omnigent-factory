@@ -32,6 +32,7 @@ async def test_doctor_resolves_live_ids_and_does_not_create_local_state(tmp_path
     _secret(secrets / "app.pem", pem)
     _secret(secrets / "webhook_secret", b"webhook")
     _secret(secrets / "omnigent-token", b"owner-token")
+    _secret(secrets / "mcp-token", b"m" * 43)
 
     clone = tmp_path / "clone"
     subprocess.run(("git", "init", str(clone)), check=True, capture_output=True)  # noqa: S603,S607
@@ -148,7 +149,7 @@ guidance: {triage: Triage safely., engineering: Build safely.}
             "/v1/hosts": {"hosts": [{"host_id": "host-1", "name": "coder", "status": "online"}]},
             "/v1/agents": {
                 "object": "list",
-                "data": [{"id": "agent-1", "name": "Molly"}],
+                "data": [{"id": "agent-1", "name": "Rosie"}],
                 "has_more": False,
             },
             "/v1/projects": {"object": "list", "data": [{"id": "project-1", "name": "Timesheets"}]},
@@ -157,14 +158,27 @@ guidance: {triage: Triage safely., engineering: Build safely.}
         return httpx.Response(200, json=values[request.url.path])
 
     before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
+    mcp_calls: list[str] = []
+
+    def mcp(request: httpx.Request) -> httpx.Response:
+        mcp_calls.append(str(request.url))
+        assert "authorization" not in request.headers  # the probe never sends the token
+        return httpx.Response(401)
+
     report = await run_doctor(
         config,
         github_transport=httpx.MockTransport(github),
         omnigent_transport=httpx.MockTransport(omnigent),
+        mcp_transport=httpx.MockTransport(mcp),
     )
     after = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
 
     assert report.ok, report.errors
+    assert mcp_calls == [f"http://127.0.0.1:{config.mcp_port}/mcp/"]
+    assert report.checks["mcp_listener"].endswith("requires the bearer token")
+    assert report.checks["mcp_token"].endswith("is private (mode 0600)")
+    assert report.checks["caller_policy"].startswith("compiles")
+    assert report.resolved["omnigent_agent_id"] == "agent-1"
     assert any(
         w.startswith("omnigent_version: server 0.0.0-other differs") for w in report.warnings
     )
@@ -174,3 +188,35 @@ guidance: {triage: Triage safely., engineering: Build safely.}
     assert "github_token_revoke" in report.checks
     assert revoked == 1
     assert before == after
+
+
+@pytest.mark.asyncio
+async def test_doctor_mcp_checks_fail_without_token_and_on_an_open_endpoint(tmp_path: Path):
+    from omnigent_factory.service.doctor import (
+        DoctorReport,
+        _check_caller_policy,
+        _check_mcp_listener,
+        _check_mcp_token,
+    )
+
+    secrets = tmp_path / "secrets"
+    secrets.mkdir(mode=0o700)
+    config = ServiceConfig(repo_id="R", owners=frozenset({1}), secrets_dir=secrets)
+    report = DoctorReport()
+    _check_mcp_token(config, report)
+    assert not report.ok and "setup mcp-token" in report.errors[0]
+    (secrets / "mcp-token").write_text("x" * 40)
+    os.chmod(secrets / "mcp-token", 0o644)
+    report = DoctorReport()
+    _check_mcp_token(config, report)
+    assert not report.ok and "0600" in report.errors[0]
+
+    report = DoctorReport()
+    await _check_mcp_listener(
+        config, report, transport=httpx.MockTransport(lambda _r: httpx.Response(200))
+    )
+    assert not report.ok  # an MCP endpoint answering without a token is a failure
+
+    report = DoctorReport()
+    _check_caller_policy(report)
+    assert report.ok, report.errors

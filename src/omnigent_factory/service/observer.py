@@ -1,4 +1,8 @@
-"""Polling Omnigent observer and conservative active-time sampler."""
+"""Polling Omnigent observer and conservative active-time sampler.
+
+Stage results are not read from the transcript: they arrive through the factory MCP tools
+(:mod:`omnigent_factory.service.mcp`).
+"""
 
 from __future__ import annotations
 
@@ -6,23 +10,11 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Mapping
-from functools import partial
-from typing import Any, cast
+from typing import Any
 
 from omnigent_factory.core import events as ev
-from omnigent_factory.core.events import Event, Provenance, PublicationKind, ResultKind
-from omnigent_factory.core.protocol import (
-    BlockedResult,
-    BuildResult,
-    CheckpointResult,
-    Correlation,
-    ParsedResult,
-    PlanResult,
-    ResultError,
-    TriageResult,
-    parse_factory_result,
-)
-from omnigent_factory.core.types import Lifecycle, Parcel, Size
+from omnigent_factory.core.events import Event, Provenance
+from omnigent_factory.core.types import DecisionSource, Parcel
 from omnigent_factory.omnigent.activity import ActivityTracker
 from omnigent_factory.omnigent.adapter import OmnigentExecutionAdapter
 from omnigent_factory.omnigent.observe import StreamNormalizer
@@ -30,7 +22,6 @@ from omnigent_factory.omnigent.rest import OmnigentReadError
 from omnigent_factory.ports.clock import Clock
 from omnigent_factory.service.directory import ServiceDispatchDirectory
 from omnigent_factory.service.runtime import FactoryService
-from omnigent_factory.store.sqlite import SqliteStore
 
 LOG = logging.getLogger(__name__)
 
@@ -55,7 +46,6 @@ class OmnigentObserver:
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._trackers: dict[str, ActivityTracker] = {}
-        self._seen_items: set[str] = set()
         self._normalizers: dict[str, StreamNormalizer] = {}
         self._last_runtime: dict[str, bool] = {}
         self._last_tree: dict[str, tuple[bool, bool, bool]] = {}
@@ -186,7 +176,6 @@ class OmnigentObserver:
                 f"crash:{session.session_id}",
             )
             self._crashed.add(session.session_id)
-        await self._results(parcel)
 
     def _tracker(self, session_id: str, grant_id: str, baseline_us: int) -> ActivityTracker:
         tracker = self._trackers.get(session_id)
@@ -222,77 +211,14 @@ class OmnigentObserver:
             for body in normalizer.on_event(session.root_id, raw):
                 await self._apply(parcel, body, f"elicitation:{session.session_id}:{eid}:open")
         for decision in parcel.decisions:
+            if decision.source != DecisionSource.ELICITATION:
+                continue  # factory_ask_owner questions have no native prompt to vanish
             if decision.session_id == session.session_id and decision.elicitation_id not in present:
                 await self._apply(
                     parcel,
                     ev.ElicitationGone(session.session_id, decision.elicitation_id),
                     f"elicitation:{session.session_id}:{decision.elicitation_id}:gone",
                 )
-
-    async def _results(self, parcel: Parcel) -> None:
-        session = parcel.current_session
-        if session is None or session.root_id is None:
-            return
-        items = await self.adapter.rest.paginate(
-            f"/v1/sessions/{session.root_id}/items", {"order": "asc"}
-        )
-        for item in items:
-            item_id = item.get("id")
-            if not isinstance(item_id, str) or item_id in self._seen_items:
-                continue
-            text = _assistant_text(item)
-            if text is None or "FACTORY_RESULT_V1" not in text:
-                continue
-            event_id = f"result:{session.root_id}:{item_id}"
-            if await self.service.db.call(partial(_has_event, event_id=event_id)):
-                # Applied before a restart: never re-parse, re-log or re-save it.
-                self._seen_items.add(item_id)
-                continue
-            expected = Correlation(
-                parcel.parcel_id,
-                session.session_id,
-                session.nonce,
-                session.revision,
-                cast(Any, session.kind.value),
-                waiver_build=(
-                    parcel.current_approval is not None
-                    and parcel.current_approval.kind.value == "skip"
-                ),
-                in_checkpoint=session.lifecycle
-                in (Lifecycle.CHECKPOINT_GRACE, Lifecycle.CHECKPOINT_WAIT),
-            )
-            try:
-                parsed = parse_factory_result(text, expected)
-            except ResultError as exc:
-                LOG.warning(
-                    "result rejected parcel=%s session=%s stage=%s errors=%s",
-                    parcel.parcel_id,
-                    session.session_id,
-                    session.kind.value,
-                    "; ".join(exc.details),
-                )
-                # Persist before the event: the correction message and the Blocked status
-                # comment render these details.
-                await self.directory.save_rejection(
-                    session.session_id, item_id, session.kind.value, exc.details
-                )
-                result_kind = (
-                    ResultKind.CHECKPOINT
-                    if expected.in_checkpoint
-                    else _default_result_kind(session.kind.value)
-                )
-                body = ev.ResultCandidate(
-                    session_id=session.session_id,
-                    root_id=session.root_id,
-                    revision=session.revision,
-                    valid=False,
-                    result_kind=result_kind,
-                )
-            else:
-                await self.directory.save_result(session.session_id, item_id, parsed)
-                body = _candidate(session.root_id, parsed)
-            await self._apply(parcel, body, event_id)
-            self._seen_items.add(item_id)
 
     async def _apply(self, parcel: Parcel, body: ev.EventBody, event_id: str) -> None:
         await self.service.apply_event(
@@ -313,94 +239,3 @@ class OmnigentObserver:
 
     async def _load_parcel(self, parcel_id: str) -> Parcel | None:
         return await self.service.db.call(lambda store: store.load_parcel(parcel_id))
-
-
-def _assistant_text(item: Mapping[str, Any]) -> str | None:
-    data = item.get("data") if isinstance(item.get("data"), dict) else item
-    if not isinstance(data, Mapping) or data.get("role") != "assistant":
-        return None
-    if item.get("status") not in (None, "completed") and data.get("status") not in (
-        None,
-        "completed",
-    ):
-        return None
-    content = data.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        texts: list[str] = [
-            str(part["text"])
-            for part in content
-            if isinstance(part, dict) and isinstance(part.get("text"), str)
-        ]
-        return "".join(texts) if texts else None
-    return None
-
-
-def _candidate(root_id: str, parsed: ParsedResult) -> ev.ResultCandidate:
-    envelope = parsed.result
-    result = envelope.result
-    if isinstance(result, TriageResult):
-        return ev.ResultCandidate(
-            session_id=envelope.stage_session_id,
-            root_id=root_id,
-            revision=envelope.revision,
-            valid=True,
-            result_kind=ResultKind.TRIAGE,
-            size=Size(result.size),
-        )
-    if isinstance(result, PlanResult):
-        return ev.ResultCandidate(
-            session_id=envelope.stage_session_id,
-            root_id=root_id,
-            revision=envelope.revision,
-            valid=True,
-            result_kind=ResultKind.PLAN,
-            publication_kind=PublicationKind(result.publication_kind),
-            contract_canonical=(
-                parsed.contract_canonical.decode()
-                if parsed.contract_canonical is not None
-                else None
-            ),
-            size=Size(result.contract.size),
-            open_decision_ids=tuple(result.open_decision_ids),
-        )
-    if isinstance(result, BuildResult):
-        return ev.ResultCandidate(
-            session_id=envelope.stage_session_id,
-            root_id=root_id,
-            revision=envelope.revision,
-            valid=True,
-            result_kind=ResultKind.BUILD_READY,
-            pr_number=result.pr_number,
-            head_sha=result.head_sha,
-        )
-    if isinstance(result, CheckpointResult):
-        return ev.ResultCandidate(
-            session_id=envelope.stage_session_id,
-            root_id=root_id,
-            revision=envelope.revision,
-            valid=True,
-            result_kind=ResultKind.CHECKPOINT,
-        )
-    if isinstance(result, BlockedResult):
-        return ev.ResultCandidate(
-            session_id=envelope.stage_session_id,
-            root_id=root_id,
-            revision=envelope.revision,
-            valid=True,
-            result_kind=ResultKind.BLOCKED,
-        )
-    raise AssertionError("unreachable result model")
-
-
-def _default_result_kind(stage: str) -> ResultKind:
-    return {
-        "triage": ResultKind.TRIAGE,
-        "plan": ResultKind.PLAN,
-        "build": ResultKind.BUILD_READY,
-    }[stage]
-
-
-def _has_event(store: SqliteStore, *, event_id: str) -> bool:
-    return store.has_event(event_id)

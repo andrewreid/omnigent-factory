@@ -187,6 +187,9 @@ class OmnigentRest:
     async def delete(self, path: str) -> WriteResponse:
         return await self._write("DELETE", path, None)
 
+    async def patch_json(self, path: str, body: Mapping[str, Any]) -> WriteResponse:
+        return await self._write("PATCH", path, body)
+
     # ------------------------------------------------------------ stream
 
     async def stream(self, session_id: str) -> AsyncIterator[dict[str, Any]]:

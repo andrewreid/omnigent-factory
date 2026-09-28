@@ -1,15 +1,25 @@
 """Session policy specs and idempotent REST reconciliation (architecture §5.2).
 
 Only ``type=python`` registered factories are attached (``type=url`` is stored but not
-instantiated by the inspected runtime). ``factory_params`` cannot be PATCHed, so a new
-cost grant is a *new* uniquely named generation: create (or adopt by exact name and
-parameters), verify, delete older generations, verify the final set. Any GET/POST/DELETE
-failure leaves the grant unready. The cost policy is a non-hard backstop: ``ask`` only,
-never ``max_cost_usd``.
+instantiated by the inspected runtime). ``factory_params`` cannot be PATCHed, so every
+change is a *new* uniquely named policy: create (or adopt by exact name and parameters),
+verify, then delete what it supersedes and verify the final set. Nothing is ever deleted
+before its replacement is verified, so a guard is never absent during a stage switch or a
+boot upgrade (overlap may briefly deny more, which is fine while the run is closed).
+
+* Static policies (``factory-github``, ``factory-cel``, ``factory-cel-operator``,
+  ``factory-caller``) are named ``<family>@<digest of handler+params>``; any other member
+  of the family (or its legacy bare name) is superseded.
+* A cost grant is a new generation ``factory-cost-grant-NNNN``; older generations are
+  superseded. The cost policy is a non-hard backstop: ``ask`` only, never ``max_cost_usd``.
+
+Any GET/POST/DELETE failure leaves the preparation or grant unready.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -31,6 +41,10 @@ COST_PREFIX = "factory-cost-grant-"
 GITHUB_NAME = "factory-github"
 CEL_NAME = "factory-cel"
 CEL_OPERATOR_NAME = "factory-cel-operator"
+CALLER_NAME = "factory-caller"
+#: Static policy families the daemon owns; members are ``<family>@<digest>``.
+STATIC_FAMILIES = (GITHUB_NAME, CEL_NAME, CEL_OPERATOR_NAME, CALLER_NAME)
+VERSION_SEPARATOR = "@"
 
 #: $35/hour: the proposal's $70 per 2h reference block (§4).
 MICRODOLLARS_PER_HOUR = 35_000_000
@@ -60,6 +74,24 @@ class PolicySpec:
             and (row.get("factory_params") or {}) == dict(self.factory_params)
             and row.get("enabled", True) is True
         )
+
+
+def versioned(family: str, handler: str, params: Mapping[str, Any]) -> PolicySpec:
+    """A static policy named by its content, so a change is always an add-then-remove."""
+    digest = hashlib.sha256(
+        json.dumps({"handler": handler, "params": params}, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:12]
+    return PolicySpec(f"{family}{VERSION_SEPARATOR}{digest}", handler, params)
+
+
+def family_of(name: object) -> str | None:
+    """The daemon-owned family a policy row belongs to (legacy bare names included)."""
+    if not isinstance(name, str):
+        return None
+    if name.startswith(COST_PREFIX):
+        return COST_PREFIX
+    base = name.split(VERSION_SEPARATOR, 1)[0]
+    return base if base in STATIC_FAMILIES else None
 
 
 class PolicyError(RuntimeError):
@@ -103,7 +135,7 @@ def github_policy(kind: SessionKind, repository: str, branch: str) -> PolicySpec
     is governed by the deny-only ``factory-cel`` scan and the worktree ``pre-push`` guard.
     """
     build = kind == SessionKind.BUILD
-    return PolicySpec(
+    return versioned(
         GITHUB_NAME,
         GITHUB_HANDLER,
         {
@@ -248,7 +280,56 @@ def _compiled(name: str, expression: str, reason: str) -> PolicySpec:
     from omnigent.policies.builtins.cel import cel_policy as compile_cel  # noqa: PLC0415
 
     compile_cel(expression=expression, reason=reason)  # raises ValueError if invalid
-    return PolicySpec(name, CEL_HANDLER, {"expression": expression, "reason": reason})
+    return versioned(name, CEL_HANDLER, {"expression": expression, "reason": reason})
+
+
+#: Every factory tool, under each name form a policy event can carry: the managed
+#: namespace (``factory__``), Claude-facing wrappers and the bare server name. The
+#: root's MCP server entry must stay named ``factory``.
+FACTORY_TOOL_PATTERN = r"^(factory__|mcp__omnigent__factory__|mcp__factory__)?factory_.*$"
+
+CALLER_REASON = (
+    "Denied by factory policy: factory tools must be called with this session's own "
+    "Omnigent session id as the session_id argument (see sys_session_get_info)."
+)
+
+
+def caller_cel_expression(session_id: str) -> str:
+    """Bind factory tool calls to ``session_id`` (the root this policy is attached to).
+
+    Total and type-guarded: every branch returns an explicit result map, because the
+    pinned ``cel_policy`` abstains (allows) on an evaluation error or a non-map result.
+    A factory tool whose ``arguments`` are missing or not a map, or whose ``session_id``
+    is absent, not a string or another id, is denied; every other call is allowed. The
+    literal comes from the session the daemon attaches the policy to, never from input.
+    """
+    if not session_id or any(c.isspace() for c in session_id):
+        raise ValueError("a session id is required")
+    data = "event.data"
+    args = f"{data}.arguments"
+    allow = '{"result": "ALLOW"}'
+    deny = f'{{"result": "DENY", "reason": {_cel_string(CALLER_REASON)}}}'
+    is_call = 'has(event.type) && event.type == "tool_call"'
+    has_data = f"has({data}) && type({data}) == map"
+    named = f"has({data}.name) && type({data}.name) == string"
+    factory = f"{data}.name.matches({_cel_string(FACTORY_TOOL_PATTERN)})"
+    has_args = f"has({args}) && type({args}) == map"
+    has_id = f"has({args}.session_id) && type({args}.session_id) == string"
+    return (
+        f"!({is_call}) ? {allow}"
+        f" : !({has_data}) ? {allow}"
+        f" : !({named}) ? {allow}"
+        f" : !({factory}) ? {allow}"
+        f" : !({has_args}) ? {deny}"
+        f" : !({has_id}) ? {deny}"
+        f" : {args}.session_id == {_cel_string(session_id)} ? {allow}"
+        f" : {deny}"
+    )
+
+
+def caller_policy(session_id: str) -> PolicySpec:
+    """The per-root caller-identity policy, compiled before it is attached."""
+    return _compiled(CALLER_NAME, caller_cel_expression(session_id), CALLER_REASON)
 
 
 def factory_cel_policy(default_branch: str = "main") -> PolicySpec:
@@ -313,20 +394,64 @@ async def replace_cost_policy(
 ) -> str:
     """Install ``spec``, delete every other cost generation, verify the final set."""
     new_id = await ensure_policy(rest, root_id, spec)
-    for row in await list_session_policies(rest, root_id):
-        name = str(row.get("name") or "")
-        if name.startswith(COST_PREFIX) and name != spec.name and isinstance(row.get("id"), str):
-            await delete_policy(rest, root_id, str(row["id"]))
+    await _delete_superseded(rest, root_id, (spec,))
     await verify_policies(rest, root_id, (spec, *keep))
     return new_id
 
 
-async def verify_policies(rest: OmnigentRest, root_id: str, expected: Sequence[PolicySpec]) -> None:
+async def reconcile_policies(
+    rest: OmnigentRest, root_id: str, wanted: Sequence[PolicySpec]
+) -> bool:
+    """Make ``wanted`` the exact daemon-owned set: add and verify first, then remove what
+    it supersedes (same family, other version), then verify the final set.
+
+    Returns whether anything changed. Raises :class:`PolicyError` on any failure; a
+    retry converges (adopts what exists by exact name and parameters).
+    """
+    before = await list_session_policies(rest, root_id)
+    changed = False
+    for spec in wanted:
+        if not any(spec.matches(r) for r in before):
+            await ensure_policy(rest, root_id, spec)
+            changed = True
+    await verify_policies(rest, root_id, wanted, exact=False)
+    changed = await _delete_superseded(rest, root_id, wanted) or changed
+    await verify_policies(rest, root_id, wanted)
+    return changed
+
+
+async def _delete_superseded(
+    rest: OmnigentRest, root_id: str, wanted: Sequence[PolicySpec]
+) -> bool:
+    """Delete daemon-owned rows of a wanted family that are not themselves wanted."""
+    names = {spec.name for spec in wanted}
+    families = {family_of(spec.name) for spec in wanted}
+    deleted = False
+    for row in await list_session_policies(rest, root_id):
+        name = row.get("name")
+        if name in names or family_of(name) not in families or not isinstance(row.get("id"), str):
+            continue
+        await delete_policy(rest, root_id, str(row["id"]))
+        deleted = True
+    return deleted
+
+
+async def verify_policies(
+    rest: OmnigentRest, root_id: str, expected: Sequence[PolicySpec], *, exact: bool = True
+) -> None:
+    """Every expected policy is present and enabled with exactly its parameters.
+
+    ``exact``: additionally no other member of an expected family remains (the final set
+    after a switch); overlap is allowed only between add and remove.
+    """
     rows = await list_session_policies(rest, root_id)
     for spec in expected:
         if not any(spec.matches(r) for r in rows):
             raise PolicyError(f"policy {spec.name} missing or altered")
-    costs = [r for r in rows if str(r.get("name") or "").startswith(COST_PREFIX)]
-    want = [s for s in expected if s.name.startswith(COST_PREFIX)]
-    if len(costs) != len(want):
-        raise PolicyError("unexpected cost policy generations remain")
+    if not exact:
+        return
+    names = {spec.name for spec in expected}
+    families = {family_of(spec.name) for spec in expected}
+    stale = [r for r in rows if r.get("name") not in names and family_of(r.get("name")) in families]
+    if stale:
+        raise PolicyError("superseded factory policies remain")

@@ -73,12 +73,15 @@ from omnigent_factory.core.types import (
     Contract,
     Decision,
     DecisionImpact,
+    DecisionSource,
     DecisionStatus,
     FenceKind,
     Grant,
     Hold,
     InboxHold,
     InboxHoldReason,
+    IssueSession,
+    IssueSessionStatus,
     Lifecycle,
     Parcel,
     PendingMove,
@@ -162,6 +165,8 @@ _DEFAULT_RETRY: dict[EffectKind, RetryClass] = {
     EffectKind.SCAN_TREE: RetryClass.READ,
     EffectKind.RECONCILE_SESSION: RetryClass.READ,
     EffectKind.REPLACE_COST_POLICY: RetryClass.ADOPTABLE_WRITE,
+    EffectKind.CLOSE_SESSION: RetryClass.READ,  # idempotent archive; safe to repeat
+    EffectKind.VERIFY_POLICIES: RetryClass.READ,  # reads, or idempotent re-establishment
     EffectKind.DISABLE_ISSUANCE: RetryClass.LOCAL_IDEMPOTENT,
     EffectKind.ENABLE_ISSUANCE: RetryClass.LOCAL_IDEMPOTENT,
     EffectKind.CLEANUP_WORKSPACE: RetryClass.LOCAL_IDEMPOTENT,
@@ -584,6 +589,11 @@ def _orphan_open_decisions(ctx: _Ctx, session_id: str) -> None:
             ctx.put_decision(replace(d, status=DecisionStatus.ORPHANED))
 
 
+def _next_policy_generation(p: Parcel) -> int:
+    """Cost-policy generations are unique per issue session, which runs share."""
+    return max((s.grant.policy_generation for s in p.sessions), default=0) + 1
+
+
 def _create_session(
     ctx: _Ctx,
     auth: StageAuthorization,
@@ -592,7 +602,14 @@ def _create_session(
     restart_count: int = 0,
     correction_count: int = 0,
     grant: Grant | None = None,
+    fresh_root: bool = False,
 ) -> StageSession | None:
+    """Start a stage run: in the parcel's live issue session, else in a new one.
+
+    Callers have established Q (every earlier run settled), so the reused root is idle and
+    no earlier run's authority is live. Its credential is still switched off explicitly
+    before this run's preparation can enable its own.
+    """
     nonce = ctx.nonce()
     if nonce is None:
         return None
@@ -601,7 +618,10 @@ def _create_session(
         grant_id=ctx.new_id("gr"),
         source_event_id=auth.source_event_id,
         duration_us=auth.grant_duration_us,
+        policy_generation=_next_policy_generation(ctx.p),
     )
+    issue = ctx.p.issue_session
+    reuse = issue if not fresh_root and issue is not None and issue.reusable else None
     s = StageSession(
         session_id=sid,
         kind=auth.kind,
@@ -609,25 +629,51 @@ def _create_session(
         authorization_id=auth.authorization_id,
         nonce=nonce,
         revision=ctx.p.revision,
-        lifecycle=Lifecycle.INTENT,
+        policy_ready=False,  # until the prepared policy set is verified after its barrier
+        lifecycle=Lifecycle.PREPARING if reuse is not None else Lifecycle.INTENT,
         grant=grant,
         restart_count=restart_count,
         correction_count=correction_count,
+        root_id=reuse.root_id if reuse is not None else None,
     )
     ctx.update(sessions=(*ctx.p.sessions, s), current_session_id=sid)
+    if reuse is not None:
+        for old in ctx.p.sessions:
+            if old.session_id != sid and old.issuance_enabled:
+                ctx.emit(EffectKind.DISABLE_ISSUANCE, session=old)
+        ctx.emit(
+            EffectKind.PREPARE_SESSION,
+            session=s,
+            args={"root_id": reuse.root_id, "profile": profile_for(s.kind).value, "reuse": True},
+        )
+        return s
+    _emit_create(ctx, s)
+    return s
+
+
+def _emit_create(ctx: _Ctx, s: StageSession) -> None:
+    auth = ctx.p.authorization(s.authorization_id)
     ctx.emit(
         EffectKind.CREATE_SESSION,
         session=s,
         args={
-            "nonce": nonce,
-            "stage": auth.kind.value,
-            "attempt": attempt,
-            "authorization_id": auth.authorization_id,
-            "revision": ctx.p.revision,
+            "nonce": s.nonce,
+            "stage": s.kind.value,
+            "attempt": s.attempt,
+            "authorization_id": s.authorization_id,
+            "revision": auth.revision if auth is not None else ctx.p.revision,
         },
-        dedupe=f"create:{sid}",
+        dedupe=f"create:{s.session_id}",
     )
-    return s
+
+
+def _retire_issue_session(ctx: _Ctx, root_id: str | None, reason: str) -> None:
+    """The issue session behind ``root_id`` is dead or unusable: the next run replaces it."""
+    issue = ctx.p.issue_session
+    if issue is not None and issue.root_id == root_id and issue.reusable:
+        ctx.update(
+            issue_session=replace(issue, status=IssueSessionStatus.DEAD, reason=reason[:200])
+        )
 
 
 def _retire_settled_current(ctx: _Ctx) -> None:
@@ -923,6 +969,7 @@ def _replace_after_crash(ctx: _Ctx, old: StageSession) -> None:
         restart_count=old.restart_count + 1,
         correction_count=old.correction_count,
         grant=grant,
+        fresh_root=True,
     )
     if created is None:
         ctx.hold(Hold.RESTART_EXHAUSTED)
@@ -977,7 +1024,7 @@ def _relay_answers(ctx: _Ctx, s: StageSession) -> None:
     for d in ctx.p.decisions:
         if d.session_id != s.session_id or d.status != DecisionStatus.ANSWERED:
             continue
-        if d.prompt_lost:
+        if d.prompt_lost or d.source == DecisionSource.MCP:
             ctx.emit(
                 EffectKind.SEND_MESSAGE,
                 session=s,
@@ -1966,6 +2013,7 @@ def _adopt(ctx: _Ctx, s: StageSession, root_id: str, nonce: str) -> None:
     ):
         raise Rejected("session-not-awaiting-create")
     s = replace(s, root_id=root_id)
+    _bind_issue_session(ctx, s, root_id)
     if s.fences or s.lifecycle == Lifecycle.DRAINING or s.session_id != ctx.p.current_session_id:
         s = ctx.put_session(replace(s, lifecycle=Lifecycle.DRAINING))
         ctx.emit(EffectKind.INTERRUPT_TREE, session=s, args={"root_id": root_id})
@@ -1976,6 +2024,19 @@ def _adopt(ctx: _Ctx, s: StageSession, root_id: str, nonce: str) -> None:
         EffectKind.PREPARE_SESSION,
         session=s,
         args={"root_id": root_id, "profile": profile_for(s.kind).value},
+    )
+
+
+def _bind_issue_session(ctx: _Ctx, s: StageSession, root_id: str) -> None:
+    """A newly created root becomes the parcel's issue session (superseding any older)."""
+    old = ctx.p.issue_session
+    ctx.update(
+        issue_session=IssueSession(
+            root_id=root_id,
+            nonce=s.nonce,
+            created_by=s.session_id,
+            generation=(old.generation + 1) if old is not None else 1,
+        )
     )
 
 
@@ -2076,6 +2137,28 @@ def _h_prepared(ctx: _Ctx, body: ev.Prepared) -> None:
     s = _session(ctx, body.session_id)
     if s.lifecycle != Lifecycle.PREPARING:
         raise Rejected("session-not-preparing")
+    if body.unusable:
+        issue = ctx.p.issue_session
+        if s.root_id is None or issue is None or issue.root_id != s.root_id:
+            raise Rejected("unusable-root-not-issue-session")
+        if issue.created_by == s.session_id:
+            # This run created the root: it is not a reused conversation to replace.
+            ctx.hold(Hold.PREPARE_FAILED)
+            _begin_drain(ctx, s)
+            return
+        _retire_issue_session(ctx, s.root_id, body.reason or "unusable")
+        s = ctx.put_session(
+            replace(
+                s,
+                root_id=None,
+                lifecycle=Lifecycle.INTENT,
+                prepared=False,
+                policy_ready=False,
+                policy_ready_at_us=0,
+            )
+        )
+        _emit_create(ctx, s)
+        return
     if body.unexpected_turn:
         ctx.hold(Hold.EXTERNAL_ACTIVITY)
         _begin_drain(ctx, s, fences=frozenset({FenceKind.SAFETY}))
@@ -2084,7 +2167,59 @@ def _h_prepared(ctx: _Ctx, body: ev.Prepared) -> None:
         ctx.hold(Hold.PREPARE_FAILED)
         _begin_drain(ctx, s)
         return
-    ctx.put_session(replace(s, prepared=True))
+    # Prepared is not open: the policy set must propagate (barrier) and be re-verified
+    # exactly before any credential or work message (see _h_policies_verified).
+    s = ctx.put_session(
+        replace(
+            s,
+            prepared=True,
+            policy_ready=False,
+            policy_ready_at_us=body.policy_ready_at_us or ctx.now,
+        )
+    )
+    _emit_verify(ctx, s, reconcile=False)
+
+
+def _emit_verify(ctx: _Ctx, s: StageSession, *, reconcile: bool) -> None:
+    ctx.emit(
+        EffectKind.VERIFY_POLICIES,
+        session=s,
+        args={
+            "root_id": s.root_id or "",
+            "not_before_us": 0 if reconcile else s.policy_ready_at_us,
+            "reconcile": reconcile,
+        },
+        dedupe=f"verify:{s.session_id}:{ctx.event.event_id}",
+    )
+
+
+def _h_policies_verified(ctx: _Ctx, body: ev.PoliciesVerified) -> None:
+    s = _session(ctx, body.session_id)
+    if s.policy_ready or s.root_id is None or s.fences or s.execution_closed:
+        raise Rejected("no-pending-policy-verification")
+    if body.reconciled:
+        s = ctx.put_session(replace(s, policy_ready_at_us=body.ready_at_us or ctx.now))
+        _emit_verify(ctx, s, reconcile=False)
+        return
+    if not body.ok:
+        # Fail closed and visible: the run never opens with an unverified guard.
+        ctx.hold(Hold.PREPARE_FAILED)
+        if s.lifecycle not in (Lifecycle.RETIRED, Lifecycle.FENCED, Lifecycle.DRAINING):
+            _begin_drain(ctx, s)
+        return
+    s = ctx.put_session(replace(s, policy_ready=True, policy_ready_at_us=0))
+    if s.lifecycle != Lifecycle.PREPARING:
+        _ensure_issuance(ctx, s)  # a boot hold lifted: re-enable once
+
+
+def _h_policy_guard_failed(ctx: _Ctx, body: ev.PolicyGuardFailed) -> None:
+    s = _current(ctx, body.session_id)
+    if s.root_id is None or s.fences or s.execution_closed or not s.prepared:
+        raise Rejected("no-live-prepared-run")
+    s = ctx.put_session(replace(s, policy_ready=False, policy_ready_at_us=0))
+    if s.issuance_enabled:
+        ctx.emit(EffectKind.DISABLE_ISSUANCE, session=s)
+    _emit_verify(ctx, s, reconcile=True)
 
 
 def _h_message_ack(ctx: _Ctx, body: ev.MessageAck) -> None:
@@ -2201,6 +2336,69 @@ def _h_elicitation_opened(ctx: _Ctx, body: ev.ElicitationOpened) -> None:
         node_id=body.node_id,
         root_id=s.root_id,
     )
+
+
+def mcp_question_id(question_key: str) -> str:
+    """The decision's ``elicitation_id`` slot for a ``factory_ask_owner`` question."""
+    return f"mcp:{question_key}"
+
+
+def _h_owner_question(ctx: _Ctx, body: ev.OwnerQuestion) -> None:
+    """One structured owner question from the current run (``factory_ask_owner``)."""
+    s = _current(ctx, body.session_id)
+    if not body.question_key:
+        raise Rejected("question-without-key")
+    if s.fences or s.execution_closed or s.lifecycle not in (Lifecycle.ACTIVE, Lifecycle.WAITING):
+        raise Rejected("question-through-closed-gate")
+    slot = mcp_question_id(body.question_key)
+    if any(d.session_id == s.session_id and d.elicitation_id == slot for d in ctx.p.decisions):
+        raise Rejected("duplicate-question")
+    decision = Decision(
+        decision_id=ctx.new_id("de"),
+        session_id=s.session_id,
+        elicitation_id=slot,
+        revision=ctx.p.revision,
+        impact=body.impact,
+        status=DecisionStatus.OPEN,
+        source=DecisionSource.MCP,
+    )
+    ctx.update(decisions=(*ctx.p.decisions, decision))
+    if s.lifecycle == Lifecycle.ACTIVE:
+        ctx.put_session(replace(s, lifecycle=Lifecycle.WAITING, wait_reason=WaitReason.DECISION))
+    ctx.comment(
+        "decision",
+        decision_id=decision.decision_id,
+        impact=body.impact.value,
+        contract_hash=ctx.p.current_contract.full_hash if ctx.p.current_contract else None,
+        summary=body.summary[:1500],
+        node_id=None,
+        root_id=s.root_id,
+    )
+
+
+def _maybe_close_issue_session(ctx: _Ctx) -> None:
+    """Archive the issue session once the parcel is terminal and its tree quiescent."""
+    issue = ctx.p.issue_session
+    if issue is None or issue.status != IssueSessionStatus.LIVE or not _completed(ctx):
+        return
+    if not all(settled(s) for s in ctx.p.sessions) or uncertain(ctx.p):
+        return
+    ctx.update(issue_session=replace(issue, status=IssueSessionStatus.CLOSING))
+    ctx.emit(
+        EffectKind.CLOSE_SESSION,
+        target=issue.root_id,
+        args={"root_id": issue.root_id},
+        dedupe=f"close:{issue.root_id}",
+    )
+
+
+def _h_issue_session_closed(ctx: _Ctx, body: ev.IssueSessionClosed) -> None:
+    issue = ctx.p.issue_session
+    if issue is None or issue.root_id != body.root_id:
+        raise Rejected("not-the-issue-session")
+    if issue.status == IssueSessionStatus.CLOSED:
+        raise Rejected("already-closed")
+    ctx.update(issue_session=replace(issue, status=IssueSessionStatus.CLOSED))
 
 
 def _find_decision(ctx: _Ctx, session_id: str, elicitation_id: str) -> Decision:
@@ -2367,18 +2565,9 @@ def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
 
 
 def _malformed(ctx: _Ctx, s: StageSession) -> None:
-    if (
-        s.correction_count == 0
-        and work_allowed(ctx.p, s)
-        and (s.kind != SessionKind.BUILD or approval_ok(ctx.p))
-    ):
-        s = ctx.put_session(replace(s, correction_count=1))
-        ctx.emit(
-            EffectKind.SEND_MESSAGE,
-            session=s,
-            args={"purpose": MessagePurpose.CORRECTION.value},
-        )
-        return
+    """A result that does not fit the run. ``factory_submit_result`` validates in-turn and
+    returns precise errors, so this only records a hard mismatch; there is no correction
+    round-trip."""
     ctx.hold(Hold.RESULT_INVALID)
     ctx.comment("result-invalid", session_id=s.session_id)
 
@@ -2422,6 +2611,7 @@ def _h_session_crashed(ctx: _Ctx, body: ev.SessionCrashed) -> None:
     s = _current(ctx, body.session_id)
     if s.lifecycle not in (Lifecycle.PREPARING, Lifecycle.ACTIVE, Lifecycle.WAITING):
         raise Rejected("crash-outside-executable-lifecycle")
+    _retire_issue_session(ctx, s.root_id, "crashed")
     if (
         s.restart_count == 0
         and not s.fences
@@ -2605,7 +2795,7 @@ def _close_stale_decisions(ctx: _Ctx) -> None:
         if d.status != DecisionStatus.OPEN:
             continue
         owner = ctx.p.session(d.session_id)
-        if d.prompt_lost or d.externally_resolved:
+        if d.source == DecisionSource.ELICITATION and (d.prompt_lost or d.externally_resolved):
             ctx.put_decision(replace(d, status=DecisionStatus.RESOLVED_IN_OMNIGENT))
         elif owner is None or owner.lifecycle in (Lifecycle.RETIRED, Lifecycle.FENCED):
             ctx.put_decision(replace(d, status=DecisionStatus.ORPHANED))
@@ -2732,7 +2922,11 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.ELICITATION_OPENED: _h_elicitation_opened,
     EventKind.ELICITATION_RESOLVED: _h_elicitation_resolved,
     EventKind.ELICITATION_GONE: _h_elicitation_gone,
+    EventKind.OWNER_QUESTION: _h_owner_question,
+    EventKind.POLICIES_VERIFIED: _h_policies_verified,
+    EventKind.POLICY_GUARD_FAILED: _h_policy_guard_failed,
     EventKind.RESULT_CANDIDATE: _h_result,
+    EventKind.ISSUE_SESSION_CLOSED: _h_issue_session_closed,
     EventKind.TREE_QUIESCENT: _h_tree_quiescent,
     EventKind.STOP_TIMEOUT: _h_stop_timeout,
     EventKind.SESSION_CRASHED: _h_session_crashed,
@@ -2833,6 +3027,7 @@ def transition(state: State, event: Event) -> TransitionResult:
             _try_activate_pending(ctx)
             _maybe_start_prepared(ctx)
             _maybe_ready(ctx)
+            _maybe_close_issue_session(ctx)
     except Rejected as rejection:
         accepted = False
         reason = rejection.reason
@@ -2901,5 +3096,6 @@ __all__ = [
     "Rejected",
     "TransitionResult",
     "derive_id",
+    "mcp_question_id",
     "transition",
 ]

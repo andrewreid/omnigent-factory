@@ -186,7 +186,9 @@ async def test_cel_safety_policy_attached_by_default(git_env: GitEnv) -> None:
     root = await _created(rig)
     outcome = await rig.adapter.execute(intent(EffectKind.PREPARE_SESSION, root_id=root), CTX)
     assert isinstance(outcome, Ack) and outcome.detail["ok"] is True
-    cel = next((p for p in rig.server.policies[root] if p["name"] == "factory-cel"), None)
+    cel = next(
+        (p for p in rig.server.policies[root] if pol.family_of(p["name"]) == "factory-cel"), None
+    )
     assert cel is not None and cel["handler"] == pol.CEL_HANDLER
     # The attached expression, evaluated by the pinned factory, denies the unsafe paths.
     from omnigent.policies.builtins.cel import cel_policy
@@ -216,9 +218,13 @@ async def test_preparation_fails_closed_when_cel_policy_cannot_attach(git_env: G
     )
     outcome = await rig.adapter.execute(intent(EffectKind.PREPARE_SESSION, root_id=root), CTX)
     assert isinstance(outcome, RetryableReadFailure)
-    posted = [b["name"] for m, path, b in rig.server.requests if m == "POST" and "policies" in path]
+    posted = [
+        pol.family_of(b["name"])
+        for m, path, b in rig.server.requests
+        if m == "POST" and "policies" in path
+    ]
     assert posted == ["factory-github", "factory-cel"]  # the CEL attach failed; nothing later
-    assert "factory-cel" not in {p["name"] for p in rig.server.policies[root]}
+    assert "factory-cel" not in {pol.family_of(p["name"]) for p in rig.server.policies[root]}
 
 
 async def test_cel_policy_removed_later_is_caught_by_verification(git_env: GitEnv) -> None:
@@ -226,7 +232,9 @@ async def test_cel_policy_removed_later_is_caught_by_verification(git_env: GitEn
     root = await _created(rig)
     await rig.adapter.execute(intent(EffectKind.PREPARE_SESSION, root_id=root), CTX)
     rig.directory.set_root("S1", root)
-    rig.server.policies[root] = [p for p in rig.server.policies[root] if p["name"] != "factory-cel"]
+    rig.server.policies[root] = [
+        p for p in rig.server.policies[root] if pol.family_of(p["name"]) != "factory-cel"
+    ]
     rig.server.faults[("POST", f"/v1/sessions/{root}/policies")].extend([None, 500])
     replace = intent(EffectKind.REPLACE_COST_POLICY, grant_id="g", generation=2, granted_us=1)
     assert not isinstance(await rig.adapter.execute(replace, CTX), Ack)

@@ -1,0 +1,5 @@
+Factory checkpoint for run {run_id}: the granted active time (grant {grant_id}) is used up.
+Stop starting new work. Settle workers, commit only already-authorised changes, then call
+factory_submit_result with kind "blocked": reason = what remains and any risks, done =
+what is finished (include the worktree state). Then stop and wait. `/continue` is
+interpreted only by the factory.

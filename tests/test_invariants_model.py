@@ -138,6 +138,8 @@ def draw_body(data: st.DataObject, p: Parcel) -> tuple[ev.EventBody, dict[str, o
             session_id=sid, root_id=d(st.sampled_from(["r1", "r2", "r3"])), nonce=nonce
         ),
         lambda: ev.Prepared(session_id=sid, ok=flag or flag2, unexpected_turn=flag and flag2),
+        lambda: ev.PoliciesVerified(session_id=sid, ok=flag or flag2, reconciled=flag and flag2),
+        lambda: ev.PolicyGuardFailed(session_id=sid),
         lambda: ev.TreeQuiescent(
             session_id=sid,
             complete=flag or flag2,
@@ -318,6 +320,7 @@ class FactoryModel(RuleBasedStateMachine):
             bodies = [
                 ev.SessionCreated(session_id=s.session_id, root_id=f"g{self.roots}", nonce=s.nonce),
                 ev.Prepared(session_id=s.session_id, ok=True),
+                ev.PoliciesVerified(session_id=s.session_id, ok=True),
             ]
         elif action == "result" and s is not None and s.root_id is not None:
             kind = {

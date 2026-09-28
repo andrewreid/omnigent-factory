@@ -42,6 +42,7 @@ class Provenance(enum.StrEnum):
     SCHEDULER = "scheduler"  # trusted clock/timer input
     OPERATOR = "operator"  # local protected CLI socket
     INBOX = "inbox"  # the daemon's durable delivery inbox (restrict-only holds)
+    MCP = "mcp"  # a factory tool call from the current run's issue session (loopback MCP)
 
 
 class EventKind(enum.StrEnum):
@@ -94,7 +95,11 @@ class EventKind(enum.StrEnum):
     ELICITATION_OPENED = "ElicitationOpened"
     ELICITATION_RESOLVED = "ElicitationResolved"
     ELICITATION_GONE = "ElicitationGone"
+    OWNER_QUESTION = "OwnerQuestion"
+    POLICIES_VERIFIED = "PoliciesVerified"
+    POLICY_GUARD_FAILED = "PolicyGuardFailed"
     RESULT_CANDIDATE = "ResultCandidate"
+    ISSUE_SESSION_CLOSED = "IssueSessionClosed"
     TREE_QUIESCENT = "TreeQuiescent"
     STOP_TIMEOUT = "StopTimeout"
     SESSION_CRASHED = "SessionCrashed"
@@ -497,11 +502,18 @@ class EffectCancelled(_Body):
 
 @dataclass(frozen=True, slots=True)
 class Prepared(_Body):
+    """``unusable``: the reused issue session is dead, archived, foreign or too full; the
+    run is re-created in a fresh issue session instead of failing."""
+
     KIND: ClassVar[EventKind] = EventKind.PREPARED
     CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
     session_id: str = ""
     ok: bool = False
     unexpected_turn: bool = False
+    unusable: bool = False
+    reason: str = ""
+    #: Cross-replica policy propagation barrier of the policy set just attached.
+    policy_ready_at_us: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -582,10 +594,61 @@ class ElicitationGone(_Body):
 
 
 @dataclass(frozen=True, slots=True)
-class ResultCandidate(_Body):
-    """A root's final completed assistant result, already parsed/validated (§7.1).
+class OwnerQuestion(_Body):
+    """``factory_ask_owner`` from the current run: one structured owner question.
 
-    ``valid`` false means the result failed format/schema/cross-record validation.
+    ``question_key`` is stable per question within the run (idempotency); the answer
+    arrives through the normal owner decision path and is relayed as a message.
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.OWNER_QUESTION
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    session_id: str = ""
+    question_key: str = ""
+    summary: str = ""
+    impact: DecisionImpact = DecisionImpact.UNKNOWN
+
+
+@dataclass(frozen=True, slots=True)
+class PoliciesVerified(_Body):
+    """Outcome of a VERIFY_POLICIES effect for one run.
+
+    ``reconciled``: the set was (re)established, and ``ready_at_us`` is its new barrier (a
+    verification follows). Otherwise ``ok`` reports the post-barrier exact-set check.
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.POLICIES_VERIFIED
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    session_id: str = ""
+    ok: bool = False
+    reconciled: bool = False
+    ready_at_us: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyGuardFailed(_Body):
+    """Boot found a live run's factory policies (caller guard included) missing, altered
+    or just repaired: its gate closes until reconciliation, barrier and verification."""
+
+    KIND: ClassVar[EventKind] = EventKind.POLICY_GUARD_FAILED
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    session_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class IssueSessionClosed(_Body):
+    """The terminal parcel's issue session was archived (adapter acknowledgement)."""
+
+    KIND: ClassVar[EventKind] = EventKind.ISSUE_SESSION_CLOSED
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    root_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ResultCandidate(_Body):
+    """A stage result accepted from ``factory_submit_result``, already validated.
+
+    ``valid`` false means the result failed schema/cross-record validation.
     ``contract_canonical`` is the canonical contract text computed by the daemon.
     """
 
@@ -740,7 +803,11 @@ EventBody = (
     | ElicitationOpened
     | ElicitationResolved
     | ElicitationGone
+    | OwnerQuestion
+    | PoliciesVerified
+    | PolicyGuardFailed
     | ResultCandidate
+    | IssueSessionClosed
     | TreeQuiescent
     | StopTimeout
     | SessionCrashed
@@ -803,7 +870,11 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         ElicitationOpened,
         ElicitationResolved,
         ElicitationGone,
+        OwnerQuestion,
+        PoliciesVerified,
+        PolicyGuardFailed,
         ResultCandidate,
+        IssueSessionClosed,
         TreeQuiescent,
         StopTimeout,
         SessionCrashed,
@@ -894,14 +965,18 @@ __all__ = [
     "GraceExpired",
     "InboxHoldReleased",
     "InboxHoldSet",
+    "IssueSessionClosed",
     "ItemRemoved",
     "LeftwardMove",
     "MessageAck",
     "OperatorResume",
     "OwnerDirectOmnigentMessage",
+    "OwnerQuestion",
     "PRObserved",
     "Pause",
     "PlanFeedback",
+    "PoliciesVerified",
+    "PolicyGuardFailed",
     "PolicyReady",
     "Prepared",
     "Provenance",

@@ -171,7 +171,7 @@ def test_rendered_example_parses_with_blank_discoverable_ids(
     path.write_text(rendered["config.example.toml"])
     parsed = load_config(path)
     assert parsed.omnigent_host_id is None
-    assert parsed.omnigent_agent_id is None
+    assert parsed.omnigent_agent_id == "rosie"  # the factory agent is configured, not discovered
     assert parsed.omnigent_project_id is None
 
 
@@ -297,57 +297,6 @@ async def test_observer_staleness_consumes_time_and_irrecoverable_failure_is_fat
     assert service.failures == ["observer"]
 
 
-@pytest.mark.asyncio
-async def test_invalid_checkpoint_result_is_recorded_as_checkpoint(
-    service_config: ServiceConfig,
-) -> None:
-    harness = Harness()
-    harness.eligible("P")
-    harness.send("P", ev.RequestTriage(via=Via.DRAG))
-    session = harness.create_ok("P")
-    harness.send(
-        "P",
-        ev.ActiveLimitReached(session_id=session.session_id, grant_id=session.grant.grant_id),
-    )
-    parcel = harness.p("P")
-    service = _ObserverService(parcel, service_config)
-    service.db = _ParcelDB(service)  # type: ignore[attr-defined]
-
-    class Rest:
-        async def paginate(self, *_: object) -> list[object]:
-            return [
-                {
-                    "id": "bad-result",
-                    "status": "completed",
-                    "data": {"role": "assistant", "content": "FACTORY_RESULT_V1\nnot-json"},
-                }
-            ]
-
-    adapter = SimpleNamespace(rest=Rest())
-    rejections: list[tuple[object, ...]] = []
-
-    async def save_rejection(*args: object) -> None:
-        rejections.append(args)
-
-    observer = OmnigentObserver(
-        service,  # type: ignore[arg-type]
-        adapter,  # type: ignore[arg-type]
-        SimpleNamespace(save_rejection=save_rejection),  # type: ignore[arg-type]
-        FakeClock(),
-        interval_seconds=1,
-    )
-    await observer._results(parcel)
-    # The validation errors are persisted for the correction message and status comment.
-    [(sid, item, stage, details)] = rejections
-    assert (sid, item, stage) == (session.session_id, "bad-result", "triage")
-    assert details == ("expected exactly one factory-result fence",)
-    [candidate] = [
-        event.body for event in service.events if isinstance(event.body, ev.ResultCandidate)
-    ]
-    assert candidate.valid is False
-    assert candidate.result_kind == ev.ResultKind.CHECKPOINT
-
-
 def test_cli_serve_builds_runs_and_stops_on_one_loop(
     service_config: ServiceConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -376,13 +325,14 @@ def test_cli_serve_builds_runs_and_stops_on_one_loop(
 
     async def build(*_: object, **__: object) -> SimpleNamespace:
         loops.append(asyncio.get_running_loop())
-        return SimpleNamespace(service=service, verifier=SimpleNamespace())
+        return SimpleNamespace(service=service, verifier=SimpleNamespace(), mcp=None)
 
     class Server:
         def __init__(self, config: Any) -> None:
             self.config = config
 
-        async def serve(self) -> None:
+        async def serve(self, sockets: object = None) -> None:
+            assert sockets == []
             loops.append(asyncio.get_running_loop())
             app = self.config.app
             async with app.router.lifespan_context(app):
@@ -391,6 +341,7 @@ def test_cli_serve_builds_runs_and_stops_on_one_loop(
     monkeypatch.setattr(cli, "_load", lambda _: (Path("config.toml"), service_config))
     monkeypatch.setattr(cli, "build_production", build)
     monkeypatch.setattr(cli.uvicorn, "Server", Server)
+    monkeypatch.setattr(cli, "listener_sockets", lambda _config: [])
     assert cli.main(["serve"]) == 0
     assert len(loops) == 4
     assert len({id(loop) for loop in loops}) == 1

@@ -68,6 +68,7 @@ class StoreDriver:
         s = self.session()
         self.send(ev.SessionCreated(session_id=s.session_id, root_id=root, nonce=s.nonce))
         self.send(ev.Prepared(session_id=s.session_id, ok=True))
+        self.send(ev.PoliciesVerified(session_id=s.session_id, ok=True))
         return self.session()
 
     def of(self, kind: EffectKind) -> list[EffectIntent]:

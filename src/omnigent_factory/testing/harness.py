@@ -112,12 +112,19 @@ class Harness:
         return self.apply(f.make(ev.GitHubSnapshot(), evidence=snapshot(read_at_us=f.now)))
 
     def create_ok(self, pid: str = "I_parcel_1") -> StageSession:
+        """Create (or, in the parcel's live issue session, just prepare) the current run."""
         s = self.cur(pid)
-        self._roots += 1
-        root = f"root-{self._roots}"
-        self.send(pid, ev.SessionCreated(session_id=s.session_id, root_id=root, nonce=s.nonce))
+        if s.root_id is None:
+            self._roots += 1
+            root = f"root-{self._roots}"
+            self.send(pid, ev.SessionCreated(session_id=s.session_id, root_id=root, nonce=s.nonce))
         self.send(pid, ev.Prepared(session_id=s.session_id, ok=True))
+        self.verify_policies(pid)
         return self.cur(pid)
+
+    def verify_policies(self, pid: str = "I_parcel_1") -> TransitionResult:
+        """The post-barrier exact policy-set verification of the current run succeeds."""
+        return self.send(pid, ev.PoliciesVerified(session_id=self.cur(pid).session_id, ok=True))
 
     def quiesce(self, pid: str, session_id: str) -> TransitionResult:
         return self.send(pid, ev.TreeQuiescent(session_id=session_id, complete=True, busy=False))

@@ -950,6 +950,10 @@ def seed_blocked_plan(config: ServiceConfig) -> None:
     store.apply_event(
         factory.make(ev.Prepared(session_id=session.session_id, ok=True)), config.trusted
     )
+    store.apply_event(
+        factory.make(ev.PoliciesVerified(session_id=session.session_id, ok=True)),
+        config.trusted,
+    )
     message = next(
         row for row in store.pending_effects() if row.effect.kind == EffectKind.SEND_MESSAGE
     )

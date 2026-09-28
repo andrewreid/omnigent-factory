@@ -26,6 +26,12 @@ class ServiceConfig(BaseModel):
     state_dir: Path = Field(default_factory=lambda: Path.home() / ".local/state/omnigent-factory")
     bind_host: str = "127.0.0.1"
     bind_port: int = Field(default=8787, ge=1, le=65535)
+    #: The factory MCP endpoint (``/mcp``) is served only on a 127.0.0.1 listener on this
+    #: port (the same socket as ``bind_host`` when that is loopback on the same port).
+    mcp_port: int = Field(default=8787, ge=1, le=65535)
+    #: Bearer token for ``/mcp`` (default ``<secrets_dir>/mcp-token``, mode 0600; created
+    #: by ``omnigent-factory setup mcp-token``).
+    mcp_token_file: Path | None = None
     repo_id: str
     owners: frozenset[int]
     repository: str = "SA-Ambulance/timesheets"
@@ -60,8 +66,9 @@ class ServiceConfig(BaseModel):
     omnigent_base_url: str = "https://omnigent.reid.ee"
     omnigent_host_id: str | None = None
     omnigent_host_name: str = "coder"
-    omnigent_agent_id: str | None = None
-    omnigent_agent_name: str = "Molly"
+    #: The factory agent every new issue session runs (``doctor`` checks it exists).
+    omnigent_agent_id: str | None = "rosie"
+    omnigent_agent_name: str = "Rosie"
     omnigent_project_id: str | None = None
     omnigent_project_name: str = "Timesheets"
     source_clone: Path = Field(
@@ -182,6 +189,10 @@ class ServiceConfig(BaseModel):
         return self.webhook_secret_file or self.secrets_dir / "webhook_secret"
 
     @property
+    def resolved_mcp_token_file(self) -> Path:
+        return self.mcp_token_file or self.secrets_dir / "mcp-token"
+
+    @property
     def resolved_omnigent_token_file(self) -> Path:
         return self.omnigent_token_file or self.secrets_dir / "omnigent-token"
 
@@ -275,6 +286,7 @@ def load_config(path: str | Path) -> ServiceConfig:
         "app_private_key_file",
         "webhook_secret_file",
         "omnigent_token_file",
+        "mcp_token_file",
         "omnigent_cli_store",
         "source_clone",
         "worktree_root",

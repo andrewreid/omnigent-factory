@@ -12,6 +12,7 @@ import pytest
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.effects import Ack, EffectKind
+from omnigent_factory.omnigent import policies as pol
 from omnigent_factory.omnigent.observe import StreamNormalizer
 from omnigent_factory.omnigent.rest import OmnigentRest
 from omnigent_factory.omnigent.tree import scan_tree
@@ -176,7 +177,7 @@ async def test_operator_cel_cannot_disable_the_fixed_rule(git_env: GitEnv, overr
     root = await _created(rig)
     outcome = await rig.adapter.execute(intent(EffectKind.PREPARE_SESSION, root_id=root), CTX)
     assert isinstance(outcome, Ack) and outcome.detail["ok"] is True
-    rows = {p["name"]: p for p in rig.server.policies[root]}
+    rows = {pol.family_of(p["name"]): p for p in rig.server.policies[root]}
     merge = {
         "type": "tool_call",
         "target": "sys_os_shell",

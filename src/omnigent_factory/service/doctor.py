@@ -55,6 +55,7 @@ async def run_doctor(
     *,
     github_transport: httpx.AsyncBaseTransport | None = None,
     omnigent_transport: httpx.AsyncBaseTransport | None = None,
+    mcp_transport: httpx.AsyncBaseTransport | None = None,
 ) -> DoctorReport:
     """Perform live reads only; print-worthy IDs are returned under ``resolved``."""
     report = DoctorReport()
@@ -113,7 +114,78 @@ async def run_doctor(
     await asyncio.to_thread(_check_clone, config, report)
     _check_socket(config, report)
     await asyncio.to_thread(_check_bind, config, report)
+    _check_mcp_token(config, report)
+    _check_caller_policy(report)
+    await _check_mcp_listener(config, report, transport=mcp_transport)
     return report
+
+
+def _check_mcp_token(config: ServiceConfig, report: DoctorReport) -> None:
+    path = config.resolved_mcp_token_file
+    try:
+        token = _private_file(path)
+    except (OSError, RuntimeError) as exc:
+        report.fail("mcp_token", f"{exc} (create it with `omnigent-factory setup mcp-token`)")
+        return
+    if len(token.strip()) < 32:
+        report.fail("mcp_token", "token file is too short")
+        return
+    report.pass_check("mcp_token", f"{path} is private (mode 0600)")
+
+
+def _check_caller_policy(report: DoctorReport) -> None:
+    """Dry compile + exercise the per-session caller-identity CEL policy."""
+    from omnigent.policies.builtins.cel import cel_policy  # noqa: PLC0415
+
+    from omnigent_factory.omnigent.policies import caller_policy  # noqa: PLC0415
+
+    try:
+        spec = caller_policy("conv_doctor_probe")
+        check = cel_policy(**spec.factory_params)
+    except (ValueError, ImportError) as exc:
+        report.fail("caller_policy", f"identity policy does not compile: {exc}")
+        return
+
+    def verdict(name: str, arguments: object) -> str | None:
+        out = check({"type": "tool_call", "data": {"name": name, "arguments": arguments}})
+        return str(out.get("result")) if isinstance(out, dict) else None
+
+    expected = [
+        (verdict("factory__factory_get_status", {"session_id": "conv_doctor_probe"}), "ALLOW"),
+        (verdict("factory__factory_get_status", {"session_id": "conv_other"}), "DENY"),
+        (verdict("mcp__factory__factory_submit_result", {}), "DENY"),
+        (verdict("factory_get_plan", "not-a-map"), "DENY"),
+        (verdict("sys_os_shell", {"command": "ls"}), "ALLOW"),
+    ]
+    if any(got != want for got, want in expected):
+        report.fail("caller_policy", f"identity policy verdicts wrong: {expected}")
+        return
+    report.pass_check("caller_policy", "compiles; binds factory tools to the calling session")
+
+
+async def _check_mcp_listener(
+    config: ServiceConfig,
+    report: DoctorReport,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> None:
+    """The loopback /mcp listener answers (401 without a token proves the gate is up).
+
+    Advisory: doctor also runs before the daemon is first started.
+    """
+    url = f"http://127.0.0.1:{config.mcp_port}/mcp/"
+    try:
+        async with httpx.AsyncClient(transport=transport, timeout=5.0) as client:
+            resp = await client.post(url, json={})
+    except httpx.HTTPError as exc:
+        report.warn(
+            "mcp_listener", f"{url} unreachable ({type(exc).__name__}); daemon not running?"
+        )
+        return
+    if resp.status_code in (401, 503):
+        report.pass_check("mcp_listener", f"{url} is up and requires the bearer token")
+    else:
+        report.fail("mcp_listener", f"{url} answered HTTP {resp.status_code} without a token")
 
 
 async def _check_github(

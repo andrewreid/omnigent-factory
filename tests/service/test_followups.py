@@ -24,7 +24,7 @@ from omnigent_factory.core.effects import (
     EffectKind,
     Preconditions,
 )
-from omnigent_factory.core.types import Lifecycle, Readiness, Via
+from omnigent_factory.core.types import Lifecycle, Readiness
 from omnigent_factory.credentials.worktree import StageWiring
 from omnigent_factory.omnigent.adapter import ELICITATION_NOT_PENDING
 from omnigent_factory.omnigent.auth import CliStoreAuth
@@ -289,46 +289,9 @@ def test_cli_waits_for_the_operator_socket_after_a_restart(service_config, monke
 # ------------------------------------------------------------------ 8. observer noise
 
 
-@pytest.mark.asyncio
-async def test_observer_skips_results_already_applied_before_a_restart(
-    service_config: ServiceConfig, caplog
-) -> None:
-    harness = Harness()
-    harness.eligible("P")
-    harness.send("P", ev.RequestTriage(via=Via.DRAG))
-    harness.create_ok("P")
-    parcel = harness.p("P")
-    events: list[Any] = []
-    service = SimpleNamespace(
-        config=service_config,
-        apply_event=lambda event, **_: events.append(event),
-        db=SimpleNamespace(call=_applied),
-    )
-
-    class Rest:
-        async def paginate(self, *_: object) -> list[object]:
-            return [
-                {
-                    "id": "old-result",
-                    "status": "completed",
-                    "data": {"role": "assistant", "content": "FACTORY_RESULT_V1\nnot-json"},
-                }
-            ]
-
-    observer = OmnigentObserver(
-        service,  # type: ignore[arg-type]
-        SimpleNamespace(rest=Rest()),  # type: ignore[arg-type]
-        SimpleNamespace(),  # type: ignore[arg-type]
-        FakeClock(),
-        interval_seconds=1,
-    )
-    caplog.set_level(logging.WARNING)
-    await observer._results(parcel)
-    assert events == [] and "result rejected" not in caplog.text
-
-
-async def _applied(operation: Any) -> Any:
-    return True  # every result event already exists in the store
+def test_observer_never_reads_results_from_the_transcript() -> None:
+    """Results arrive only through factory_submit_result (no transcript parsing path)."""
+    assert not hasattr(OmnigentObserver, "_results")
 
 
 def test_merged_pr_or_closed_issue_schedules_workspace_cleanup():

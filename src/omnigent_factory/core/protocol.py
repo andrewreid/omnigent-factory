@@ -1,11 +1,12 @@
-"""Frozen stage-result protocol v1 (architecture §7.1-§7.2).
+"""Stage-result schema v1 and its cross-record constraints (architecture §7.2).
 
-A root's final completed assistant response must contain a literal ``FACTORY_RESULT_V1``
-line followed by exactly one fenced ``factory-result`` JSON object (backtick or tilde
-fence). :func:`parse_factory_result` extracts it, parses strictly (no duplicate keys, no
-non-finite numbers, ≤128 KiB), validates it against the models below (which mirror
-``result_schema_v1.json`` exactly: unknown properties rejected) and then enforces the
-cross-record constraints listed under the schema in §7.2.
+Results arrive through ``factory_submit_result`` as a JSON object (the ``result`` member of
+the v1 envelope). :func:`validate_result` wraps it in the envelope the service derives from
+the calling run (parcel, run, nonce, revision: never taken from the agent), validates it
+against the models below (which mirror ``result_schema_v1.json`` exactly: unknown
+properties rejected, ≤128 KiB) and then enforces the cross-record constraints. Errors carry
+compact ``location: message`` details the tool returns so the agent can fix the call in
+the same turn.
 
 The daemon computes hashes/timestamps itself; model-provided values never override them.
 """
@@ -13,7 +14,7 @@ The daemon computes hashes/timestamps itself; model-provided values never overri
 from __future__ import annotations
 
 import json
-import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated, Literal
 
@@ -25,9 +26,7 @@ from omnigent_factory.core.canonical import (
     parse_json_strict,
 )
 
-SENTINEL = "FACTORY_RESULT_V1"
 MAX_RESULT_BYTES = 128 * 1024
-MAX_ID_CHARS = 128
 #: The canonical contract is published verbatim in one GitHub issue comment (65,536
 #: characters maximum) together with its header, fence and effect marker, and its hash
 #: binds approval. A contract that cannot be published whole is an invalid result.
@@ -161,7 +160,7 @@ class FactoryResult(_Strict):
 
 
 class ResultError(ValueError):
-    """The final response does not carry a valid factory result.
+    """The submitted result is not a valid factory result for this run.
 
     ``details`` are compact ``location: message`` lines safe to show the agent and the
     owner: field locations and validator messages only, never the rejected input values.
@@ -178,7 +177,7 @@ MAX_ERROR_DETAIL_CHARS = 200
 _RESULT_KINDS = frozenset({"triage", "plan", "build_ready", "checkpoint", "blocked"})
 
 
-#: Compact field types per result kind, quoted in the format-correction message.
+#: Compact field types per result kind, quoted in tool errors and descriptions.
 RESULT_SHAPES: dict[str, str] = {
     "triage": '{"kind":"triage","summary":str,"priority":"P0|P1|P2|P3","size":"S|M|L",'
     '"recommendation":"fix|wont_fix|duplicate|needs_info","duplicate_issue":int|null,'
@@ -198,17 +197,6 @@ RESULT_SHAPES: dict[str, str] = {
     '"remaining":[str],"risks":[str],"worktree_state":str,"elicitation_id":str|null}',
     "blocked": '{"kind":"blocked","reason":str,"done":[str]}',
 }
-_STAGE_KINDS = {
-    "triage": ("triage", "blocked"),
-    "plan": ("plan", "blocked"),
-    "build": ("build_ready", "plan", "checkpoint", "blocked"),
-}
-
-
-def result_shapes(stage: str) -> str:
-    """The result shapes a stage may return, one per line."""
-    kinds = _STAGE_KINDS.get(stage, tuple(RESULT_SHAPES))
-    return "\n".join(f"- {RESULT_SHAPES[k]}" for k in kinds)
 
 
 def validation_details(exc: ValidationError) -> tuple[str, ...]:
@@ -245,70 +233,40 @@ class ParsedResult:
     contract_canonical: bytes | None
 
 
-_FENCE_OPEN = re.compile(r"^(?P<fence>`{3,}|~{3,})\s*factory-result\s*$")
-
-
-def extract_result_block(final_text: str) -> str:
-    """Return the JSON text of the single fenced block that follows the sentinel."""
-    lines = [ln for ln in final_text.replace("\r\n", "\n").split("\n")]
-    unquoted = [ln for ln in lines if not ln.lstrip().startswith(">")]
-    if sum(1 for ln in unquoted if ln.strip() == SENTINEL) != 1:
-        raise ResultError("expected exactly one sentinel line")
-    if sum(1 for ln in unquoted if _FENCE_OPEN.match(ln.strip())) != 1:
-        raise ResultError("expected exactly one factory-result fence")
-    idx = next(i for i, ln in enumerate(unquoted) if ln.strip() == SENTINEL) + 1
-    while idx < len(unquoted) and not unquoted[idx].strip():
-        idx += 1
-    if idx >= len(unquoted):
-        raise ResultError("sentinel not followed by a fence")
-    opener = _FENCE_OPEN.match(unquoted[idx].strip())
-    if opener is None:
-        raise ResultError("sentinel not followed by a factory-result fence")
-    fence = opener.group("fence")
-    body: list[str] = []
-    for ln in unquoted[idx + 1 :]:
-        if ln.strip() == fence:
-            return "\n".join(body)
-        body.append(ln)
-    raise ResultError("unterminated factory-result fence")
-
-
 def _check_ids(values: list[str], what: str) -> None:
     if len(set(values)) != len(values):
         raise ResultError(f"duplicate {what} id")
 
 
-def parse_factory_result(final_text: str, expected: Correlation) -> ParsedResult:
-    raw = extract_result_block(final_text)
+def validate_result(result: Mapping[str, object], expected: Correlation) -> ParsedResult:
+    """Validate one submitted stage result for the run described by ``expected``."""
+    if not isinstance(result, Mapping):
+        raise ResultError("result: must be a JSON object")
+    try:
+        raw = json.dumps(result, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ResultError("result: must be plain JSON (no NaN/Infinity)") from exc
     if len(raw.encode("utf-8")) > MAX_RESULT_BYTES:
         raise ResultError("result exceeds 128 KiB")
     try:
-        json.loads(raw)
-    except json.JSONDecodeError as exc:
-        detail = f"invalid JSON: {exc.msg} at line {exc.lineno} column {exc.colno}"
-        if len(raw) - exc.pos <= 8:
-            detail += " (near the end: a closing brace or bracket is probably missing)"
-        raise ResultError(detail, (detail,)) from exc
-    try:
-        data = parse_json_strict(raw)
+        # Strict re-parse: no duplicate keys or non-finite numbers reach the models.
+        inner = parse_json_strict(raw)
     except CanonicalizationError as exc:
         raise ResultError(str(exc)[:MAX_ERROR_DETAIL_CHARS]) from exc
+    data = {
+        "version": 1,
+        "parcel_id": expected.parcel_id,
+        "stage_session_id": expected.stage_session_id,
+        "dispatch_nonce": expected.dispatch_nonce,
+        "revision": expected.revision,
+        "result": inner,
+    }
     try:
-        result = FactoryResult.model_validate(data)
+        result_model = FactoryResult.model_validate(data)
     except ValidationError as exc:
         details = validation_details(exc)
         raise ResultError("schema: " + "; ".join(details), details) from exc
-    for value in (result.parcel_id, result.stage_session_id, result.dispatch_nonce):
-        if len(value) > MAX_ID_CHARS:
-            raise ResultError("identifier too long")
-    if (result.parcel_id, result.stage_session_id, result.dispatch_nonce, result.revision) != (
-        expected.parcel_id,
-        expected.stage_session_id,
-        expected.dispatch_nonce,
-        expected.revision,
-    ):
-        raise ResultError("correlation mismatch")
-    r = result.result
+    r = result_model.result
     contract_bytes: bytes | None = None
     if isinstance(r, BlockedResult):
         pass  # any stage may report that it could not finish
@@ -348,4 +306,4 @@ def parse_factory_result(final_text: str, expected: Correlation) -> ParsedResult
             raise ResultError("build-ready findings must all be dispositioned")
         if r.review.implementation_vendor == r.review.review_vendor:
             raise ResultError("independent review must use the opposite vendor")
-    return ParsedResult(result=result, contract_canonical=contract_bytes)
+    return ParsedResult(result=result_model, contract_canonical=contract_bytes)

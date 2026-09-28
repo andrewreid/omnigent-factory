@@ -48,12 +48,26 @@ def observations(effect: EffectIntent, outcome: AdapterOutcome) -> tuple[ev.Even
                 session_id=sid,
                 ok=bool(d.get("ok")),
                 unexpected_turn=bool(d.get("unexpected_turn")),
+                unusable=bool(d.get("unusable")),
+                reason=str(d.get("reason") or "")[:200] if d.get("unusable") else "",
+                policy_ready_at_us=_int(d.get("policy_ready_at_us")),
             ),
         )
     if kind in (EffectKind.SEND_MESSAGE, EffectKind.RESOLVE_ELICITATION) and outcome.remote_id:
         return (
             ev.MessageAck(session_id=sid, effect_id=effect.effect_id, item_id=outcome.remote_id),
         )
+    if kind == EffectKind.VERIFY_POLICIES:
+        return (
+            ev.PoliciesVerified(
+                session_id=sid,
+                ok=d.get("ok") is True,
+                reconciled=d.get("reconciled") is True,
+                ready_at_us=_int(d.get("ready_at_us")),
+            ),
+        )
+    if kind == EffectKind.CLOSE_SESSION:
+        return (ev.IssueSessionClosed(root_id=str(effect.args.get("root_id") or "")),)
     if kind == EffectKind.SCAN_TREE:
         return (
             ev.TreeQuiescent(
@@ -95,3 +109,7 @@ def _reconciled(effect: EffectIntent, sid: str, outcome: Ack) -> tuple[ev.EventB
         return (ev.EffectReconciled(effect_id=target, session_id=sid or None, delivered=False),)
     # pending_input / ambiguous / gone: the outcome stays UNKNOWN (no proof either way).
     return ()
+
+
+def _int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0

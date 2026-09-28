@@ -24,7 +24,7 @@ from omnigent_factory.core.protocol import (
     MAX_CONTRACT_CHARS,
     Correlation,
     ResultError,
-    parse_factory_result,
+    validate_result,
 )
 from omnigent_factory.core.types import InboxHoldReason, Size, Via
 from omnigent_factory.github.adapter import GitHubAPIAdapter, ParcelBinding
@@ -449,28 +449,20 @@ async def test_unpublishable_contract_is_refused_before_any_post(
     assert server.posts == 0
 
 
-def _plan_result(contract_body: dict[str, object]) -> str:
-    envelope = {
-        "version": 1,
-        "parcel_id": "P",
-        "stage_session_id": "S",
-        "dispatch_nonce": "N",
-        "revision": 0,
-        "result": {
-            "kind": "plan",
-            "publication_kind": "contract",
-            "approach": "a",
-            "risks": [],
-            "contract": contract_body,
-            "open_decision_ids": [],
-        },
+def _plan_result(contract_body: dict[str, object]) -> dict[str, object]:
+    return {
+        "kind": "plan",
+        "publication_kind": "contract",
+        "approach": "a",
+        "risks": [],
+        "contract": contract_body,
+        "open_decision_ids": [],
     }
-    return f"FACTORY_RESULT_V1\n```factory-result\n{json.dumps(envelope)}\n```"
 
 
 def test_plan_result_whose_contract_cannot_be_published_whole_is_invalid() -> None:
     expected = Correlation("P", "S", "N", 0, "plan")
     fits = _big_contract(MAX_CONTRACT_CHARS - 20_000)
-    assert parse_factory_result(_plan_result(fits), expected).contract_canonical is not None
+    assert validate_result(_plan_result(fits), expected).contract_canonical is not None
     with pytest.raises(ResultError, match="publishable comment size"):
-        parse_factory_result(_plan_result(_big_contract(MAX_CONTRACT_CHARS)), expected)
+        validate_result(_plan_result(_big_contract(MAX_CONTRACT_CHARS)), expected)

@@ -74,8 +74,9 @@ class EventFactory:
     """Builds events for one parcel with increasing IDs and source times.
 
     Controls default to the owner via a signed webhook; safety facts to a webhook from
-    ``OTHER_USER_ID``; observations to the adapter. Every event carries fresh entropy and,
-    for controls, a fresh eligible snapshot unless ``evidence`` is overridden.
+    ``OTHER_USER_ID``; observations to the adapter (results and questions: MCP). Every
+    event carries fresh entropy and, for controls, a fresh eligible snapshot unless
+    ``evidence`` is overridden.
     """
 
     def __init__(
@@ -136,6 +137,8 @@ class EventFactory:
                 provenance = Provenance.SCHEDULER
             if isinstance(body, ev.InboxHoldSet | ev.InboxHoldReleased):
                 provenance = Provenance.INBOX
+            if isinstance(body, ev.ResultCandidate | ev.OwnerQuestion):
+                provenance = Provenance.MCP
         if actor is None and cls == EventClass.CONTROL and provenance != Provenance.OPERATOR:
             actor = OWNER_ID
         if isinstance(evidence, str):

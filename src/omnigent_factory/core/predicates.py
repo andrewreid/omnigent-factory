@@ -170,7 +170,13 @@ def build_ok(p: Parcel, s: StageSession) -> bool:
 
 
 def work_allowed(p: Parcel, s: StageSession) -> bool:
-    """Common preflight for any work-bearing relay to ``s``."""
+    """Common preflight for any work-bearing relay to ``s``.
+
+    Includes the run's verified policy barrier: until the root's exact policy set (with
+    the caller-identity guard) is verified after propagation, nothing may run.
+    """
+    if not s.policy_ready:
+        return False
     if not (gate_open(p, s) and authority_ok(p, s)) or message_uncertain(p, s):
         return False
     if board_pending(p):  # the column (and so the authority it implies) is unresolved

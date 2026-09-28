@@ -224,6 +224,27 @@ class Workspaces:
             raise WorktreeError("source clone push URL differs from the expected HTTPS URL")
         self._git(["config", "--local", "extensions.worktreeConfig", "true"], self.source_clone)
 
+    def ensure_excluded(self, pattern: str) -> bool:
+        """Add ``pattern`` to the clone's effective ``info/exclude`` once (idempotent).
+
+        The path comes from Git (``--git-path``), so every linked worktree of the clone
+        shares it; the repository's tracked ``.gitignore`` is never touched. Returns
+        whether the file changed.
+        """
+        out = self._git(
+            ["rev-parse", "--path-format=absolute", "--git-path", "info/exclude"],
+            (self.source_clone),
+        )
+        path = Path(out)
+        existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+        if pattern in (line.strip() for line in existing.splitlines()):
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        prefix = "" if not existing or existing.endswith("\n") else "\n"
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(f"{prefix}{pattern}\n")
+        return True
+
     def fetch_base(self, base_branch: str = "main") -> str:
         """Fetch ``origin/<base>`` explicitly and return its OID (§5.1)."""
         ref = f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}"

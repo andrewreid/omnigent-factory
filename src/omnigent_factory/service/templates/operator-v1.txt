@@ -1,8 +1,0 @@
-Factory operator note for stage session {session_id}. The factory has re-checked this
-session's authority and credentials; the note below comes from the local operator and does
-not widen your approved scope.
-
-{note}
-
-When done, return the stage's normal FACTORY_RESULT_V1 block (or a "blocked" result with
-the reason if something still refuses).

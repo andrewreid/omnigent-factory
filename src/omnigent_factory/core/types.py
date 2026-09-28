@@ -254,6 +254,26 @@ class DecisionStatus(enum.StrEnum):
     RESOLVED_IN_OMNIGENT = "resolved_in_omnigent"
 
 
+class DecisionSource(enum.StrEnum):
+    """Where an owner question came from."""
+
+    #: A native Omnigent elicitation (answered by resolving the prompt).
+    ELICITATION = "elicitation"
+    #: ``factory_ask_owner`` (answered by relaying a message to the issue session).
+    MCP = "mcp"
+
+
+class IssueSessionStatus(enum.StrEnum):
+    """Lifetime of the parcel's Omnigent issue session (independent of any stage run)."""
+
+    LIVE = "live"
+    #: Crashed, deleted, archived elsewhere or otherwise unusable: the next run replaces it.
+    DEAD = "dead"
+    #: Terminal parcel: an archive request is pending.
+    CLOSING = "closing"
+    CLOSED = "closed"
+
+
 class DecisionImpact(enum.StrEnum):
     WITHIN_CONTRACT = "within_contract"
     PLAN_REVISION = "plan_revision"
@@ -366,7 +386,12 @@ class Grant:
 
 @dataclass(frozen=True, slots=True)
 class StageSession:
-    """A stage session and its entire recursive worker tree."""
+    """One stage run (epoch) and its entire recursive worker tree.
+
+    ``root_id`` is the parcel's issue session root the run executes in; successive runs
+    share it (see :class:`IssueSession`). Fences, grant, credentials and lifecycle belong
+    to the run only.
+    """
 
     session_id: str
     kind: SessionKind
@@ -392,6 +417,37 @@ class StageSession:
     report_published: bool = False
     #: The reducer last emitted ENABLE_ISSUANCE for this session (reconcile skips a repeat).
     issuance_enabled: bool = False
+    #: The root's exact factory policy set (caller identity included) was re-verified after
+    #: its cross-replica propagation barrier. False closes the work gate: no credential,
+    #: no work message. Runs recorded before this field existed default to verified.
+    policy_ready: bool = True
+    #: Not-before time of the pending post-barrier policy verification (0: none pending).
+    policy_ready_at_us: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class IssueSession:
+    """The parcel's one Omnigent root conversation, reused by successive stage runs.
+
+    Stage runs (:class:`StageSession`) carry the fences, grant and credentials; the issue
+    session carries none of them, so stopping or revoking a run never fences the
+    conversation itself. It is replaced only when it is dead/unusable (``generation``
+    increments) and archived once the parcel is terminal.
+    """
+
+    root_id: str
+    #: The ``factory.dispatch`` label the root was created with (its creating run's nonce).
+    nonce: str
+    #: The stage run whose create produced this root.
+    created_by: str
+    generation: int = 1
+    status: IssueSessionStatus = IssueSessionStatus.LIVE
+    #: Why it was retired (dead/unusable reason); audit only.
+    reason: str = ""
+
+    @property
+    def reusable(self) -> bool:
+        return self.status == IssueSessionStatus.LIVE
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,6 +465,7 @@ class Decision:
     answer_event_id: str | None = None
     externally_resolved: bool = False
     prompt_lost: bool = False
+    source: DecisionSource = DecisionSource.ELICITATION
 
 
 @dataclass(frozen=True, slots=True)
@@ -515,6 +572,9 @@ class Parcel:
     #: Inbox deliveries that could not be interpreted for this parcel. While any is
     #: present the parcel is not dispatchable; releasing one restores no authority.
     inbox_holds: tuple[InboxHold, ...] = ()
+    #: The Omnigent conversation reused by every stage run of this issue (None before the
+    #: first create is adopted).
+    issue_session: IssueSession | None = None
     applied_event_ids: frozenset[str] = frozenset()
 
     def session(self, session_id: str | None) -> StageSession | None:

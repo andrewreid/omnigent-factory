@@ -44,6 +44,11 @@ P = "I_parcel_1"
 Q = "I_parcel_2"
 
 
+def starts_run(result):
+    """A new stage run: a fresh issue session (create) or the live one reused (prepare)."""
+    return bool({EffectKind.CREATE_SESSION, EffectKind.PREPARE_SESSION} & set(kinds(result)))
+
+
 def kinds(result):
     return [e.kind for e in result.effects]
 
@@ -306,7 +311,9 @@ def test_B02_request_plan_opens_revision():
     r = h.send(P, ev.RequestPlan(via=Via.DRAG))
     p = h.p()
     assert p.stage == Stage.SCOPED and p.revision == 1 and p.revision_pending
-    assert EffectKind.CREATE_SESSION in kinds(r) and h.cur().kind == SessionKind.PLAN
+    # The plan run reuses the triage run's issue session (prepare, no second create).
+    assert EffectKind.PREPARE_SESSION in kinds(r) and EffectKind.CREATE_SESSION not in kinds(r)
+    assert h.cur().kind == SessionKind.PLAN
     assert h.cur().grant.duration_us == 4 * MICROS_PER_HOUR
 
 
@@ -325,11 +332,12 @@ def test_B03_replan_from_building_revokes_then_plans_after_quiescence(how):
     s = p.session(b.session_id)
     assert {FenceKind.SAFETY, FenceKind.REVOKED} <= s.fences
     assert not p.approval(old_approval).valid and p.revision_pending
-    assert EffectKind.CREATE_SESSION not in kinds(r)  # not before Q
+    assert not starts_run(r)  # not before Q
     assert p.pending_authorization_id is not None
     r = h.quiesce(P, b.session_id)
-    assert EffectKind.CREATE_SESSION in kinds(r)
+    assert starts_run(r)
     assert h.cur().kind == SessionKind.PLAN
+    assert h.cur().root_id == b.root_id  # same issue session; the build run stays fenced
     assert h.p().session(b.session_id).fences >= {FenceKind.SAFETY, FenceKind.REVOKED}
 
 
@@ -365,7 +373,7 @@ def test_B05_feedback_without_current_plan_starts_new_root():
     h.send(P, ev.Stop())
     h.quiesce(P, plan.session_id)
     r = h.send(P, ev.PlanFeedback(text_digest="d"))
-    assert EffectKind.CREATE_SESSION in kinds(r)
+    assert starts_run(r)
     assert h.cur().session_id != plan.session_id
 
 
@@ -608,15 +616,12 @@ def test_B12_invalid_drag_approval_rolls_back_card():
     assert h.p().current_approval_id is None and not work(r)
 
 
-def test_B13_malformed_result_gets_one_correction_then_blocks():
+def test_B13_malformed_result_blocks_without_correction_round_trip():
     h = Harness()
     h.eligible()
     h.send(P, ev.RequestPlan())
     s = h.create_ok()
     bad = result_candidate(s.session_id, s.root_id, s.revision, ev.ResultKind.PLAN, valid=False)
-    r = h.send(P, bad)
-    [msg] = Harness.of(r, EffectKind.SEND_MESSAGE)
-    assert msg.args["purpose"] == MessagePurpose.CORRECTION.value
     r = h.send(P, bad)
     assert not work(r) and Hold.RESULT_INVALID in h.p().holds
     assert h.p().bot == BotState.BLOCKED
@@ -694,9 +699,11 @@ def test_C04_capacity_available_reserves_and_creates():
     assert h.admission.queue_entry(P).status == QueueStatus.RESERVED
     assert h.admission.building_count == 1
     s = h.cur()
-    assert s.kind == SessionKind.BUILD and s.lifecycle == Lifecycle.INTENT
-    [create] = Harness.of(r, EffectKind.CREATE_SESSION)
-    assert create.args["nonce"] == s.nonce and create.preconditions.approval_id is not None
+    # The build run reuses the plan run's issue session: prepare it, no create.
+    assert s.kind == SessionKind.BUILD and s.lifecycle == Lifecycle.PREPARING
+    [prepare] = Harness.of(r, EffectKind.PREPARE_SESSION)
+    assert prepare.args["reuse"] is True and prepare.preconditions.approval_id is not None
+    assert not Harness.of(r, EffectKind.CREATE_SESSION)
 
 
 def test_C05_admission_guards():
@@ -770,9 +777,16 @@ def test_C09_prepared_starts_first_message_under_authority():
     h.send(P, ev.RequestTriage())
     s = h.cur()
     h.send(P, ev.SessionCreated(session_id=s.session_id, root_id="r", nonce=s.nonce))
-    r = h.send(P, ev.Prepared(session_id=s.session_id, ok=True))
+    r = h.send(P, ev.Prepared(session_id=s.session_id, ok=True, policy_ready_at_us=12345))
+    # Prepared is not open: wait the propagation barrier and re-verify the policy set.
+    assert h.cur().lifecycle == Lifecycle.PREPARING and not work(r)
+    [verify] = Harness.of(r, EffectKind.VERIFY_POLICIES)
+    assert verify.args == {"root_id": "r", "not_before_us": 12345, "reconcile": False}
+    r = h.verify_policies()
     assert h.cur().lifecycle == Lifecycle.ACTIVE
+    enable = Harness.of(r, EffectKind.ENABLE_ISSUANCE)[0]
     msg = Harness.of(r, EffectKind.SEND_MESSAGE)[0]
+    assert r.effects.index(enable) < r.effects.index(msg)
     assert msg.args["purpose"] == MessagePurpose.FIRST.value
     assert msg.preconditions.authorization_id == s.authorization_id
 
@@ -1411,23 +1425,20 @@ def test_B07f_owner_plan_command_resumes_after_refused_prepare():
     r = h.send(P, ev.RequestPlan(via=Via.COMMAND))
     p = h.p()
     assert r.audit.accepted and Hold.PREPARE_FAILED not in p.holds
-    assert EffectKind.CREATE_SESSION in kinds(r)
+    assert starts_run(r)
     assert p.current_session.kind == SessionKind.PLAN
     assert [x.kind for x in p.sessions].count(SessionKind.TRIAGE) == 1  # triage not re-run
 
 
 def test_B07g_owner_plan_command_resumes_after_result_invalid():
-    """Resume path when a plan result stays invalid after the one correction: ``/plan``."""
+    """Resume path when a plan result is invalid: ``/plan``."""
     h = Harness()
     h.triage()
     h.send(P, ev.RequestPlan(via=Via.DRAG))
     s = h.create_ok()
     bad = result_candidate(s.session_id, s.root_id, s.revision, ev.ResultKind.PLAN)
     first = h.send(P, replace(bad, valid=False))
-    assert [e.args.get("purpose") for e in Harness.of(first, EffectKind.SEND_MESSAGE)] == [
-        MessagePurpose.CORRECTION.value
-    ]
-    h.send(P, replace(bad, valid=False), event_id="result:second")
+    assert not Harness.of(first, EffectKind.SEND_MESSAGE)
     assert Hold.RESULT_INVALID in h.p().holds and h.p().bot == BotState.BLOCKED
     r = h.send(P, ev.RequestPlan(via=Via.COMMAND))
     assert r.audit.accepted, r.audit.reason
@@ -1435,7 +1446,7 @@ def test_B07g_owner_plan_command_resumes_after_result_invalid():
     assert EffectKind.INTERRUPT_TREE in kinds(r)  # the stale plan tree is drained first
     after = h.quiesce(P, s.session_id)
     p = h.p()
-    assert EffectKind.CREATE_SESSION in kinds(after)
+    assert starts_run(after)
     assert p.current_session.session_id != s.session_id
     assert p.current_session.kind == SessionKind.PLAN
     assert [x.kind for x in p.sessions].count(SessionKind.TRIAGE) == 1

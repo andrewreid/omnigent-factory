@@ -272,7 +272,7 @@ def test_F3_stopped_stage_recovery_is_allowed():
     h.send(P, ev.Stop())
     h.quiesce(P, b.session_id)
     r = h.send(P, ev.RequestTriage(via=Via.DRAG))
-    assert r.audit.accepted and EffectKind.CREATE_SESSION in kinds(r)
+    assert r.audit.accepted and EffectKind.PREPARE_SESSION in kinds(r)  # reused issue session
 
 
 def test_F3_plan_from_building_is_the_replan_row():

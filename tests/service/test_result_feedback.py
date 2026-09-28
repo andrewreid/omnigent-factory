@@ -1,30 +1,25 @@
-"""Pilot #677 plan rejection: validation errors reach the agent and the owner.
+"""Pilot #677 plan rejection: validation errors are precise enough to fix in-turn.
 
-The fixture is Molly's actual first plan block from session fe89b099b3364e4ca147c273b7cd3810.
-It is one closing brace short, which also puts ``open_decision_ids`` inside ``contract``;
-with the brace restored, ``resolved_decisions`` holds free-text design choices instead of
-owner-answered decision objects.
+The fixture is Molly's actual first plan block from session fe89b099b3364e4ca147c273b7cd3810
+(the transcript format is gone; its ``result`` object is what factory_submit_result would
+now receive). With its missing brace restored, ``resolved_decisions`` holds free-text design
+choices instead of owner-answered decision objects and ``open_decision_ids`` sits inside
+``contract``.
 """
 
 from __future__ import annotations
 
 import json
-from importlib.resources import files
 from pathlib import Path
 
 import pytest
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.effects import EffectIntent, EffectKind, Preconditions
-from omnigent_factory.core.protocol import (
-    Correlation,
-    ResultError,
-    extract_result_block,
-    parse_factory_result,
-)
+from omnigent_factory.core.protocol import Correlation, ResultError, validate_result
 from omnigent_factory.core.types import Via
 from omnigent_factory.service.config import ServiceConfig
-from omnigent_factory.service.directory import PublicationRenderer, ServiceDispatchDirectory
+from omnigent_factory.service.directory import ServiceDispatchDirectory
 from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.testing.builders import EventFactory, snapshot
 from omnigent_factory.testing.fakes import (
@@ -45,21 +40,21 @@ MOLLY = Correlation(
 )
 
 
-def _errors(text: str) -> tuple[str, ...]:
+def _errors(result: object) -> tuple[str, ...]:
     with pytest.raises(ResultError) as caught:
-        parse_factory_result(text, MOLLY)
+        validate_result(result, MOLLY)  # type: ignore[arg-type]
     return caught.value.details
 
 
-def test_molly_block_reports_the_json_error_with_location():
-    [detail] = _errors(FIXTURE.read_text())
-    assert detail.startswith("invalid JSON: Expecting ',' delimiter at line 1 column ")
-    assert "closing brace or bracket is probably missing" in detail
+def _molly_result() -> dict[str, object]:
+    lines = FIXTURE.read_text().splitlines()
+    raw = lines[lines.index("```factory-result") + 1] + "}"  # the missing closing brace
+    envelope = json.loads(raw)
+    return envelope["result"]
 
 
-def test_molly_block_with_brace_restored_reports_each_schema_mismatch():
-    raw = extract_result_block(FIXTURE.read_text()) + "}"
-    details = _errors(f"FACTORY_RESULT_V1\n```factory-result\n{raw}\n```\n")
+def test_molly_plan_reports_each_schema_mismatch():
+    details = _errors(_molly_result())
     assert details[:4] == tuple(
         f"result.contract.resolved_decisions.{i}: "
         "Input should be a valid dictionary or instance of ResolvedDecision"
@@ -73,108 +68,22 @@ def test_molly_block_with_brace_restored_reports_each_schema_mismatch():
 
 
 def test_error_details_are_capped():
-    body = {
-        "version": 1,
-        "parcel_id": MOLLY.parcel_id,
-        "stage_session_id": MOLLY.stage_session_id,
-        "dispatch_nonce": MOLLY.dispatch_nonce,
-        "revision": 3,
-        "result": {"kind": "plan", **{f"x{i}": i for i in range(30)}},
-    }
-    details = _errors(f"FACTORY_RESULT_V1\n```factory-result\n{json.dumps(body)}\n```\n")
+    details = _errors({"kind": "plan", **{f"x{i}": i for i in range(30)}})
     assert len(details) == 11 and details[-1].startswith("... and ")
 
 
-def test_templates_state_field_shapes():
-    root = files("omnigent_factory.service") / "templates"
-    plan = (root / "plan-v1.txt").read_text(encoding="utf-8")
-    assert '{{"decision_id","answer","source_event_id"}}' in plan
-    assert "open_decision_ids: at the result level (not inside contract)" in plan
-    assert "own design choices" in plan
-    for name in ("triage-v1.txt", "plan-v1.txt", "build-v1.txt", "checkpoint-v1.txt"):
-        assert "use exactly the keys shown, no others" in (root / name).read_text("utf-8")
-    assert "{errors}" in (root / "correction-v1.txt").read_text(encoding="utf-8")
-
-
-@pytest.mark.asyncio
-async def test_correction_message_and_blocked_comment_carry_the_errors(
-    service_config: ServiceConfig,
-):
-    service = FactoryService(
-        service_config,
-        adapters=(FakeGitHub(), FakeOmnigent(), FakeCredentialBroker()),
-        clock=FakeClock(),
-    )
-    await service.start()
-    try:
-        await service.operator_command("unpause", {})
-        factory = EventFactory("P-result", issue_number=677)
-        await service.apply_event(
-            factory.make(ev.GitHubSnapshot(), evidence=snapshot(read_at_us=factory.now))
-        )
-        await service.apply_event(factory.make(ev.RequestTriage(via=Via.DRAG)))
-
-        async def created() -> bool:
-            parcel = await service.db.call(lambda store: store.load_parcel("P-result"))
-            return bool(parcel and parcel.current_session and parcel.current_session.root_id)
-
-        await eventually(created)
-        parcel = await service.db.call(lambda store: store.load_parcel("P-result"))
-        sid = parcel.current_session.session_id
-        directory = ServiceDispatchDirectory(service.db, service_config)
-        details = _errors(FIXTURE.read_text())
-        await directory.save_rejection(sid, "item-1", "plan", details)
-
-        def effect(kind: EffectKind, **args: object) -> EffectIntent:
-            return EffectIntent(
-                effect_id="ef_x",
-                kind=kind,
-                parcel_id="P-result",
-                target=sid,
-                preconditions=Preconditions(1, 0, session_id=sid),
-                args=args,
-            )
-
-        message = await directory.message_text(
-            effect(EffectKind.SEND_MESSAGE, purpose="correction")
-        )
-        assert message is not None and f"- {details[0]}" in message
-        assert "fixing exactly these errors" in message
-        # Expected types are quoted (#677: `done` was sent as a string, not a list).
-        assert '{"kind":"blocked","reason":str,"done":[str]}' in message
-
-        comment = await PublicationRenderer(directory, service_config)(
-            effect(EffectKind.POST_COMMENT, template="result-invalid", session_id=sid)
-        )
-        assert comment is not None
-        assert "the plan result failed validation" in comment
-        assert "Expecting ',' delimiter" in comment and "`/plan`" in comment
-    finally:
-        await service.stop()
-
-
-def test_blocked_result_parses_for_any_stage_and_pr_zero_is_still_invalid():
+def test_blocked_result_validates_for_any_stage():
     body = {
-        "version": 1,
-        "parcel_id": MOLLY.parcel_id,
-        "stage_session_id": MOLLY.stage_session_id,
-        "dispatch_nonce": MOLLY.dispatch_nonce,
-        "revision": 3,
-        "result": {
-            "kind": "blocked",
-            "reason": "broker refused: core-work-gate-closed; candidate staged as tree ce3388c",
-            "done": ["3 files, 20 tests", "Codex review: no findings"],
-        },
+        "kind": "blocked",
+        "reason": "broker refused: core-work-gate-closed; candidate staged as tree ce3388c",
+        "done": ["3 files, 20 tests", "Codex review: no findings"],
     }
     for stage in ("triage", "plan", "build"):
         corr = Correlation(MOLLY.parcel_id, MOLLY.stage_session_id, MOLLY.dispatch_nonce, 3, stage)
-        parsed = parse_factory_result(
-            f"FACTORY_RESULT_V1\n```factory-result\n{json.dumps(body)}\n```\n", corr
-        )
-        assert parsed.result.result.kind == "blocked"
+        assert validate_result(body, corr).result.result.kind == "blocked"
     from omnigent_factory.service.directory import _public_result
 
-    text = _public_result(body["result"])
+    text = _public_result(body)
     assert "> broker refused: core-work-gate-closed" in text and "Codex review" in text
 
 
@@ -213,6 +122,6 @@ async def test_operator_note_renders_for_an_existing_session(service_config: Ser
             )
         )
         assert text is not None and "Publish the staged candidate." in text
-        assert "does\nnot widen your approved scope" in text
+        assert "does not widen your approved" in text and "factory_submit_result" in text
     finally:
         await service.stop()

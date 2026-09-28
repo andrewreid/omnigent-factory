@@ -450,9 +450,44 @@ V4_SQL = """
 ALTER TABLE parked_deliveries ADD COLUMN reason TEXT;
 """
 
+# Issue sessions and the factory MCP endpoint.
+#
+# * Successive stage runs share one Omnigent root, so V1's UNIQUE
+#   stage_sessions.omnigent_root_id can no longer hold every run's root. It is left for
+#   rows written before this migration; runs record their root in issue_root_id.
+# * mcp_receipts: one row per accepted factory tool mutation, written in the same
+#   transaction as its reducer event. ``receipt_key`` is the idempotency key (run, tool,
+#   slot); ``request_sha256`` detects a conflicting retry.
+# * mcp_plan_reads: the approved plan digest a run fetched with factory_get_plan, which a
+#   build result must echo.
+V5_SQL = """
+ALTER TABLE stage_sessions ADD COLUMN issue_root_id TEXT;
+CREATE INDEX ix_stage_sessions_issue_root ON stage_sessions (issue_root_id);
+
+CREATE TABLE mcp_receipts (
+    receipt_key TEXT PRIMARY KEY,
+    parcel_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    receipt_json TEXT NOT NULL,
+    created_at_us INTEGER NOT NULL
+);
+CREATE INDEX ix_mcp_receipts_run ON mcp_receipts (run_id);
+
+CREATE TABLE mcp_plan_reads (
+    run_id TEXT NOT NULL,
+    plan_hash TEXT NOT NULL,
+    read_at_us INTEGER NOT NULL,
+    PRIMARY KEY (run_id, plan_hash)
+);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
     Migration(3, "delivery-resolution-backoff", V3_SQL),
     Migration(4, "parked-delivery-reason", V4_SQL),
+    Migration(5, "issue-sessions-and-mcp", V5_SQL),
 )

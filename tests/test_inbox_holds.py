@@ -170,7 +170,8 @@ def test_after_release_fresh_owner_control_after_quiescence_dispatches():
     release(h, provenance=Provenance.OPERATOR)
     r = h.send(P, ev.RequestTriage(via=Via.LABEL))
     assert r.audit.accepted
-    assert EffectKind.CREATE_SESSION in kinds(r)
+    # A new run in the (reused) issue session.
+    assert {EffectKind.CREATE_SESSION, EffectKind.PREPARE_SESSION} & set(kinds(r))
 
 
 def test_pending_authority_recorded_during_hold_wakes_on_release():
@@ -181,7 +182,7 @@ def test_pending_authority_recorded_during_hold_wakes_on_release():
     h.send(P, ev.RequestTriage(via=Via.LABEL))
     r = release(h, provenance=Provenance.OPERATOR)
     # owner authority recorded after the barrier is legitimate once the hold is gone
-    assert EffectKind.CREATE_SESSION in kinds(r)
+    assert {EffectKind.CREATE_SESSION, EffectKind.PREPARE_SESSION} & set(kinds(r))
 
 
 def test_hold_is_parcel_scoped():

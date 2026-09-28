@@ -29,7 +29,7 @@ For a longer randomized search: `HYPOTHESIS_PROFILE=thorough uv run pytest -q te
 
 | Path | Contents |
 | --- | --- |
-| `src/omnigent_factory/core/` | Pure state kernel, no I/O: domain types (`types.py`), event catalog (`events.py`), effect intents and adapter outcomes (`effects.py`), the reducer `transition(State, Event)` (`reducer.py`), authorization predicates (`predicates.py`), effect precondition re-check (`preconditions.py`), board projection and admission (`projection.py`), contract/waiver canonicalization and hashing (`canonical.py`), the frozen stage-result protocol v1 (`protocol.py`, `result_schema_v1.json`), active-time union (`accounting.py`) and the JSON codec (`codec.py`). |
+| `src/omnigent_factory/core/` | Pure state kernel, no I/O: domain types (`types.py`), event catalog (`events.py`), effect intents and adapter outcomes (`effects.py`), the reducer `transition(State, Event)` (`reducer.py`), authorization predicates (`predicates.py`), effect precondition re-check (`preconditions.py`), board projection and admission (`projection.py`), contract/waiver canonicalization and hashing (`canonical.py`), the stage-result schema v1 and its validation (`protocol.py`, `result_schema_v1.json`), active-time union (`accounting.py`) and the JSON codec (`codec.py`). |
 | `src/omnigent_factory/store/` | SQLite store: checksummed migrations (`migrations.py`) and `SqliteStore` (`sqlite.py`) with the durable delivery inbox, one-transaction event application, outbox of effect intents with dispatch nonces, parcel leases, WIP reservations and audit. |
 | `src/omnigent_factory/ports/` | Adapter protocols only (GitHub, Omnigent, credential broker, scheduler, clock). |
 | `src/omnigent_factory/testing/` | In-memory fakes and a fake clock, fixture builders, and a multi-parcel reducer harness with scripted flows. |
@@ -58,6 +58,28 @@ waits up to 90 s for it instead of failing.
 
 A triage/report/status publication that failed definitively leaves the card at
 `Bot: Blocked`. Fix the cause, then run `recovery` and `retry-effect <effect_id>`.
+
+### Issue sessions and the factory MCP endpoint
+
+Each issue gets one Omnigent session (the configured `omnigent_agent_id`, default
+`rosie`), titled `#<n> · <issue title>`. Triage, plan and build are successive stage runs
+in that session; each run has its own credential capability, work gate and policies, and
+a stop or revoke ends the run, never the session. A dead, archived, foreign-agent or
+context-full session is replaced before the next run (the new one gets a short stored
+summary in its start message). When the parcel is terminal (merged or closed) and its
+tree is quiescent, the session is archived.
+
+Stage messages are short pointers; the agent works through six MCP tools served by the
+daemon at `http://127.0.0.1:<mcp_port>/mcp/` (loopback only, bearer token):
+`factory_get_issue`, `factory_get_plan`, `factory_get_feedback`, `factory_get_status`,
+`factory_ask_owner` and `factory_submit_result`. Each takes the caller's own Omnigent
+`session_id`; a per-session CEL policy (`factory-caller@…`) denies factory tool calls
+carrying any other id, and the daemon resolves issue, run and stage from its own store.
+Create the token once with `omnigent-factory setup mcp-token` (written to
+`<secrets_dir>/mcp-token`, mode 0600, never printed) and give it to the agent host as
+`FACTORY_MCP_TOKEN`; `doctor` checks the token file, the loopback listener, the agent
+and a dry compile of the identity policy. The factory clone's `info/exclude` ignores
+`/.molly/`.
 
 ### Finished parcels
 

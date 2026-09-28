@@ -51,6 +51,9 @@ class FakeSession:
     active_response_id: str | None = None
     native: bool = False
     created_at: int = T0
+    title: str | None = None
+    context_window: int | None = None
+    last_total_tokens: int | None = None
 
     @property
     def kind(self) -> str:
@@ -78,6 +81,9 @@ class FakeSession:
             "active_response_id": self.active_response_id,
             "project_id": self.project_id,
             "host_id": self.host_id,
+            "title": self.title,
+            "context_window": self.context_window,
+            "last_total_tokens": self.last_total_tokens,
         }
 
     def list_item(self) -> dict[str, Any]:
@@ -240,6 +246,11 @@ class FakeOmnigentServer:
             return httpx.Response(
                 404, json={"error": {"code": "not_found", "message": "Session not found"}}
             )
+        if len(parts) == 3 and method == "PATCH":
+            for key in ("archived", "title"):
+                if key in (body or {}):
+                    setattr(session, key, body[key])
+            return httpx.Response(200, json=session.response())
         if len(parts) == 3 and method == "GET":
             body = session.response()
             body["pending_elicitations"] = self._snapshot_elicitations(session)
@@ -316,6 +327,7 @@ class FakeOmnigentServer:
                 git_branch=branch,
                 project_id=body.get("project_id"),
                 host_id=body.get("host_id"),
+                title=body.get("title"),
             )
         )
         return httpx.Response(201, json=session.response())

@@ -84,6 +84,11 @@ class _ScriptedAdapter:
                 remote_id=f"{effect.kind.value}-{next(self._ids)}",
                 detail={"ok": True, "unexpected_turn": False},
             )
+        if effect.kind == EffectKind.VERIFY_POLICIES:
+            # Mirror the real adapter: reconcile reports a barrier; verification is ok.
+            if effect.args.get("reconcile") is True:
+                return Ack(detail={"reconciled": True, "ready_at_us": 0})
+            return Ack(detail={"ok": True})
         return Ack(remote_id=f"{effect.kind.value}-{next(self._ids)}")
 
     async def execute(self, effect: EffectIntent, ctx: ExecutionContext) -> AdapterOutcome:

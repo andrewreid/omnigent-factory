@@ -6,6 +6,8 @@ import argparse
 import asyncio
 import json
 import os
+import secrets
+import socket
 import sys
 import time
 from collections.abc import Mapping, Sequence
@@ -86,6 +88,10 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--output", type=Path)
     validate = setup_sub.add_parser("validate")
     _config_arg(validate)
+    token = setup_sub.add_parser(
+        "mcp-token", help="create the factory MCP bearer token file if absent (mode 0600)"
+    )
+    _config_arg(token)
     return parser
 
 
@@ -168,6 +174,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _operator(config, "rerender-comment", {"effect": args.effect})
     if args.command == "retry-effect":
         return _operator(config, "retry-effect", {"effect": args.effect})
+    if args.command == "setup" and args.setup_command == "mcp-token":
+        path, created = ensure_mcp_token(config)
+        print(f"{'created' if created else 'exists'}: {path}")
+        return 0
     renderer = OperationsRenderer(config_path)
     if args.command == "setup" and args.setup_command == "validate":
         errors = renderer.validate(config)
@@ -195,7 +205,7 @@ async def _serve(config: ServiceConfig) -> None:
     """Build and run the complete daemon on one asyncio event loop."""
     configure_logging()
     production = await build_production(config, fatal_exit=os._exit)
-    app = create_app(production.service, production.verifier)
+    app = create_app(production.service, production.verifier, production.mcp)
     server = uvicorn.Server(
         uvicorn.Config(
             app,
@@ -205,14 +215,59 @@ async def _serve(config: ServiceConfig) -> None:
             access_log=False,
         )
     )
+    sockets = listener_sockets(config)
     try:
-        await server.serve()
+        await server.serve(sockets=sockets)
     finally:
         # Lifespan normally owns shutdown; this also releases a pre-acquired lock if
         # uvicorn fails before entering lifespan.
         if production.service.ready or production.service._tasks:
             await production.service.stop()
         production.service.process_lock.close()
+
+
+def listener_sockets(config: ServiceConfig) -> list[socket.socket]:
+    """The configured (LAN) listener plus the loopback-only MCP listener.
+
+    One socket when both are the same address. ``/mcp`` is refused on every listener
+    except loopback (``McpGate``); only ``/webhooks/github`` is forwarded by ingress.
+    """
+    wanted = [(config.bind_host, config.bind_port)]
+    if (MCP_HOST, config.mcp_port) != (config.bind_host, config.bind_port):
+        wanted.append((MCP_HOST, config.mcp_port))
+    sockets: list[socket.socket] = []
+    try:
+        for host, port in wanted:
+            family = socket.AF_INET6 if ":" in host.strip("[]") else socket.AF_INET
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sockets.append(sock)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host.strip("[]"), port))
+            sock.set_inheritable(True)
+    except OSError:
+        for sock in sockets:
+            sock.close()
+        raise
+    return sockets
+
+
+def ensure_mcp_token(config: ServiceConfig) -> tuple[Path, bool]:
+    """Create ``<secrets>/mcp-token`` (0600, owner-only) unless present. Never printed."""
+    path = config.resolved_mcp_token_file
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return path, False
+    try:
+        os.write(fd, (secrets.token_urlsafe(32) + "\n").encode("ascii"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return path, True
+
+
+MCP_HOST = "127.0.0.1"
 
 
 if __name__ == "__main__":  # pragma: no cover

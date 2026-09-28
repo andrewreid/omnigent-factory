@@ -107,6 +107,18 @@ class DeliveryOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class McpReceipt:
+    """An accepted factory tool mutation, committed with its reducer event."""
+
+    receipt_key: str
+    run_id: str
+    tool: str
+    request_sha256: str
+    receipt_json: str
+    event_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class ApplyResult:
     duplicate: bool
     sequence: int | None
@@ -467,15 +479,72 @@ class SqliteStore:
         *,
         reducer: Reducer = transition,
         delivery_status: str | None = None,
+        receipt: Callable[[Parcel], McpReceipt] | None = None,
     ) -> ApplyResult:
         """Run the reducer and commit everything it produced in one transaction.
 
         ``event.entropy`` is filled with a fresh random value when empty, then persisted.
         When ``event.delivery_guid`` is set, that delivery is marked ``delivery_status``
-        (default ``processed``) in the same transaction.
+        (default ``processed``) in the same transaction. ``receipt`` renders a factory
+        tool receipt from the accepted post-state; it is stored in the same transaction,
+        and only when the reducer accepts the event.
         """
         with self._txn() as conn:
-            return self._apply_in_txn(conn, event, config, reducer, delivery_status)
+            result = self._apply_in_txn(conn, event, config, reducer, delivery_status)
+            if (
+                receipt is not None
+                and result.accepted
+                and not result.duplicate
+                and result.parcel is not None
+            ):
+                row = receipt(result.parcel)
+                conn.execute(
+                    "INSERT INTO mcp_receipts (receipt_key, parcel_id, run_id, tool, event_id, "
+                    "request_sha256, receipt_json, created_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        row.receipt_key,
+                        event.parcel_id,
+                        row.run_id,
+                        row.tool,
+                        event.event_id,
+                        row.request_sha256,
+                        row.receipt_json,
+                        self._clock.now_utc_us(),
+                    ),
+                )
+            return result
+
+    def mcp_receipt(self, receipt_key: str) -> McpReceipt | None:
+        row = self._conn.execute(
+            "SELECT receipt_key, run_id, tool, request_sha256, receipt_json, event_id "
+            "FROM mcp_receipts WHERE receipt_key = ?",
+            (receipt_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return McpReceipt(
+            receipt_key=str(row[0]),
+            run_id=str(row[1]),
+            tool=str(row[2]),
+            request_sha256=str(row[3]),
+            receipt_json=str(row[4]),
+            event_id=str(row[5]),
+        )
+
+    def record_plan_read(self, run_id: str, plan_hash: str) -> None:
+        with self._txn() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO mcp_plan_reads (run_id, plan_hash, read_at_us) "
+                "VALUES (?, ?, ?)",
+                (run_id, plan_hash, self._clock.now_utc_us()),
+            )
+
+    def plan_read(self, run_id: str, plan_hash: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM mcp_plan_reads WHERE run_id = ? AND plan_hash = ?",
+            (run_id, plan_hash),
+        ).fetchone()
+        return row is not None
 
     def _apply_in_txn(
         self,
@@ -674,10 +743,10 @@ class SqliteStore:
                 mask |= FENCE_BITS[f]
             conn.execute(
                 "INSERT INTO stage_sessions (session_id, parcel_id, kind, generation, attempt, "
-                "authorization_id, omnigent_root_id, nonce, lifecycle, execution_closed, "
+                "authorization_id, issue_root_id, nonce, lifecycle, execution_closed, "
                 "fence_mask, revision, restart_count, correction_count) VALUES (?, ?, ?, ?, ?, ?, "
                 "?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET "
-                "omnigent_root_id = excluded.omnigent_root_id, lifecycle = excluded.lifecycle, "
+                "issue_root_id = excluded.issue_root_id, lifecycle = excluded.lifecycle, "
                 "execution_closed = excluded.execution_closed, fence_mask = excluded.fence_mask, "
                 "revision = excluded.revision, restart_count = excluded.restart_count, "
                 "correction_count = excluded.correction_count",

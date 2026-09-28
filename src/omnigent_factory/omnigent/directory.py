@@ -28,7 +28,7 @@ FormValue = str | int | float | bool | list[str] | None
 
 @dataclass(frozen=True, slots=True)
 class StageSpec:
-    """Persisted dispatch tuple for one stage session (§3.4 create row).
+    """Persisted dispatch tuple for one stage run (§3.4 create row).
 
     ``bind_worktree`` set means a successor stage binding the verified existing parcel
     worktree (``existing_worktree=true``, no base branch). Otherwise Omnigent creates a
@@ -48,6 +48,9 @@ class StageSpec:
     grant_id: str = ""
     granted_us: int = 0
     policy_generation: int = 1
+    #: The ``factory.dispatch`` label of the issue session this run executes in (the
+    #: creating run's nonce); ``None`` means the run's own ``nonce``.
+    root_nonce: str | None = None
 
 
 @runtime_checkable

@@ -260,7 +260,7 @@ def test_decision_relay_says_what_is_asked_and_links_the_prompt_holder(
     base = service_config.omnigent_base_url.rstrip("/")
     assert "> Molly asks: keep the harness change or drop it?" in text
     assert f"[open the prompt in Omnigent]({base}/c/e724833307bb43279d8b0f76ff47bc53)" in text
-    assert f"[stage session]({base}/c/53085a291e43487cb8fa288501a95ec9)" in text
+    assert f"[issue session]({base}/c/53085a291e43487cb8fa288501a95ec9)" in text
     assert "`/decide de_1 <answer>`" in text and "returns to Working" in text
 
 

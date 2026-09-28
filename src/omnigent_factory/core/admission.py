@@ -12,6 +12,9 @@ Trust classes:
 * ``ADAPTER`` is the daemon's executor/observer: effect outcomes, session/stream
   observations, read-after-write board acknowledgements.
 * ``SCHEDULER`` is the trusted clock; ``OPERATOR`` the local protected CLI socket.
+* ``MCP`` is a factory tool call over the loopback MCP endpoint, already resolved by the
+  service to the calling issue session's current run. It can only report that run's own
+  result or ask the owner a question; it never carries authority.
 * ``INBOX`` is the durable delivery inbox. It may only restrict (hold a parcel whose
   delivery it could not interpret) or retire its own ``unresolved`` hold once the
   delivery resolved; a ``parked`` hold is released only by the operator (handler check).
@@ -43,6 +46,7 @@ _ADAPTER = frozenset({Provenance.ADAPTER})
 _SCHEDULER = frozenset({Provenance.SCHEDULER})
 _OPERATOR = frozenset({Provenance.OPERATOR})
 _INBOX = frozenset({Provenance.INBOX})
+_MCP = frozenset({Provenance.MCP})
 
 _OWNER_CONTROL = Admission(_GITHUB, ActorRule.OWNER)
 
@@ -98,7 +102,12 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.ELICITATION_OPENED: Admission(_ADAPTER),
     EventKind.ELICITATION_RESOLVED: Admission(_ADAPTER),
     EventKind.ELICITATION_GONE: Admission(_ADAPTER),
-    EventKind.RESULT_CANDIDATE: Admission(_ADAPTER),
+    # factory tool calls, resolved to the current run by the service (never by arguments)
+    EventKind.RESULT_CANDIDATE: Admission(_MCP),
+    EventKind.OWNER_QUESTION: Admission(_MCP),
+    EventKind.ISSUE_SESSION_CLOSED: Admission(_ADAPTER),
+    EventKind.POLICIES_VERIFIED: Admission(_ADAPTER),
+    EventKind.POLICY_GUARD_FAILED: Admission(_ADAPTER),
     EventKind.TREE_QUIESCENT: Admission(_ADAPTER),
     EventKind.STOP_TIMEOUT: Admission(_ADAPTER | _SCHEDULER),
     EventKind.SESSION_CRASHED: Admission(_ADAPTER),

@@ -46,7 +46,8 @@ def test_invariant5_revoke_quiesce_replan_publish_approve_new_build():
     new = h.admit()
     p = h.p()
     assert new.kind == SessionKind.BUILD and new.session_id != old.session_id
-    assert new.root_id != old.root_id and new.lifecycle == Lifecycle.ACTIVE
+    # One issue session across the revoked build, the replan and the new build.
+    assert new.root_id == old.root_id and new.lifecycle == Lifecycle.ACTIVE
     # No old build fence was removed.
     assert p.session(old.session_id).fences >= {FenceKind.SAFETY, FenceKind.REVOKED}
     assert p.session(old.session_id).lifecycle == Lifecycle.RETIRED

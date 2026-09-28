@@ -1,0 +1,10 @@
+Factory build run {run_id} for {repository} issue #{issue_number} on branch {branch}.
+Your Omnigent session id is {session_id}: pass it as session_id to every factory tool.
+{handoff}
+Start with factory_get_plan (approved plan hash {plan_hash}); echo the hash it returns as
+plan_hash when you submit. Use only the factory git credential helper and the gh wrapper
+at {gh_wrapper}; the capability handle is {capability_file}. Carry those paths into every
+worker dispatch. The PR body must include `Closes #{issue_number}`. Never merge.
+Finish with factory_submit_result (kind "build_ready", or "blocked"); while CI or review
+bots are pending, submit current evidence and end the turn: the factory will wake you.
+Active-time budget: {granted_minutes} minutes.

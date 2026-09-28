@@ -33,7 +33,21 @@ async def _created(rig: Rig, sid: str = "S1", **kw: object) -> str:
 
 
 def _names(rig: Rig, root: str) -> list[str]:
-    return sorted(p["name"] for p in rig.server.policies[root])
+    """Policy families (static policies are ``<family>@<digest>``; cost keeps its name)."""
+    return sorted(_family(p["name"]) for p in rig.server.policies[root])
+
+
+def _family(name: str) -> str:
+    family = pol.family_of(name)
+    return name if family in (None, pol.COST_PREFIX) else family
+
+
+def _set(generation: int) -> list[str]:
+    return ["factory-caller", "factory-cel", pol.cost_policy_name(generation), "factory-github"]
+
+
+def _rows(rig: Rig, root: str) -> dict[str, dict[str, object]]:
+    return {_family(p["name"]): p for p in rig.server.policies[root]}
 
 
 async def test_prepare_wires_worktree_and_attaches_verified_policies(git_env: GitEnv) -> None:
@@ -44,14 +58,20 @@ async def test_prepare_wires_worktree_and_attaches_verified_policies(git_env: Gi
     assert isinstance(outcome, Ack), outcome
     assert outcome.detail["ok"] is True and outcome.detail["unexpected_turn"] is False
     assert outcome.detail["policy_ready_at_us"] == rig.clock.now_utc_us() + 35_000_000
+    # The propagation barrier travels with the event (the reducer waits for it).
     assert observations(prep, outcome) == (
-        ev.Prepared(session_id="S1", ok=True, unexpected_turn=False),
+        ev.Prepared(
+            session_id="S1",
+            ok=True,
+            unexpected_turn=False,
+            policy_ready_at_us=rig.clock.now_utc_us() + 35_000_000,
+        ),
     )
     wt = rig.server.sessions[root].workspace
     assert wt is not None
     assert git("config", "--get", "factory.stageSession", cwd=Path(wt)) == "S1"
     assert git("config", "--get", "user.email", cwd=Path(wt)) == BOT.email
-    rows = {p["name"]: p for p in rig.server.policies[root]}
+    rows = _rows(rig, root)
     gh = rows["factory-github"]["factory_params"]
     assert gh["write_repos"] == [REPO] and gh["write_branches"] == ["factory/issue-42-g1"]
     # MCP surface only (the shell surface ASKed); force-push to the parcel branch is fine.
@@ -71,7 +91,7 @@ async def test_plan_stage_gets_no_write_scope(git_env: GitEnv) -> None:
     rig = make_rig(git_env)
     root = await _created(rig, kind=SessionKind.PLAN)
     await rig.adapter.execute(intent(EffectKind.PREPARE_SESSION, root_id=root), CTX)
-    gh = next(p for p in rig.server.policies[root] if p["name"] == "factory-github")
+    gh = _rows(rig, root)["factory-github"]
     assert (
         gh["factory_params"]["write_repos"] == [] and gh["factory_params"]["write_branches"] == []
     )
@@ -131,7 +151,12 @@ async def test_policy_create_failure_leaves_prepare_unready(git_env: GitEnv) -> 
     # Re-running is safe: adopts what exists by exact name + params, creates the rest.
     again = await rig.adapter.execute(prep, CTX)
     assert isinstance(again, Ack) and again.detail["ok"] is True
-    assert _names(rig, root) == ["factory-cel", "factory-cost-grant-0001", "factory-github"]
+    assert _names(rig, root) == [
+        "factory-caller",
+        "factory-cel",
+        "factory-cost-grant-0001",
+        "factory-github",
+    ]
 
 
 async def test_lost_policy_ack_is_adopted_not_duplicated(git_env: GitEnv) -> None:
@@ -140,16 +165,22 @@ async def test_lost_policy_ack_is_adopted_not_duplicated(git_env: GitEnv) -> Non
     rig.server.faults[("POST", f"/v1/sessions/{root}/policies")].append("timeout-after")
     outcome = await rig.adapter.execute(intent(EffectKind.PREPARE_SESSION, root_id=root), CTX)
     assert isinstance(outcome, Ack) and outcome.detail["ok"] is True
-    assert _names(rig, root) == ["factory-cel", "factory-cost-grant-0001", "factory-github"]
+    assert _names(rig, root) == [
+        "factory-caller",
+        "factory-cel",
+        "factory-cost-grant-0001",
+        "factory-github",
+    ]
 
 
 async def test_same_name_policy_with_other_params_blocks(git_env: GitEnv) -> None:
     rig = make_rig(git_env)
     root = await _created(rig)
+    wanted = pol.github_policy(SessionKind.BUILD, REPO, "factory/issue-42-g1")
     rig.server.policies[root].append(
         {
             "id": "pol_x",
-            "name": "factory-github",
+            "name": wanted.name,  # the exact versioned name, other parameters
             "type": "python",
             "handler": pol.GITHUB_HANDLER,
             "factory_params": {"read_all": True},
@@ -177,7 +208,12 @@ async def test_replace_cost_policy_new_generation_then_delete_old(git_env: GitEn
     )
     outcome = await rig.adapter.execute(replace, CTX)
     assert isinstance(outcome, Ack), outcome
-    assert _names(rig, root) == ["factory-cel", "factory-cost-grant-0002", "factory-github"]
+    assert _names(rig, root) == [
+        "factory-caller",
+        "factory-cel",
+        "factory-cost-grant-0002",
+        "factory-github",
+    ]
     row = next(p for p in rig.server.policies[root] if p["name"] == "factory-cost-grant-0002")
     assert row["factory_params"] == {"ask_thresholds_usd": [82.5]}  # 12.5 + 35 x 2
     assert outcome.detail["spend_known"] is True
@@ -200,7 +236,12 @@ async def test_cost_policy_delete_failure_leaves_grant_unready(git_env: GitEnv) 
     # Retry converges: adopts generation 2, deletes generation 1, verifies.
     again = await rig.adapter.execute(replace, CTX)
     assert isinstance(again, Ack)
-    assert _names(rig, root) == ["factory-cel", "factory-cost-grant-0002", "factory-github"]
+    assert _names(rig, root) == [
+        "factory-caller",
+        "factory-cel",
+        "factory-cost-grant-0002",
+        "factory-github",
+    ]
 
 
 async def test_cost_policy_create_failure_and_unknown_spend(git_env: GitEnv) -> None:
@@ -211,7 +252,12 @@ async def test_cost_policy_create_failure_and_unknown_spend(git_env: GitEnv) -> 
         EffectKind.REPLACE_COST_POLICY, grant_id="g", generation=2, granted_us=3_600_000_000
     )
     assert isinstance(await rig.adapter.execute(replace, CTX), RetryableReadFailure)
-    assert _names(rig, root) == ["factory-cel", "factory-cost-grant-0001", "factory-github"]
+    assert _names(rig, root) == [
+        "factory-caller",
+        "factory-cel",
+        "factory-cost-grant-0001",
+        "factory-github",
+    ]
     rig.server.sessions[root].total_cost_usd = None  # unpriced: unknown, not zero
     outcome = await rig.adapter.execute(replace, CTX)
     assert isinstance(outcome, Ack) and outcome.detail["spend_known"] is False
@@ -258,7 +304,7 @@ async def test_operator_cel_must_compile_and_is_attached_in_addition(git_env: Gi
     rig = make_rig(git_env, cel_expression='{"result": "ALLOW"}')
     root = await _created(rig)
     await rig.adapter.execute(intent(EffectKind.PREPARE_SESSION, root_id=root), CTX)
-    rows = {p["name"]: p for p in rig.server.policies[root]}
+    rows = _rows(rig, root)
     assert rows["factory-cel"]["factory_params"]["expression"] == pol.factory_cel_expression()
     assert rows["factory-cel-operator"]["handler"] == pol.CEL_HANDLER
     assert rows["factory-cel-operator"]["factory_params"]["expression"] == '{"result": "ALLOW"}'
@@ -274,14 +320,20 @@ async def test_boot_upgrades_a_live_sessions_old_factory_policies_in_place(
     out = await rig.adapter.execute(intent(EffectKind.PREPARE_SESSION, root_id=root), CTX)
     assert isinstance(out, Ack) and out.detail["ok"] is True
     rows = rig.server.policies[root]
-    github = next(r for r in rows if r["name"] == "factory-github")
+    github = next(r for r in rows if _family(r["name"]) == "factory-github")
+    # A session prepared by an older daemon: legacy bare name, pre-change parameters.
+    github["name"] = "factory-github"
     github["factory_params"] = {**github["factory_params"], "read_all": False}
-    github["factory_params"].pop("shell_tools")  # pre-change parameters
+    github["factory_params"].pop("shell_tools")
     cost_before = [r for r in rows if r["name"].startswith(pol.COST_PREFIX)]
+    rig.server.requests.clear()
     assert await rig.adapter.upgrade_static_policies("S1") is True
     after = rig.server.policies[root]
-    upgraded = next(r for r in after if r["name"] == "factory-github")
+    upgraded = next(r for r in after if _family(r["name"]) == "factory-github")
     assert upgraded["factory_params"]["shell_tools"] == []
     assert [r for r in after if r["name"].startswith(pol.COST_PREFIX)] == cost_before
-    assert sorted(r["name"] for r in after).count("factory-github") == 1
+    assert [_family(r["name"]) for r in after].count("factory-github") == 1
+    # Never delete-before-add: the replacement is created before the old row goes.
+    writes = [m for m, path, _ in rig.server.requests if "/policies" in path and m != "GET"]
+    assert writes == ["POST", "DELETE"]
     assert await rig.adapter.upgrade_static_policies("S1") is False  # idempotent

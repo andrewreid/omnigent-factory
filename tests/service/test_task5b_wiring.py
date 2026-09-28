@@ -4,59 +4,42 @@ import os
 from importlib.resources import files
 from pathlib import Path
 
-from omnigent_factory.core.protocol import Correlation, parse_factory_result
 from omnigent_factory.core.types import MICROS_PER_MINUTE, Size
 from omnigent_factory.service.config import ServiceConfig, load_app_env
 from omnigent_factory.service.setup import OperationsRenderer
 
 
-def test_stage_templates_state_outcomes_guardrails_and_complete_result_shapes():
+def test_stage_templates_are_short_tool_pointers():
     root = files("omnigent_factory.service") / "templates"
-    triage = (root / "triage-v1.txt").read_text(encoding="utf-8")
-    plan = (root / "plan-v1.txt").read_text(encoding="utf-8")
-    build = (root / "build-v1.txt").read_text(encoding="utf-8")
-    checkpoint = (root / "checkpoint-v1.txt").read_text(encoding="utf-8")
-    correction = (root / "correction-v1.txt").read_text(encoding="utf-8")
-
-    for template in (triage, plan, build, checkpoint):
-        assert "Outcome:" in template
-        assert "FACTORY_RESULT_V1" in template
-        assert "...}" not in template
-    assert "scope, behaviour, cost, or risk" in plan
-    assert "at most one fix batch and one targeted recheck" in build
-    assert "Every bot finding" in build
-    assert "Never\nmerge" in build
-    assert "Stop starting new work" in checkpoint
-    assert "only automatic\nformat-correction request" in correction
-
     values = {
         "repository": "owner/repo",
         "issue_number": 1,
-        "parcel_id": "parcel",
-        "session_id": "session",
-        "nonce": "nonce",
+        "run_id": "ss_run",
+        "session_id": "conv_root",
         "revision": 2,
-        "granted_us": 7_200_000_000,
-        "issue_snapshot": "issue",
-        "guidance": "guidance",
+        "granted_minutes": 120,
+        "handoff": "",
         "branch": "factory/issue-1",
         "gh_wrapper": "/factory/gh",
         "capability_file": "/factory/cap",
-        "authority": "authority",
-        "authority_hash": "0" * 64,
-        "grant_id": "grant",
-        "untrusted_boundary": "FACTORY_DATA_test",
+        "plan_hash": "0" * 64,
     }
-    for stage, template, checkpointed in (
-        ("triage", triage, False),
-        ("plan", plan, False),
-        ("build", build, False),
-        ("build", checkpoint, True),
-    ):
-        parse_factory_result(
-            template.format(**values),
-            Correlation("parcel", "session", "nonce", 2, stage, in_checkpoint=checkpointed),
-        )
+    first_tool = {
+        "triage": "factory_get_issue",
+        "plan": "factory_get_issue",
+        "build": "factory_get_plan",
+    }
+    for stage, tool in first_tool.items():
+        text = (root / f"{stage}-v2.txt").read_text(encoding="utf-8").format(**values)
+        assert f"Start with {tool}" in text
+        assert "conv_root" in text and "ss_run" in text and "factory_submit_result" in text
+        # No result-format instructions or correction templates in the pointer.
+        assert "FACTORY_RESULT" not in text and "```" not in text
+        assert len(text) < 1200
+    build = (root / "build-v2.txt").read_text(encoding="utf-8").format(**values)
+    assert "`Closes #1`" in build and "Never merge" in build and "0" * 64 in build
+    assert "/factory/gh" in build and "/factory/cap" in build
+    assert not (root / "correction-v1.txt").is_file()
 
 
 def test_app_env_is_private_and_checkpoint_config_reaches_trust_root(tmp_path: Path):

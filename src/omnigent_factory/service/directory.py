@@ -26,10 +26,13 @@ from omnigent_factory.core.effects import (
     EffectKind,
     ExecutionContext,
 )
-from omnigent_factory.core.protocol import ParsedResult, result_shapes
+from omnigent_factory.core.events import EventKind
+from omnigent_factory.core.protocol import ParsedResult
 from omnigent_factory.core.types import (
+    MICROS_PER_MINUTE,
     ApprovalKind,
     Contract,
+    IssueSnapshot,
     Parcel,
     SessionKind,
     StageSession,
@@ -90,14 +93,17 @@ class ServiceDispatchDirectory:
             grant_id=session.grant.grant_id,
             granted_us=session.grant.remaining_us,
             policy_generation=session.grant.policy_generation,
+            root_nonce=_root_nonce(parcel, session),
         )
 
     async def _make_snapshot(self, parcel: Parcel, session: StageSession) -> dict[str, object]:
         issue = parcel.issue_number or 0
         branch = f"factory/issue-{issue or _safe(parcel.parcel_id)}"
         previous = await self._previous_worktree(parcel, session, branch)
-        template_name = f"{session.kind.value}-v1.txt"
+        template_name = f"{session.kind.value}-v2.txt"
         template = _template(template_name)
+        evidence = await self.issue_evidence(parcel)
+        issue_title = " ".join((evidence.title if evidence is not None else "").split())
         return {
             "version": 1,
             "session_id": session.session_id,
@@ -107,7 +113,8 @@ class ServiceDispatchDirectory:
             "branch": branch,
             "base_branch": self.config.default_branch,
             "bind_worktree": previous,
-            "title": f"Factory {self.config.repository}#{issue} — {session.kind.value}",
+            # The issue session's title (Omnigent keeps it for every later run).
+            "title": f"#{issue} · {issue_title}"[:200] if issue_title else f"#{issue}",
             "template": template_name,
             "template_sha256": hashlib.sha256(template.encode()).hexdigest(),
             "untrusted_boundary": _new_boundary(),
@@ -168,20 +175,8 @@ class ServiceDispatchDirectory:
             snapshot["untrusted_boundary"] = boundary
             _atomic_json(self.root / f"{_safe(sid)}.json", snapshot)
         purpose = str(effect.args.get("purpose") or "first")
-        if purpose == "correction":
-            rejection = self.latest_rejection(sid)
-            errors = rejection[1] if rejection is not None else ("no details recorded",)
-            return _template("correction-v1.txt").format(
-                errors=_error_list(errors), shapes=result_shapes(spec.kind.value)
-            )
         if purpose == "checkpoint_cleanup":
-            return _template("checkpoint-v1.txt").format(
-                grant_id=spec.grant_id,
-                parcel_id=parcel.parcel_id,
-                session_id=sid,
-                nonce=spec.nonce,
-                revision=parcel.revision,
-            )
+            return _template("checkpoint-v2.txt").format(grant_id=spec.grant_id, run_id=sid)
         if purpose == "continuation":
             return _template("continuation-v1.txt").format(grant_id=spec.grant_id)
         if purpose == "answer_relay":
@@ -192,51 +187,81 @@ class ServiceDispatchDirectory:
                 decision_id=decision.decision_id, answer=decision.answer
             )
         if purpose == "feedback":
-            feedback = await self._feedback(parcel)
-            return _template("feedback-v1.txt").format(
-                stage=spec.kind.value,
-                revision=parcel.revision,
-                feedback=_untrusted(feedback, boundary),
-                untrusted_boundary=boundary,
-            )
+            return _template("feedback-v2.txt").format(revision=parcel.revision, run_id=sid)
         if purpose == "readiness_wake":
-            return _template("readiness-wake-v1.txt").format(
+            return _template("readiness-wake-v2.txt").format(
                 pr_number=int(str(effect.args.get("pr_number") or 0)),
                 head_sha=str(effect.args.get("head_sha") or ""),
                 reason=str(effect.args.get("reason") or "")[:500],
-                session_id=sid,
+                run_id=sid,
             )
         if purpose == "operator_note":
             note = str(effect.args.get("text") or "").strip()
             if not note:
                 return None
-            return _template("operator-v1.txt").format(note=note, session_id=sid)
+            return _template("operator-v2.txt").format(note=note, run_id=sid)
         # The dispatch snapshot pins the first message's template bytes (restart-stable).
         if hashlib.sha256(template.encode()).hexdigest() != snapshot.get("template_sha256"):
             return None
-        issue_snapshot = await self._issue_snapshot(parcel)
+        # A short pointer: the factory tools are the source of truth for the issue, plan,
+        # feedback and status (no task data is copied into the conversation).
         common: dict[str, object] = {
             "repository": self.config.repository,
             "issue_number": parcel.issue_number or 0,
-            "parcel_id": parcel.parcel_id,
-            "session_id": sid,
-            "nonce": spec.nonce,
+            "run_id": sid,
+            "session_id": spec.root_id or "",
             "revision": parcel.revision,
-            "issue_snapshot": _untrusted(issue_snapshot, boundary),
-            "untrusted_boundary": boundary,
-            "guidance": str(snapshot.get("guidance") or ""),
-            "granted_us": spec.granted_us,
+            "granted_minutes": max(1, spec.granted_us // MICROS_PER_MINUTE),
+            "handoff": self._handoff(parcel, sid),
         }
         if spec.kind == SessionKind.BUILD:
-            authority, authority_hash = _authority(parcel)
+            _authority_text, authority_hash = _authority(parcel)
             common.update(
                 branch=spec.branch,
                 gh_wrapper=self.config.wrapper_bin_dir / "gh",
                 capability_file=self.config.capability_dir / f"{_safe(sid)}.cap",
-                authority=_untrusted(authority, boundary),
-                authority_hash=authority_hash,
+                plan_hash=authority_hash,
             )
         return template.format(**common)
+
+    def _handoff(self, parcel: Parcel, run_id: str) -> str:
+        """Stored summary for the first run in a replacement issue session.
+
+        Only when this run created a root that replaced an earlier one: what the earlier
+        conversation knew, as authoritative store fields. Tools remain the source of truth.
+        """
+        issue = parcel.issue_session
+        if issue is None or issue.created_by != run_id or issue.generation <= 1:
+            return ""
+        lines = ["This is a new issue session replacing an earlier one. Stored summary:"]
+        stages = [s.kind.value for s in parcel.sessions if s.session_id != run_id]
+        if stages:
+            lines.append(f"- earlier runs: {', '.join(stages)}")
+        triage = self.latest_triage(parcel)
+        if triage is not None:
+            lines.append(
+                f"- triage: {triage.get('recommendation')}, priority {triage.get('priority')},"
+                f" size {triage.get('size')}"
+            )
+        contract = parcel.current_contract
+        if contract is not None:
+            lines.append(f"- current plan: revision {contract.revision}, hash {contract.full_hash}")
+        if parcel.readiness is not None:
+            lines.append(f"- PR #{parcel.readiness.pr_number} at {parcel.readiness.head_sha[:12]}")
+        lines.append("Check factory_get_status before continuing.")
+        return "\n".join(lines)
+
+    def latest_triage(self, parcel: Parcel) -> dict[str, Any] | None:
+        """The most recent accepted triage result of the parcel, if any."""
+        for session in reversed(parcel.sessions):
+            if session.kind != SessionKind.TRIAGE:
+                continue
+            stored = self.latest_result(session.session_id)
+            record = stored.get("factory_result") if stored is not None else None
+            body = record.get("result") if isinstance(record, dict) else None
+            if isinstance(body, dict) and body.get("kind") == "triage":
+                return body
+        return None
 
     async def elicitation_content(self, effect: EffectIntent) -> dict[str, FormValue] | None:
         sid = effect.preconditions.session_id
@@ -262,9 +287,17 @@ class ServiceDispatchDirectory:
             return None
         return value
 
-    async def save_result(self, session_id: str, item_id: str, parsed: ParsedResult) -> None:
+    def save_result(
+        self, session_id: str, slot: str, parsed: ParsedResult
+    ) -> dict[str, Any] | None:
+        """Store an accepted result for publication; returns the previous ``latest``.
+
+        Written before its reducer event commits (under the parcel lock, so no effect can
+        read it in between). A rejected event restores the previous ``latest``
+        (:meth:`restore_latest`); a crash in between leaves at most an unreferenced file.
+        """
         payload: dict[str, object] = {
-            "item_id": item_id,
+            "item_id": slot,
             "factory_result": parsed.result.model_dump(mode="json"),
             "contract_canonical": (
                 parsed.contract_canonical.decode()
@@ -272,21 +305,18 @@ class ServiceDispatchDirectory:
                 else None
             ),
         }
-        self._write_once(self.results / f"{_safe(session_id)}-{_safe(item_id)}.json", payload)
-        _atomic_json(self.results / f"{_safe(session_id)}-latest.json", payload)
+        latest = self.results / f"{_safe(session_id)}-latest.json"
+        previous = self._read(latest)
+        _atomic_json(self.results / f"{_safe(session_id)}-{_safe(slot)}.json", payload)
+        _atomic_json(latest, payload)
+        return previous
 
-    async def save_rejection(
-        self, session_id: str, item_id: str, stage: str, details: tuple[str, ...]
-    ) -> None:
-        """Validation errors of a rejected result (locations/messages only, no input)."""
-        payload: dict[str, object] = {"item_id": item_id, "stage": stage, "errors": list(details)}
-        _atomic_json(self.results / f"{_safe(session_id)}-rejected.json", payload)
-
-    def latest_rejection(self, session_id: str) -> tuple[str, tuple[str, ...]] | None:
-        data = self._read(self.results / f"{_safe(session_id)}-rejected.json")
-        if data is None or not isinstance(data.get("errors"), list):
-            return None
-        return str(data.get("stage") or "stage"), tuple(str(e) for e in data["errors"])
+    def restore_latest(self, session_id: str, previous: dict[str, Any] | None) -> None:
+        latest = self.results / f"{_safe(session_id)}-latest.json"
+        if previous is None:
+            latest.unlink(missing_ok=True)
+        else:
+            _atomic_json(latest, previous)
 
     def plan_result_for(self, session_id: str, canonical: str) -> dict[str, Any] | None:
         """The accepted plan result whose canonical contract is exactly ``canonical``."""
@@ -294,7 +324,7 @@ class ServiceDispatchDirectory:
         if not self.results.is_dir():
             return None
         for path in sorted(self.results.glob(f"{prefix}*.json")):
-            if path.name in (f"{prefix}latest.json", f"{prefix}rejected.json"):
+            if path.name == f"{prefix}latest.json":
                 continue
             data = self._read(path)
             if data is None or data.get("contract_canonical") != canonical:
@@ -320,32 +350,88 @@ class ServiceDispatchDirectory:
             return None
         return parcel_from_json(str(rows[0][0]))
 
-    async def _issue_snapshot(self, parcel: Parcel) -> str:
-        events = await self.db.call(lambda store: store.events_for(parcel.parcel_id))
-        evidence = next((event.evidence for event in reversed(events) if event.evidence), None)
-        if evidence is None:
-            return f"Issue #{parcel.issue_number or 0}; content unavailable in current snapshot."
-        return f"Title: {evidence.title}\n\n{evidence.body or ''}"
-
-    async def _feedback(self, parcel: Parcel) -> str:
+    async def issue_evidence(self, parcel: Parcel) -> IssueSnapshot | None:
+        """The freshest verified read of the issue (title/body) recorded for the parcel."""
+        parcel_id = parcel.parcel_id
         rows = await self.db.call(
             lambda store: store.query(
-                "SELECT d.body FROM deliveries d JOIN events e "
-                "ON e.delivery_guid = d.delivery_guid "
-                "WHERE e.parcel_id = ? AND e.kind = 'PlanFeedback' ORDER BY e.sequence",
-                (parcel.parcel_id,),
+                "SELECT payload_json FROM events WHERE parcel_id = ? "
+                "AND payload_json LIKE '%\"evidence\":{%' ORDER BY sequence DESC LIMIT 1",
+                (parcel_id,),
             )
         )
-        texts: list[str] = []
+        if not rows:
+            return None
+        from omnigent_factory.core.codec import event_from_json  # noqa: PLC0415
+
+        return event_from_json(str(rows[0][0])).evidence
+
+    async def issue_labels(self, parcel: Parcel) -> list[str] | None:
+        """Labels from the newest issue payload among the parcel's deliveries (None: none)."""
+        for payload in await self._delivery_payloads(parcel, None, newest_first=True):
+            issue = payload.get("issue")
+            labels = issue.get("labels") if isinstance(issue, dict) else None
+            if isinstance(labels, list):
+                return [
+                    str(label["name"])
+                    for label in labels
+                    if isinstance(label, dict) and isinstance(label.get("name"), str)
+                ]
+        return None
+
+    async def owner_comments(
+        self, parcel: Parcel, *, since_us: int = 0, kinds: tuple[EventKind, ...] = ()
+    ) -> list[dict[str, Any]]:
+        """Owner comment texts carried by the parcel's control events, oldest first."""
+        wanted = kinds or (
+            EventKind.PLAN_FEEDBACK,
+            EventKind.DECIDE,
+            EventKind.REQUEST_PLAN,
+            EventKind.REQUEST_REPLAN,
+            EventKind.APPROVE_PLAN,
+            EventKind.CONTINUE,
+        )
+        parcel_id = parcel.parcel_id
+        kinds_json = json.dumps([k.value for k in wanted])
+        rows = await self.db.call(
+            lambda store: store.query(
+                "SELECT e.event_id, e.kind, e.source_time_us, d.body FROM events e "
+                "JOIN deliveries d ON e.delivery_guid = d.delivery_guid "
+                "WHERE e.parcel_id = ? AND e.accepted = 1 "
+                "AND e.kind IN (SELECT value FROM json_each(?)) "
+                "AND e.source_time_us >= ? ORDER BY e.sequence",
+                (parcel_id, kinds_json, since_us),
+            )
+        )
+        comments: list[dict[str, Any]] = []
+        for row in rows:
+            text = _comment_body(row[3])
+            if text is not None:
+                comments.append(
+                    {
+                        "event_id": str(row[0]),
+                        "kind": str(row[1]),
+                        "at_us": int(row[2]),
+                        "text": text,
+                    }
+                )
+        return comments
+
+    async def _delivery_payloads(
+        self, parcel: Parcel, kind: str | None, *, newest_first: bool = False
+    ) -> list[dict[str, Any]]:
+        parcel_id = parcel.parcel_id
+        sql = _NEWEST_PAYLOADS if newest_first else _OLDEST_PAYLOADS
+        rows = await self.db.call(lambda store: store.query(sql, (parcel_id, kind, kind)))
+        payloads: list[dict[str, Any]] = []
         for row in rows:
             try:
-                payload = json.loads(bytes(row[0]))
-                text = payload.get("comment", {}).get("body")
-                if isinstance(text, str):
-                    texts.append(text)
-            except (ValueError, TypeError, AttributeError):
+                value = json.loads(bytes(row[0]))
+            except (ValueError, TypeError):
                 continue
-        return "\n\n".join(texts) or "No recoverable feedback text; inspect the issue."
+            if isinstance(value, dict):
+                payloads.append(value)
+        return payloads
 
     def _read(self, path: Path) -> dict[str, Any] | None:
         if not path.is_file():
@@ -487,22 +573,6 @@ class PublicationRenderer:
         elif effect.kind == EffectKind.POST_COMMENT:
             template = str(effect.args.get("template") or "status")
             text = _status_text(template, effect.args)
-            rejection = (
-                self.directory.latest_rejection(str(effect.args.get("session_id") or ""))
-                if template == "result-invalid"
-                else None
-            )
-            if rejection is not None:
-                stage, errors = rejection
-                hint = (
-                    f"\n\nComment `/{stage}` to start a fresh {stage} session."
-                    if stage in ("triage", "plan")
-                    else ""
-                )
-                text = (
-                    f"Factory status: the {stage} result failed validation and the "
-                    f"parcel is Blocked.\n\n{_error_list(errors[:5])}{hint}"
-                )
         else:
             return None
         sid = effect.args.get("session_id") or effect.preconditions.session_id
@@ -527,14 +597,14 @@ class PublicationRenderer:
         summary = str(args.get("summary") or "").strip()
         node = omnigent_link(self.config.omnigent_base_url, _text_or_none(args.get("node_id")))
         root = omnigent_link(self.config.omnigent_base_url, _text_or_none(args.get("root_id")))
-        lines = [f"**Factory: Molly is waiting for an answer** (decision `{decision_id}`)."]
+        lines = [f"**Factory: the agent is waiting for an answer** (decision `{decision_id}`)."]
         if summary:
-            lines += ["", f"> {summary}"]
+            lines += ["", *(f"> {line}" for line in summary.splitlines())]
         where: list[str] = []
         if node is not None:
             where.append(f"[open the prompt in Omnigent]({node})")
         if root is not None and root != node:
-            where.append(f"[stage session]({root})")
+            where.append(f"[issue session]({root})")
         answer = "Answer it in Omnigent" + (f" ({', '.join(where)})" if where else "")
         lines += [
             "",
@@ -793,12 +863,6 @@ def _neutralise(text: str) -> str:
     return text.replace("<!--", "&lt;!--")
 
 
-def _error_list(errors: tuple[str, ...]) -> str:
-    """Bounded bullet list of validation errors (``loc: msg``; no rejected input)."""
-    text = "\n".join(f"- {error}" for error in errors)
-    return text if len(text) <= 2_000 else text[:1_970].rstrip() + "\n- ... (truncated)"
-
-
 def _bullets(items: object) -> str:
     return "\n".join(f"- {item}" for item in items) if isinstance(items, list) and items else ""
 
@@ -894,6 +958,7 @@ def _credential_block(text: str, config: ServiceConfig) -> str | None:
     for path in (
         config.resolved_webhook_secret_file,
         config.resolved_omnigent_token_file,
+        config.resolved_mcp_token_file,
     ):
         try:
             value = path.read_text(encoding="utf-8").strip()
@@ -907,6 +972,48 @@ def _credential_block(text: str, config: ServiceConfig) -> str | None:
             "Provide a redacted result before continuing."
         )
     return None
+
+
+_PAYLOADS = (
+    "SELECT d.body FROM deliveries d JOIN events e ON e.delivery_guid = d.delivery_guid "
+    "WHERE e.parcel_id = ? AND (? IS NULL OR e.kind = ?) "
+)
+_NEWEST_PAYLOADS = _PAYLOADS + "ORDER BY e.sequence DESC LIMIT 50"
+_OLDEST_PAYLOADS = _PAYLOADS + "ORDER BY e.sequence ASC LIMIT 50"
+
+
+def _root_nonce(parcel: Parcel, session: StageSession) -> str | None:
+    """The creation label of the issue session a reused run executes in."""
+    issue = parcel.issue_session
+    if (
+        issue is not None
+        and session.root_id is not None
+        and issue.root_id == session.root_id
+        and issue.created_by != session.session_id
+    ):
+        return issue.nonce
+    return None
+
+
+def _comment_body(raw: object) -> str | None:
+    if not isinstance(raw, bytes | bytearray | memoryview | str):
+        return None
+    try:
+        payload = json.loads(raw if isinstance(raw, str) else bytes(raw))
+    except (ValueError, TypeError):
+        return None
+    comment = payload.get("comment") if isinstance(payload, dict) else None
+    text = comment.get("body") if isinstance(comment, dict) else None
+    return text if isinstance(text, str) else None
+
+
+def untrusted_block(text: str, boundary: str, label: str = "UNTRUSTED DATA") -> str:
+    """``text`` framed by an unguessable boundary it cannot reproduce."""
+    return f"BEGIN {label} {boundary}\n{_untrusted(text, boundary)}\nEND {label} {boundary}"
+
+
+def new_boundary() -> str:
+    return _new_boundary()
 
 
 def _untrusted(text: str, boundary: str) -> str:

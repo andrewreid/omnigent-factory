@@ -54,6 +54,7 @@ from omnigent_factory.service.github_delivery import (
     GitHubWebhookVerifier,
 )
 from omnigent_factory.service.locking import ProcessLock
+from omnigent_factory.service.mcp import McpEndpoint, build_endpoint
 from omnigent_factory.service.observer import OmnigentObserver
 from omnigent_factory.service.omnigent_auth import log_expiry, omnigent_auth
 from omnigent_factory.service.runtime import FactoryService
@@ -68,6 +69,7 @@ class ProductionComposition:
 
     service: FactoryService
     verifier: GitHubWebhookVerifier
+    mcp: McpEndpoint
 
 
 class ProductionRuntime:
@@ -106,6 +108,8 @@ class ProductionRuntime:
             self.config.wrapper_bin_dir, self.config.real_gh_path, self.config.gh_config_dir
         )
         await _in_thread(self.workspaces.ensure_source_clone)
+        # Molly/Rosie scratch state never shows up as untracked work (never .gitignore).
+        await asyncio.to_thread(self.workspaces.ensure_excluded, "/.molly/")
         await self.broker.restore()
         await self.broker_server.restore()
         github_observed = await self._github_reconcile()
@@ -120,8 +124,12 @@ class ProductionRuntime:
             session = parcel.current_session
             if session is not None and not self.broker.capabilities.usable(session.session_id):
                 await self.broker.provision(session.session_id)
-        await self._upgrade_live_policies(parcels)
-        await reenable_issuance_after_boot(self.broker, parcels)
+        held = await self._upgrade_live_policies(parcels)
+        # A run whose policy guard failed or was just repaired stays closed: it reopens
+        # (once) only after reconciliation, the propagation barrier and verification.
+        await reenable_issuance_after_boot(
+            self.broker, [p for p in parcels if p.current_session_id not in held]
+        )
         await self.broker_server.start()
         await self.observer.start()
         # Keep the installed helper reachable in diagnostics and make accidental changes
@@ -130,8 +138,15 @@ class ProductionRuntime:
             raise RuntimeError("credential helper installation path changed during boot")
         self._started = True
 
-    async def _upgrade_live_policies(self, parcels: list[Parcel]) -> None:
-        """Live sessions get the current factory policies (no human prompts), in place."""
+    async def _upgrade_live_policies(self, parcels: list[Parcel]) -> frozenset[str]:
+        """Live runs get the current factory policies (caller guard included), in place.
+
+        Returns the runs held closed: any whose reconciliation failed or changed something
+        (a change needs the propagation barrier before it is effective). Each gets a
+        ``PolicyGuardFailed`` event, which closes its work gate and schedules the
+        reconcile -> barrier -> verify sequence that alone reopens it.
+        """
+        held: set[str] = set()
         for parcel in parcels:
             session = parcel.current_session
             if (
@@ -145,9 +160,22 @@ class ProductionRuntime:
                 changed = await self.omnigent_adapter.upgrade_static_policies(session.session_id)
             except (PolicyError, OmnigentReadError) as exc:
                 LOG.warning("policy upgrade failed session=%s reason=%s", session.session_id, exc)
+                changed = True
+            if not changed:
                 continue
-            if changed:
-                LOG.info("policies upgraded session=%s", session.session_id)
+            LOG.info("policy guard held closed session=%s", session.session_id)
+            held.add(session.session_id)
+            await self.service.apply_event(
+                Event(
+                    event_id=f"boot-policy-hold:{session.session_id}:{self.service.clock.now_utc_us()}",
+                    repo_id=self.config.repo_id,
+                    parcel_id=parcel.parcel_id,
+                    source_time_us=self.service.clock.now_utc_us(),
+                    provenance=Provenance.ADAPTER,
+                    body=ev.PolicyGuardFailed(session_id=session.session_id),
+                )
+            )
+        return frozenset(held)
 
     async def _github_reconcile(self) -> frozenset[str]:
         observed: set[str] = set()
@@ -365,6 +393,7 @@ async def build_production(
     return ProductionComposition(
         service,
         GitHubWebhookVerifier(config.resolved_webhook_secret_file, normalizer, clock),
+        build_endpoint(service, directory, config),
     )
 
 

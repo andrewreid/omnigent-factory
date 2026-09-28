@@ -26,8 +26,12 @@ Outcome contract per effect kind (``Ack.detail`` keys are stable):
 ``PREPARE_SESSION``
     Verifies the root (nonce label, agent, project, workspace = our clone's worktree on the
     recorded branch inside owned roots), checks no unexpected turn ran, provisions/rotates
-    the stage capability, wires the worktree, attaches github/CEL/cost policies and
-    verifies them. ``detail``: ``ok``, ``unexpected_turn``, ``reason``, ``policy_ready_at_us``
+    the run's capability, wires the worktree, attaches github/CEL/caller/cost policies
+    (added and verified before anything they supersede is removed) and verifies the final
+    set. ``args.reuse``: the root is the parcel's existing issue session, so earlier turns
+    are expected; a missing, archived, failed, foreign-agent or context-full root is
+    ``unusable`` (the reducer re-creates the run in a fresh issue session). ``detail``:
+    ``ok``, ``unexpected_turn``, ``unusable``, ``reason``, ``policy_ready_at_us``
     (cross-replica propagation barrier). Transient/ambiguous steps are
     ``RetryableReadFailure``: re-running adopts by exact policy name and parameters.
 ``SEND_MESSAGE``
@@ -50,6 +54,16 @@ Outcome contract per effect kind (``Ack.detail`` keys are stable):
     delete older generations, verify final set. ``detail``: ``grant_id``, ``generation``,
     ``threshold_usd``, ``spend_known``, ``ready_at_us``. Same-name conflict is definitive;
     other failures are retryable and leave the grant unready.
+``VERIFY_POLICIES``
+    Not before ``args.not_before_us`` (the propagation barrier the preparation reported;
+    earlier it is ``RetryableReadFailure`` with the remaining delay, so the wait survives a
+    restart in the outbox): re-read the root's policies and require exactly the run's
+    static set (github/CEL/caller) plus its one cost generation. ``detail.ok``.
+    ``args.reconcile``: first re-establish the static set (add before delete) and report
+    ``reconciled`` with a fresh ``ready_at_us``; the verification follows as a new effect.
+``CLOSE_SESSION``
+    ``PATCH /v1/sessions/{root}`` ``{"archived": true}`` for a terminal parcel's issue
+    session (idempotent; a missing root counts as closed). Other failures are retryable.
 """
 
 from __future__ import annotations
@@ -132,6 +146,10 @@ class OmnigentConfig:
     #: The fixed ``factory-cel`` deny rule is always attached and verified regardless.
     cel_expression: str | None = None
     cel_reason: str = pol.CEL_REASON
+    #: Replace a reused issue session before a new stage run when its last turn filled at
+    #: least this fraction of the model's context window (``last_total_tokens`` /
+    #: ``context_window`` from the session snapshot; absent telemetry never replaces).
+    context_rollover_ratio: float = 0.8
 
 
 def _message_texts(item: Mapping[str, Any]) -> list[str]:
@@ -215,6 +233,8 @@ class OmnigentExecutionAdapter:
             EffectKind.SCAN_TREE: self._scan,
             EffectKind.RECONCILE_SESSION: self._reconcile,
             EffectKind.REPLACE_COST_POLICY: self._replace_cost,
+            EffectKind.CLOSE_SESSION: self._close,
+            EffectKind.VERIFY_POLICIES: self._verify,
         }
         handler = handlers.get(effect.kind)
         if handler is None:
@@ -317,6 +337,7 @@ class OmnigentExecutionAdapter:
             "labels": {
                 NONCE_LABEL: spec.nonce,
                 "factory.parcel": spec.parcel_id,
+                # The stage that created this issue session; later runs reuse it.
                 "factory.stage": spec.kind.value,
                 "factory.attempt": str(spec.attempt),
             },
@@ -397,21 +418,44 @@ class OmnigentExecutionAdapter:
 
     # ================================================================ prepare
 
-    def _unexpected_turn(self, snap: Mapping[str, Any]) -> str | None:
+    def _unexpected_turn(self, snap: Mapping[str, Any], *, reuse: bool = False) -> str | None:
+        """Activity nobody asked for. A reused issue session has earlier runs' turns; it
+        must still be idle with nothing pending before the next run is prepared."""
         if snap.get("status") not in ("idle", None):
             return f"status {snap.get('status')}"
         if snap.get("active_response_id"):
             return "active response"
         if snap.get("pending_inputs") or snap.get("pending_elicitations"):
             return "pending input or prompt"
+        if reuse:
+            return None
         items = snap.get("items") or []
         if any(isinstance(i, dict) and i.get("type") in _TURN_ITEM_TYPES for i in items):
             return "conversation items present"
         return None
 
+    def _unusable(self, snap: Mapping[str, Any]) -> str | None:
+        """Why a reused issue session cannot host the next run (it is then replaced)."""
+        if snap.get("archived") is True:
+            return "issue session archived"
+        if snap.get("status") == "failed":
+            return "issue session failed"
+        if snap.get("agent_id") != self.config.agent_id:
+            return "issue session runs another agent"
+        window = snap.get("context_window")
+        used = snap.get("last_total_tokens")
+        if (
+            isinstance(window, int)
+            and isinstance(used, int)
+            and window > 0
+            and used >= window * self.config.context_rollover_ratio
+        ):
+            return f"context rollover ({used}/{window} tokens)"
+        return None
+
     def _check_root(self, snap: Mapping[str, Any], spec: StageSpec) -> str | None:
         labels = as_map(snap.get("labels"))
-        if labels.get(NONCE_LABEL) != spec.nonce:
+        if labels.get(NONCE_LABEL) != (spec.root_nonce or spec.nonce):
             return "nonce label mismatch"
         problem = self._identity_problem(snap, spec)
         if problem is not None:
@@ -423,16 +467,23 @@ class OmnigentExecutionAdapter:
     async def _prepare(self, effect: EffectIntent) -> AdapterOutcome:
         spec = await self._spec(effect)
         root = effect.args.get("root_id")
+        reuse = effect.args.get("reuse") is True
         if spec is None or not isinstance(root, str):
             return DefinitiveFailure("stage-spec-missing")
         try:
             snap = await self.rest.get_json(f"/v1/sessions/{root}")
         except OmnigentReadError as exc:
+            if reuse and exc.status == 404:
+                return self._prepared(root, ok=False, unusable=True, reason="issue session gone")
             return RetryableReadFailure(f"root snapshot: {exc.reason}")
+        if reuse:
+            unusable = self._unusable(snap)
+            if unusable is not None:
+                return self._prepared(root, ok=False, unusable=True, reason=unusable)
         problem = self._check_root(snap, spec)
         if problem is not None:
             return self._prepared(root, ok=False, reason=problem)
-        turn = self._unexpected_turn(snap)
+        turn = self._unexpected_turn(snap, reuse=reuse)
         if turn is not None:
             return self._prepared(root, ok=True, unexpected=True, reason=turn)
         try:
@@ -449,11 +500,11 @@ class OmnigentExecutionAdapter:
             spec.policy_generation,
             pol.cost_threshold_usd(_cost(snap), spec.granted_us),
         )
-        wanted = (*self._static_policies(spec), cost)
+        wanted = (*self._static_policies(spec, root), cost)
         try:
-            for policy in wanted:
-                await pol.ensure_policy(self.rest, root, policy)
-            await pol.verify_policies(self.rest, root, wanted)
+            # A reused root carries the previous run's stage policies: the new set is
+            # added and verified before the superseded ones are removed.
+            await pol.reconcile_policies(self.rest, root, wanted)
         except pol.PolicyError as exc:
             if exc.conflict:
                 return self._prepared(root, ok=False, reason=exc.reason)
@@ -462,7 +513,7 @@ class OmnigentExecutionAdapter:
             again = await self.rest.get_json(f"/v1/sessions/{root}")
         except OmnigentReadError as exc:
             return RetryableReadFailure(f"root re-read: {exc.reason}")
-        turn = self._unexpected_turn(again)
+        turn = self._unexpected_turn(again, reuse=reuse)
         if turn is not None:
             return self._prepared(root, ok=True, unexpected=True, reason=turn)
         return self._prepared(
@@ -480,44 +531,44 @@ class OmnigentExecutionAdapter:
         )
 
     async def upgrade_static_policies(self, session_id: str) -> bool:
-        """Boot: bring a live session's factory-owned static policies to the current version.
+        """Boot: bring a live run's factory-owned static policies to the current version
+        and read back the caller-identity guard.
 
-        ``factory-github`` / ``factory-cel`` are deterministic and daemon-owned; a session
+        The github/CEL/caller policies are deterministic and daemon-owned; a session
         prepared by an older daemon keeps its old parameters (e.g. the shell surface that
-        raised human prompts) and would fail the next policy verification. A same-name
-        policy with other parameters is replaced; cost generations are untouched.
-        Returns whether anything changed. Raises :class:`PolicyError` on failure.
+        raised human prompts) and would fail the next policy verification. The current
+        version is added and verified *before* the superseded one is deleted, so the guard
+        is never absent; cost generations are untouched. Returns whether anything changed.
+        Raises :class:`PolicyError` on failure.
         """
         spec = await self.directory.stage_spec(session_id)
         if spec is None or spec.root_id is None:
             return False
-        root = spec.root_id
-        changed = False
-        rows = await pol.list_session_policies(self.rest, root)
-        for wanted in self._static_policies(spec):
-            same = [r for r in rows if r.get("name") == wanted.name]
-            if any(wanted.matches(r) for r in same):
-                continue
-            for row in same:
-                if isinstance(row.get("id"), str):
-                    await pol.delete_policy(self.rest, root, str(row["id"]))
-            await pol.ensure_policy(self.rest, root, wanted)
-            changed = True
-        rows = await pol.list_session_policies(self.rest, root)
-        for wanted in self._static_policies(spec):
-            if not any(wanted.matches(r) for r in rows):
-                raise pol.PolicyError(f"policy {wanted.name} upgrade unverified")
-        return changed
+        return await pol.reconcile_policies(
+            self.rest, spec.root_id, self._static_policies(spec, spec.root_id)
+        )
 
-    def _static_policies(self, spec: StageSpec) -> tuple[pol.PolicySpec, ...]:
-        return (pol.github_policy(spec.kind, self.config.repository, spec.branch), *self._cel)
+    def _static_policies(self, spec: StageSpec, root: str) -> tuple[pol.PolicySpec, ...]:
+        return (
+            pol.github_policy(spec.kind, self.config.repository, spec.branch),
+            *self._cel,
+            pol.caller_policy(root),
+        )
 
     def _prepared(
-        self, root: str, *, ok: bool, unexpected: bool = False, reason: str = "", **extra: str
+        self,
+        root: str,
+        *,
+        ok: bool,
+        unexpected: bool = False,
+        unusable: bool = False,
+        reason: str = "",
+        **extra: str,
     ) -> Ack:
         detail: dict[str, JsonValue] = {
             "ok": ok,
             "unexpected_turn": unexpected,
+            "unusable": unusable,
             "reason": reason,
             **extra,
         }
@@ -700,7 +751,7 @@ class OmnigentExecutionAdapter:
         new = pol.cost_policy(generation, threshold)
         try:
             pid = await pol.replace_cost_policy(
-                self.rest, spec.root_id, new, keep=self._static_policies(spec)
+                self.rest, spec.root_id, new, keep=self._static_policies(spec, spec.root_id)
             )
         except pol.PolicyError as exc:
             if exc.conflict:
@@ -716,6 +767,51 @@ class OmnigentExecutionAdapter:
                 "ready_at_us": self.clock.now_utc_us() + self.config.policy_barrier_us,
             },
         )
+
+    # ================================================================ policy barrier
+
+    async def _verify(self, effect: EffectIntent) -> AdapterOutcome:
+        spec = await self._spec(effect)
+        root = effect.args.get("root_id")
+        if spec is None or not isinstance(root, str) or not root:
+            return DefinitiveFailure("no run or root to verify")
+        static = self._static_policies(spec, root)
+        if effect.args.get("reconcile") is True:
+            try:
+                await pol.reconcile_policies(self.rest, root, static)
+            except pol.PolicyError as exc:
+                return RetryableReadFailure(f"policy reconciliation incomplete: {exc.reason}")
+            ready = self.clock.now_utc_us() + self.config.policy_barrier_us
+            return Ack(remote_id=root, detail={"reconciled": True, "ready_at_us": ready})
+        not_before = effect.args.get("not_before_us")
+        now = self.clock.now_utc_us()
+        if isinstance(not_before, int) and now < not_before:
+            return RetryableReadFailure("policy propagation barrier", not_before - now)
+        try:
+            rows = await pol.list_session_policies(self.rest, root)
+            await pol.verify_policies(self.rest, root, static)
+        except pol.PolicyError as exc:
+            if "missing or altered" in exc.reason or "superseded" in exc.reason:
+                return Ack(remote_id=root, detail={"ok": False, "reason": exc.reason})
+            return RetryableReadFailure(f"policy verification incomplete: {exc.reason}")
+        costs = [r.get("name") for r in rows if pol.family_of(r.get("name")) == pol.COST_PREFIX]
+        ok = costs == [pol.cost_policy_name(spec.policy_generation)]
+        return Ack(remote_id=root, detail={"ok": ok, "reason": "" if ok else "cost generation"})
+
+    # ================================================================ closure
+
+    async def _close(self, effect: EffectIntent) -> AdapterOutcome:
+        """Archive a terminal parcel's issue session (history and title are kept)."""
+        root = effect.args.get("root_id")
+        if not isinstance(root, str) or not root:
+            return DefinitiveFailure("no root to close")
+        resp = await self.rest.patch_json(f"/v1/sessions/{root}", {"archived": True})
+        if classify_write(resp) == WriteClass.OK:
+            return Ack(remote_id=root, detail={"archived": True})
+        if resp.status == 404:
+            return Ack(remote_id=root, detail={"archived": False, "gone": True})
+        # PATCH archived=true is idempotent: any other outcome is simply retried.
+        return RetryableReadFailure(f"archive failed: {resp.status or resp.error}", 60_000_000)
 
 
 def _cost(snap: Mapping[str, Any]) -> float | None:

@@ -43,6 +43,11 @@ class EffectKind(enum.StrEnum):
     SCAN_TREE = "scan_tree"
     RECONCILE_SESSION = "reconcile_session"
     REPLACE_COST_POLICY = "replace_cost_policy"
+    #: Archive the terminal parcel's issue session (idempotent PATCH archived=true).
+    CLOSE_SESSION = "close_session"
+    #: After ``args.not_before_us``: re-read and verify the run's exact policy set
+    #: (``args.reconcile``: first re-establish it, then report a new barrier).
+    VERIFY_POLICIES = "verify_policies"
     # local credentials
     DISABLE_ISSUANCE = "disable_issuance"
     ENABLE_ISSUANCE = "enable_issuance"
@@ -67,7 +72,6 @@ WORK_BEARING_KINDS = frozenset(
 class MessagePurpose(enum.StrEnum):
     FIRST = "first"
     FEEDBACK = "feedback"
-    CORRECTION = "correction"
     CHECKPOINT_CLEANUP = "checkpoint_cleanup"
     CONTINUATION = "continuation"
     ANSWER_RELAY = "answer_relay"

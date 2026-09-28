@@ -469,7 +469,21 @@ class EffectExecutor:
                 session_id=session_id,
                 ok=detail.get("ok") is True,
                 unexpected_turn=detail.get("unexpected_turn") is True,
+                unusable=detail.get("unusable") is True,
+                reason=(
+                    str(detail.get("reason") or "")[:200] if detail.get("unusable") is True else ""
+                ),
+                policy_ready_at_us=_json_int(detail.get("policy_ready_at_us"), 0),
             )
+        elif effect.kind == EffectKind.VERIFY_POLICIES:
+            body = ev.PoliciesVerified(
+                session_id=session_id,
+                ok=detail.get("ok") is True,
+                reconciled=detail.get("reconciled") is True,
+                ready_at_us=_json_int(detail.get("ready_at_us"), 0),
+            )
+        elif effect.kind == EffectKind.CLOSE_SESSION:
+            body = ev.IssueSessionClosed(root_id=str(effect.args.get("root_id") or ""))
         elif effect.kind in _PUBLICATION_ACK_KINDS and ack.remote_id:
             body = ev.PublicationAcked(
                 effect_id=effect.effect_id,
@@ -596,6 +610,8 @@ _ACK_EVENT_REQUIRED = frozenset(
         EffectKind.PUBLISH_REPORT,
         EffectKind.SCAN_TREE,
         EffectKind.FETCH_PR_EVIDENCE,
+        EffectKind.CLOSE_SESSION,
+        EffectKind.VERIFY_POLICIES,
     }
 )
 

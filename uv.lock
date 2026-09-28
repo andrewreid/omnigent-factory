@@ -870,6 +870,7 @@ source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
     { name = "httpx" },
+    { name = "mcp" },
     { name = "omnigent" },
     { name = "omnigent-client" },
     { name = "omnigent-ui-sdk" },
@@ -894,6 +895,7 @@ dev = [
 requires-dist = [
     { name = "cryptography", specifier = ">=46,<51" },
     { name = "httpx", specifier = ">=0.28,<1" },
+    { name = "mcp", specifier = ">=1.30,<2" },
     { name = "omnigent", git = "https://github.com/omnigent-ai/omnigent.git?rev=1c0153aa87cb7c0eff57b3a3169a4f94b5967c6d" },
     { name = "omnigent-client", git = "https://github.com/omnigent-ai/omnigent.git?subdirectory=sdks%2Fpython-client&rev=1c0153aa87cb7c0eff57b3a3169a4f94b5967c6d" },
     { name = "omnigent-ui-sdk", git = "https://github.com/omnigent-ai/omnigent.git?subdirectory=sdks%2Fui&rev=1c0153aa87cb7c0eff57b3a3169a4f94b5967c6d" },

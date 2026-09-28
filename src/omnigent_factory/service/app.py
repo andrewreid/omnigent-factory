@@ -1,34 +1,48 @@
-"""The deliberately tiny public ASGI surface."""
+"""The deliberately tiny ASGI surface: health, the GitHub webhook and (loopback) MCP.
+
+Public ingress forwards only ``/webhooks/github``. ``/mcp`` is refused on any listener or
+peer that is not loopback (:class:`omnigent_factory.service.mcp.McpGate`).
+"""
 
 from __future__ import annotations
 
 import json
 import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-from typing import Any
+from contextlib import AsyncExitStack, asynccontextmanager
+from typing import TYPE_CHECKING, Any
 
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
-from starlette.routing import Route
+from starlette.routing import BaseRoute, Mount, Route
 
 from omnigent_factory.service.interfaces import WebhookRejected, WebhookVerifier
 from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.store.sqlite import DeliveryOutcome, DeliveryRecord
 
+if TYPE_CHECKING:
+    from omnigent_factory.service.mcp import McpEndpoint
+
 LOG = logging.getLogger(__name__)
 
 
-def create_app(service: FactoryService, verifier: WebhookVerifier) -> Starlette:
+def create_app(
+    service: FactoryService, verifier: WebhookVerifier, mcp: McpEndpoint | None = None
+) -> Starlette:
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         del app
-        await service.start()
-        try:
-            yield
-        finally:
-            await service.stop()
+        async with AsyncExitStack() as stack:
+            if mcp is not None:
+                # Tool calls are refused until the service reports ready (after store
+                # migration and startup recovery), see McpGate.
+                await stack.enter_async_context(mcp.manager.run())
+            await service.start()
+            try:
+                yield
+            finally:
+                await service.stop()
 
     async def health(request: Request) -> Response:
         del request
@@ -68,14 +82,13 @@ def create_app(service: FactoryService, verifier: WebhookVerifier) -> Starlette:
             status_code=202 if outcome == DeliveryOutcome.INSERTED else 200,
         )
 
-    return Starlette(
-        debug=False,
-        lifespan=lifespan,
-        routes=[
-            Route("/healthz", health, methods=["GET"]),
-            Route("/webhooks/github", webhook, methods=["POST"]),
-        ],
-    )
+    routes: list[BaseRoute] = [
+        Route("/healthz", health, methods=["GET"]),
+        Route("/webhooks/github", webhook, methods=["POST"]),
+    ]
+    if mcp is not None:
+        routes += [Route("/mcp", mcp.gate), Mount("/mcp", app=mcp.gate)]
+    return Starlette(debug=False, lifespan=lifespan, routes=routes)
 
 
 async def _bounded_body(request: Request, limit: int) -> bytes | None:

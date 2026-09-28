@@ -98,5 +98,5 @@ def test_missing_closing_reference_reaches_the_reducer_and_the_build_template_re
     event = executor._ack_event(fetch, Ack("683", detail))
     assert event is not None and isinstance(event.body, ev.ReadinessEvidence)
     assert event.body.closes_issue is False
-    build = (files("omnigent_factory.service") / "templates" / "build-v1.txt").read_text("utf-8")
+    build = (files("omnigent_factory.service") / "templates" / "build-v2.txt").read_text("utf-8")
     assert "`Closes #{issue_number}`" in build
