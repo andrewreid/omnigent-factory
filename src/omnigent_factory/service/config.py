@@ -18,6 +18,22 @@ class ConfigError(RuntimeError):
     """Configuration is unsafe or invalid."""
 
 
+#: Keys ``omnigent-factory reload`` applies to the running daemon; any other change
+#: needs a restart.
+HOT_RELOAD_KEYS = frozenset(
+    {
+        "max_building",
+        "max_open_bot_prs",
+        "checkpoint_block_hours",
+        "checkpoint_grace_minutes",
+        "cost_backstop_usd_per_hour",
+        "independent_reviewer_ids",
+        "triage_guidance",
+        "engineering_guidance",
+    }
+)
+
+
 class ServiceConfig(BaseModel):
     """Configuration whose defaults keep the HTTP listener private to the host."""
 
@@ -88,6 +104,8 @@ class ServiceConfig(BaseModel):
     real_gh_path: Path = Path("/usr/bin/gh")
     default_branch: str = "main"
     required_checks: tuple[tuple[str, int], ...] = ()
+    # Factory policy. This host file is the single source of truth (the target repository
+    # carries no factory config); every key below is hot-reloadable (``reload``).
     independent_reviewer_ids: frozenset[int] = frozenset()
     triage_guidance: str = "Follow repository-local instructions and minimise assumptions."
     engineering_guidance: str = "Follow repository-local engineering and test conventions."
@@ -96,7 +114,6 @@ class ServiceConfig(BaseModel):
     checkpoint_block_hours: dict[str, int] = Field(default_factory=lambda: {"S": 2, "M": 4, "L": 6})
     checkpoint_grace_minutes: int = Field(default=15, ge=1, le=120)
     cost_backstop_usd_per_hour: int = Field(default=35, ge=1, le=1000)
-    repository_config: Path | None = None
     github_config: Path | None = None
     secrets_dir: Path = Field(
         default_factory=lambda: Path.home() / ".config/omnigent-factory/secrets"
@@ -219,7 +236,6 @@ class ServiceConfig(BaseModel):
     def validate_paths(self) -> list[str]:
         errors: list[str] = []
         for path, required in (
-            (self.repository_config, False),
             (self.github_config, False),
             (self.app_env, False),
         ):
@@ -279,7 +295,6 @@ def load_config(path: str | Path) -> ServiceConfig:
     # Resolve configured paths relative to the configuration file, not the caller's cwd.
     for key in (
         "state_dir",
-        "repository_config",
         "github_config",
         "secrets_dir",
         "app_env",

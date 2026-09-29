@@ -44,6 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("status", "doctor", "pause", "unpause", "recovery"):
         command = sub.add_parser(name)
         _config_arg(command)
+    reload = sub.add_parser(
+        "reload",
+        help="re-read the config file into the running daemon (hot keys only; also SIGHUP)",
+    )
+    _config_arg(reload)
     explain = sub.add_parser("explain", help="explain persisted state for a parcel")
     explain.add_argument("parcel")
     _config_arg(explain)
@@ -149,13 +154,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     config_path, config = _load(args)
     if args.command == "serve":
-        asyncio.run(_serve(config))
+        asyncio.run(_serve(config, config_path))
         return 0
     if args.command == "doctor":
         report = asyncio.run(run_doctor(config))
         print(json.dumps(report.as_dict(), indent=2, sort_keys=True))
         return 0 if report.ok else 1
-    if args.command in ("status", "pause", "unpause", "recovery"):
+    if args.command in ("status", "pause", "unpause", "recovery", "reload"):
         return _operator(config, args.command)
     if args.command == "explain":
         return _operator(config, "explain", {"parcel": args.parcel})
@@ -201,10 +206,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     raise AssertionError("unhandled command")
 
 
-async def _serve(config: ServiceConfig) -> None:
+async def _serve(config: ServiceConfig, config_path: Path | None = None) -> None:
     """Build and run the complete daemon on one asyncio event loop."""
     configure_logging()
     production = await build_production(config, fatal_exit=os._exit)
+    production.service.config_path = config_path
     app = create_app(production.service, production.verifier, production.mcp)
     server = uvicorn.Server(
         uvicorn.Config(

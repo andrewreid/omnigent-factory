@@ -6,13 +6,11 @@ import json
 
 import httpx
 import pytest
-from pydantic import ValidationError
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.events import Provenance
 from omnigent_factory.core.types import Stage
 from omnigent_factory.github.client import GitHubClient
-from omnigent_factory.github.config import parse_factory_config
 from omnigent_factory.github.setup import REQUIRED_CHECKS, render_setup
 from omnigent_factory.github.webhook import (
     DeliveryIdentity,
@@ -247,36 +245,6 @@ async def test_any_actor_leftward_drag_is_safety_but_automation_rightward_is_obs
     assert left.body.from_stage == Stage.BUILDING
     (right,) = (await resolve_drag(project_drag(actor=888, old="Inbox", new="Triaged"))).events
     assert isinstance(right.body, ev.ColumnObserved)
-
-
-FACTORY_CONFIG = b"""version: 1
-concurrency:
-  max_building: 1
-  max_open_bot_prs: 3
-checkpoints:
-  block_hours: {S: 2, M: 4, L: 6}
-  grace_minutes: 15
-  cost_backstop_usd_per_hour: 35
-review:
-  bot_login: sa-ambulance-factory[bot]
-  approver_ids: [114979]
-guidance:
-  triage: classify work
-  engineering: follow AGENTS.md
-"""
-
-
-def test_strict_config_accepts_review_and_size_blocks():
-    config = parse_factory_config(FACTORY_CONFIG)
-    assert config.review.approver_ids == [114979]
-    assert config.checkpoints.block_hours.model_dump() == {"S": 2, "M": 4, "L": 6}
-
-
-def test_strict_config_rejects_review_gate_and_duplicate_keys():
-    with pytest.raises(ValidationError):
-        parse_factory_config(FACTORY_CONFIG.replace(b"review:", b"review_gate:"))
-    with pytest.raises(ValueError, match="duplicate YAML key"):
-        parse_factory_config(FACTORY_CONFIG + b"version: 1\n")
 
 
 def test_setup_payloads_preserve_ids_and_render_native_review_rule():

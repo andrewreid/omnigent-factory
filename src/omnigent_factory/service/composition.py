@@ -27,7 +27,6 @@ from omnigent_factory.credentials.worktree import BotIdentity, Workspaces
 from omnigent_factory.github.adapter import BoardSchema, GitHubAPIAdapter
 from omnigent_factory.github.auth import AppAuthenticator, InstallationTokenService
 from omnigent_factory.github.client import GitHubClient
-from omnigent_factory.github.config import FactoryConfig
 from omnigent_factory.github.webhook import DeliveryIdentity, DeliveryNormalizer
 from omnigent_factory.omnigent.adapter import OmnigentConfig, OmnigentExecutionAdapter
 from omnigent_factory.omnigent.policies import PolicyError
@@ -219,7 +218,7 @@ async def build_production(
     github_transport: httpx.AsyncBaseTransport | None = None,
     omnigent_transport: httpx.AsyncBaseTransport | None = None,
 ) -> ProductionComposition:
-    """Build every real adapter used by ``serve``; network I/O is config preflight only."""
+    """Build every real adapter used by ``serve``; no network I/O happens here."""
     _require_production_config(config)
     log_expiry(config)
     config.prepare_private_directories()
@@ -238,25 +237,6 @@ async def build_production(
         config.github_api_url,
     )
     daemon_tokens = DaemonTokenProvider(token_service, clock)
-    github_client = GitHubClient(github_http, daemon_tokens.token, api_url=config.github_api_url)
-    try:
-        repository_config = await github_client.default_branch_config(config.repository)
-        config = _apply_repository_config(config, repository_config)
-    except BaseException:
-        await github_http.aclose()
-        process_lock.close()
-        raise
-    preflight_token = daemon_tokens.cached()
-    await github_http.aclose()
-    github_http = httpx.AsyncClient(transport=github_transport, timeout=15.0)
-    token_service = InstallationTokenService(
-        github_http,
-        authenticator,
-        config.github_installation_id,
-        config.repository,
-        config.github_api_url,
-    )
-    daemon_tokens = DaemonTokenProvider(token_service, clock, initial=preflight_token)
     github_client = GitHubClient(github_http, daemon_tokens.token, api_url=config.github_api_url)
 
     service = FactoryService(
@@ -383,6 +363,14 @@ async def build_production(
         omnigent_adapter=omnigent_adapter,
     )
     service.comment_rerenderer = github.rerender_comment
+
+    def adopt_reloaded(new: ServiceConfig) -> None:
+        # Hot-reloadable keys only (the service rejects any other change).
+        directory.config = new
+        publications.config = new
+        github.independent_reviewer_ids = new.independent_reviewer_ids
+
+    service.config_listeners.append(adopt_reloaded)
     cleaner = WorkspaceCleaner(directory, workspaces, config.worktree_root)
     service.workspace_cleaner = cleaner
     service.bind_integrations(
@@ -411,26 +399,6 @@ def owned_worktree_roots(config: ServiceConfig) -> tuple[Path, ...]:
     """
     sibling = config.source_clone.with_name(f"{config.source_clone.name}-worktrees")
     return (config.worktree_root, sibling)
-
-
-def _apply_repository_config(config: ServiceConfig, repo: FactoryConfig) -> ServiceConfig:
-    if repo.review.bot_login != config.github_bot_login:
-        raise ConfigError("factory.yml bot login differs from the configured App bot")
-    if frozenset(repo.review.approver_ids) != config.owners:
-        raise ConfigError("factory.yml approvers differ from the host trust root")
-    reviewers = frozenset(repo.review.independent_reviewer_ids)
-    values = config.model_dump()
-    values.update(
-        max_building=min(config.max_building, repo.concurrency.max_building),
-        max_open_bot_prs=min(config.max_open_bot_prs, repo.concurrency.max_open_bot_prs),
-        checkpoint_block_hours=repo.checkpoints.block_hours.model_dump(),
-        checkpoint_grace_minutes=repo.checkpoints.grace_minutes,
-        cost_backstop_usd_per_hour=repo.checkpoints.cost_backstop_usd_per_hour,
-        independent_reviewer_ids=reviewers,
-        triage_guidance=repo.guidance.triage,
-        engineering_guidance=repo.guidance.engineering,
-    )
-    return ServiceConfig.model_validate(values)
 
 
 def _require_production_config(config: ServiceConfig) -> None:

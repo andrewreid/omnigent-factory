@@ -86,8 +86,20 @@ worktree_root = "~/.local/share/omnigent-factory/worktrees/timesheets"
 wrapper_bin_dir = "~/.local/share/omnigent-factory/bin"
 gh_config_dir = "~/.local/state/omnigent-factory/gh"
 real_gh_path = "/usr/bin/gh"
+# Factory policy: this file is the single source of truth (no repository factory.yml).
+# These keys are hot-reloadable with `omnigent-factory reload` (or SIGHUP).
 max_building = 1
 max_open_bot_prs = 3
+checkpoint_grace_minutes = 15
+cost_backstop_usd_per_hour = 35
+independent_reviewer_ids = []
+# triage_guidance = "Classify work with the repo's area:* labels."
+# engineering_guidance = "Engineering conventions live in AGENTS.md."
+
+[service.checkpoint_block_hours]
+S = 2
+M = 4
+L = 6
 
 [service.status_options]
 Inbox = "915abb46"

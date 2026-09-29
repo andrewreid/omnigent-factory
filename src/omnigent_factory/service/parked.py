@@ -97,6 +97,10 @@ class ParkedDeliveries:
         self.legacy_path = state_dir / LEGACY_REGISTRY
         self._items: dict[str, str | None] = {}
 
+    def update_config(self, config: TrustedConfig) -> None:
+        """Adopt a hot-reloaded trusted config (same repository)."""
+        self._config = config
+
     async def load(self) -> None:
         """Startup: import any legacy registry, reconcile statuses, fill the mirror."""
         legacy = read_legacy_registry(self.legacy_path)

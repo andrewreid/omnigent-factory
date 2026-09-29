@@ -55,6 +55,10 @@ waits up to 90 s for it instead of failing.
 | `cleanup <parcel> [--merged]` | Remove a finished parcel's factory worktree(s) and local `factory/` branch from the factory clone. |
 | `release-delivery <guid>` | Release one parked webhook delivery for processing. |
 | `pause` / `unpause` | Stop / resume admitting new work repository-wide; in-flight parcels and safety events carry on. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, cost backstop, guidance and `independent_reviewer_ids`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+
+The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
+of factory configuration; the target repository carries no factory config file.
 
 A triage/report/status publication that failed definitively leaves the card at
 `Bot: Blocked`. Fix the cause, then run `recovery` and `retry-effect <effect_id>`.

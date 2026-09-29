@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import signal
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import replace
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 from omnigent_factory.core import events as ev
@@ -30,7 +32,7 @@ from omnigent_factory.core.types import (
 )
 from omnigent_factory.ports.adapter import EffectAdapter
 from omnigent_factory.ports.clock import Clock, SystemClock
-from omnigent_factory.service.config import ServiceConfig
+from omnigent_factory.service.config import HOT_RELOAD_KEYS, ServiceConfig, load_config
 from omnigent_factory.service.db import StoreWorker
 from omnigent_factory.service.executor import (
     EffectExecutor,
@@ -127,6 +129,12 @@ class FactoryService:
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
         self._managed: list[ManagedRuntime] = []
+        #: The host config file ``reload`` re-reads (set by ``serve``).
+        self.config_path: Path | None = None
+        #: Called with the new config after a successful ``reload`` (composition wiring).
+        self.config_listeners: list[Callable[[ServiceConfig], None]] = []
+        self._reload_lock = asyncio.Lock()
+        self._reload_tasks: set[asyncio.Task[None]] = set()
 
     def bind_integrations(
         self,
@@ -161,6 +169,8 @@ class FactoryService:
                 await managed.start()
             await self.operator.start()
             self.accepting_admission = True
+            if self.config_path is not None:
+                asyncio.get_running_loop().add_signal_handler(signal.SIGHUP, self._sighup)
             self._tasks = [
                 asyncio.create_task(self.executor.run(), name="outbox"),
                 asyncio.create_task(self._delivery_loop(), name="deliveries"),
@@ -181,6 +191,8 @@ class FactoryService:
         self.ready = False
         self.accepting_admission = False
         self._stop.set()
+        if self.config_path is not None:
+            asyncio.get_running_loop().remove_signal_handler(signal.SIGHUP)
         await self.executor.stop()
         outbox = [task for task in self._tasks if task.get_name() == "outbox"]
         other_tasks = [task for task in self._tasks if task.get_name() != "outbox"]
@@ -654,6 +666,8 @@ class FactoryService:
     ) -> Mapping[str, object]:
         if command == "status":
             return await self._status()
+        if command == "reload":
+            return {**await self.reload_config(), **await self._status()}
         if command == "doctor":
             errors = self.config.validate_paths()
             schema_version = await self.db.call(lambda store: store.schema_version())
@@ -752,6 +766,48 @@ class FactoryService:
                 return {"released": delivery_guid, **await self._status()}
         raise ValueError("unknown command")
 
+    async def reload_config(self) -> dict[str, object]:
+        """Re-read the host config file and apply hot keys; all-or-nothing."""
+        if self.config_path is None:
+            raise ValueError("reload unavailable: the daemon's config path is unknown")
+        async with self._reload_lock:
+            try:
+                new = await asyncio.to_thread(load_config, self.config_path)
+            except Exception as exc:
+                raise ValueError(f"invalid config, nothing applied: {exc}") from exc
+            old = self.config
+            changed = sorted(
+                key for key in type(old).model_fields if getattr(old, key) != getattr(new, key)
+            )
+            restart = [key for key in changed if key not in HOT_RELOAD_KEYS]
+            if restart:
+                raise ValueError(f"restart required: {', '.join(restart)}; nothing applied")
+            if not changed:
+                return {"reloaded": False, "changed": [], "message": "no changes"}
+            # Store caps first: if it fails, nothing in memory has changed. Lowering a cap
+            # never stops running builds; the store only refuses *new* reservations.
+            await self.db.call(lambda store: store.ensure_repository(new.trusted))
+            self.config = new
+            self.executor.update_config(new.trusted)
+            self.parked.update_config(new.trusted)
+            for listener in self.config_listeners:
+                listener(new)
+            # Re-evaluate admission on the next tick even if the snapshot is unchanged.
+            self._last_admission_attempt = None
+            LOG.info("config reloaded changed=%s", ",".join(changed))
+            return {"reloaded": True, "changed": changed}
+
+    def _sighup(self) -> None:
+        task = asyncio.create_task(self._reload_logged(), name="reload")
+        self._reload_tasks.add(task)
+        task.add_done_callback(self._reload_tasks.discard)
+
+    async def _reload_logged(self) -> None:
+        try:
+            await self.reload_config()
+        except ValueError as exc:
+            LOG.warning("config reload refused: %s", exc)
+
     async def _status(self) -> dict[str, object]:
         admission = await self.db.call(lambda store: store.load_admission(self.config.repo_id))
         pending = await self.db.call(lambda store: len(store.effects_in_state("pending")))
@@ -762,6 +818,7 @@ class FactoryService:
             "paused": admission.paused,
             "building": admission.building_count,
             "building_cap": self.config.max_building,
+            "open_bot_pr_cap": self.config.max_open_bot_prs,
             "queued": sum(q.status == QueueStatus.QUEUED for q in admission.queue),
             "pending_effects": pending,
             "unknown_effects": unknown,

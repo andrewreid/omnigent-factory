@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import email.utils
 import inspect
 import json
@@ -13,8 +12,6 @@ from datetime import datetime
 from typing import Any
 
 import httpx
-
-from omnigent_factory.github.config import FactoryConfig, parse_factory_config
 
 TokenSource = str | Callable[[], str] | Callable[[], Awaitable[str]]
 
@@ -181,27 +178,6 @@ class GitHubClient:
         if not isinstance(result, dict):
             raise GitHubAPIError("GitHub GraphQL response omitted data")
         return result
-
-    async def default_branch_config(self, repository: str) -> FactoryConfig:
-        """Read .github/factory.yml explicitly from the current default branch."""
-        metadata: Any = await self.get_json(f"/repos/{repository}")
-        default_branch = metadata.get("default_branch") if isinstance(metadata, dict) else None
-        if not isinstance(default_branch, str) or not default_branch:
-            raise GitHubAPIError("repository metadata omitted default_branch")
-        encoded_ref = httpx.QueryParams({"ref": default_branch})
-        content: Any = await self.get_json(
-            f"/repos/{repository}/contents/.github/factory.yml?{encoded_ref}"
-        )
-        if not isinstance(content, dict) or content.get("encoding") != "base64":
-            raise GitHubAPIError("factory config response was not base64 file content")
-        encoded = content.get("content")
-        if not isinstance(encoded, str):
-            raise GitHubAPIError("factory config response omitted content")
-        try:
-            raw = base64.b64decode("".join(encoded.split()), validate=True)
-        except ValueError as exc:
-            raise GitHubAPIError("factory config content was invalid base64") from exc
-        return parse_factory_config(raw)
 
     async def recover_deliveries(self, *, per_page: int = 100) -> list[dict[str, Any]]:
         deliveries = await self.paginate(f"/app/hook/deliveries?per_page={per_page}")

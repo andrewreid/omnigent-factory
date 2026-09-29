@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import importlib.metadata
 import ipaddress
-import json
 import os
 import socket
 import stat
@@ -221,12 +220,6 @@ async def _check_github(
         report.fail("github_repository_identity", "configured repository IDs differ from GitHub")
     else:
         report.pass_check("github_repository_identity")
-    factory = await client.default_branch_config(config.repository)
-    report.pass_check(
-        "factory_yml",
-        "parsed; checkpoint blocks "
-        + json.dumps(factory.checkpoints.block_hours.model_dump(), sort_keys=True),
-    )
     await _check_project(config, client, report)
 
 

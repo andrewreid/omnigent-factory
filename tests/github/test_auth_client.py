@@ -167,34 +167,6 @@ async def test_rate_limit_exposes_retry_delay_without_retrying():
 
 
 @pytest.mark.asyncio
-async def test_config_is_read_only_from_default_branch():
-    refs = []
-    raw = b"""version: 1
-concurrency: {max_building: 1, max_open_bot_prs: 3}
-checkpoints:
-  block_hours: {S: 2, M: 4, L: 6}
-  grace_minutes: 15
-  cost_backstop_usd_per_hour: 35
-review: {bot_login: "factory[bot]", approver_ids: [114979]}
-guidance: {triage: classify, engineering: follow rules}
-"""
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/repos/SA-Ambulance/timesheets":
-            return httpx.Response(200, json={"default_branch": "trunk"})
-        refs.append(request.url.params.get("ref"))
-        return httpx.Response(
-            200,
-            json={"encoding": "base64", "content": base64.b64encode(raw).decode()},
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        config = await GitHubClient(http, "token").default_branch_config("SA-Ambulance/timesheets")
-    assert refs == ["trunk"]
-    assert config.review.approver_ids == [114979]
-
-
-@pytest.mark.asyncio
 async def test_authenticated_delivery_recovery_gets_all_pages_and_original_payload():
     auth = []
 

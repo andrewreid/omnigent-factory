@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import os
 import subprocess
 from pathlib import Path
@@ -62,19 +61,6 @@ async def test_doctor_resolves_live_ids_and_does_not_create_local_state(tmp_path
         omnigent_agent_id=None,
         omnigent_project_id=None,
     )
-    factory_yml = b"""version: 1
-concurrency: {max_building: 1, max_open_bot_prs: 3}
-checkpoints:
-  block_hours: {S: 2, M: 4, L: 6}
-  grace_minutes: 15
-  cost_backstop_usd_per_hour: 35
-review:
-  bot_login: molly-omnigent-factory[bot]
-  approver_ids: [114979]
-  independent_reviewer_ids: []
-guidance: {triage: Triage safely., engineering: Build safely.}
-"""
-
     revoked = 0
 
     def github(request: httpx.Request) -> httpx.Response:
@@ -110,14 +96,6 @@ guidance: {triage: Triage safely., engineering: Build safely.}
             )
         if request.url.path == f"/repos/{config.repository}":
             return httpx.Response(200, json={"default_branch": "main"})
-        if request.url.path.endswith("/.github/factory.yml"):
-            return httpx.Response(
-                200,
-                json={
-                    "encoding": "base64",
-                    "content": base64.b64encode(factory_yml).decode(),
-                },
-            )
         if request.url.path == "/graphql":
             fields = []
             for name, field_id, options in (

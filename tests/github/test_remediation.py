@@ -7,7 +7,6 @@ from datetime import UTC, datetime
 
 import httpx
 import pytest
-from pydantic import ValidationError
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.effects import AmbiguousWrite, EffectKind
@@ -16,7 +15,6 @@ from omnigent_factory.core.types import Stage
 from omnigent_factory.github.adapter import BoardSchema, GitHubAPIAdapter, ParcelBinding
 from omnigent_factory.github.auth import AppAuthenticator, InstallationTokenService
 from omnigent_factory.github.client import GitHubAPIError, GitHubClient, RateLimited
-from omnigent_factory.github.config import parse_factory_config
 from omnigent_factory.github.setup import render_app_manifest
 from omnigent_factory.github.webhook import (
     DeliveryIdentity,
@@ -355,16 +353,6 @@ def test_B4_only_configured_opposite_vendor_review_is_accepted():
     assert github._review_accepted(reviews, "head") is True
 
 
-def test_B4_independent_reviewer_config_is_numeric_and_disjoint_from_owners():
-    raw = _factory_config().replace(
-        b"  approver_ids: [114979]\n",
-        b"  approver_ids: [114979]\n  independent_reviewer_ids: [99]\n",
-    )
-    assert parse_factory_config(raw).review.independent_reviewer_ids == [99]
-    with pytest.raises(ValidationError):
-        parse_factory_config(raw.replace(b"[99]", b"[114979]"))
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "headers",
@@ -482,13 +470,6 @@ def test_S4_malformed_review_number_is_ignored():
         pull_request={"number": "not-an-int", "head": {"sha": "abc"}},
     )
     assert normalize(data, "pull_request_review").events == ()
-
-
-@pytest.mark.parametrize("owners", [b"approver_ids: [true]", b'approver_ids: ["114979"]'])
-def test_S5_owner_ids_are_strict_integers(owners):
-    raw = _factory_config().replace(b"approver_ids: [114979]", owners)
-    with pytest.raises(ValidationError):
-        parse_factory_config(raw)
 
 
 def test_S6_pr_thread_comment_is_not_issue_control():
@@ -620,17 +601,3 @@ def _bare_adapter(**kwargs) -> GitHubAPIAdapter:
         required_checks=frozenset(),
         **kwargs,
     )
-
-
-def _factory_config() -> bytes:
-    return b"""version: 1
-concurrency: {max_building: 1, max_open_bot_prs: 3}
-checkpoints:
-  block_hours: {S: 2, M: 4, L: 6}
-  grace_minutes: 15
-  cost_backstop_usd_per_hour: 35
-review:
-  bot_login: "factory[bot]"
-  approver_ids: [114979]
-guidance: {triage: classify, engineering: follow rules}
-"""

@@ -93,6 +93,10 @@ class EffectExecutor:
         for adapter in adapters:
             self.install(adapter)
 
+    def update_config(self, config: TrustedConfig) -> None:
+        """Adopt a hot-reloaded trusted config (same repository)."""
+        self._config = config
+
     def install(self, adapter: EffectAdapter) -> None:
         """Bind an adapter before :meth:`run`; supports the service construction cycle."""
         if self._workers or self._scheduled:

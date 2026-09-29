@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import os
 import subprocess
 from pathlib import Path
@@ -72,20 +71,12 @@ async def test_production_composition_binds_every_external_effect_and_real_verif
         omnigent_host_id="host",
         omnigent_agent_id="agent",
         omnigent_project_id="project",
+        # Factory policy lives only in the host config: no repository factory.yml.
+        max_building=2,
+        checkpoint_block_hours={"S": 3, "M": 5, "L": 7},
+        independent_reviewer_ids=frozenset({999}),
+        engineering_guidance="Build safely.",
     )
-    factory = b"""version: 1
-concurrency: {max_building: 2, max_open_bot_prs: 5}
-checkpoints:
-  block_hours: {S: 3, M: 5, L: 7}
-  grace_minutes: 19
-  cost_backstop_usd_per_hour: 41
-review:
-  bot_login: molly-omnigent-factory[bot]
-  approver_ids: [114979]
-  independent_reviewer_ids: [999]
-guidance: {triage: Triage safely., engineering: Build safely.}
-"""
-
     token_calls = 0
 
     def github(request: httpx.Request) -> httpx.Response:
@@ -105,11 +96,7 @@ guidance: {triage: Triage safely., engineering: Build safely.}
             )
         if request.url.path == f"/repos/{config.repository}":
             return httpx.Response(200, json={"default_branch": "main"})
-        if request.url.path.endswith("/.github/factory.yml"):
-            return httpx.Response(
-                200,
-                json={"encoding": "base64", "content": base64.b64encode(factory).decode()},
-            )
+        assert "/contents/" not in request.url.path, "factory must not read repo files"
         return httpx.Response(500)
 
     production = await build_production(
@@ -127,11 +114,11 @@ guidance: {triage: Triage safely., engineering: Build safely.}
         assert externally_handled <= adapters.keys()
         assert production.service.delivery_processor is not None
         assert production.verifier.secret_file == config.resolved_webhook_secret_file
-        assert production.service.config.max_building == 1
+        assert production.service.config.max_building == 2
         assert production.service.config.checkpoint_block_hours == {"S": 3, "M": 5, "L": 7}
         assert production.service.config.independent_reviewer_ids == frozenset({999})
         assert production.service.config.engineering_guidance == "Build safely."
-        assert token_calls == 1
+        assert token_calls == 0  # building the daemon does no network I/O
         await production.service.start()
         started = True
         assert (config.wrapper_bin_dir / "git-credential-omnigent-factory").is_file()

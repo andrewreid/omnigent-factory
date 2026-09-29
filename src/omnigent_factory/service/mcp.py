@@ -1079,6 +1079,11 @@ def build_endpoint(
     service: FactoryService, directory: ServiceDispatchDirectory, config: ServiceConfig
 ) -> McpEndpoint:
     tools = FactoryTools(service, directory, config)
+
+    def adopt_reloaded(new: ServiceConfig) -> None:
+        tools.config = new
+
+    service.config_listeners.append(adopt_reloaded)
     server = build_mcp_server(tools, config)
     server.streamable_http_app()  # creates the session manager
     manager = server.session_manager
