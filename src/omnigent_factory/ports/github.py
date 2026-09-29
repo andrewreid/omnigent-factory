@@ -51,6 +51,8 @@ GITHUB_EFFECT_KINDS = frozenset(
     {
         EffectKind.MOVE_CARD,
         EffectKind.SET_BOT,
+        EffectKind.SET_NOTE,
+        EffectKind.REACT_COMMENT,
         EffectKind.POST_COMMENT,
         EffectKind.PUBLISH_CONTRACT,
         EffectKind.PUBLISH_TRIAGE,

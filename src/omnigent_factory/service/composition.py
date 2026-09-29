@@ -261,6 +261,7 @@ async def build_production(
             config.status_options,
             config.bot_field_node_id,
             config.bot_options,
+            config.note_field_node_id,
         ),
         publication_renderer=publications,
         independent_reviewer_ids=config.independent_reviewer_ids,

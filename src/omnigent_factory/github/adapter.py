@@ -75,6 +75,8 @@ class BoardSchema:
     status_options: Mapping[str, str]
     bot_field_id: str
     bot_options: Mapping[str, str]
+    #: The "Factory note" text field ("" when not configured: notes are not written).
+    note_field_id: str = ""
 
 
 class GitHubAPIAdapter:
@@ -136,7 +138,7 @@ class GitHubAPIAdapter:
             )
             if not isinstance(issue, dict) or issue.get("node_id") != ref.parcel_id:
                 return RetryableReadFailure("issue identity did not match requested parcel")
-            stage, in_project, bot = await self._project_stage(ref.parcel_id)
+            stage, in_project, bot, note = await self._project_stage(ref.parcel_id)
             assignees = issue.get("assignees")
             human_assigned = not isinstance(assignees, list) or any(
                 not isinstance(user, dict) or user.get("type") != "Bot" for user in assignees
@@ -152,14 +154,18 @@ class GitHubAPIAdapter:
                 body=issue.get("body") if isinstance(issue.get("body"), str) else None,
                 read_at_us=self._now_us(),
                 bot=bot,
+                note=note,
             )
         except RateLimited as exc:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
         except GitHubAPIError as exc:
             return RetryableReadFailure(str(exc))
 
-    async def _project_stage(self, parcel_id: str) -> tuple[Stage | None, bool, str | None]:
-        """(stage by Status option ID, in project, current Bot display value or None)."""
+    async def _project_stage(
+        self, parcel_id: str
+    ) -> tuple[Stage | None, bool, str | None, str | None]:
+        """(stage by Status option ID, in project, current Bot display value or None,
+        current Factory note text or None when not read)."""
         query = """
         query($id: ID!, $after: String) {
           node(id: $id) { ... on Issue {
@@ -173,6 +179,9 @@ class GitHubAPIAdapter:
               }
               bot: fieldValueByName(name: "Bot") {
                 ... on ProjectV2ItemFieldSingleSelectValue { optionId }
+              }
+              note: fieldValueByName(name: "Factory note") {
+                ... on ProjectV2ItemFieldTextValue { text field { ... on ProjectV2Field { id } } }
               } }
               pageInfo { hasNextPage endCursor }
             }
@@ -196,19 +205,21 @@ class GitHubAPIAdapter:
                 if not isinstance(project, dict) or project.get("id") != self.project_node_id:
                     continue
                 bot = self._bot_name(item.get("bot"))
+                note = self._note_text(item.get("note"))
                 value = item.get("fieldValueByName")
                 if value is None:
-                    return None, True, bot
+                    return None, True, bot, note
                 if not isinstance(value, dict):
                     raise GitHubAPIError("Status field value was malformed")
                 field = value.get("field")
                 if not isinstance(field, dict) or field.get("id") != self.status_field_node_id:
                     raise GitHubAPIError("Status field identity changed")
                 # Read by option ID only: a renamed option must not change the stage.
-                return stage_for_option(value.get("optionId"), self.status_options), True, bot
+                stage = stage_for_option(value.get("optionId"), self.status_options)
+                return stage, True, bot, note
             page = items.get("pageInfo")
             if not isinstance(page, dict) or not page.get("hasNextPage"):
-                return None, False, None
+                return None, False, None, None
             after_value = page.get("endCursor")
             if not isinstance(after_value, str):
                 raise GitHubAPIError("projectItems pagination cursor was missing")
@@ -221,6 +232,20 @@ class GitHubAPIAdapter:
         option = value.get("optionId")
         names = [n for n, o in self.board_schema.bot_options.items() if o == option]
         return names[0] if len(names) == 1 else None
+
+    def _note_text(self, value: object) -> str | None:
+        """Factory note text ("" when empty), by the persisted field ID; None if unread."""
+        if self.board_schema is None or not self.board_schema.note_field_id:
+            return None
+        if value is None:
+            return ""
+        if not isinstance(value, dict):
+            return None
+        field = value.get("field")
+        if not isinstance(field, dict) or field.get("id") != self.board_schema.note_field_id:
+            return None
+        text = value.get("text")
+        return text if isinstance(text, str) else ""
 
     async def pull_request(
         self,
@@ -661,6 +686,8 @@ class GitHubAPIAdapter:
                 return await self._post_comment(effect)
             if effect.kind in {EffectKind.MOVE_CARD, EffectKind.SET_BOT}:
                 return await self._write_board(effect)
+            if effect.kind in {EffectKind.SET_NOTE, EffectKind.REACT_COMMENT}:
+                return await self._display_write(effect)
             if effect.kind == EffectKind.ENSURE_PROJECT_ITEM:
                 return await self._ensure_project_item(effect)
             if effect.kind == EffectKind.FETCH_PR_EVIDENCE:
@@ -1032,6 +1059,80 @@ class GitHubAPIAdapter:
         if observed != option_id:
             return AmbiguousWrite("board write did not read back at the requested option id")
         return Ack(str(item_id), {"option_id": str(option_id)})
+
+    async def _display_write(self, effect: EffectIntent) -> AdapterOutcome:
+        """Factory note / command reaction: idempotent display writes, never authority.
+
+        Both are safe to repeat (a text value is set, a reaction exists at most once per
+        user), so an uncertain outcome is retried instead of blocking the parcel.
+        """
+        try:
+            if effect.kind == EffectKind.SET_NOTE:
+                return await self._write_note(effect)
+            return await self._react(effect)
+        except AmbiguousRequest as exc:
+            return RetryableReadFailure(f"display write uncertain: {exc}")
+        except GitHubRejected as exc:
+            if 400 <= exc.status_code < 500:
+                return DefinitiveFailure(str(exc))
+            return RetryableReadFailure(str(exc))
+
+    async def _write_note(self, effect: EffectIntent) -> AdapterOutcome:
+        field_id = self.board_schema.note_field_id if self.board_schema is not None else ""
+        note = effect.args.get("note")
+        if not field_id:
+            return DefinitiveFailure("no Factory note field is configured")
+        if not isinstance(note, str):
+            return DefinitiveFailure("SET_NOTE requires note text")
+        binding = await self._binding(effect)
+        item_id = binding.project_item_id if binding is not None else None
+        if item_id is None and effect.parcel_id is not None:
+            item_id = await self._project_item_id(effect.parcel_id)
+        if item_id is None:
+            return DefinitiveFailure("the parcel has no project item")
+        query = """
+        query($id: ID!) { node(id: $id) { ... on ProjectV2Item {
+          fieldValueByName(name: "Factory note") { ... on ProjectV2ItemFieldTextValue {
+            text field { ... on ProjectV2Field { id } }
+          } }
+        } } }
+        """
+        data = await self.client.graphql(query, {"id": item_id})
+        node = data.get("node")
+        current = self._note_text(node.get("fieldValueByName") if isinstance(node, dict) else None)
+        if current == note:
+            return Ack(item_id, {"adopted": True, "note": note})
+        variables: dict[str, Any] = {
+            "input": {"projectId": self.project_node_id, "itemId": item_id, "fieldId": field_id}
+        }
+        if note:
+            variables["input"]["value"] = {"text": note}
+            mutation = """
+            mutation($input: UpdateProjectV2ItemFieldValueInput!) {
+              updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
+            }
+            """
+        else:
+            mutation = """
+            mutation($input: ClearProjectV2ItemFieldValueInput!) {
+              clearProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
+            }
+            """
+        await self.client.graphql(mutation, variables)
+        return Ack(item_id, {"note": note})
+
+    async def _react(self, effect: EffectIntent) -> AdapterOutcome:
+        comment_id = effect.args.get("comment_id")
+        content = effect.args.get("content")
+        if not isinstance(comment_id, int) or content not in {"+1", "confused"}:
+            return DefinitiveFailure("REACT_COMMENT requires comment_id and +1/confused")
+        await self.client.request(
+            "POST",
+            f"/repos/{self.repository}/issues/comments/{comment_id}/reactions",
+            json_body={"content": content},
+            expected=frozenset({200, 201}),
+        )
+        return Ack(str(comment_id), {"content": str(content)})
 
     async def _project_item_id(self, parcel_id: str) -> str | None:
         query = """

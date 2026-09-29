@@ -765,18 +765,11 @@ def _plan_context(plan: dict[str, Any] | None) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+#: Status comments: only what the owner must read or act on (each one notifies him).
+#: Informational status goes to the card's "Factory note" field instead (reducer).
 _STATUS_TEXT = {
     "checkpoint": "Factory checkpoint: the granted time is used up and Molly is wrapping up. "
     "Comment `/continue` (optionally with a duration, e.g. `/continue 2h`) to grant more.",
-    "queued": "Factory: approval recorded; the build is queued behind earlier approvals.",
-    "approval-acknowledged": "Factory: approval recorded; the build starts when capacity allows.",
-    "stopped": "Factory: stopped by the owner. Nothing runs until a new stage control.",
-    "rework-unsupported": "Factory: rework on a Ready parcel is not supported yet.",
-    "approval-invalidated": "Factory: the approval is no longer valid ({reason}). "
-    "Approve the current plan again to continue.",
-    "pr-closed-unmerged": "Factory: PR #{pr_number} was closed without merging; "
-    "the parcel needs an owner decision.",
-    "ready-invalidated": "Factory: the parcel is no longer Ready ({reason}).",
     "ready-blocked": "Factory: PR #{pr_number} at `{head_sha}` is not Ready: {reason}. "
     "No automatic fix attempt remains; the parcel needs an owner decision.",
     "create-rejected": "Factory: Omnigent refused to create the session ({reason}); "
@@ -785,68 +778,14 @@ _STATUS_TEXT = {
     "({matches} matches); the parcel is Blocked for operator review.",
     "decision": "Factory: Molly needs a decision (`{decision_id}`, impact {impact}). "
     "Answer it in Omnigent or comment `/decide {decision_id} <answer>`.",
-    "decision-resolved-externally": "Factory: decision `{decision_id}` was resolved "
-    "outside the factory.",
-    "result-invalid": "Factory status: the stage result was invalid; the parcel is Blocked.",
     "stop-unverified": "Factory: a stop could not be verified; the parcel is Blocked until "
     "the session tree is confirmed idle.",
     "restart-exhausted": "Factory: the session stopped and could not be restarted "
     "automatically; the parcel is Blocked.",
-    "queue-entry-invalid": "Factory: a queued build was dropped because its approval is "
-    "no longer valid.",
-    "control-rejected": "Factory: that command was not accepted ({reason}).",
 }
-
-
-_CONTROL_NAMES = {
-    "WaivePlan": "start building (plan waived)",
-    "ApprovePlan": "approve the plan",
-    "RequestPlan": "start a plan",
-    "RequestReplan": "start a replan",
-    "RequestTriage": "start triage",
-    "Continue": "continue",
-    "Decide": "record that answer",
-}
-_REFUSAL_REASONS = {
-    "open-decisions": "{n} open question(s) from an earlier session ({ids}). Answer in "
-    "Omnigent or comment `/decide <id> <answer>`, then try again.",
-    "revision-in-flight": "a plan revision is still in progress; wait for the updated plan.",
-    "waiver-stage-invalid": "the card can skip the plan only from Inbox or Triaged, and not "
-    "while another build or approval is active.",
-    "approval-stage-invalid": "approval is only possible from Scoped while no build is live.",
-    "plan-not-approvable": "the current plan is not approvable yet (open decisions or a "
-    "pending revision).",
-    "no-published-contract": "there is no published plan to approve.",
-    "hash-does-not-identify-latest": "that hash does not identify the latest plan.",
-    "decision-not-open": "that decision is not open (it may already be answered in Omnigent).",
-    "decision-ambiguous": "more than one question is open; name it with `/decide <id> <answer>`.",
-    "parcel-not-eligible": "the issue is not eligible (closed, assigned to a person, or not "
-    "on the board).",
-    "not-at-checkpoint": "nothing is waiting at a checkpoint.",
-}
-
-
-def _refusal_text(args: Mapping[str, Any]) -> str:
-    """A refused owner control in plain language, with the next step and any card rollback."""
-    control = _CONTROL_NAMES.get(str(args.get("control") or ""), "do that")
-    reason = str(args.get("reason") or "")
-    ids = [i for i in str(args.get("open_decisions") or "").split(",") if i]
-    pattern = _REFUSAL_REASONS.get(reason)
-    why = (
-        pattern.format(n=len(ids), ids=", ".join(f"`{i}`" for i in ids) or "none recorded")
-        if pattern is not None
-        else f"the request was not valid now ({reason.replace('-', ' ')})."
-    )
-    text = f"Factory: couldn't {control}: {why}"
-    rolled = args.get("rolled_back_to")
-    if isinstance(rolled, str) and rolled:
-        text += f" The card was moved back to {rolled}; drag it again when ready."
-    return text
 
 
 def _status_text(template: str, args: Mapping[str, Any]) -> str:
-    if template == "control-rejected":
-        return _refusal_text(args)
     fallback = f"Factory status: {template.replace('-', ' ')}."
     pattern = _STATUS_TEXT.get(template)
     if pattern is None:

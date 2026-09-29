@@ -63,6 +63,20 @@ of factory configuration; the target repository carries no factory config file.
 A triage/report/status publication that failed definitively leaves the card at
 `Bot: Blocked`. Fix the cause, then run `recovery` and `retry-effect <effect_id>`.
 
+### Card status vs. comments
+
+Bot comments notify the owner, so the factory comments only when he must read or act:
+triage, plan, Ready report, agent questions, checkpoint (`/continue`) and blocks that need
+owner action (agent blocked, restart exhausted, create refused, stop unverified, ambiguous
+adoption, PR not Ready with no fix attempt left). Everything else (queued, stopped,
+approval acknowledged/invalidated, Ready withdrawn, PR closed unmerged, refused commands,
+invalid result, ...) is the card's `Factory note` text field: one line with the latest
+reason, written only when it changes and cleared when the card moves on. Blocked,
+Checkpoint, Needs you and Queued cards without a specific reason get a derived note.
+`Bot: Queued` marks an approved build waiting for capacity. Owner command comments get a
+reaction: 👍 accepted, 😕 refused (the reason is in the note). Config keys:
+`note_field_node_id` and `bot_options.Queued`; `doctor` checks both exist.
+
 ### Issue sessions and the factory MCP endpoint
 
 Each issue gets one Omnigent session (the configured `omnigent_agent_id`, default

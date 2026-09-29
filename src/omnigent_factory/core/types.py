@@ -143,6 +143,8 @@ class BotState(enum.StrEnum):
     NEEDS_YOU = "Needs you"
     CHECKPOINT = "Checkpoint"
     BLOCKED = "Blocked"
+    #: Approved and waiting for build capacity (an admission queue entry).
+    QUEUED = "Queued"
     IDLE = "Idle"
 
 
@@ -299,6 +301,8 @@ class IssueSnapshot:
     read_at_us: int
     #: The board's current Bot value (display name) when read; None when not read.
     bot: str | None = None
+    #: The board's current "Factory note" text ("" when empty); None when not read.
+    note: str | None = None
 
     @property
     def eligible(self) -> bool:
@@ -564,6 +568,10 @@ class Parcel:
     readiness_wakes: int = 0
     pr_number: int | None = None
     bot: BotState = BotState.IDLE
+    #: Latest informational status reason (replaces status comments; "" when none).
+    note: str = ""
+    #: The "Factory note" value last written to the board (derived, like ``bot``).
+    board_note: str = ""
     #: The in-flight daemon board write: at most one per parcel (serialised).
     pending_moves: tuple[PendingMove, ...] = ()
     #: Coalesced desired column awaiting the in-flight write's trusted outcome.

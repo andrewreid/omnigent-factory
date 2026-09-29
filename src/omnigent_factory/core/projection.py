@@ -1,7 +1,7 @@
 """Derived board projection and admission arithmetic (architecture §2.7).
 
 ``Bot`` is derived from state, never used as authority. Precedence:
-Blocked > Checkpoint > Needs you > Working > Idle.
+Blocked > Checkpoint > Needs you > Queued > Working > Idle.
 """
 
 from __future__ import annotations
@@ -42,7 +42,8 @@ def finished(p: Parcel) -> bool:
     )
 
 
-def project_bot(p: Parcel) -> BotState:
+def project_bot(p: Parcel, *, queued: bool = False) -> BotState:
+    """``queued``: the parcel's admission queue entry is waiting for build capacity."""
     cur = p.current_session
     lifecycles = {s.lifecycle for s in p.sessions}
     if finished(p) and not p.unknown_effects:
@@ -65,6 +66,8 @@ def project_bot(p: Parcel) -> BotState:
         return BotState.CHECKPOINT
     if p.open_decisions or p.holds & NEEDS_YOU_HOLDS:
         return BotState.NEEDS_YOU
+    if queued:
+        return BotState.QUEUED
     if (
         p.stage == Stage.READY
         and p.readiness is not None
@@ -76,6 +79,56 @@ def project_bot(p: Parcel) -> BotState:
     if lifecycles & _WORKING:
         return BotState.WORKING
     return BotState.IDLE
+
+
+#: Longest "Factory note" the board gets (one short line).
+NOTE_MAX = 120
+
+_HOLD_TEXT = {
+    Hold.STOP_UNVERIFIED: "stop not verified",
+    Hold.RESULT_INVALID: "stage result invalid",
+    Hold.CREATE_REJECTED: "session create refused",
+    Hold.PREPARE_FAILED: "session prepare failed",
+    Hold.PUBLICATION_FAILED: "comment publication failed",
+    Hold.RESTART_EXHAUSTED: "session could not be restarted",
+    Hold.INBOX: "webhook delivery held",
+    Hold.AGENT_BLOCKED: "agent reported blocked",
+    Hold.AWAITING_OWNER: "awaiting owner",
+    Hold.CHECKS_FAILED: "checks failed",
+    Hold.READINESS_FAILED: "PR not Ready, no fix attempt left",
+    Hold.REMEDIATION_EXHAUSTED: "fix budget used up",
+    Hold.REWORK_CONTROL_REQUIRED: "needs a new stage control",
+    Hold.UNSUPPORTED_REWORK: "rework not supported",
+    Hold.PR_CLOSED: "PR closed unmerged",
+    Hold.NO_PROJECT_ITEM: "not on the board",
+    Hold.APPROVAL_VOIDED: "approval voided",
+    Hold.EXTERNAL_ACTIVITY: "external session activity",
+}
+
+
+def project_note(p: Parcel, bot: BotState) -> str:
+    """The board's "Factory note": the latest status reason, else one derived from ``bot``."""
+    if p.note:
+        return p.note[:NOTE_MAX]
+    if bot == BotState.BLOCKED:
+        why = [_HOLD_TEXT[h] for h in sorted(p.holds & BLOCKING_HOLDS) if h in _HOLD_TEXT]
+        if p.unknown_effects:
+            why.append("unconfirmed write")
+        if not why:
+            why.append("session failed")
+        text = f"Blocked: {', '.join(why)}"
+    elif bot == BotState.CHECKPOINT:
+        text = "Checkpoint: comment /continue to grant more time"
+    elif bot == BotState.NEEDS_YOU:
+        n = len(p.open_decisions)
+        why = [f"{n} open question(s)"] if n else []
+        why += [_HOLD_TEXT[h] for h in sorted(p.holds & NEEDS_YOU_HOLDS) if h in _HOLD_TEXT]
+        text = f"Needs you: {', '.join(why) or 'owner decision'}"
+    elif bot == BotState.QUEUED:
+        text = "Queued: waiting for build capacity"
+    else:
+        text = ""
+    return text[:NOTE_MAX]
 
 
 def queue_head(admission: AdmissionSnapshot) -> QueueEntry | None:

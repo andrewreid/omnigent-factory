@@ -27,6 +27,10 @@ class EffectKind(enum.StrEnum):
     # GitHub (daemon installation credential)
     MOVE_CARD = "move_card"
     SET_BOT = "set_bot"
+    #: Write the board's "Factory note" text field (display only, never authority).
+    SET_NOTE = "set_note"
+    #: React to an owner command comment (+1 accepted, confused refused).
+    REACT_COMMENT = "react_comment"
     POST_COMMENT = "post_comment"
     PUBLISH_CONTRACT = "publish_contract"
     PUBLISH_TRIAGE = "publish_triage"

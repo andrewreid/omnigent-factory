@@ -64,6 +64,7 @@ owners = [114979]
 # organization_id = 123        # pin the value printed by doctor
 project_node_id = "PVT_kwDOEanNes4BkJhb"
 status_field_node_id = "PVTSSF_lADOEanNes4BkJhbzhi7I9w"
+note_field_node_id = "PVTF_lADOEanNes4BkJhbzhjww0c"
 github_app_id = 5085812
 github_installation_id = 165144097
 github_bot_login = "molly-omnigent-factory[bot]"
@@ -114,6 +115,7 @@ Working = "18ff4a7c"
 "Needs you" = "b1767cfa"
 Checkpoint = "b85b9520"
 Blocked = "d28564d7"
+Queued = "13cc68fd"
 Idle = "cd0936de"
 '''
         return {

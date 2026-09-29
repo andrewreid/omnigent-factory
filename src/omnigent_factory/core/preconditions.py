@@ -18,7 +18,7 @@ from omnigent_factory.core.predicates import (
 from omnigent_factory.core.types import Hold, Lifecycle, Parcel, SessionKind, Stage
 
 #: Comments that would regress a merged/closed parcel if posted after the fact.
-_REGRESSION_COMMENTS = frozenset({"ready-invalidated", "ready-blocked", "pr-closed-unmerged"})
+_REGRESSION_COMMENTS = frozenset({"ready-blocked"})
 
 
 def effect_still_valid(parcel: Parcel | None, effect: EffectIntent) -> str | None:
@@ -33,6 +33,12 @@ def effect_still_valid(parcel: Parcel | None, effect: EffectIntent) -> str | Non
         if s is None or s.lifecycle != Lifecycle.PREPARING or s.fences:
             return "session-not-preparing"
         return None
+    if (
+        effect.kind == EffectKind.SET_NOTE
+        and parcel is not None
+        and effect.args.get("note") != parcel.board_note
+    ):
+        return "note-superseded"  # a newer note write is queued; latest wins
     if parcel is not None and Hold.COMPLETED in parcel.holds:
         completed = _completed_invalid(effect)
         if completed is not None:

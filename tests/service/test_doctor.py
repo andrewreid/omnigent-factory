@@ -112,6 +112,9 @@ async def test_doctor_resolves_live_ids_and_does_not_create_local_state(tmp_path
                         ],
                     }
                 )
+            fields.append(
+                {"id": config.note_field_node_id, "name": "Factory note", "dataType": "TEXT"}
+            )
             return httpx.Response(
                 200,
                 json={

@@ -207,33 +207,14 @@ def test_live_legacy_comment_carries_the_same_canonical_bytes():
 def test_status_comments_are_sentences_not_template_names():
     from omnigent_factory.service.directory import _status_text
 
-    assert _status_text("control-rejected", {"reason": "plan-not-allowed", "event_id": "e"}) == (
-        "Factory: couldn't do that: the request was not valid now (plan not allowed)."
+    assert _status_text("restart-exhausted", {"session_id": "s_1"}) == (
+        "Factory: the session stopped and could not be restarted automatically; "
+        "the parcel is Blocked."
     )
     assert "`/decide dc_1 <answer>`" in _status_text(
         "decision", {"decision_id": "dc_1", "impact": "plan_revision"}
     )
     assert _status_text("unknown-template", {}) == "Factory status: unknown template."
-
-
-def test_refused_waiver_drag_is_explained_with_the_next_step():
-    from omnigent_factory.service.directory import _status_text
-
-    text = _status_text(
-        "control-rejected",
-        {
-            "reason": "open-decisions",
-            "control": "WaivePlan",
-            "open_decisions": "de_21ada6942c3a9806d3b15ef8",
-            "rolled_back_to": "Triaged",
-        },
-    )
-    assert text == (
-        "Factory: couldn't start building (plan waived): 1 open question(s) from an earlier "
-        "session (`de_21ada6942c3a9806d3b15ef8`). Answer in Omnigent or comment "
-        "`/decide <id> <answer>`, then try again. The card was moved back to Triaged; drag "
-        "it again when ready."
-    )
 
 
 def test_decision_relay_says_what_is_asked_and_links_the_prompt_holder(

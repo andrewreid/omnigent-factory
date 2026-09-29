@@ -65,9 +65,12 @@ class ServiceConfig(BaseModel):
             "Needs you": "b1767cfa",
             "Checkpoint": "b85b9520",
             "Blocked": "d28564d7",
+            "Queued": "13cc68fd",
             "Idle": "cd0936de",
         }
     )
+    #: Projects v2 TEXT field "Factory note": the card's latest status reason.
+    note_field_node_id: str = "PVTF_lADOEanNes4BkJhbzhjww0c"
     github_app_id: int = 5_085_812
     github_installation_id: int = 165_144_097
     github_bot_login: str = "molly-omnigent-factory[bot]"
@@ -165,7 +168,7 @@ class ServiceConfig(BaseModel):
             self.status_options
         ):
             raise ValueError("status_options must map every unique live Status option id")
-        expected_bots = {"Working", "Needs you", "Checkpoint", "Blocked", "Idle"}
+        expected_bots = {"Working", "Needs you", "Checkpoint", "Blocked", "Queued", "Idle"}
         if set(self.bot_options) != expected_bots or len(set(self.bot_options.values())) != len(
             self.bot_options
         ):

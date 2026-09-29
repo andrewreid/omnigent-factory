@@ -219,7 +219,7 @@ def test_queued_regression_is_cancelled_at_the_call_boundary_after_the_merge():
             P,
             P,
             Preconditions(1, 0),
-            {"template": "ready-invalidated", "reason": "checks-or-head-changed"},
+            {"template": "ready-blocked", "reason": "checks-or-head-changed"},
         ),
         EffectIntent(
             "ef_m",
@@ -429,9 +429,9 @@ def test_red_new_head_on_a_ready_card_needs_you_with_the_reason():
     _ready(h)
     h.send(P, evidence(h, OLD, observed_head_sha=NEW, checks=ev.ChecksState.PENDING))
     r = h.send(P, evidence(h, NEW, checks=ev.ChecksState.FAILED, checks_summary="1 failure"))
-    [c] = comments(r, "ready-invalidated")
-    assert "required checks failed" in str(c.args["reason"])
+    assert not comments(r, "ready-invalidated")  # informational: the card's note, no comment
     p = h.p()
+    assert p.note.startswith("Ready withdrawn: ") and "required checks failed" in p.note
     assert p.stage == Stage.BUILDING and p.bot == BotState.NEEDS_YOU and not sends(r)
 
 

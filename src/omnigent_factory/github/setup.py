@@ -87,7 +87,7 @@ def render_project_migration(
         _option("Ready", "GREEN", "Ready for owner review and merge", "6df89cbb"),
         _option("Done", "GREEN", "Merged / closed", "4980e49d"),
     ]
-    fields = [
+    fields: list[dict[str, Any]] = [
         {
             "name": "Bot",
             "dataType": "SINGLE_SELECT",
@@ -96,9 +96,11 @@ def render_project_migration(
                 _option("Needs you", "YELLOW", "Owner decision or review needed"),
                 _option("Checkpoint", "ORANGE", "Time block awaits continuation"),
                 _option("Blocked", "RED", "Cannot safely progress"),
+                _option("Queued", "PURPLE", "Approved; waiting for build capacity"),
                 _option("Idle", "GRAY", "No admitted execution"),
             ],
         },
+        {"name": "Factory note", "dataType": "TEXT"},
         {
             "name": "Priority",
             "dataType": "SINGLE_SELECT",

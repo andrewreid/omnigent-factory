@@ -39,6 +39,7 @@ def snapshot(
     repo_matches: bool = True,
     identity_resolved: bool = True,
     bot: str | None = None,
+    note: str | None = None,
 ) -> IssueSnapshot:
     return IssueSnapshot(
         open=open,
@@ -51,6 +52,7 @@ def snapshot(
         body=body,
         read_at_us=read_at_us,
         bot=bot,
+        note=note,
     )
 
 

@@ -19,6 +19,7 @@ work effect and at most one explanation. There is no "otherwise resume" path.
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
@@ -59,9 +60,11 @@ from omnigent_factory.core.predicates import (
     work_allowed,
 )
 from omnigent_factory.core.projection import (
+    NOTE_MAX,
     building_capacity_available,
     pr_capacity_available,
     project_bot,
+    project_note,
     queue_head,
 )
 from omnigent_factory.core.types import (
@@ -70,6 +73,7 @@ from omnigent_factory.core.types import (
     AdmissionSnapshot,
     Approval,
     ApprovalKind,
+    BotState,
     Contract,
     Decision,
     DecisionImpact,
@@ -150,6 +154,8 @@ def derive_id(prefix: str, *parts: str) -> str:
 _DEFAULT_RETRY: dict[EffectKind, RetryClass] = {
     EffectKind.MOVE_CARD: RetryClass.ADOPTABLE_WRITE,
     EffectKind.SET_BOT: RetryClass.ADOPTABLE_WRITE,
+    EffectKind.SET_NOTE: RetryClass.ADOPTABLE_WRITE,
+    EffectKind.REACT_COMMENT: RetryClass.ADOPTABLE_WRITE,
     EffectKind.POST_COMMENT: RetryClass.ADOPTABLE_WRITE,
     EffectKind.PUBLISH_CONTRACT: RetryClass.ADOPTABLE_WRITE,
     EffectKind.PUBLISH_TRIAGE: RetryClass.ADOPTABLE_WRITE,
@@ -190,6 +196,8 @@ class _Ctx:
         self.before_version = state.parcel.version if state.parcel else None
         #: Persisted column before this event's evidence (control allow-lists use it).
         self.origin_stage = state.parcel.stage if state.parcel else None
+        #: This event set the parcel's status note (it wins over clearing).
+        self.note_set = False
 
     # -- parcel access
     @property
@@ -334,7 +342,13 @@ class _Ctx:
         return effect
 
     def comment(self, template: str, **args: JsonValue) -> None:
+        """An issue comment: only for what the owner must read or act on (it notifies)."""
         self.emit(EffectKind.POST_COMMENT, args={"template": template, **args})
+
+    def note(self, text: str) -> None:
+        """Informational status: shown on the card's "Factory note" field, no comment."""
+        self.update(note=text[:NOTE_MAX])
+        self.note_set = True
 
 
 # ============================================================ generic helpers
@@ -1057,7 +1071,12 @@ def _enqueue_build(ctx: _Ctx, approval: Approval, duration_us: int) -> None:
         ctx.p.parcel_id,
     )
     ctx.admission = replace(ctx.admission, next_sequence=seq + 1)
-    ctx.comment("queued", approval_id=approval.approval_id, sequence=seq)
+    ahead = sum(
+        1
+        for q in ctx.admission.queue
+        if q.status == QueueStatus.QUEUED and q.parcel_id != ctx.p.parcel_id and q.sequence < seq
+    )
+    ctx.note(f"Queued: {_ordinal(ahead + 1)} in line at approval")
     ctx.emit(EffectKind.WAKE_SCHEDULER, target=ctx.admission.repo_id)
 
 
@@ -1383,7 +1402,7 @@ def _h_approve_plan(ctx: _Ctx, body: ev.ApprovePlan) -> None:
         and a.full_hash == latest.full_hash
         and _approval_active(ctx)
     ):
-        ctx.comment("approval-acknowledged", approval_id=a.approval_id)
+        ctx.note("Approved: build starts when capacity allows")
         return
     if _build_blocked_by_live(ctx) or ctx.origin_stage not in (Stage.SCOPED, Stage.BUILDING):
         raise Rejected("approval-stage-invalid", explain=True, rollback_to=rollback)
@@ -1425,7 +1444,7 @@ def _h_waive_plan(ctx: _Ctx, body: ev.WaivePlan) -> None:
         and a.full_hash == digest
         and (_approval_active(ctx))
     ):
-        ctx.comment("approval-acknowledged", approval_id=a.approval_id)
+        ctx.note("Approved: build starts when capacity allows")
         return
     if ctx.p.open_decisions:
         raise Rejected("open-decisions", explain=True, rollback_to=rollback)
@@ -1518,7 +1537,7 @@ def _h_continue(ctx: _Ctx, body: ev.Continue) -> None:
 def _h_stop(ctx: _Ctx, body: ev.Stop) -> None:
     _control(ctx)
     _safety(ctx, "owner-stop", fence=FenceKind.STOPPED)
-    ctx.comment("stopped")
+    ctx.note("Stopped: /stop")
     _ = body
 
 
@@ -1527,7 +1546,7 @@ def _h_request_rework(ctx: _Ctx, body: ev.RequestRework) -> None:
     _require_eligible(ctx)
     # Phases 0-3: record the unsupported request visibly; never dispatch.
     ctx.hold(Hold.UNSUPPORTED_REWORK)
-    ctx.comment("rework-unsupported", phase4_enabled=ctx.config.phase4_enabled)
+    ctx.note("Rework refused: rework on a Ready parcel is not supported yet")
     _ = body
 
 
@@ -1571,7 +1590,7 @@ def _h_leftward(ctx: _Ctx, body: ev.LeftwardMove) -> None:
             _start_plan(ctx, Via.DRAG)
     elif from_stage == Stage.READY and body.to_stage == Stage.BUILDING and owner_fresh:
         ctx.hold(Hold.UNSUPPORTED_REWORK)
-        ctx.comment("rework-unsupported", phase4_enabled=ctx.config.phase4_enabled)
+        ctx.note("Rework refused: rework on a Ready parcel is not supported yet")
 
 
 def _h_ineligible(
@@ -1644,7 +1663,7 @@ def _invalidate(ctx: _Ctx, reason: str, *, revision_pending: bool) -> None:
             ctx.hold(Hold.APPROVAL_VOIDED)
         if ctx.p.stage == Stage.BUILDING:
             _move(ctx, Stage.SCOPED)
-        ctx.comment("approval-invalidated", reason=reason)
+        ctx.note(f"Approval invalidated: {_words(reason)}; approve the current plan again")
 
 
 def _h_approval_invalidated(ctx: _Ctx, body: ev.ApprovalInvalidated) -> None:
@@ -1693,9 +1712,10 @@ def _h_snapshot(ctx: _Ctx, body: ev.GitHubSnapshot) -> None:
     if evidence is None:
         raise Rejected("snapshot-without-evidence")
     _ = body
-    # Drift correction from a fresh read: write Bot only when the board shows another
-    # value than the derived one (a change in this event is written by the projection).
-    derived = project_bot(ctx.p)
+    # Drift correction from a fresh read: write Bot / Factory note only when the board
+    # shows another value than the derived one (a change in this event is written by
+    # the projection).
+    derived = project_bot(ctx.p, queued=_queued(ctx))
     if (
         evidence.bot is not None
         and ctx.p.in_project
@@ -1703,6 +1723,15 @@ def _h_snapshot(ctx: _Ctx, body: ev.GitHubSnapshot) -> None:
         and evidence.bot != derived.value
     ):
         ctx.emit(EffectKind.SET_BOT, args={"bot": derived.value})
+    note = project_note(ctx.p, derived)
+    if (
+        evidence.note is not None
+        and ctx.p.in_project
+        and derived == ctx.p.bot
+        and note == ctx.p.board_note
+        and evidence.note != note
+    ):
+        ctx.emit(EffectKind.SET_NOTE, args={"note": note})
 
 
 def _h_column_observed(ctx: _Ctx, body: ev.ColumnObserved) -> None:
@@ -1809,7 +1838,7 @@ def _h_pr_observed(ctx: _Ctx, body: ev.PRObserved) -> None:
     ):
         _invalidate_ready(ctx, "pr-closed-unmerged")
     ctx.hold(Hold.PR_CLOSED)
-    ctx.comment("pr-closed-unmerged", pr_number=body.pr_number)
+    ctx.note(f"PR #{body.pr_number} closed without merging")
 
 
 def _invalidate_ready(ctx: _Ctx, reason: str) -> None:
@@ -1820,7 +1849,8 @@ def _invalidate_ready(ctx: _Ctx, reason: str) -> None:
         ctx.update(readiness=replace(r, ready=False, verified=False))
     _move(ctx, Stage.BUILDING)
     ctx.hold(Hold.REWORK_CONTROL_REQUIRED)
-    ctx.comment("ready-invalidated", reason=reason)
+    head = r.head_sha[:7] if r is not None and r.head_sha else ""
+    ctx.note(f"Ready withdrawn: {_words(reason)}" + (f" on {head}" if head else ""))
 
 
 def _fetch_evidence(ctx: _Ctx, r: Readiness) -> None:
@@ -2005,6 +2035,7 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
     if Hold.READINESS_FAILED not in ctx.p.holds:
         ctx.hold(Hold.READINESS_FAILED)
         ctx.comment("ready-blocked", pr_number=r.pr_number, head_sha=r.head_sha, reason=reason)
+        ctx.note(f"Needs you: PR #{r.pr_number} not Ready on {r.head_sha[:7]}: {reason}")
 
 
 def _failure_reason(r: Readiness, body: ev.ReadinessEvidence, issue: int | None) -> str:
@@ -2128,6 +2159,7 @@ def _h_create_rejected(ctx: _Ctx, body: ev.CreateRejected) -> None:
     if not s.fences:
         ctx.hold(Hold.CREATE_REJECTED)
         ctx.comment("create-rejected", reason=body.reason)
+        ctx.note("Blocked: Omnigent refused to create the session")
     _finish_drain(ctx, replace(s, drain_target=Lifecycle.FENCED if s.fences else Lifecycle.RETIRED))
 
 
@@ -2140,6 +2172,7 @@ def _h_adoption_result(ctx: _Ctx, body: ev.AdoptionResult) -> None:
         return
     if body.matches > 1:
         ctx.comment("adoption-ambiguous", session_id=s.session_id, matches=body.matches)
+        ctx.note("Blocked: ambiguous Omnigent session adoption")
     # Zero matches is not proof of failure; remain UNKNOWN (no work, no blind retry).
 
 
@@ -2646,7 +2679,7 @@ def _malformed(ctx: _Ctx, s: StageSession) -> None:
     returns precise errors, so this only records a hard mismatch; there is no correction
     round-trip."""
     ctx.hold(Hold.RESULT_INVALID)
-    ctx.comment("result-invalid", session_id=s.session_id)
+    ctx.note("Blocked: stage result invalid")
 
 
 def _h_tree_quiescent(ctx: _Ctx, body: ev.TreeQuiescent) -> None:
@@ -2680,6 +2713,7 @@ def _h_stop_timeout(ctx: _Ctx, body: ev.StopTimeout) -> None:
     s = ctx.put_session(replace(s, lifecycle=Lifecycle.BLOCKED))
     ctx.hold(Hold.STOP_UNVERIFIED)
     ctx.comment("stop-unverified", session_id=s.session_id)
+    ctx.note("Blocked: stop not verified")
     if s.root_id is not None:
         ctx.emit(EffectKind.SCAN_TREE, session=s, args={"root_id": s.root_id})
 
@@ -2700,6 +2734,7 @@ def _h_session_crashed(ctx: _Ctx, body: ev.SessionCrashed) -> None:
         return
     ctx.hold(Hold.RESTART_EXHAUSTED)
     ctx.comment("restart-exhausted", session_id=s.session_id)
+    ctx.note("Blocked: session stopped and could not be restarted")
     _begin_drain(ctx, s)
 
 
@@ -2808,7 +2843,7 @@ def _h_capacity(ctx: _Ctx, body: ev.CapacityAvailable) -> None:
     )
     if a is None or a.approval_id != entry.approval_id or auth is None or not approval_ok(ctx.p):
         _set_queue(ctx, replace(entry, status=QueueStatus.CANCELLED), ctx.p.parcel_id)
-        ctx.comment("queue-entry-invalid")
+        ctx.note("Queued build dropped: its approval is no longer valid")
         return
     if ctx.admission.paused:
         raise Rejected("paused")
@@ -3019,25 +3054,84 @@ HANDLERS: dict[EventKind, _Handler] = {
 
 
 def _explanation(ctx: _Ctx, rejection: Rejected) -> None:
-    """At most one explanation (and guarded card rollback) for an owner's invalid control."""
+    """At most one explanation (and guarded card rollback) for an owner's invalid control.
+
+    The explanation is the card's "Factory note" (plus a reaction on a command comment),
+    never a comment.
+    """
     e = ctx.event
     if ctx.maybe_parcel is None or not rejection.explain:
         return
     if e.actor_id is None or e.actor_id not in ctx.config.owners:
         return
-    ctx.comment(
-        "control-rejected",
-        reason=rejection.reason,
-        event_id=e.event_id,
-        control=e.kind.value,
-        open_decisions=",".join(d.decision_id for d in ctx.p.open_decisions),
-        rolled_back_to=rejection.rollback_to.value if rejection.rollback_to else None,
-    )
+    note = f"Command refused: {rejection.reason}"
+    if rejection.rollback_to is not None:
+        note += f"; card moved back to {rejection.rollback_to.value}"
+    ctx.note(note)
     if rejection.rollback_to is not None and ctx.p.stage != rejection.rollback_to:
         # The owner's drag already put the card in Building; the persisted stage is
         # unchanged, so the expected source is given explicitly. Serialised like every
         # daemon board write.
         _emit_move(ctx, rejection.rollback_to, source=Stage.BUILDING)
+
+
+_COMMENT_EVENT_ID = re.compile(r"github:comment:(\d+):created")
+
+
+def _react(ctx: _Ctx, accepted: bool) -> None:
+    """React to an owner's command comment: +1 accepted, confused refused.
+
+    Only slash commands (not free-form feedback). A replayed event is a duplicate and
+    never reaches here, and a GitHub reaction is idempotent, so a retry cannot double it.
+    """
+    e = ctx.event
+    if ctx.maybe_parcel is None or e.kind == EventKind.PLAN_FEEDBACK:
+        return
+    if e.actor_id is None or e.actor_id not in ctx.config.owners:
+        return
+    match = _COMMENT_EVENT_ID.fullmatch(e.event_id)
+    if match is None:
+        return
+    ctx.emit(
+        EffectKind.REACT_COMMENT,
+        args={"comment_id": int(match.group(1)), "content": "+1" if accepted else "confused"},
+    )
+
+
+def _queued(ctx: _Ctx) -> bool:
+    entry = ctx.admission.queue_entry(ctx.p.parcel_id)
+    return entry is not None and entry.status == QueueStatus.QUEUED
+
+
+def _project_board(ctx: _Ctx) -> None:
+    """Derived Bot and "Factory note" values; each is written only when it changes.
+
+    The status note is cleared when the card changes column or Bot state (a finished
+    drain, Working -> Idle, keeps it: it explains why the card is idle), unless this
+    event set it.
+    """
+    old_bot = ctx.p.bot
+    bot = project_bot(ctx.p, queued=_queued(ctx))
+    if ctx.p.note and not ctx.note_set:
+        drained = old_bot == BotState.WORKING and bot == BotState.IDLE
+        if ctx.p.stage != ctx.origin_stage or (bot != old_bot and not drained):
+            ctx.update(note="")
+    if bot != old_bot:
+        ctx.update(bot=bot)
+        ctx.emit(EffectKind.SET_BOT, args={"bot": bot.value})
+    note = project_note(ctx.p, bot)
+    if note != ctx.p.board_note:
+        ctx.update(board_note=note)
+        ctx.emit(EffectKind.SET_NOTE, args={"note": note})
+
+
+def _ordinal(n: int) -> str:
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _words(reason: str) -> str:
+    return reason.replace("-", " ").replace("_", " ")
 
 
 def _reject(state: State, event: Event, reason: str) -> TransitionResult:
@@ -3109,16 +3203,15 @@ def transition(state: State, event: Event) -> TransitionResult:
         accepted = False
         reason = rejection.reason
         ctx.restore(checkpoint_parcel, checkpoint_admission, checkpoint_effects)
+        ctx.note_set = False
         _explanation(ctx, rejection)
+    _react(ctx, accepted)
 
     # ---- family 5: derived board projection and bookkeeping
     dropped = 0
     new_parcel = ctx.maybe_parcel
     if new_parcel is not None:
-        bot = project_bot(new_parcel)
-        if bot != new_parcel.bot:
-            ctx.update(bot=bot)
-            ctx.emit(EffectKind.SET_BOT, args={"bot": bot.value})
+        _project_board(ctx)
         new_parcel = ctx.p
         kept: list[EffectIntent] = []
         dropped_ids: set[str] = set()

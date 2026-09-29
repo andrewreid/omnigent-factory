@@ -226,7 +226,10 @@ async def _check_github(
 async def _check_project(config: ServiceConfig, client: GitHubClient, report: DoctorReport) -> None:
     query = """
     query($id: ID!) { node(id: $id) { ... on ProjectV2 { id fields(first: 100) {
-      nodes { ... on ProjectV2SingleSelectField { id name options { id name } } }
+      nodes {
+        ... on ProjectV2SingleSelectField { id name options { id name } }
+        ... on ProjectV2Field { id name dataType }
+      }
     } } } }
     """
     data = await client.graphql(query, {"id": config.project_node_id})
@@ -254,6 +257,14 @@ async def _check_project(config: ServiceConfig, client: GitHubClient, report: Do
         if observed != expected:
             report.fail("github_project", f"{name} option IDs differ from configuration")
             return
+    note = by_id.get(config.note_field_node_id)
+    if (
+        not isinstance(note, dict)
+        or note.get("name") != "Factory note"
+        or note.get("dataType") != "TEXT"
+    ):
+        report.fail("github_project", "Factory note text field ID does not match")
+        return
     report.pass_check("github_project", "project and live field/option IDs match")
 
 

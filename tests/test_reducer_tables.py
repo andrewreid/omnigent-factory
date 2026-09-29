@@ -160,7 +160,8 @@ def test_A06_owner_stop_fences_and_cancels_queue():
     assert h.admission.queue_entry(P).status == QueueStatus.QUEUED
     r = h.send(P, ev.Stop())
     assert h.admission.queue_entry(P).status == QueueStatus.CANCELLED
-    assert Hold.STOPPED in h.p().holds and EffectKind.POST_COMMENT in kinds(r)
+    assert Hold.STOPPED in h.p().holds and EffectKind.POST_COMMENT not in kinds(r)
+    assert h.p().note == "Stopped: /stop" and EffectKind.SET_NOTE in kinds(r)
     h2 = Harness()
     b = h2.to_building()
     h2.send(P, ev.Stop())
@@ -254,7 +255,18 @@ def test_A13_irrelevant_events_are_audited_self_loops():
         r = h.send(P, body)
         assert not r.audit.accepted and not work(r)
     p = h.p()
-    assert replace(p, version=before.version, applied_event_ids=before.applied_event_ids) == before
+    # Only the card's status note explains the refused owner control.
+    assert p.note == "Command refused: nothing-to-continue"
+    assert (
+        replace(
+            p,
+            version=before.version,
+            applied_event_ids=before.applied_event_ids,
+            note=before.note,
+            board_note=before.board_note,
+        )
+        == before
+    )
 
 
 def test_A13_non_owner_controls_never_trigger_work():
@@ -612,7 +624,8 @@ def test_B12_invalid_drag_approval_rolls_back_card():
     h.send(P, ev.PlanFeedback(text_digest="x"))  # revision pending
     r = h.send(P, ev.ApprovePlan(via=Via.DRAG))
     assert not r.audit.accepted and r.audit.reason == "plan-not-approvable"
-    assert EffectKind.POST_COMMENT in kinds(r) and h.p().stage == Stage.SCOPED
+    assert EffectKind.POST_COMMENT not in kinds(r) and h.p().stage == Stage.SCOPED
+    assert h.p().note == "Command refused: plan-not-approvable; card moved back to Scoped"
     assert h.p().current_approval_id is None and not work(r)
 
 
@@ -648,7 +661,9 @@ def test_C01_plan_approval_queues_in_approval_order():
     assert h.admission.queue_entry(Q).sequence < h.admission.queue_entry(P).sequence
     a = h.p(P).current_approval
     assert a.kind == ApprovalKind.PLAN and a.owner_id == OWNER_ID
-    assert h.p(P).stage == Stage.BUILDING and h.p(P).bot == BotState.IDLE
+    assert h.p(P).stage == Stage.BUILDING and h.p(P).bot == BotState.QUEUED
+    assert h.p(P).note == "Queued: 2nd in line at approval"
+    assert h.p(Q).note == "Queued: 1st in line at approval"
 
 
 @pytest.mark.parametrize(
@@ -687,7 +702,8 @@ def test_C03_duplicate_semantic_approval_acknowledged_once():
     h.approve()
     seq = h.admission.next_sequence
     r = h.send(P, ev.ApprovePlan(via=Via.COMMAND))
-    assert r.audit.accepted and kinds(r)[:1] == [EffectKind.POST_COMMENT]
+    assert r.audit.accepted and EffectKind.POST_COMMENT not in kinds(r)
+    assert h.p().note == "Approved: build starts when capacity allows"
     assert h.admission.next_sequence == seq and len(h.p().approvals) == 1
 
 
@@ -1408,6 +1424,8 @@ def test_totality_every_state_and_event_kind(scenario):
                 EffectKind.POST_COMMENT,
                 EffectKind.MOVE_CARD,
                 EffectKind.SET_BOT,
+                EffectKind.SET_NOTE,
+                EffectKind.REACT_COMMENT,
             }
             assert after.sessions == before.sessions and after.approvals == before.approvals
 
@@ -1527,10 +1545,11 @@ def test_C02b_refused_waiver_drag_rolls_the_card_back_and_explains_next_step():
         )
     )
     assert not r.audit.accepted and r.audit.reason == "open-decisions"
-    [comment] = Harness.of(r, EffectKind.POST_COMMENT)
-    assert comment.args["template"] == "control-rejected"
-    assert comment.args["open_decisions"] == d.decision_id
-    assert comment.args["rolled_back_to"] == "Triaged"
+    assert not Harness.of(r, EffectKind.POST_COMMENT)
+    assert h.p().note == "Command refused: open-decisions; card moved back to Triaged"
+    [note] = Harness.of(r, EffectKind.SET_NOTE)
+    assert note.args == {"note": h.p().note}
+    assert d.decision_id in {x.decision_id for x in h.p().open_decisions}
     [move] = Harness.of(r, EffectKind.MOVE_CARD)
     assert move.args == {"to": "Triaged", "expected_from": "Building"}
 
