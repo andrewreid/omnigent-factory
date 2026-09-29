@@ -504,22 +504,29 @@ class FactoryModel(RuleBasedStateMachine):
             "owner_scoped_drag": ev.LeftwardMove(from_stage=Stage.BUILDING, to_stage=Stage.SCOPED),
         }[what]
         kw: dict[str, object] = {}
+        fresh = self.h.f(pid).now + 1  # read for this event, after any landed write
         if what == "restore":
-            kw = {"evidence": snapshot(), "provenance": Provenance.RECONCILER}
+            kw = {"evidence": snapshot(read_at_us=fresh), "provenance": Provenance.RECONCILER}
         if what == "snap_left":
             order = [Stage.INBOX, Stage.TRIAGED, Stage.SCOPED, Stage.BUILDING, Stage.READY]
             left = order[max(0, order.index(p.stage) - 1)] if p.stage in order else Stage.INBOX
-            kw = {"evidence": snapshot(stage=left), "provenance": Provenance.RECONCILER}
+            kw = {
+                "evidence": snapshot(stage=left, read_at_us=fresh),
+                "provenance": Provenance.RECONCILER,
+            }
         if what.startswith("forged"):
             kw = {"provenance": Provenance.WEBHOOK, "actor": OTHER_USER_ID}
         if what.startswith("stale"):
             order = [Stage.INBOX, Stage.TRIAGED, Stage.SCOPED, Stage.BUILDING, Stage.READY]
             left = order[max(0, order.index(p.stage) - 1)] if p.stage in order else Stage.INBOX
-            kw = {"evidence": snapshot(stage=left)}
+            kw = {"evidence": snapshot(stage=left, read_at_us=fresh)}
         if what == "snap_own":
             move = p.pending_moves[-1] if p.pending_moves else None
             seen = (move.from_stage or move.to_stage) if move else p.stage
-            kw = {"evidence": snapshot(stage=seen), "provenance": Provenance.RECONCILER}
+            kw = {
+                "evidence": snapshot(stage=seen, read_at_us=fresh),
+                "provenance": Provenance.RECONCILER,
+            }
         if what == "assign":
             kw = {"actor": OTHER_USER_ID}
         if what == "owner_scoped_drag":
@@ -807,7 +814,11 @@ class FactoryModel(RuleBasedStateMachine):
                 assert all(after.pending_move(m.effect_id) for m in before.pending_moves) or (
                     event.provenance == Provenance.ADAPTER
                 )
-            elif snap.stage not in targets and is_leftward(before.stage, snap.stage):
+            elif (
+                snap.stage not in targets
+                and is_leftward(before.stage, snap.stage)
+                and snap.read_at_us >= before.board_written_at_us  # older reads are stale
+            ):
                 assert after.barrier_time_us >= event.source_time_us
                 if event.event_class == EventClass.CONTROL:
                     assert not result.audit.accepted

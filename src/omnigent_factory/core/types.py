@@ -430,6 +430,8 @@ class StageSession:
     #: Owner comments relayed to this (build) run while it waited on checks; each one
     #: opens a fresh result slot so the run can re-submit the same head.
     feedback_wakes: int = 0
+    #: An owner comment arrived mid-turn: relay it if the turn ends without a result.
+    comment_pending: bool = False
 
 
 @dataclass(frozen=True, slots=True)

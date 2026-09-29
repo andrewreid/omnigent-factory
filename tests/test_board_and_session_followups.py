@@ -180,16 +180,14 @@ def test_queue_position_note_moves_up_when_a_build_ahead_is_admitted():
 def test_comment_reaches_an_active_build_whose_turn_ended_once_until_idle_again():
     h = Harness()
     build = h.to_building()
-    r = comment(h, "first")
-    assert not feedback_messages(r)  # mid-turn: folded into the running turn
     h.quiesce(P, build.session_id)  # the turn ended without a result
-    r = comment(h, "second")
+    r = comment(h, "first")
     [msg] = feedback_messages(r)
     assert msg.preconditions.session_id == build.session_id
-    r = comment(h, "third")
-    assert not feedback_messages(r)  # debounced until the tree is seen idle again
-    h.quiesce(P, build.session_id)
-    assert feedback_messages(comment(h, "fourth"))
+    r = comment(h, "second")
+    assert not feedback_messages(r)  # debounced: the run is busy with the first
+    assert len(feedback_messages(h.quiesce(P, build.session_id))) == 1  # then once
+    assert not feedback_messages(h.quiesce(P, build.session_id))
     assert sum(s.kind == SessionKind.BUILD for s in h.p().sessions) == 1  # no new run
 
 
@@ -278,3 +276,43 @@ def test_replaced_issue_session_is_archived():
     assert r.audit.accepted and issue.root_id == replacement.root_id
     assert issue.status == IssueSessionStatus.LIVE
     assert h.p().current_session.lifecycle == Lifecycle.ACTIVE
+
+
+def test_comment_during_a_turn_is_relayed_when_the_turn_ends_without_a_result():
+    """Periodic scans can report an incomplete tree, so the run may look busy when the
+    comment arrives; it is delivered at the next idle observation instead."""
+    h = Harness()
+    build = h.to_building()
+    assert not feedback_messages(comment(h, "mid-turn"))
+    r = h.quiesce(P, build.session_id)
+    [msg] = feedback_messages(r)
+    assert msg.preconditions.session_id == build.session_id
+    assert not feedback_messages(h.quiesce(P, build.session_id))  # once
+
+
+def test_comment_read_before_a_result_is_not_relayed_again():
+    h = Harness()
+    build = h.to_building()
+    comment(h, "mid-turn")
+    assert build.root_id is not None
+    h.send(
+        P,
+        result_candidate(
+            build.session_id,
+            build.root_id,
+            build.revision,
+            ev.ResultKind.BUILD_READY,
+            pr_number=PR,
+            head_sha=HEAD,
+        ),
+    )
+    assert not feedback_messages(h.quiesce(P, build.session_id))
+
+
+def test_comment_during_a_plan_turn_is_relayed_when_it_ends_without_a_plan():
+    h = Harness()
+    h.eligible()
+    h.send(P, ev.RequestPlan(via=Via.DRAG))
+    plan = h.create_ok()
+    assert not feedback_messages(comment(h))
+    assert feedback_messages(h.quiesce(P, plan.session_id))

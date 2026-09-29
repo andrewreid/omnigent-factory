@@ -1314,6 +1314,7 @@ def _plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
                     lifecycle=Lifecycle.ACTIVE,
                     wait_reason=None,
                     quiescent=cur.quiescent and busy,
+                    comment_pending=busy,
                 )
             )
             ctx.unhold(Hold.AWAITING_OWNER)
@@ -1372,6 +1373,8 @@ def _triage_feedback(ctx: _Ctx) -> None:
         if not (finished or cur.execution_closed) and cur.lifecycle in _TRIAGE_IN_PROGRESS:
             if _idle_run(cur) and work_allowed(ctx.p, cur):
                 _relay_comment(ctx, cur)  # its turn ended without a result: nudge it
+            elif cur.lifecycle == Lifecycle.ACTIVE:
+                ctx.put_session(replace(cur, comment_pending=True))  # see _h_tree_quiescent
             return  # in progress: it must read the comment before it can submit
     ctx.unhold(*CONTROL_CLEARED_HOLDS)
     _start_stage(ctx, SessionKind.TRIAGE, ctx.config.block_us(ctx.p.size or Size.S))
@@ -1385,6 +1388,14 @@ def _build_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
         and cur.lifecycle == Lifecycle.WAITING
         and cur.wait_reason == WaitReason.CHECKS
     )
+    if (
+        cur is not None
+        and cur.kind == SessionKind.BUILD
+        and cur.lifecycle == Lifecycle.ACTIVE
+        and not _idle_run(cur)
+    ):
+        ctx.put_session(replace(cur, comment_pending=True))  # see _h_tree_quiescent
+        return
     if (
         cur is None
         or cur.kind != SessionKind.BUILD
@@ -1420,7 +1431,7 @@ def _relay_comment(ctx: _Ctx, s: StageSession, digest: str = "") -> None:
     """Relay an owner comment to an idle run once; it is not re-sent until the tree has
     been seen idle again, so a burst of comments becomes one message."""
     ctx.unhold(Hold.AGENT_BLOCKED, Hold.RESULT_INVALID)  # the owner's steer answers it
-    s = ctx.put_session(replace(s, quiescent=False))
+    s = ctx.put_session(replace(s, quiescent=False, comment_pending=False))
     _ensure_issuance(ctx, s)
     ctx.emit(
         EffectKind.SEND_MESSAGE,
@@ -2696,6 +2707,8 @@ def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
     if not (body.valid and kind_ok and decisions_ok):
         _malformed(ctx, s)
         return
+    if s.comment_pending:
+        s = ctx.put_session(replace(s, comment_pending=False))
     if body.result_kind == ev.ResultKind.BLOCKED:
         # Honest "could not finish": Blocked with the agent's reason; nothing inferred.
         ctx.hold(Hold.AGENT_BLOCKED)
@@ -2796,6 +2809,15 @@ def _h_tree_quiescent(ctx: _Ctx, body: ev.TreeQuiescent) -> None:
             replace(s, lifecycle=Lifecycle.FENCED, fences=s.fences | {FenceKind.CHECKPOINT})
         )
         ctx.emit(EffectKind.DISABLE_ISSUANCE, session=s)
+    elif (
+        s.comment_pending
+        and _idle_run(s)
+        and s.session_id == ctx.p.current_session_id
+        and not ctx.p.open_decisions
+        and work_allowed(ctx.p, s)
+        and (s.kind != SessionKind.BUILD or approval_ok(ctx.p))
+    ):
+        _relay_comment(ctx, s)  # a comment came mid-turn and the turn ended without a result
 
 
 def _h_stop_timeout(ctx: _Ctx, body: ev.StopTimeout) -> None:
