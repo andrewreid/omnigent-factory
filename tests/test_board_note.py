@@ -92,7 +92,7 @@ def test_queued_is_a_note_and_bot_queued_not_a_comment():
     assert h.admission.queue_entry(P).status == QueueStatus.QUEUED
     assert h.p(P).bot == BotState.QUEUED
     assert {"bot": "Queued"} in [e.args for e in Harness.of(r, EffectKind.SET_BOT)]
-    assert notes(r) == ["Queued: 2nd in line at approval"]
+    assert notes(r) == ["Queued: 2nd in line"]
 
 
 def test_admission_clears_the_queued_note():

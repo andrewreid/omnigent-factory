@@ -46,7 +46,7 @@ waits up to 90 s for it instead of failing.
 | Command | What it does |
 |---|---|
 | `status` | Readiness, pause state, building count/cap, queue, pending/unknown effects, parked deliveries. |
-| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). |
+| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. |
 | `explain <parcel>` | The parcel's persisted state: stage, bot, sessions, holds, effects. |
 | `recovery` | Failed/unknown effects and parked webhook deliveries. |
 | `retry-effect <effect_id>` | Requeue a failed/unknown `publish_triage`/`publish_report`/`post_comment`; it adopts an existing comment by its marker, so it never duplicates. |
@@ -55,7 +55,7 @@ waits up to 90 s for it instead of failing.
 | `cleanup <parcel> [--merged]` | Remove a finished parcel's factory worktree(s) and local `factory/` branch from the factory clone. |
 | `release-delivery <guid>` | Release one parked webhook delivery for processing. |
 | `pause` / `unpause` | Stop / resume admitting new work repository-wide; in-flight parcels and safety events carry on. |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, cost backstop, guidance and `independent_reviewer_ids`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, cost backstop, `review_bot_grace_minutes`, guidance and `independent_reviewer_ids`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.
@@ -73,7 +73,8 @@ approval acknowledged/invalidated, Ready withdrawn, PR closed unmerged, refused 
 invalid result, ...) is the card's `Factory note` text field: one line with the latest
 reason, written only when it changes and cleared when the card moves on. Blocked,
 Checkpoint, Needs you and Queued cards without a specific reason get a derived note.
-`Bot: Queued` marks an approved build waiting for capacity. Owner command comments get a
+`Bot: Queued` marks an approved build waiting for capacity; its note (`Queued: 2nd in line`)
+follows the queue as builds ahead are admitted (refreshed by the periodic reconcile). Owner command comments get a
 reaction: 👍 accepted, 😕 refused (the reason is in the note). Config keys:
 `note_field_node_id` and `bot_options.Queued`; `doctor` checks both exist.
 
@@ -85,7 +86,8 @@ in that session; each run has its own credential capability, work gate and polic
 a stop or revoke ends the run, never the session. A dead, archived, foreign-agent or
 context-full session is replaced before the next run (the new one gets a short stored
 summary in its start message). When the parcel is terminal (merged or closed) and its
-tree is quiescent, the session is archived.
+tree is quiescent, the session is archived; a session replaced by a fresh one is archived
+too. When the issue title changes, the live session is renamed.
 
 Stage messages are short pointers; the agent works through six MCP tools served by the
 daemon at `http://127.0.0.1:<mcp_port>/mcp/` (loopback only, bearer token):
@@ -106,8 +108,24 @@ serves all of them to every later run, oldest first, flagged `new` since the ses
 last result for that stage. In Triaged a comment re-runs triage in the issue session (a
 revised triage comment follows); in Scoped it revises the plan; in Building it is relayed
 to a build waiting on checks without touching the approval. Elsewhere it only waits for
-later stages. A run that is mid-turn gets no extra message: its result is refused until
+later stages. A run whose turn ended without a result (its tree is idle) gets the comment
+as one message, even if it reported blocked; the next comment waits until it is idle again.
+A run that is mid-turn gets no extra message: its result is refused until
 it has read every comment, so a burst of comments folds into the run in progress.
+
+### Review bots
+
+Every review-bot finding needs an outcome; a clean bot verdict is not required. The build
+fixes in-scope findings; for a valid out-of-scope finding it opens a follow-up issue (as
+the bot, so it lands in the board Inbox), replies on the thread with the disposition and
+link, and resolves the thread; an advisory finding gets a reply and is resolved. It
+resolves only threads it replied to: readiness counts a bot thread as handled when the
+factory bot replied or a person resolved it, and a thread the bot resolved without a reply
+stays open. The agent's shell policy allows `gh issue create`, thread replies and
+`resolveReviewThread`, and denies closing, deleting, transferring or locking issues and PRs
+(CLI, REST and GraphQL), merging and administration. A PR head is Ready only from a green
+read taken `review_bot_grace_minutes` (default 10) after the build reported it, so late bot
+comments are handled by the build's one readiness wake instead of pulling a Ready card back.
 
 ### Finished parcels
 

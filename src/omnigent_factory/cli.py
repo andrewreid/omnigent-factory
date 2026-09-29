@@ -44,6 +44,12 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("status", "doctor", "pause", "unpause", "recovery"):
         command = sub.add_parser(name)
         _config_arg(command)
+        if name == "doctor":
+            command.add_argument(
+                "--live",
+                action="store_true",
+                help="also create and archive a throwaway session for the configured agent",
+            )
     reload = sub.add_parser(
         "reload",
         help="re-read the config file into the running daemon (hot keys only; also SIGHUP)",
@@ -157,7 +163,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         asyncio.run(_serve(config, config_path))
         return 0
     if args.command == "doctor":
-        report = asyncio.run(run_doctor(config))
+        report = asyncio.run(run_doctor(config, live=args.live))
         print(json.dumps(report.as_dict(), indent=2, sort_keys=True))
         return 0 if report.ok else 1
     if args.command in ("status", "pause", "unpause", "recovery", "reload"):

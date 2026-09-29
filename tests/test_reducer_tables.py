@@ -662,8 +662,8 @@ def test_C01_plan_approval_queues_in_approval_order():
     a = h.p(P).current_approval
     assert a.kind == ApprovalKind.PLAN and a.owner_id == OWNER_ID
     assert h.p(P).stage == Stage.BUILDING and h.p(P).bot == BotState.QUEUED
-    assert h.p(P).note == "Queued: 2nd in line at approval"
-    assert h.p(Q).note == "Queued: 1st in line at approval"
+    assert h.p(P).note == "Queued: 2nd in line"
+    assert h.p(Q).note == "Queued: 1st in line"
 
 
 @pytest.mark.parametrize(

@@ -152,6 +152,7 @@ def test_F1_checkpoint_cleanup_precondition_respects_ambiguity():
 
 
 def snap_event(h, stage, **kw):
+    kw.setdefault("read_at_us", h.f(P).now + 1)  # a fresh read, taken for this event
     return h.send(
         P,
         ev.GitHubSnapshot(),

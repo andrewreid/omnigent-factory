@@ -52,7 +52,10 @@ def test_triage_plan_build_share_one_issue_session():
     # Each run gets its own cost-policy generation in the shared root.
     generations = [s.grant.policy_generation for s in p.sessions]
     assert generations == sorted(set(generations))
-    assert build.lifecycle == Lifecycle.ACTIVE and p.issue_session == issue
+    assert build.lifecycle == Lifecycle.ACTIVE and p.issue_session is not None
+    assert (p.issue_session.root_id, p.issue_session.generation) == (issue.root_id, 1)
+    assert p.issue_session.title == "Add export button"  # learnt from reads, no rename
+    assert not any(e.kind == EffectKind.RENAME_SESSION for _, r in h.log for e in r.effects)
 
 
 def test_reused_run_switches_off_the_previous_runs_credential_first():

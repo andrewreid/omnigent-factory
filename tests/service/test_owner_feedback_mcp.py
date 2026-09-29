@@ -115,15 +115,24 @@ async def test_A_stage_templates_point_at_owner_feedback():
         "triage-v3.txt",
         "triage-feedback-v1.txt",
         "plan-v3.txt",
-        "build-v3.txt",
+        "build-v4.txt",
         "feedback-v3.txt",
-        "build-feedback-v1.txt",
+        "build-feedback-v2.txt",
+        "triage-comment-v1.txt",
         "continuation-v2.txt",
     ):
         text = (root / name).read_text("utf-8")
         assert "factory_get_feedback" in text, name
         assert len(text) < 1200, name
-    for gone in ("triage-v2.txt", "plan-v2.txt", "build-v2.txt", "feedback-v2.txt"):
+    for gone in (
+        "triage-v2.txt",
+        "plan-v2.txt",
+        "build-v2.txt",
+        "build-v3.txt",
+        "feedback-v2.txt",
+        "build-feedback-v1.txt",
+        "readiness-wake-v2.txt",
+    ):
         assert not (root / gone).is_file()
 
 

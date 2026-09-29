@@ -17,7 +17,12 @@ import httpx
 
 from omnigent_factory.github.auth import AppAuthenticator, InstallationTokenService
 from omnigent_factory.github.client import GitHubClient
-from omnigent_factory.omnigent.rest import OmnigentReadError, OmnigentRest
+from omnigent_factory.omnigent.rest import (
+    OmnigentReadError,
+    OmnigentRest,
+    WriteClass,
+    classify_write,
+)
 from omnigent_factory.ports.credentials import TokenRefusal
 from omnigent_factory.service.composition import _private_file
 from omnigent_factory.service.config import ServiceConfig
@@ -55,8 +60,14 @@ async def run_doctor(
     github_transport: httpx.AsyncBaseTransport | None = None,
     omnigent_transport: httpx.AsyncBaseTransport | None = None,
     mcp_transport: httpx.AsyncBaseTransport | None = None,
+    live: bool = False,
 ) -> DoctorReport:
-    """Perform live reads only; print-worthy IDs are returned under ``resolved``."""
+    """Perform live reads only; print-worthy IDs are returned under ``resolved``.
+
+    ``live`` (opt-in) also creates a throwaway session for the configured agent in the
+    configured project and archives it: server-side create failures (e.g. an agent env
+    variable the server cannot resolve) only show up then.
+    """
     report = DoctorReport()
     try:
         key = _private_file(config.resolved_app_private_key_file)
@@ -98,6 +109,8 @@ async def run_doctor(
             client = GitHubClient(github_http, daemon.token, api_url=config.github_api_url)
             await _check_github(config, client, jwt, report)
         await _check_omnigent(config, omnigent, report)
+        if live:
+            await _check_live_session(config, omnigent, report)
     except (httpx.HTTPError, ValueError, RuntimeError) as exc:
         report.fail("live_checks", f"{type(exc).__name__}: {exc}")
     finally:
@@ -349,6 +362,50 @@ async def _check_omnigent(config: ServiceConfig, rest: OmnigentRest, report: Doc
             await _check_server_version(rest, report)
     except OmnigentReadError as exc:
         report.fail("omnigent_auth", exc.reason)
+
+
+async def _check_live_session(
+    config: ServiceConfig, rest: OmnigentRest, report: DoctorReport
+) -> None:
+    """Create a session exactly as a stage run would (no message, no git branch) and
+    archive it again."""
+    agent = report.resolved.get("omnigent_agent_id")
+    host = report.resolved.get("omnigent_host_id")
+    if not agent or not host:
+        report.fail("live_session", "agent or host is not resolved")
+        return
+    body: dict[str, Any] = {
+        "agent_id": agent,
+        "host_type": "external",
+        "host_id": host,
+        "workspace": str(config.source_clone),
+        "title": "factory doctor probe (safe to delete)",
+        "labels": {"factory.doctor": "probe"},
+        "initial_items": [],
+    }
+    project = report.resolved.get("omnigent_project_id")
+    if project:
+        body["project_id"] = project
+    created = await rest.post_json("/v1/sessions", body)
+    root = (created.body or {}).get("id") or (created.body or {}).get("session_id")
+    if classify_write(created) != WriteClass.OK or not isinstance(root, str) or not root:
+        detail = created.error_code or _error_message(created.body) or created.error or ""
+        report.fail("live_session", f"session create failed: HTTP {created.status} {detail}")
+        return
+    archived = await rest.patch_json(f"/v1/sessions/{root}", {"archived": True})
+    if classify_write(archived) != WriteClass.OK:
+        report.fail(
+            "live_session",
+            f"created {root} but could not archive it: HTTP {archived.status}",
+        )
+        return
+    report.pass_check("live_session", f"created and archived {root}")
+
+
+def _error_message(body: object) -> str:
+    err = body.get("error") if isinstance(body, dict) else None
+    message = err.get("message") if isinstance(err, dict) else None
+    return str(message)[:300] if message else ""
 
 
 async def _identity_rows(rest: OmnigentRest, path: str) -> list[dict[str, Any]]:

@@ -153,10 +153,11 @@ def github_policy(kind: SessionKind, repository: str, branch: str) -> PolicySpec
 CEL_REASON = (
     "Denied by factory policy: merging, --admin or hook bypass, pushing the default "
     "branch, repository/ruleset/branch-protection/collaborator/secret/workflow "
-    "administration, closing or deleting issues and deleting repositories are the owner's. "
-    "Everything else is allowed. If this matched text inside a message, commit body or "
-    "file content, write that text to a file and pass it by path (e.g. --body-file / -F) "
-    "and rerun the command."
+    "administration, closing, deleting, transferring or locking issues and pull requests "
+    "and deleting repositories are the owner's. Everything else is allowed (e.g. opening "
+    "a follow-up issue, replying to and resolving review threads). If this matched text "
+    "inside a message, commit body or file content, write that text to a file and pass it "
+    "by path (e.g. --body-file / -F) and rerun the command."
 )
 
 #: MCP GitHub tools that merge or administer (matched against ``event.data.name``).
@@ -219,9 +220,18 @@ def _shell_pattern(default_branch: str) -> str:
         r"\bgh\s+api\b" + _SEG + r"(-X|--method)[\s=]*DELETE\b",
         r"\bgh\s+(repo\s+(delete|edit|rename|archive|transfer)|ruleset|secret|variable)\b",
         r"\bgh\s+workflow\s+(enable|disable)\b",
-        # closing / deleting issues and deleting repositories
+        # closing / deleting issues and pull requests (CLI, REST, GraphQL) and deleting
+        # repositories; creating issues, replying to and resolving threads stay allowed
         r"\bgh\s+issue\s+(close|delete|transfer|lock)\b",
-        r"\bgh\s+api\b" + _SEG + r"/issues/[0-9]+\b" + _SEG + r"\bstate[\s=:]+[\"']?closed\b",
+        r"\bgh\s+pr\s+(close|lock)\b",
+        r"\bgh\s+(issue|pr)\s+comment\b" + _SEG + r"\s--delete-last\b",
+        r"\bgh\s+api\b"
+        + _SEG
+        + r"/(issues|pulls)/[0-9]+\b"
+        + _SEG
+        + r"\bstate[\s=:]+[\"']?closed\b",
+        r"\b(closeIssue|deleteIssue|transferIssue|lockLockable|closePullRequest"
+        r"|deleteIssueComment|deletePullRequestReview|deletePullRequestReviewComment)\b",
     ]
     return "(" + "|".join(rules) + ")"
 

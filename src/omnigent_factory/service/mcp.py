@@ -879,7 +879,7 @@ def _gaps(evidence: ev.ReadinessEvidence, issue_number: int | None) -> list[str]
     elif evidence.checks == ev.ChecksState.FAILED:
         gaps.append(f"required checks failed ({evidence.checks_summary[:120]})")
     if evidence.findings_open:
-        gaps.append("review-bot findings unresolved")
+        gaps.append("review-bot findings without an outcome (reply; resolve only after replying)")
     if not evidence.review_accepted:
         gaps.append("no accepted cross-vendor review of the current head")
     if not evidence.closes_issue:

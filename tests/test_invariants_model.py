@@ -942,7 +942,9 @@ class FactoryModel(RuleBasedStateMachine):
         # (16) closed vocabulary; nothing merges/closes/bypasses.
         for e in effects:
             assert e.kind in EffectKind
-            assert "merge" not in e.kind.value and "close" not in e.kind.value
+            assert "merge" not in e.kind.value
+            # Archiving an Omnigent session is the only "close": never an issue or PR.
+            assert "close" not in e.kind.value or e.kind == EffectKind.CLOSE_SESSION
 
     # ------------------------------------------------------------ state invariants
 

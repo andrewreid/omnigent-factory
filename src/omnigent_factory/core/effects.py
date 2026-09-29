@@ -49,6 +49,8 @@ class EffectKind(enum.StrEnum):
     REPLACE_COST_POLICY = "replace_cost_policy"
     #: Archive the terminal parcel's issue session (idempotent PATCH archived=true).
     CLOSE_SESSION = "close_session"
+    #: Retitle the live issue session after the issue title changed (idempotent PATCH).
+    RENAME_SESSION = "rename_session"
     #: After ``args.not_before_us``: re-read and verify the run's exact policy set
     #: (``args.reconcile``: first re-establish it, then report a new barrier).
     VERIFY_POLICIES = "verify_policies"

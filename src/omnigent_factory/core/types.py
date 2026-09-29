@@ -451,10 +451,18 @@ class IssueSession:
     status: IssueSessionStatus = IssueSessionStatus.LIVE
     #: Why it was retired (dead/unusable reason); audit only.
     reason: str = ""
+    #: The issue title the session is named after ("" = unknown, older records).
+    title: str = ""
 
     @property
     def reusable(self) -> bool:
         return self.status == IssueSessionStatus.LIVE
+
+
+def issue_session_title(issue_number: int | None, title: str) -> str:
+    """The Omnigent title of an issue session: ``#<n> · <issue title>``."""
+    title = " ".join(title.split())
+    return f"#{issue_number} · {title}"[:200] if title else f"#{issue_number}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,6 +496,11 @@ class Readiness:
     checks_summary: str = ""
     #: The head the agent's accepted review attested ("" = ``head_sha``, older records).
     reviewed_head: str = ""
+    #: Review bots get until this time to comment on ``head_sha``: only a green read
+    #: taken at or after it can make the parcel Ready (0 = no wait, older records).
+    settle_at_us: int = 0
+    #: Source time of the read that set ``verified`` (0 = unknown, older records).
+    verified_at_us: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -574,6 +587,11 @@ class Parcel:
     board_note: str = ""
     #: The in-flight daemon board write: at most one per parcel (serialised).
     pending_moves: tuple[PendingMove, ...] = ()
+    #: When the last daemon board write landed: a column read taken before it is stale.
+    board_written_at_us: int = 0
+    #: The issue title from the newest read (whitespace-normalised) and that read's time.
+    issue_title: str = ""
+    issue_title_read_at_us: int = 0
     #: Coalesced desired column awaiting the in-flight write's trusted outcome.
     queued_move: Stage | None = None
     unknown_effects: tuple[UnknownEffect, ...] = ()
@@ -706,6 +724,8 @@ class TrustedConfig:
     max_grant_us: int = 12 * MICROS_PER_HOUR
     cost_usd_per_hour_micros: int = 35_000_000
     phase4_enabled: bool = False
+    #: How long review bots get to comment on a new PR head before it can be Ready.
+    review_grace_us: int = 0
 
     def block_us(self, size: Size) -> int:
         return self.block_hours[size] * MICROS_PER_HOUR

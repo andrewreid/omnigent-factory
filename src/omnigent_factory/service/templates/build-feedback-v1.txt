@@ -1,4 +1,0 @@
-Factory: the owner commented while build run {run_id} waited on checks. Read
-factory_get_feedback and adjust the work within the approved plan (factory_get_plan); if a
-comment asks for more than the plan, ask with factory_ask_owner instead of expanding scope.
-Then submit build_ready for the resulting head, even if it is unchanged.

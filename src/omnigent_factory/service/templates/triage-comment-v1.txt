@@ -1,0 +1,2 @@
+Factory: the owner commented on triage run {run_id}. Read factory_get_feedback and finish
+the triage with factory_submit_result (kind "triage"). Triage stays read-only.

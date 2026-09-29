@@ -27,6 +27,7 @@ HOT_RELOAD_KEYS = frozenset(
         "checkpoint_block_hours",
         "checkpoint_grace_minutes",
         "cost_backstop_usd_per_hour",
+        "review_bot_grace_minutes",
         "independent_reviewer_ids",
         "triage_guidance",
         "engineering_guidance",
@@ -117,6 +118,8 @@ class ServiceConfig(BaseModel):
     checkpoint_block_hours: dict[str, int] = Field(default_factory=lambda: {"S": 2, "M": 4, "L": 6})
     checkpoint_grace_minutes: int = Field(default=15, ge=1, le=120)
     cost_backstop_usd_per_hour: int = Field(default=35, ge=1, le=1000)
+    #: Minutes review bots get to comment on a new PR head before the card can be Ready.
+    review_bot_grace_minutes: int = Field(default=10, ge=0, le=120)
     github_config: Path | None = None
     secrets_dir: Path = Field(
         default_factory=lambda: Path.home() / ".config/omnigent-factory/secrets"
@@ -226,6 +229,7 @@ class ServiceConfig(BaseModel):
             block_hours={Size(key): value for key, value in self.checkpoint_block_hours.items()},
             grace_us=self.checkpoint_grace_minutes * MICROS_PER_MINUTE,
             cost_usd_per_hour_micros=self.cost_backstop_usd_per_hour * 1_000_000,
+            review_grace_us=self.review_bot_grace_minutes * MICROS_PER_MINUTE,
         )
 
     def prepare_private_directories(self) -> None:

@@ -36,6 +36,7 @@ from omnigent_factory.core.types import (
     Parcel,
     SessionKind,
     StageSession,
+    issue_session_title,
 )
 from omnigent_factory.github.adapter import ParcelBinding, TriageFields
 from omnigent_factory.omnigent.directory import FormValue, StageSpec
@@ -105,7 +106,6 @@ class ServiceDispatchDirectory:
             template_name = _RETRIAGE_TEMPLATE  # a re-run on owner feedback
         template = _template(template_name)
         evidence = await self.issue_evidence(parcel)
-        issue_title = " ".join((evidence.title if evidence is not None else "").split())
         return {
             "version": 1,
             "session_id": session.session_id,
@@ -116,7 +116,7 @@ class ServiceDispatchDirectory:
             "base_branch": self.config.default_branch,
             "bind_worktree": previous,
             # The issue session's title (Omnigent keeps it for every later run).
-            "title": f"#{issue} · {issue_title}"[:200] if issue_title else f"#{issue}",
+            "title": issue_session_title(issue, evidence.title if evidence is not None else ""),
             "template": template_name,
             "template_sha256": hashlib.sha256(template.encode()).hexdigest(),
             "untrusted_boundary": _new_boundary(),
@@ -188,10 +188,12 @@ class ServiceDispatchDirectory:
             )
         if purpose == "feedback":
             if spec.kind == SessionKind.BUILD:
-                return _template("build-feedback-v1.txt").format(run_id=sid)
+                return _template("build-feedback-v2.txt").format(run_id=sid)
+            if spec.kind == SessionKind.TRIAGE:
+                return _template("triage-comment-v1.txt").format(run_id=sid)
             return _template("feedback-v3.txt").format(revision=parcel.revision, run_id=sid)
         if purpose == "readiness_wake":
-            return _template("readiness-wake-v2.txt").format(
+            return _template("readiness-wake-v3.txt").format(
                 pr_number=int(str(effect.args.get("pr_number") or 0)),
                 head_sha=str(effect.args.get("head_sha") or ""),
                 reason=str(effect.args.get("reason") or "")[:500],
@@ -574,12 +576,12 @@ class PublicationRenderer:
             body = self._stored_result(effect)
             if body is None:
                 return None
-            text = _public_result(body)
+            text = _public_result(body, agent_display_name(self.config))
         elif effect.kind == EffectKind.POST_COMMENT and effect.args.get("template") == "decision":
             return _safe_publication(self._decision_text(effect), self.config)
         elif effect.kind == EffectKind.POST_COMMENT:
             template = str(effect.args.get("template") or "status")
-            text = _status_text(template, effect.args)
+            text = _status_text(template, effect.args, agent_display_name(self.config))
         else:
             return None
         sid = effect.args.get("session_id") or effect.preconditions.session_id
@@ -598,7 +600,7 @@ class PublicationRenderer:
         return omnigent_link(self.config.omnigent_base_url, session.root_id if session else None)
 
     def _decision_text(self, effect: EffectIntent) -> str:
-        """What Molly is asking, where to answer it, and the ``/decide`` fallback."""
+        """What the agent is asking, where to answer it, and the ``/decide`` fallback."""
         args = effect.args
         decision_id = str(args.get("decision_id") or "")
         summary = str(args.get("summary") or "").strip()
@@ -768,7 +770,7 @@ def _plan_context(plan: dict[str, Any] | None) -> str:
 #: Status comments: only what the owner must read or act on (each one notifies him).
 #: Informational status goes to the card's "Factory note" field instead (reducer).
 _STATUS_TEXT = {
-    "checkpoint": "Factory checkpoint: the granted time is used up and Molly is wrapping up. "
+    "checkpoint": "Factory checkpoint: the granted time is used up and {agent} is wrapping up. "
     "Comment `/continue` (optionally with a duration, e.g. `/continue 2h`) to grant more.",
     "ready-blocked": "Factory: PR #{pr_number} at `{head_sha}` is not Ready: {reason}. "
     "No automatic fix attempt remains; the parcel needs an owner decision.",
@@ -776,7 +778,7 @@ _STATUS_TEXT = {
     "the parcel is Blocked.",
     "adoption-ambiguous": "Factory: could not tell which Omnigent session is ours "
     "({matches} matches); the parcel is Blocked for operator review.",
-    "decision": "Factory: Molly needs a decision (`{decision_id}`, impact {impact}). "
+    "decision": "Factory: {agent} needs a decision (`{decision_id}`, impact {impact}). "
     "Answer it in Omnigent or comment `/decide {decision_id} <answer>`.",
     "stop-unverified": "Factory: a stop could not be verified; the parcel is Blocked until "
     "the session tree is confirmed idle.",
@@ -785,13 +787,20 @@ _STATUS_TEXT = {
 }
 
 
-def _status_text(template: str, args: Mapping[str, Any]) -> str:
+def agent_display_name(config: ServiceConfig) -> str:
+    """The factory agent's name for owner-facing text (config ``omnigent_agent_name``)."""
+    name = " ".join(config.omnigent_agent_name.split())
+    return name[:1].upper() + name[1:] if name else "The factory agent"
+
+
+def _status_text(template: str, args: Mapping[str, Any], agent: str = "The factory agent") -> str:
     fallback = f"Factory status: {template.replace('-', ' ')}."
     pattern = _STATUS_TEXT.get(template)
     if pattern is None:
         return fallback
     values = {key: str(value).replace("_", " ") for key, value in args.items()}
     values.update({key: str(value) for key, value in args.items() if key.endswith("_id")})
+    values["agent"] = agent
     try:
         return pattern.format(**values)
     except (KeyError, IndexError, ValueError):
@@ -813,7 +822,7 @@ def _bullets(items: object) -> str:
     return "\n".join(f"- {item}" for item in items) if isinstance(items, list) and items else ""
 
 
-def _public_result(result: dict[str, Any]) -> str:
+def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> str:
     kind = str(result.get("kind") or "result")
     if kind == "triage":
         recommendation = str(result.get("recommendation") or "").replace("_", " ")
@@ -856,7 +865,7 @@ def _public_result(result: dict[str, Any]) -> str:
         return "\n".join(lines)
     if kind == "blocked":
         lines = [
-            "### Factory: Molly stopped and needs the owner",
+            f"### Factory: {agent} stopped and needs the owner",
             "",
             f"> {' '.join(str(result.get('reason', '')).split())}",
         ]
@@ -975,7 +984,7 @@ def _new_boundary() -> str:
 _FIRST_TEMPLATES = {
     SessionKind.TRIAGE: "triage-v3.txt",
     SessionKind.PLAN: "plan-v3.txt",
-    SessionKind.BUILD: "build-v3.txt",
+    SessionKind.BUILD: "build-v4.txt",
 }
 _RETRIAGE_TEMPLATE = "triage-feedback-v1.txt"
 

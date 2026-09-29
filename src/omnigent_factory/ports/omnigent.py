@@ -29,6 +29,7 @@ OMNIGENT_EFFECT_KINDS = frozenset(
         EffectKind.RECONCILE_SESSION,
         EffectKind.REPLACE_COST_POLICY,
         EffectKind.CLOSE_SESSION,
+        EffectKind.RENAME_SESSION,
         EffectKind.VERIFY_POLICIES,
     }
 )

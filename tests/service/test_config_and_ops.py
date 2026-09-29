@@ -109,3 +109,18 @@ def test_structured_secret_fields_are_redacted():
         "Authorization": "[REDACTED]",
         "webhook_signature": "[REDACTED]",
     }
+
+
+def test_review_bot_grace_defaults_to_ten_minutes_and_is_hot():
+    from omnigent_factory.core.types import MICROS_PER_MINUTE
+    from omnigent_factory.service.config import HOT_RELOAD_KEYS
+
+    config = ServiceConfig(repo_id="R", owners=frozenset({1}))
+    assert config.trusted.review_grace_us == 10 * MICROS_PER_MINUTE
+    assert (
+        ServiceConfig(
+            repo_id="R", owners=frozenset({1}), review_bot_grace_minutes=0
+        ).trusted.review_grace_us
+        == 0
+    )
+    assert "review_bot_grace_minutes" in HOT_RELOAD_KEYS

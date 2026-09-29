@@ -86,6 +86,7 @@ from omnigent_factory.core.types import (
     InboxHoldReason,
     IssueSession,
     IssueSessionStatus,
+    IssueSnapshot,
     Lifecycle,
     Parcel,
     PendingMove,
@@ -105,6 +106,7 @@ from omnigent_factory.core.types import (
     Via,
     WaitReason,
     is_leftward,
+    issue_session_title,
 )
 
 
@@ -172,6 +174,7 @@ _DEFAULT_RETRY: dict[EffectKind, RetryClass] = {
     EffectKind.RECONCILE_SESSION: RetryClass.READ,
     EffectKind.REPLACE_COST_POLICY: RetryClass.ADOPTABLE_WRITE,
     EffectKind.CLOSE_SESSION: RetryClass.READ,  # idempotent archive; safe to repeat
+    EffectKind.RENAME_SESSION: RetryClass.READ,  # idempotent title PATCH
     EffectKind.VERIFY_POLICIES: RetryClass.READ,  # reads, or idempotent re-establishment
     EffectKind.DISABLE_ISSUANCE: RetryClass.LOCAL_IDEMPOTENT,
     EffectKind.ENABLE_ISSUANCE: RetryClass.LOCAL_IDEMPOTENT,
@@ -429,6 +432,8 @@ def _retire_move(ctx: _Ctx, move: PendingMove, *, landed: bool) -> None:
     Otherwise the queued target is issued from the source column.
     """
     ctx.update(pending_moves=tuple(m for m in ctx.p.pending_moves if m.effect_id != move.effect_id))
+    if landed:
+        ctx.update(board_written_at_us=max(ctx.p.board_written_at_us, ctx.now))
     board = move.to_stage if landed else move.from_stage
     if not landed and move.from_stage is not None:
         _observe_stage(ctx, move.from_stage)
@@ -758,6 +763,7 @@ def _apply_evidence(ctx: _Ctx) -> None:
     was_eligible = ctx.p.eligible
     was_in_project = ctx.p.in_project
     ctx.update(eligible=snap.eligible, in_project=snap.in_project)
+    _sync_session_title(ctx, snap)
     if snap.in_project:
         ctx.unhold(Hold.NO_PROJECT_ITEM)
     if was_eligible and not snap.eligible:
@@ -773,9 +779,16 @@ def _apply_evidence(ctx: _Ctx) -> None:
     # daemon board write (the waiver-text check below moves the card to Scoped), so
     # the observation is compared with the persisted column and can never be mistaken
     # for a pending write issued within this same event.
-    if snap.stage is not None and ctx.event.kind not in (
-        EventKind.LEFTWARD_MOVE,
-        EventKind.COLUMN_OBSERVED,
+    # A read taken before the daemon's last landed board write shows the old column: it
+    # is stale, never a move (a late pre-write read once looked like a leftward drag).
+    if (
+        snap.stage is not None
+        and snap.read_at_us >= ctx.p.board_written_at_us
+        and ctx.event.kind
+        not in (
+            EventKind.LEFTWARD_MOVE,
+            EventKind.COLUMN_OBSERVED,
+        )
     ):
         _observe_stage(ctx, snap.stage)
     # Issue text differing from a live waiver is an edit even if the webhook was lost.
@@ -931,6 +944,8 @@ def _maybe_ready(ctx: _Ctx) -> None:
         return
     if _completed(ctx):
         return
+    if r.verified_at_us < r.settle_at_us:
+        return  # review bots still have time to comment on this head
     s = ctx.p.session(r.session_id)
     if s is None or s.session_id != ctx.p.current_session_id:
         return
@@ -1071,12 +1086,7 @@ def _enqueue_build(ctx: _Ctx, approval: Approval, duration_us: int) -> None:
         ctx.p.parcel_id,
     )
     ctx.admission = replace(ctx.admission, next_sequence=seq + 1)
-    ahead = sum(
-        1
-        for q in ctx.admission.queue
-        if q.status == QueueStatus.QUEUED and q.parcel_id != ctx.p.parcel_id and q.sequence < seq
-    )
-    ctx.note(f"Queued: {_ordinal(ahead + 1)} in line at approval")
+    ctx.note(_queued_note(ctx))
     ctx.emit(EffectKind.WAKE_SCHEDULER, target=ctx.admission.repo_id)
 
 
@@ -1296,13 +1306,20 @@ def _plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
     cur = ctx.p.current_session
     if cur is not None and cur.kind == SessionKind.PLAN:
         if executable(ctx.p, cur) and work_allowed(ctx.p, cur):
-            busy = cur.lifecycle == Lifecycle.ACTIVE
+            busy = cur.lifecycle == Lifecycle.ACTIVE and not _idle_run(cur)
             cur = ctx.put_session(
-                replace(cur, revision=ctx.p.revision, lifecycle=Lifecycle.ACTIVE, wait_reason=None)
+                replace(
+                    cur,
+                    revision=ctx.p.revision,
+                    lifecycle=Lifecycle.ACTIVE,
+                    wait_reason=None,
+                    quiescent=cur.quiescent and busy,
+                )
             )
             ctx.unhold(Hold.AWAITING_OWNER)
             if busy:
                 return  # the running turn must read it before it can submit
+            ctx.unhold(Hold.AGENT_BLOCKED, Hold.RESULT_INVALID)
             ctx.emit(
                 EffectKind.SEND_MESSAGE,
                 session=cur,
@@ -1353,6 +1370,8 @@ def _triage_feedback(ctx: _Ctx) -> None:
             return  # recorded; /continue required before execution
         finished = bool(ctx.p.holds & {Hold.AGENT_BLOCKED, Hold.RESULT_INVALID})
         if not (finished or cur.execution_closed) and cur.lifecycle in _TRIAGE_IN_PROGRESS:
+            if _idle_run(cur) and work_allowed(ctx.p, cur):
+                _relay_comment(ctx, cur)  # its turn ended without a result: nudge it
             return  # in progress: it must read the comment before it can submit
     ctx.unhold(*CONTROL_CLEARED_HOLDS)
     _start_stage(ctx, SessionKind.TRIAGE, ctx.config.block_us(ctx.p.size or Size.S))
@@ -1361,11 +1380,15 @@ def _triage_feedback(ctx: _Ctx) -> None:
 def _build_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
     """Building: relay the comment to an idle build within its approval (never voids it)."""
     cur = ctx.p.current_session
+    waiting = (
+        cur is not None
+        and cur.lifecycle == Lifecycle.WAITING
+        and cur.wait_reason == WaitReason.CHECKS
+    )
     if (
         cur is None
         or cur.kind != SessionKind.BUILD
-        or cur.lifecycle != Lifecycle.WAITING
-        or cur.wait_reason != WaitReason.CHECKS
+        or not (waiting or _idle_run(cur))
         or ctx.p.open_decisions
         or not approval_ok(ctx.p)
         or not work_allowed(ctx.p, cur)
@@ -1379,11 +1402,30 @@ def _build_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
             feedback_wakes=cur.feedback_wakes + 1,
         )
     )
-    _ensure_issuance(ctx, cur)
+    _relay_comment(ctx, cur, body.text_digest)
+
+
+def _idle_run(s: StageSession) -> bool:
+    """A live run whose turn ended without a result: its tree was observed idle."""
+    return (
+        s.lifecycle == Lifecycle.ACTIVE
+        and s.quiescent
+        and s.root_id is not None
+        and not s.fences
+        and not s.execution_closed
+    )
+
+
+def _relay_comment(ctx: _Ctx, s: StageSession, digest: str = "") -> None:
+    """Relay an owner comment to an idle run once; it is not re-sent until the tree has
+    been seen idle again, so a burst of comments becomes one message."""
+    ctx.unhold(Hold.AGENT_BLOCKED, Hold.RESULT_INVALID)  # the owner's steer answers it
+    s = ctx.put_session(replace(s, quiescent=False))
+    _ensure_issuance(ctx, s)
     ctx.emit(
         EffectKind.SEND_MESSAGE,
-        session=cur,
-        args={"purpose": MessagePurpose.FEEDBACK.value, "text_digest": body.text_digest},
+        session=s,
+        args={"purpose": MessagePurpose.FEEDBACK.value, "text_digest": digest},
     )
 
 
@@ -1746,6 +1788,8 @@ def _h_column_observed(ctx: _Ctx, body: ev.ColumnObserved) -> None:
         return
     if body.stage is None:
         raise Rejected("column-observation-without-stage")
+    if ctx.now < ctx.p.board_written_at_us:
+        return  # e.g. a late echo of an earlier daemon write: older than the board
     # Observation only (never authority): leftward routes through the safety half.
     _observe_stage(ctx, body.stage)
 
@@ -1954,9 +1998,21 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
     ctx.unhold(Hold.READINESS_FAILED, Hold.CHECKS_FAILED)
     ctx.update(
         readiness=replace(
-            r, verified=True, ready=r.ready or in_ready, checks_summary=body.checks_summary[:200]
+            r,
+            verified=True,
+            ready=r.ready or in_ready,
+            checks_summary=body.checks_summary[:200],
+            verified_at_us=ctx.now,
         )
     )
+
+
+def _settle_at(ctx: _Ctx, head: str) -> int:
+    """Review-bot grace for ``head``: a re-submission of the same head keeps its clock."""
+    r = ctx.p.readiness
+    if r is not None and r.head_sha == head and r.settle_at_us:
+        return r.settle_at_us
+    return ctx.now + ctx.config.review_grace_us
 
 
 def _refreshing(ctx: _Ctx) -> bool:
@@ -1980,6 +2036,8 @@ def _head_changed(ctx: _Ctx, r: Readiness, head: str) -> None:
         verified=False,
         ready=False,
         checks_summary="",
+        settle_at_us=ctx.now + ctx.config.review_grace_us,
+        verified_at_us=0,
     )
     ctx.update(readiness=r)
     ctx.unhold(Hold.CHECKS_FAILED, Hold.READINESS_FAILED)
@@ -2048,7 +2106,7 @@ def _failure_reason(r: Readiness, body: ev.ReadinessEvidence, issue: int | None)
     if body.checks == ev.ChecksState.FAILED:
         parts.append(f"required checks failed ({body.checks_summary[:120]})")
     if body.findings_open:
-        parts.append("review-bot findings are unresolved")
+        parts.append("review-bot findings have no outcome (fixed, follow-up or advisory)")
     if not body.review_accepted:
         parts.append(f"no accepted cross-vendor review of head {r.head_sha[:12]}")
     return "; ".join(parts) or "the PR does not meet the readiness checks"
@@ -2144,8 +2202,41 @@ def _bind_issue_session(ctx: _Ctx, s: StageSession, root_id: str) -> None:
             nonce=s.nonce,
             created_by=s.session_id,
             generation=(old.generation + 1) if old is not None else 1,
+            title=ctx.p.issue_title,  # the directory names a new session after this read
         )
     )
+    if old is not None and old.root_id != root_id and old.status != IssueSessionStatus.CLOSED:
+        _archive(ctx, old.root_id)  # the replaced conversation is kept, but archived
+
+
+def _archive(ctx: _Ctx, root_id: str) -> None:
+    ctx.emit(
+        EffectKind.CLOSE_SESSION,
+        target=root_id,
+        args={"root_id": root_id},
+        dedupe=f"close:{root_id}",
+    )
+
+
+def _sync_session_title(ctx: _Ctx, snap: IssueSnapshot) -> None:
+    """Rename the live issue session when the issue title changes (a newer read wins)."""
+    title = " ".join(snap.title.split())
+    if title and title != ctx.p.issue_title and snap.read_at_us >= ctx.p.issue_title_read_at_us:
+        ctx.update(issue_title=title, issue_title_read_at_us=snap.read_at_us)
+    title = ctx.p.issue_title
+    issue = ctx.p.issue_session
+    if not title or issue is None or not issue.reusable or title == issue.title:
+        return
+    ctx.update(issue_session=replace(issue, title=title))
+    if issue.title:  # "" = an older record: adopt the title without a write
+        ctx.emit(
+            EffectKind.RENAME_SESSION,
+            target=issue.root_id,
+            args={
+                "root_id": issue.root_id,
+                "title": issue_session_title(ctx.p.issue_number, title),
+            },
+        )
 
 
 def _h_create_rejected(ctx: _Ctx, body: ev.CreateRejected) -> None:
@@ -2494,17 +2585,14 @@ def _maybe_close_issue_session(ctx: _Ctx) -> None:
     if not all(settled(s) for s in ctx.p.sessions) or uncertain(ctx.p):
         return
     ctx.update(issue_session=replace(issue, status=IssueSessionStatus.CLOSING))
-    ctx.emit(
-        EffectKind.CLOSE_SESSION,
-        target=issue.root_id,
-        args={"root_id": issue.root_id},
-        dedupe=f"close:{issue.root_id}",
-    )
+    _archive(ctx, issue.root_id)
 
 
 def _h_issue_session_closed(ctx: _Ctx, body: ev.IssueSessionClosed) -> None:
     issue = ctx.p.issue_session
-    if issue is None or issue.root_id != body.root_id:
+    if issue is not None and issue.root_id != body.root_id:
+        return  # a replaced issue session was archived
+    if issue is None:
         raise Rejected("not-the-issue-session")
     if issue.status == IssueSessionStatus.CLOSED:
         raise Rejected("already-closed")
@@ -2650,7 +2738,11 @@ def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
         assert body.pr_number is not None and body.head_sha is not None  # noqa: S101
         ctx.update(
             readiness=Readiness(
-                s.session_id, body.pr_number, body.head_sha, reviewed_head=body.head_sha
+                s.session_id,
+                body.pr_number,
+                body.head_sha,
+                reviewed_head=body.head_sha,
+                settle_at_us=_settle_at(ctx, body.head_sha),
             )
         )
         s = ctx.put_session(
@@ -2953,7 +3045,7 @@ def _awaiting_evidence(ctx: _Ctx) -> bool:
     r = ctx.p.readiness
     return (
         r is not None
-        and not r.verified
+        and (not r.verified or (not r.ready and r.verified_at_us < r.settle_at_us))
         and not _completed(ctx)
         and Hold.PR_CLOSED not in ctx.p.holds
     )
@@ -3098,6 +3190,20 @@ def _react(ctx: _Ctx, accepted: bool) -> None:
     )
 
 
+def _queued_note(ctx: _Ctx) -> str:
+    """The parcel's current place in the build queue (1st = next to be admitted)."""
+    entry = ctx.admission.queue_entry(ctx.p.parcel_id)
+    if entry is None or entry.status != QueueStatus.QUEUED:
+        return ""
+    key = (entry.sequence, entry.parcel_id)
+    ahead = sum(
+        1
+        for q in ctx.admission.queue
+        if q.status == QueueStatus.QUEUED and (q.sequence, q.parcel_id) < key
+    )
+    return f"Queued: {_ordinal(ahead + 1)} in line"
+
+
 def _queued(ctx: _Ctx) -> bool:
     entry = ctx.admission.queue_entry(ctx.p.parcel_id)
     return entry is not None and entry.status == QueueStatus.QUEUED
@@ -3116,6 +3222,10 @@ def _project_board(ctx: _Ctx) -> None:
         drained = old_bot == BotState.WORKING and bot == BotState.IDLE
         if ctx.p.stage != ctx.origin_stage or (bot != old_bot and not drained):
             ctx.update(note="")
+    if bot == BotState.QUEUED and (not ctx.p.note or ctx.p.note.startswith("Queued: ")):
+        # Builds ahead are admitted without an event here: every event (at least the
+        # periodic reconcile) refreshes the position; the board is written on change.
+        ctx.update(note=_queued_note(ctx) or ctx.p.note)
     if bot != old_bot:
         ctx.update(bot=bot)
         ctx.emit(EffectKind.SET_BOT, args={"bot": bot.value})

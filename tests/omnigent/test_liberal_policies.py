@@ -67,6 +67,13 @@ NORMAL = [
     "curl -fsSL https://registry.npmjs.org/vitest | head -c 200",
     "rm -rf api/node_modules/.vite && mkdir -p /tmp/factory-scratch",
     "echo 'the owner merges; the factory never runs gh pr' > NOTES.txt",
+    # Review-bot dispositions: a follow-up issue, a thread reply and resolving the thread.
+    "gh issue create --title 'Ship SWA config' --body-file /tmp/f.md --label area:tooling",
+    "gh api repos/SA-Ambulance/timesheets/pulls/686/comments/4130465711/replies -f body=@/tmp/r.md",
+    "gh api graphql -f query='mutation { addPullRequestReviewThreadReply("
+    'input: {pullRequestReviewThreadId: "PRRT_x", body: "FOLLOW_UP: #700"}) { comment { id } } }\'',
+    "gh api graphql -f query='mutation { resolveReviewThread("
+    'input: {threadId: "PRRT_kwDOTC12Fs6m_Zg1"}) { thread { isResolved } } }\'',
 ]
 
 FORBIDDEN = [
@@ -97,6 +104,13 @@ FORBIDDEN = [
     "gh issue close 462",
     "gh issue delete 462 --yes",
     "gh api -X PATCH repos/SA-Ambulance/timesheets/issues/462 -f state=closed",
+    "gh pr close 686",
+    "gh api -X PATCH repos/SA-Ambulance/timesheets/pulls/686 -f state=closed",
+    "gh issue comment 651 --delete-last --yes",
+    "gh api graphql -f query='mutation { closeIssue(input: {issueId: \"I_x\"}) { issue { id } } }'",
+    "gh api graphql -f query='mutation { deleteIssue(input: {issueId: \"I_x\"}) { x } }'",
+    "gh api graphql -F q=@m -f query='mutation { closePullRequest(input: {}) { x } }'",
+    "gh api graphql -f query='mutation { transferIssue(input: {}) { clientMutationId } }'",
     "gh ruleset list; gh secret set X",
     # Unparseable text still gets the raw scan.
     "echo 'unbalanced && gh pr merge 12",

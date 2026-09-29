@@ -9,6 +9,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from omnigent_factory.omnigent.rest import OmnigentRest
 from omnigent_factory.service.config import ServiceConfig
 from omnigent_factory.service.doctor import run_doctor
 
@@ -201,3 +202,72 @@ async def test_doctor_mcp_checks_fail_without_token_and_on_an_open_endpoint(tmp_
     report = DoctorReport()
     _check_caller_policy(report)
     assert report.ok, report.errors
+
+
+def _live_rest(handler) -> OmnigentRest:
+    return OmnigentRest("https://omnigent.test", transport=httpx.MockTransport(handler))
+
+
+def _resolved_report():
+    from omnigent_factory.service.doctor import DoctorReport
+
+    report = DoctorReport()
+    report.resolved.update(
+        omnigent_agent_id="agent-1", omnigent_host_id="host-1", omnigent_project_id="project-1"
+    )
+    return report
+
+
+@pytest.mark.asyncio
+async def test_doctor_live_creates_and_archives_a_throwaway_session(tmp_path: Path):
+    from omnigent_factory.service.doctor import _check_live_session
+
+    config = ServiceConfig(repo_id="R", owners=frozenset({1}), source_clone=tmp_path)
+    calls: list[tuple[str, str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = __import__("json").loads(request.content)
+        calls.append((request.method, request.url.path, body))
+        if request.method == "POST":
+            return httpx.Response(201, json={"id": "conv_probe"})
+        return httpx.Response(200, json={"id": "conv_probe", "archived": True})
+
+    report = _resolved_report()
+    rest = _live_rest(handler)
+    await _check_live_session(config, rest, report)
+    await rest.aclose()
+    assert report.ok and report.checks["live_session"] == "created and archived conv_probe"
+    (m1, p1, create), (m2, p2, patch) = calls
+    assert (m1, p1, m2, p2) == ("POST", "/v1/sessions", "PATCH", "/v1/sessions/conv_probe")
+    assert create["agent_id"] == "agent-1" and create["project_id"] == "project-1"
+    assert create["initial_items"] == [] and patch == {"archived": True}
+
+
+@pytest.mark.asyncio
+async def test_doctor_live_reports_a_refused_create(tmp_path: Path):
+    """E.g. the server cannot resolve an env variable the agent config references."""
+    from omnigent_factory.service.doctor import _check_live_session
+
+    config = ServiceConfig(repo_id="R", owners=frozenset({1}), source_clone=tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"  # nothing to archive
+        return httpx.Response(
+            422,
+            json={"error": {"code": "unresolved_env", "message": "FACTORY_MCP_TOKEN unset"}},
+        )
+
+    report = _resolved_report()
+    rest = _live_rest(handler)
+    await _check_live_session(config, rest, report)
+    await rest.aclose()
+    assert not report.ok and "HTTP 422 unresolved_env" in report.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_doctor_is_not_live_by_default():
+    import inspect
+
+    from omnigent_factory.service.doctor import run_doctor as doctor
+
+    assert inspect.signature(doctor).parameters["live"].default is False

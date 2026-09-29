@@ -560,7 +560,9 @@ class GitHubAPIAdapter:
         return required
 
     async def _bot_threads_settled(self, pr_number: int) -> bool:
-        """Every review thread opened by a bot is resolved or answered by the factory bot."""
+        """Every review thread opened by a bot has an outcome: answered by the factory bot,
+        or resolved by a person. A thread the factory bot resolved without replying
+        (``resolvedBy`` is a user, so a bot resolver reads as null) is still open."""
         owner, _, name = self.repository.partition("/")
         query = """
         query($owner: String!, $name: String!, $number: Int!, $after: String) {
@@ -569,6 +571,7 @@ class GitHubAPIAdapter:
               reviewThreads(first: 100, after: $after) {
                 nodes {
                   isResolved
+                  resolvedBy { login }
                   comments(first: 50) {
                     nodes { author { __typename ... on Bot { databaseId } } }
                   }
@@ -591,8 +594,10 @@ class GitHubAPIAdapter:
             if not isinstance(nodes, list):
                 raise GitHubAPIError("review threads were unavailable")
             for thread in nodes:
-                if not isinstance(thread, dict) or thread.get("isResolved") is True:
+                if not isinstance(thread, dict):
                     continue
+                if thread.get("isResolved") is True and thread.get("resolvedBy"):
+                    continue  # a person resolved it
                 comments = thread.get("comments")
                 authors = [
                     c.get("author") or {}

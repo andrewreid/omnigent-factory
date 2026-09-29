@@ -7,6 +7,9 @@ the approved plan; if one asks for more than the plan, ask with factory_ask_owne
 Use only the factory git credential helper and the gh wrapper at {gh_wrapper}; the
 capability handle is {capability_file}. Carry those paths into every worker dispatch. The PR
 body must include `Closes #{issue_number}`. Never merge.
+Each review-bot finding needs an outcome: fix it in scope; valid but out of scope: open a
+follow-up issue, reply with the disposition and link, resolve; advisory: reply with the
+rationale, resolve. Only resolve threads you have replied to.
 Finish with factory_submit_result (kind "build_ready", or "blocked"); while CI or review
 bots are pending, submit current evidence and end the turn: the factory will wake you.
 Active-time budget: {granted_minutes} minutes.

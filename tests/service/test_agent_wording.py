@@ -1,0 +1,43 @@
+"""Owner-facing text names the configured agent, never a hard-coded one, and the build
+prompts carry the agreed review-bot disposition rule."""
+
+from __future__ import annotations
+
+from importlib.resources import files
+
+from omnigent_factory.service.config import ServiceConfig
+from omnigent_factory.service.directory import (
+    _STATUS_TEXT,
+    _public_result,
+    _status_text,
+    agent_display_name,
+)
+
+
+def test_agent_name_comes_from_config():
+    base = {"repo_id": "R", "owners": frozenset({1})}
+    assert agent_display_name(ServiceConfig(**base, omnigent_agent_name="rosie")) == "Rosie"
+    assert agent_display_name(ServiceConfig(**base, omnigent_agent_name=" ")) == (
+        "The factory agent"
+    )
+
+
+def test_blocked_report_and_status_comments_name_the_configured_agent():
+    blocked = _public_result({"kind": "blocked", "reason": "needs a decision"}, "Rosie")
+    assert blocked.startswith("### Factory: Rosie stopped and needs the owner")
+    args = {"decision_id": "d1", "impact": "within_contract", "pr_number": 1, "head_sha": "a"}
+    texts = [_status_text(name, {**args, "reason": "x"}, "Rosie") for name in _STATUS_TEXT]
+    assert any("Rosie is wrapping up" in text for text in texts)
+    assert any("Rosie needs a decision" in text for text in texts)
+    assert not any("Molly" in text for text in [blocked, *texts])
+    assert "The factory agent stopped" in _public_result({"kind": "blocked", "reason": "x"})
+
+
+def test_build_prompts_carry_the_review_bot_disposition_rule():
+    root = files("omnigent_factory.service") / "templates"
+    for name in ("build-v4.txt", "readiness-wake-v3.txt"):
+        text = " ".join((root / name).read_text("utf-8").split())
+        assert "follow-up issue" in text and "resolve" in text, name
+        assert "Only resolve threads you have replied to." in text, name
+    wake = " ".join((root / "readiness-wake-v3.txt").read_text("utf-8").split())
+    assert "submit build_ready, not blocked" in wake

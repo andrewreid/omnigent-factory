@@ -63,7 +63,11 @@ Outcome contract per effect kind (``Ack.detail`` keys are stable):
     ``reconciled`` with a fresh ``ready_at_us``; the verification follows as a new effect.
 ``CLOSE_SESSION``
     ``PATCH /v1/sessions/{root}`` ``{"archived": true}`` for a terminal parcel's issue
-    session (idempotent; a missing root counts as closed). Other failures are retryable.
+    session or one replaced by a fresh session (idempotent; a missing root counts as
+    closed). Other failures are retryable.
+``RENAME_SESSION``
+    ``PATCH /v1/sessions/{root}`` ``{"title": args.title}`` after the issue title changed
+    (idempotent; a missing root is ignored). Other failures are retryable.
 """
 
 from __future__ import annotations
@@ -234,6 +238,7 @@ class OmnigentExecutionAdapter:
             EffectKind.RECONCILE_SESSION: self._reconcile,
             EffectKind.REPLACE_COST_POLICY: self._replace_cost,
             EffectKind.CLOSE_SESSION: self._close,
+            EffectKind.RENAME_SESSION: self._rename,
             EffectKind.VERIFY_POLICIES: self._verify,
         }
         handler = handlers.get(effect.kind)
@@ -812,6 +817,19 @@ class OmnigentExecutionAdapter:
             return Ack(remote_id=root, detail={"archived": False, "gone": True})
         # PATCH archived=true is idempotent: any other outcome is simply retried.
         return RetryableReadFailure(f"archive failed: {resp.status or resp.error}", 60_000_000)
+
+    async def _rename(self, effect: EffectIntent) -> AdapterOutcome:
+        """Retitle the issue session after the issue title changed (idempotent PATCH)."""
+        root = effect.args.get("root_id")
+        title = effect.args.get("title")
+        if not isinstance(root, str) or not root or not isinstance(title, str) or not title:
+            return DefinitiveFailure("no root or title to rename")
+        resp = await self.rest.patch_json(f"/v1/sessions/{root}", {"title": title})
+        if classify_write(resp) == WriteClass.OK:
+            return Ack(remote_id=root, detail={"title": title})
+        if resp.status == 404:
+            return Ack(remote_id=root, detail={"gone": True})
+        return RetryableReadFailure(f"rename failed: {resp.status or resp.error}", 60_000_000)
 
 
 def _cost(snap: Mapping[str, Any]) -> float | None:

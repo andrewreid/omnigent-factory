@@ -195,6 +195,17 @@ async def test_close_archives_the_issue_session(git_env: GitEnv) -> None:
     assert isinstance(await rig.adapter.execute(other, CTX), RetryableReadFailure)
 
 
+async def test_rename_retitles_the_issue_session(git_env: GitEnv) -> None:
+    rig = make_rig(git_env)
+    root = await _root_with_triage_run(rig)
+    rename = intent(EffectKind.RENAME_SESSION, "T1", root_id=root, title="#1 · New title")
+    outcome = await rig.adapter.execute(rename, CTX)
+    assert isinstance(outcome, Ack) and rig.server.sessions[root].title == "#1 · New title"
+    assert observations(rename, outcome) == ()
+    del rig.server.sessions[root]
+    assert isinstance(await rig.adapter.execute(rename, CTX), Ack)  # gone: nothing to do
+
+
 async def test_verify_waits_the_barrier_then_checks_the_exact_set(git_env: GitEnv) -> None:
     rig = make_rig(git_env)
     root = await _root_with_triage_run(rig)

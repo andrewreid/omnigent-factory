@@ -183,9 +183,12 @@ async def test_failing_commit_status_is_not_ready():
     assert isinstance(outcome, Ack) and outcome.detail["verified"] is False
 
 
-def _thread(*authors: tuple[str, int | None], resolved: bool = False) -> dict[str, Any]:
+def _thread(
+    *authors: tuple[str, int | None], resolved: bool = False, by: str | None = None
+) -> dict[str, Any]:
     return {
         "isResolved": resolved,
+        "resolvedBy": {"login": by} if by else None,
         "comments": {
             "nodes": [
                 {"author": {"__typename": kind, **({"databaseId": db} if db else {})}}
@@ -201,9 +204,10 @@ async def test_unresolved_bot_review_thread_blocks_until_resolved_or_answered():
     outcome = await evidence(server(threads=unresolved))
     assert isinstance(outcome, Ack) and outcome.detail["findings_dispositioned"] is False
     answered = [_thread(("Bot", 999), ("Bot", BOT_ID))]
-    resolved = [_thread(("Bot", 999), resolved=True)]
+    resolved = [_thread(("Bot", 999), resolved=True, by="andrewreid")]
     human = [_thread(("User", None))]  # the owner's thread is a merge-time concern
-    for threads in (answered, resolved, human):
+    replied_and_resolved = [_thread(("Bot", 999), ("Bot", BOT_ID), resolved=True)]
+    for threads in (answered, resolved, human, replied_and_resolved):
         outcome = await evidence(server(threads=threads))
         assert isinstance(outcome, Ack) and outcome.detail["verified"] is True, threads
 
@@ -242,3 +246,12 @@ async def test_head_moved_since_the_report_is_not_verified():
             CTX,
         )
     assert isinstance(outcome, Ack) and outcome.detail["verified"] is False
+
+
+@pytest.mark.asyncio
+async def test_bot_resolving_a_thread_without_a_reply_is_not_an_outcome():
+    """The factory bot may resolve only threads it replied to: GitHub reports a bot
+    resolver as ``resolvedBy: null``, so a silent resolve leaves the finding open."""
+    silent = [_thread(("Bot", 999), resolved=True)]
+    outcome = await evidence(server(threads=silent))
+    assert isinstance(outcome, Ack) and outcome.detail["findings_dispositioned"] is False
