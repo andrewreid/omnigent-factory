@@ -1,0 +1,3 @@
+The daemon recorded grant {grant_id} and reopened this stage after rechecking authority.
+Continue the previously approved outcome from the current worktree, applying any new owner
+comments (factory_get_feedback). Do not broaden scope or merge a pull request.

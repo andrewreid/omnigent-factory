@@ -1,4 +1,0 @@
-Factory: the owner gave feedback on the plan (revision {revision} of run {run_id}).
-Read it with factory_get_feedback, revise the plan, and submit it with
-factory_submit_result (kind "plan"). Ask only if a decision changes scope, behaviour, cost
-or risk.

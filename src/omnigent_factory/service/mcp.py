@@ -69,7 +69,7 @@ from omnigent_factory.service.directory import (
     untrusted_block,
 )
 from omnigent_factory.service.runtime import FactoryService
-from omnigent_factory.store.sqlite import McpReceipt
+from omnigent_factory.store.sqlite import McpReceipt, SqliteStore
 
 TOOL_NAMES = (
     "factory_get_issue",
@@ -90,6 +90,8 @@ _STAGE_KINDS: dict[SessionKind, frozenset[str]] = {
     SessionKind.BUILD: frozenset({"build_ready", "blocked", "plan"}),
 }
 _SUBMITTABLE = frozenset({Lifecycle.ACTIVE, Lifecycle.WAITING, Lifecycle.CHECKPOINT_GRACE})
+#: Results refused while the run has unread owner comments ("blocked" is always accepted).
+_FEEDBACK_GATED = frozenset({"triage", "plan", "build_ready"})
 
 
 class FactoryToolError(ToolError):
@@ -269,11 +271,11 @@ class FactoryTools:
     async def get_feedback(self, session_id: str) -> dict[str, Any]:
         caller = await self.resolve(session_id)
         parcel, run = caller.parcel, caller.run
-        since = 0
-        if run is not None:
-            auth = parcel.authorization(run.authorization_id)
-            since = auth.source_time_us if auth is not None else 0
-        comments = await self.directory.owner_comments(parcel, since_us=since)
+        comments = await self.directory.owner_comments(parcel)
+        since = await self._new_since(caller)
+        if run is not None and comments:
+            run_id, newest = run.session_id, max(int(c["sequence"]) for c in comments)
+            await self.service.db.call(lambda store: store.record_feedback_read(run_id, newest))
         boundary = self._boundary(run)
         answers = [
             {
@@ -288,10 +290,52 @@ class FactoryTools:
         ]
         return {
             **self._header(caller),
-            "since_us": since,
-            "owner_comments": [self._comment(c, boundary) for c in comments],
+            "new_since_us": since,
+            "owner_comments": [
+                {**self._comment(c, boundary), "new": int(c["at_us"]) >= since} for c in comments
+            ],
             "decisions": answers,
+            "note": "Every owner comment on the issue, oldest first: the owner's directions "
+            "for this issue, a later comment overriding an earlier one. new = posted since "
+            "your last result for this stage (or since this run started).",
         }
+
+    async def _new_since(self, caller: Caller) -> int:
+        """This session's last result time for the run's stage, else the run's start."""
+        run = caller.run
+        if run is None:
+            return 0
+        runs = [
+            s.session_id
+            for s in caller.parcel.sessions
+            if s.kind == run.kind and s.root_id == caller.session_id
+        ]
+        rows = await self.service.db.call(
+            lambda store: store.query(
+                "SELECT MAX(created_at_us) FROM mcp_receipts WHERE tool = 'submit' "
+                "AND run_id IN (SELECT value FROM json_each(?))",
+                (json.dumps(runs),),
+            )
+        )
+        if rows and rows[0][0] is not None:
+            return int(rows[0][0])
+        auth = caller.parcel.authorization(run.authorization_id)
+        return auth.source_time_us if auth is not None else 0
+
+    async def _unread_feedback(self, parcel: Parcel, run: StageSession) -> bool:
+        """An owner comment was recorded after the newest one ``run`` has read."""
+        run_id, parcel_id = run.session_id, parcel.parcel_id
+
+        def unread(store: SqliteStore) -> bool:
+            seen = store.feedback_read(run_id)
+            rows = store.query(
+                "SELECT 1 FROM events WHERE parcel_id = ? AND kind = ? AND accepted = 1 "
+                "AND sequence > ? LIMIT 1",
+                (parcel_id, EventKind.PLAN_FEEDBACK.value, seen),
+            )
+            return bool(rows)
+
+        return bool(await self.service.db.call(unread))
 
     async def get_status(self, session_id: str) -> dict[str, Any]:
         caller = await self.resolve(session_id)
@@ -519,6 +563,7 @@ class FactoryTools:
             body=body,
             receipt=receipt,
             parsed=(slot, parsed),
+            feedback_gate=kind in _FEEDBACK_GATED and not in_checkpoint,
         )
 
     # ------------------------------------------------------------------ helpers
@@ -606,6 +651,7 @@ class FactoryTools:
         body: ev.EventBody,
         receipt: Callable[[Parcel], dict[str, Any]],
         parsed: tuple[str, ParsedResult] | None = None,
+        feedback_gate: bool = False,
     ) -> dict[str, Any]:
         parcel_id = caller.parcel.parcel_id
         async with self.service.serializers.lock(parcel_id):
@@ -616,6 +662,11 @@ class FactoryTools:
             if current.run is None or current.run.session_id != run.session_id:
                 raise FactoryToolError("the run changed; call factory_get_status")
             self._check_gate(current, current.run)
+            if feedback_gate and await self._unread_feedback(current.parcel, current.run):
+                raise FactoryToolError(
+                    "the owner commented since you last read feedback: call "
+                    "factory_get_feedback, apply the owner's directions, then submit again"
+                )
             previous_latest: dict[str, Any] | None = None
             if parsed is not None:
                 previous_latest = self.directory.save_result(run.session_id, *parsed)
@@ -727,7 +778,9 @@ def _slot(run: StageSession, kind: str, payload: Mapping[str, Any]) -> str:
         return f"plan-r{run.revision}"
     if kind == "build_ready":
         head = payload.get("head_sha")
-        return f"build-{head}" if isinstance(head, str) and _SHA40.fullmatch(head) else "build"
+        slot = f"build-{head}" if isinstance(head, str) and _SHA40.fullmatch(head) else "build"
+        # Each owner comment relayed to a waiting build opens a new slot for the same head.
+        return f"{slot}-f{run.feedback_wakes}" if run.feedback_wakes else slot
     return "blocked"
 
 

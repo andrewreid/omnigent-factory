@@ -1,0 +1,8 @@
+Factory triage run {run_id} for {repository} issue #{issue_number}.
+Your Omnigent session id is {session_id}: pass it as session_id to every factory tool.
+{handoff}
+Start with factory_get_issue, then factory_get_feedback: owner comments are the owner's
+directions (a later one overrides an earlier one). Triage is read-only: do not edit, push,
+comment or open a pull request. Ask material owner questions with factory_ask_owner. Finish
+with factory_submit_result (kind "triage", or "blocked" if you cannot finish).
+Active-time budget: {granted_minutes} minutes.

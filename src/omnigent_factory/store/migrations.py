@@ -484,10 +484,21 @@ CREATE TABLE mcp_plan_reads (
 );
 """
 
+# Owner feedback reads: the newest owner-comment event (by sequence) a run has fetched
+# with factory_get_feedback. A result is refused while newer owner comments are unread.
+V6_SQL = """
+CREATE TABLE mcp_feedback_reads (
+    run_id TEXT PRIMARY KEY,
+    sequence INTEGER NOT NULL,
+    read_at_us INTEGER NOT NULL
+);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
     Migration(3, "delivery-resolution-backoff", V3_SQL),
     Migration(4, "parked-delivery-reason", V4_SQL),
     Migration(5, "issue-sessions-and-mcp", V5_SQL),
+    Migration(6, "mcp-feedback-reads", V6_SQL),
 )

@@ -100,7 +100,9 @@ class ServiceDispatchDirectory:
         issue = parcel.issue_number or 0
         branch = f"factory/issue-{issue or _safe(parcel.parcel_id)}"
         previous = await self._previous_worktree(parcel, session, branch)
-        template_name = f"{session.kind.value}-v2.txt"
+        template_name = _FIRST_TEMPLATES[session.kind]
+        if session.kind == SessionKind.TRIAGE and self.latest_triage(parcel) is not None:
+            template_name = _RETRIAGE_TEMPLATE  # a re-run on owner feedback
         template = _template(template_name)
         evidence = await self.issue_evidence(parcel)
         issue_title = " ".join((evidence.title if evidence is not None else "").split())
@@ -167,8 +169,6 @@ class ServiceDispatchDirectory:
         snapshot = self._read(self.root / f"{_safe(sid)}.json")
         if snapshot is None:
             return None
-        template_name = str(snapshot.get("template") or "")
-        template = _template(template_name)
         boundary = snapshot.get("untrusted_boundary")
         if not isinstance(boundary, str) or not boundary:
             boundary = _new_boundary()
@@ -178,7 +178,7 @@ class ServiceDispatchDirectory:
         if purpose == "checkpoint_cleanup":
             return _template("checkpoint-v2.txt").format(grant_id=spec.grant_id, run_id=sid)
         if purpose == "continuation":
-            return _template("continuation-v1.txt").format(grant_id=spec.grant_id)
+            return _template("continuation-v2.txt").format(grant_id=spec.grant_id)
         if purpose == "answer_relay":
             decision = parcel.decision(str(effect.args.get("decision_id") or ""))
             if decision is None or decision.answer is None:
@@ -187,7 +187,9 @@ class ServiceDispatchDirectory:
                 decision_id=decision.decision_id, answer=decision.answer
             )
         if purpose == "feedback":
-            return _template("feedback-v2.txt").format(revision=parcel.revision, run_id=sid)
+            if spec.kind == SessionKind.BUILD:
+                return _template("build-feedback-v1.txt").format(run_id=sid)
+            return _template("feedback-v3.txt").format(revision=parcel.revision, run_id=sid)
         if purpose == "readiness_wake":
             return _template("readiness-wake-v2.txt").format(
                 pr_number=int(str(effect.args.get("pr_number") or 0)),
@@ -201,6 +203,10 @@ class ServiceDispatchDirectory:
                 return None
             return _template("operator-v2.txt").format(note=note, run_id=sid)
         # The dispatch snapshot pins the first message's template bytes (restart-stable).
+        try:
+            template = _template(str(snapshot.get("template") or ""))
+        except FileNotFoundError:
+            return None  # pinned to a template this release no longer ships
         if hashlib.sha256(template.encode()).hexdigest() != snapshot.get("template_sha256"):
             return None
         # A short pointer: the factory tools are the source of truth for the issue, plan,
@@ -395,7 +401,7 @@ class ServiceDispatchDirectory:
         kinds_json = json.dumps([k.value for k in wanted])
         rows = await self.db.call(
             lambda store: store.query(
-                "SELECT e.event_id, e.kind, e.source_time_us, d.body FROM events e "
+                "SELECT e.event_id, e.kind, e.source_time_us, d.body, e.sequence FROM events e "
                 "JOIN deliveries d ON e.delivery_guid = d.delivery_guid "
                 "WHERE e.parcel_id = ? AND e.accepted = 1 "
                 "AND e.kind IN (SELECT value FROM json_each(?)) "
@@ -412,6 +418,7 @@ class ServiceDispatchDirectory:
                         "event_id": str(row[0]),
                         "kind": str(row[1]),
                         "at_us": int(row[2]),
+                        "sequence": int(row[4]),
                         "text": text,
                     }
                 )
@@ -1023,6 +1030,15 @@ def _untrusted(text: str, boundary: str) -> str:
 
 def _new_boundary() -> str:
     return f"FACTORY_DATA_{secrets.token_hex(16)}"
+
+
+#: First-message template of each stage run (the dispatch snapshot pins name and bytes).
+_FIRST_TEMPLATES = {
+    SessionKind.TRIAGE: "triage-v3.txt",
+    SessionKind.PLAN: "plan-v3.txt",
+    SessionKind.BUILD: "build-v3.txt",
+}
+_RETRIAGE_TEMPLATE = "triage-feedback-v1.txt"
 
 
 def _template(name: str) -> str:

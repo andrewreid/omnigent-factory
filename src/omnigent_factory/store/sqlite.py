@@ -546,6 +546,23 @@ class SqliteStore:
         ).fetchone()
         return row is not None
 
+    def record_feedback_read(self, run_id: str, sequence: int) -> None:
+        """``run_id`` has read every owner comment up to event ``sequence``."""
+        with self._txn() as conn:
+            conn.execute(
+                "INSERT INTO mcp_feedback_reads (run_id, sequence, read_at_us) VALUES (?, ?, ?) "
+                "ON CONFLICT (run_id) DO UPDATE SET sequence = max(sequence, excluded.sequence), "
+                "read_at_us = excluded.read_at_us",
+                (run_id, sequence, self._clock.now_utc_us()),
+            )
+
+    def feedback_read(self, run_id: str) -> int:
+        """The newest owner-comment event sequence ``run_id`` has read (-1: none)."""
+        row = self._conn.execute(
+            "SELECT sequence FROM mcp_feedback_reads WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return int(row[0]) if row is not None else -1
+
     def _apply_in_txn(
         self,
         conn: sqlite3.Connection,

@@ -1247,10 +1247,27 @@ def _h_request_replan(ctx: _Ctx, body: ev.RequestReplan) -> None:
 
 
 def _h_plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
+    """A plain owner comment (not a command): the owner steering the current stage.
+
+    Every accepted comment is recorded (``factory_get_feedback`` serves them to all later
+    runs). What it starts depends on the column: Triaged re-runs triage, Scoped revises
+    the plan, Building nudges the build within its approval; elsewhere nothing starts.
+    A run that is executing a turn gets no message: ``factory_submit_result`` refuses a
+    result until the run has read every recorded comment, so a burst of comments folds
+    into the run in progress instead of queuing several re-runs.
+    """
     _control(ctx)
     _require_eligible(ctx)
-    if ctx.origin_stage != Stage.SCOPED:
-        raise Rejected("feedback-outside-scoped")
+    stage = ctx.origin_stage
+    if stage == Stage.SCOPED:
+        _plan_feedback(ctx, body)
+    elif stage == Stage.TRIAGED:
+        _triage_feedback(ctx)
+    elif stage == Stage.BUILDING:
+        _build_feedback(ctx, body)
+
+
+def _plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
     ctx.update(
         revision=ctx.p.revision + 1,
         revision_pending=True,
@@ -1260,10 +1277,13 @@ def _h_plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
     cur = ctx.p.current_session
     if cur is not None and cur.kind == SessionKind.PLAN:
         if executable(ctx.p, cur) and work_allowed(ctx.p, cur):
+            busy = cur.lifecycle == Lifecycle.ACTIVE
             cur = ctx.put_session(
                 replace(cur, revision=ctx.p.revision, lifecycle=Lifecycle.ACTIVE, wait_reason=None)
             )
             ctx.unhold(Hold.AWAITING_OWNER)
+            if busy:
+                return  # the running turn must read it before it can submit
             ctx.emit(
                 EffectKind.SEND_MESSAGE,
                 session=cur,
@@ -1289,6 +1309,63 @@ def _h_plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
     # No usable current plan: fresh owner feedback is a new plan control.
     ctx.unhold(*CONTROL_CLEARED_HOLDS)
     _start_stage(ctx, SessionKind.PLAN, ctx.config.block_us(ctx.p.size or Size.M))
+
+
+_TRIAGE_IN_PROGRESS = frozenset(
+    {
+        Lifecycle.INTENT,
+        Lifecycle.CREATING,
+        Lifecycle.PREPARING,
+        Lifecycle.ACTIVE,
+        Lifecycle.WAITING,
+        Lifecycle.UNKNOWN,
+    }
+)
+
+
+def _triage_feedback(ctx: _Ctx) -> None:
+    """Triaged: re-run triage in the issue session unless a triage run will read it anyway."""
+    pending = ctx.p.authorization(ctx.p.pending_authorization_id)
+    if pending is not None and not pending.cancelled:
+        return  # the pending run reads every comment before it submits
+    cur = ctx.p.current_session
+    if cur is not None and cur.kind == SessionKind.TRIAGE and not cur.fences:
+        if cur.lifecycle in (Lifecycle.CHECKPOINT_GRACE, Lifecycle.CHECKPOINT_WAIT):
+            return  # recorded; /continue required before execution
+        finished = bool(ctx.p.holds & {Hold.AGENT_BLOCKED, Hold.RESULT_INVALID})
+        if not (finished or cur.execution_closed) and cur.lifecycle in _TRIAGE_IN_PROGRESS:
+            return  # in progress: it must read the comment before it can submit
+    ctx.unhold(*CONTROL_CLEARED_HOLDS)
+    _start_stage(ctx, SessionKind.TRIAGE, ctx.config.block_us(ctx.p.size or Size.S))
+
+
+def _build_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
+    """Building: relay the comment to an idle build within its approval (never voids it)."""
+    cur = ctx.p.current_session
+    if (
+        cur is None
+        or cur.kind != SessionKind.BUILD
+        or cur.lifecycle != Lifecycle.WAITING
+        or cur.wait_reason != WaitReason.CHECKS
+        or ctx.p.open_decisions
+        or not approval_ok(ctx.p)
+        or not work_allowed(ctx.p, cur)
+    ):
+        return  # recorded: a running, queued or paused build reads it before submitting
+    cur = ctx.put_session(
+        replace(
+            cur,
+            lifecycle=Lifecycle.ACTIVE,
+            wait_reason=None,
+            feedback_wakes=cur.feedback_wakes + 1,
+        )
+    )
+    _ensure_issuance(ctx, cur)
+    ctx.emit(
+        EffectKind.SEND_MESSAGE,
+        session=cur,
+        args={"purpose": MessagePurpose.FEEDBACK.value, "text_digest": body.text_digest},
+    )
 
 
 def _h_approve_plan(ctx: _Ctx, body: ev.ApprovePlan) -> None:

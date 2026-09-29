@@ -423,6 +423,9 @@ class StageSession:
     policy_ready: bool = True
     #: Not-before time of the pending post-barrier policy verification (0: none pending).
     policy_ready_at_us: int = 0
+    #: Owner comments relayed to this (build) run while it waited on checks; each one
+    #: opens a fresh result slot so the run can re-submit the same head.
+    feedback_wakes: int = 0
 
 
 @dataclass(frozen=True, slots=True)

@@ -81,6 +81,16 @@ Create the token once with `omnigent-factory setup mcp-token` (written to
 and a dry compile of the identity policy. The factory clone's `info/exclude` ignores
 `/.molly/`.
 
+### Steering by comment
+
+Every plain (non-command) comment from an owner is recorded, and `factory_get_feedback`
+serves all of them to every later run, oldest first, flagged `new` since the session's
+last result for that stage. In Triaged a comment re-runs triage in the issue session (a
+revised triage comment follows); in Scoped it revises the plan; in Building it is relayed
+to a build waiting on checks without touching the approval. Elsewhere it only waits for
+later stages. A run that is mid-turn gets no extra message: its result is refused until
+it has read every comment, so a burst of comments folds into the run in progress.
+
 ### Finished parcels
 
 When a parcel's PR is merged or its issue is closed, the daemon removes its worktree and

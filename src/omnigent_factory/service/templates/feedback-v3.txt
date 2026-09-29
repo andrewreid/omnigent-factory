@@ -1,0 +1,4 @@
+Factory: the owner commented on the plan (revision {revision} of run {run_id}).
+Read factory_get_feedback (a later comment overrides an earlier one), revise the plan, and
+submit it with factory_submit_result (kind "plan"). Ask only if a decision changes scope,
+behaviour, cost or risk.
