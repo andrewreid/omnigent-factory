@@ -369,6 +369,8 @@ class StageAuthorization:
     grant_duration_us: int
     approval_id: str | None = None
     cancelled: bool = False
+    #: A build re-run on owner feedback after the work was built (same approval).
+    rework: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -725,7 +727,6 @@ class TrustedConfig:
     grace_us: int = 15 * MICROS_PER_MINUTE
     max_grant_us: int = 12 * MICROS_PER_HOUR
     cost_usd_per_hour_micros: int = 35_000_000
-    phase4_enabled: bool = False
     #: How long review bots get to comment on a new PR head before it can be Ready.
     review_grace_us: int = 0
 

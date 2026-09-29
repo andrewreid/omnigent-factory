@@ -1076,9 +1076,12 @@ def _relay_answers(ctx: _Ctx, s: StageSession) -> None:
         ctx.put_session(replace(s, lifecycle=Lifecycle.ACTIVE, wait_reason=None))
 
 
-def _enqueue_build(ctx: _Ctx, approval: Approval, duration_us: int) -> None:
+def _enqueue_build(
+    ctx: _Ctx, approval: Approval, duration_us: int, *, rework: bool = False
+) -> None:
     auth = _new_authorization(ctx, SessionKind.BUILD, duration_us, approval.approval_id)
-    _ = auth
+    if rework:
+        ctx.put_authorization(replace(auth, rework=True))
     seq = ctx.admission.next_sequence
     _set_queue(
         ctx,
@@ -1168,7 +1171,7 @@ _NO_RECOVERY_STAGES = frozenset({Stage.READY, Stage.DONE})
 def _stopped_recovery(ctx: _Ctx) -> bool:
     """§2.6B "any eligible stopped stage": a stop/safety barrier left no live work.
 
-    Ready (and legacy Done) are excluded: rework from Ready is the phase-4 control row.
+    Ready (and legacy Done) are excluded: owner feedback on a Ready card is rework.
     """
     p = ctx.p
     return (
@@ -1245,12 +1248,12 @@ def _replan(ctx: _Ctx, via: Via | None) -> None:
 
 def _plan_control(ctx: _Ctx, via: Via | None) -> None:
     """§2.6B plan rows: Inbox/Triaged/Scoped or stopped recovery start a plan;
-    Building replans (revoking any build); Ready rework is the phase-4 control row."""
+    Building replans (revoking any build); Ready takes rework, not a plan."""
     _control(ctx)
     _require_eligible(ctx)
     stage = ctx.origin_stage
     if stage in _NO_RECOVERY_STAGES:
-        raise Rejected("rework-requires-phase4-control", explain=True)
+        raise Rejected("plan-not-allowed-from-ready", explain=True)
     if (
         ctx.event.kind == EventKind.REQUEST_PLAN
         and stage == Stage.SCOPED
@@ -1280,7 +1283,8 @@ def _h_plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
 
     Every accepted comment is recorded (``factory_get_feedback`` serves them to all later
     runs). What it starts depends on the column: Triaged re-runs triage, Scoped revises
-    the plan, Building nudges the build within its approval; elsewhere nothing starts.
+    the plan, Building nudges the build within its approval (or reworks a finished one),
+    Ready reworks the build (see ``_rework``); elsewhere nothing starts.
     A run that is executing a turn gets no message: ``factory_submit_result`` refuses a
     result until the run has read every recorded comment, so a burst of comments folds
     into the run in progress instead of queuing several re-runs.
@@ -1294,6 +1298,8 @@ def _h_plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
         _triage_feedback(ctx)
     elif stage == Stage.BUILDING:
         _build_feedback(ctx, body)
+    elif stage == Stage.READY:
+        _feedback_rework(ctx)
 
 
 def _plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
@@ -1396,6 +1402,9 @@ def _build_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
     ):
         ctx.put_session(replace(cur, comment_pending=True))  # see _h_tree_quiescent
         return
+    if _build_ended(ctx):
+        _feedback_rework(ctx)  # e.g. Needs you with no fix attempt left, run closed
+        return
     if (
         cur is None
         or cur.kind != SessionKind.BUILD
@@ -1405,6 +1414,10 @@ def _build_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
         or not work_allowed(ctx.p, cur)
     ):
         return  # recorded: a running, queued or paused build reads it before submitting
+    if Hold.READINESS_FAILED in ctx.p.holds:
+        # Needs you on readiness: the owner's steer restarts the loop with a fresh fix budget.
+        ctx.unhold(Hold.READINESS_FAILED, Hold.REWORK_CONTROL_REQUIRED)
+        ctx.update(readiness_wakes=0)
     cur = ctx.put_session(
         replace(
             cur,
@@ -1438,6 +1451,66 @@ def _relay_comment(ctx: _Ctx, s: StageSession, digest: str = "") -> None:
         session=s,
         args={"purpose": MessagePurpose.FEEDBACK.value, "text_digest": digest},
     )
+
+
+def _build_ended(ctx: _Ctx) -> bool:
+    """Building with no build running, queued or paused at a checkpoint (its run closed)."""
+    cur = ctx.p.current_session
+    if _approval_active(ctx):
+        return False
+    if cur is None or cur.kind != SessionKind.BUILD:
+        return cur is None or settled(cur)
+    return (
+        settled(cur)
+        and (cur.execution_closed or cur.lifecycle == Lifecycle.RETIRED)
+        and not cur.fences & {FenceKind.CHECKPOINT, FenceKind.STOPPED}
+    )
+
+
+def _rework_refusal(ctx: _Ctx) -> str | None:
+    """Why a rework cannot start now (None: it can)."""
+    if _completed(ctx):
+        return "PR merged or issue closed"
+    if not approval_ok(ctx.p):
+        return "the approval is no longer valid"
+    if _approval_active(ctx):
+        return "a build is already queued or running"
+    return None
+
+
+def _feedback_rework(ctx: _Ctx) -> None:
+    """An owner comment or review on a finished build (Ready, or Needs you in Building).
+
+    Not after ``/stop`` (a stopped parcel resumes only by an explicit control) nor once
+    merged/closed. A comment during a rework already queued or running only steers it.
+    """
+    if Hold.STOPPED in ctx.p.holds or _completed(ctx) or _approval_active(ctx):
+        return
+    reason = _rework_refusal(ctx)
+    if reason is not None:
+        ctx.note(f"Rework refused: {reason}")
+        return
+    _rework(ctx, None)
+
+
+def _rework(ctx: _Ctx, via: Via | None) -> None:
+    """Owner feedback on the built work: back to Building under the same approval.
+
+    A new build episode on the parcel's branch and PR (admitted like any build, so it may
+    queue for a slot) with a fresh time block and a fresh fix budget. The first message
+    points the issue session at the feedback; Ready is then re-evaluated as usual.
+    """
+    a = ctx.p.current_approval
+    assert a is not None  # noqa: S101 - approval_ok checked by the caller
+    ctx.unhold(*CONTROL_CLEARED_HOLDS, Hold.REMEDIATION_EXHAUSTED)
+    ctx.update(readiness=None, readiness_wakes=0)
+    _cancel_pending(ctx)
+    _move(ctx, Stage.BUILDING, via)
+    _enqueue_build(ctx, a, ctx.config.block_us(ctx.p.size or Size.M), rework=True)
+    ctx.note(_REWORK_NOTE)
+
+
+_REWORK_NOTE = "Rework: owner feedback"
 
 
 def _h_approve_plan(ctx: _Ctx, body: ev.ApprovePlan) -> None:
@@ -1597,9 +1670,12 @@ def _h_stop(ctx: _Ctx, body: ev.Stop) -> None:
 def _h_request_rework(ctx: _Ctx, body: ev.RequestRework) -> None:
     _control(ctx)
     _require_eligible(ctx)
-    # Phases 0-3: record the unsupported request visibly; never dispatch.
-    ctx.hold(Hold.UNSUPPORTED_REWORK)
-    ctx.note("Rework refused: rework on a Ready parcel is not supported yet")
+    if ctx.origin_stage != Stage.READY:
+        raise Rejected("rework-only-from-ready", explain=True)
+    reason = _rework_refusal(ctx)
+    if reason is not None:
+        raise Rejected(f"rework refused: {reason}", explain=True)
+    _rework(ctx, Via.DRAG)
     _ = body
 
 
@@ -1642,8 +1718,13 @@ def _h_leftward(ctx: _Ctx, body: ev.LeftwardMove) -> None:
         if owner_fresh and eligible(ctx.p):
             _start_plan(ctx, Via.DRAG)
     elif from_stage == Stage.READY and body.to_stage == Stage.BUILDING and owner_fresh:
-        ctx.hold(Hold.UNSUPPORTED_REWORK)
-        ctx.note("Rework refused: rework on a Ready parcel is not supported yet")
+        # The owner's drag back to Building asks for rework (the stop above stays if not).
+        reason = _rework_refusal(ctx) if eligible(ctx.p) else "the issue is not eligible"
+        if reason is None:
+            _rework(ctx, Via.DRAG)
+        else:
+            ctx.hold(Hold.REWORK_CONTROL_REQUIRED)
+            ctx.note(f"Rework refused: {reason}")
 
 
 def _h_ineligible(
@@ -2991,6 +3072,8 @@ def _h_capacity(ctx: _Ctx, body: ev.CapacityAvailable) -> None:
         )
     ctx.admission = replace(ctx.admission, reservations=(*ctx.admission.reservations, *new))
     _set_queue(ctx, replace(entry, status=QueueStatus.RESERVED), ctx.p.parcel_id)
+    if auth.rework:
+        ctx.note(_REWORK_NOTE)  # Queued -> Working keeps the reason on the card
 
 
 def _h_retry_due(ctx: _Ctx, body: ev.RetryDue) -> None:

@@ -1208,15 +1208,18 @@ def test_E04_remediation_exhausted_blocks_ready():
     assert h.p().stage == Stage.BUILDING and h.p().bot == BotState.NEEDS_YOU
 
 
-def test_E05_owner_ready_to_building_is_unsupported_rework():
+def test_E05_owner_ready_to_building_is_rework_under_the_same_approval():
     h = Harness()
     h.to_building()
     h.build_ready()
+    approval = h.p().current_approval_id
     r = h.send(P, ev.LeftwardMove(from_stage=Stage.READY, to_stage=Stage.BUILDING), actor=OWNER_ID)
-    assert Hold.UNSUPPORTED_REWORK in h.p().holds and not work(r)
-    assert EffectKind.CREATE_SESSION not in kinds(r)
+    assert r.audit.accepted and Hold.UNSUPPORTED_REWORK not in h.p().holds
+    assert h.p().stage == Stage.BUILDING and h.p().current_approval_id == approval
+    assert h.admission.queue_entry(P) is not None  # admitted as a build (capacity decides)
+    # A second control while the rework is queued adds nothing.
     r = h.send(P, ev.RequestRework())
-    assert not work(r) and EffectKind.CREATE_SESSION not in kinds(r)
+    assert not r.audit.accepted and not work(r)
 
 
 @pytest.mark.parametrize(

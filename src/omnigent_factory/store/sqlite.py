@@ -556,6 +556,16 @@ class SqliteStore:
                 (run_id, sequence, self._clock.now_utc_us()),
             )
 
+    def record_review_comments(self, delivery_guid: str, comments_json: str) -> None:
+        """The inline comments of the owner review carried by ``delivery_guid``."""
+        with self._txn() as conn:
+            conn.execute(
+                "INSERT INTO pr_review_comments (delivery_guid, comments_json, fetched_at_us) "
+                "VALUES (?, ?, ?) ON CONFLICT (delivery_guid) DO UPDATE SET "
+                "comments_json = excluded.comments_json, fetched_at_us = excluded.fetched_at_us",
+                (delivery_guid, comments_json, self._clock.now_utc_us()),
+            )
+
     def feedback_read(self, run_id: str) -> int:
         """The newest owner-comment event sequence ``run_id`` has read (-1: none)."""
         row = self._conn.execute(

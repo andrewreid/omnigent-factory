@@ -494,6 +494,16 @@ CREATE TABLE mcp_feedback_reads (
 );
 """
 
+# Inline comments of an owner's PR review, read from GitHub when the review delivery is
+# processed (the pull_request_review webhook carries only the review body).
+V7_SQL = """
+CREATE TABLE pr_review_comments (
+    delivery_guid TEXT PRIMARY KEY,
+    comments_json TEXT NOT NULL,
+    fetched_at_us INTEGER NOT NULL
+);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -501,4 +511,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(4, "parked-delivery-reason", V4_SQL),
     Migration(5, "issue-sessions-and-mcp", V5_SQL),
     Migration(6, "mcp-feedback-reads", V6_SQL),
+    Migration(7, "pr-review-comments", V7_SQL),
 )

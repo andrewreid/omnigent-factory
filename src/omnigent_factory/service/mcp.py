@@ -295,9 +295,10 @@ class FactoryTools:
                 {**self._comment(c, boundary), "new": int(c["at_us"]) >= since} for c in comments
             ],
             "decisions": answers,
-            "note": "Every owner comment on the issue, oldest first: the owner's directions "
-            "for this issue, a later comment overriding an earlier one. new = posted since "
-            "your last result for this stage (or since this run started).",
+            "note": "Every owner comment on the issue and, on its PR, every owner conversation "
+            "comment and review (with inline comments as path:line), oldest first: the "
+            "owner's directions for this issue, a later comment overriding an earlier one. "
+            "new = posted since your last result for this stage (or since this run started).",
         }
 
     async def _new_since(self, caller: Caller) -> int:
@@ -729,6 +730,8 @@ class FactoryTools:
         return {
             "event_id": comment["event_id"],
             "kind": comment["kind"],
+            "source": comment.get("source", "issue"),
+            "pr_number": comment.get("pr_number"),
             "at_us": comment["at_us"],
             "text": untrusted_block(str(comment["text"]), boundary, "OWNER COMMENT"),
         }

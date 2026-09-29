@@ -28,6 +28,7 @@ from omnigent_factory.core.types import (
     Lifecycle,
     Parcel,
     QueueStatus,
+    ReservationKind,
     Stage,
 )
 from omnigent_factory.ports.adapter import EffectAdapter
@@ -534,13 +535,16 @@ class FactoryService:
                 break
         if head is None:
             return
+        parcel = await self.db.call(partial(_load_parcel, parcel_id=head.parcel_id))
         if not (
             not admission.paused
             and admission.building_count < self.config.max_building
-            and admission.prospective_pr_count < self.config.max_open_bot_prs
+            and (
+                _has_own_pr(parcel, admission)  # e.g. a rework: its PR is already open
+                or admission.prospective_pr_count < self.config.max_open_bot_prs
+            )
         ):
             return
-        parcel = await self.db.call(partial(_load_parcel, parcel_id=head.parcel_id))
         signature = _admission_signature(parcel, admission, head.parcel_id, head.sequence)
         if signature == self._last_admission_attempt:
             return
@@ -961,6 +965,18 @@ def _has_pending_delivery(store: SqliteStore) -> bool:
 def _delivery_status(store: SqliteStore, *, delivery_guid: str) -> str | None:
     rows = store.query("SELECT status FROM deliveries WHERE delivery_guid = ?", (delivery_guid,))
     return str(rows[0][0]) if rows else None
+
+
+def _has_own_pr(parcel: Parcel | None, admission: AdmissionSnapshot) -> bool:
+    """The parcel already holds an open bot PR or a live PR reservation (no new PR slot)."""
+    if parcel is None:
+        return False
+    if parcel.pr_number is not None and parcel.pr_number in admission.open_bot_prs:
+        return True
+    return any(
+        r.parcel_id == parcel.parcel_id and r.kind == ReservationKind.OPEN_PR and r.live
+        for r in admission.reservations
+    )
 
 
 def _admission_signature(

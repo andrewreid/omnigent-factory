@@ -104,6 +104,9 @@ class ServiceDispatchDirectory:
         template_name = _FIRST_TEMPLATES[session.kind]
         if session.kind == SessionKind.TRIAGE and self.latest_triage(parcel) is not None:
             template_name = _RETRIAGE_TEMPLATE  # a re-run on owner feedback
+        auth = parcel.authorization(session.authorization_id)
+        if session.kind == SessionKind.BUILD and auth is not None and auth.rework:
+            template_name = _REWORK_TEMPLATE  # owner feedback on the built work
         template = _template(template_name)
         evidence = await self.issue_evidence(parcel)
         return {
@@ -229,6 +232,7 @@ class ServiceDispatchDirectory:
                 gh_wrapper=self.config.wrapper_bin_dir / "gh",
                 capability_file=self.config.capability_dir / f"{_safe(sid)}.cap",
                 plan_hash=authority_hash,
+                pr_number=parcel.pr_number or 0,
             )
         return template.format(**common)
 
@@ -256,6 +260,8 @@ class ServiceDispatchDirectory:
             lines.append(f"- current plan: revision {contract.revision}, hash {contract.full_hash}")
         if parcel.readiness is not None:
             lines.append(f"- PR #{parcel.readiness.pr_number} at {parcel.readiness.head_sha[:12]}")
+        elif parcel.pr_number is not None:
+            lines.append(f"- PR #{parcel.pr_number}")
         lines.append("Check factory_get_status before continuing.")
         return "\n".join(lines)
 
@@ -390,7 +396,9 @@ class ServiceDispatchDirectory:
     async def owner_comments(
         self, parcel: Parcel, *, since_us: int = 0, kinds: tuple[EventKind, ...] = ()
     ) -> list[dict[str, Any]]:
-        """Owner comment texts carried by the parcel's control events, oldest first."""
+        """Owner comment texts carried by the parcel's control events, oldest first: issue
+        comments, and on the parcel's PR conversation comments and reviews (with their
+        inline comments)."""
         wanted = kinds or (
             EventKind.PLAN_FEEDBACK,
             EventKind.DECIDE,
@@ -403,8 +411,10 @@ class ServiceDispatchDirectory:
         kinds_json = json.dumps([k.value for k in wanted])
         rows = await self.db.call(
             lambda store: store.query(
-                "SELECT e.event_id, e.kind, e.source_time_us, d.body, e.sequence FROM events e "
+                "SELECT e.event_id, e.kind, e.source_time_us, d.body, e.sequence, "
+                "r.comments_json FROM events e "
                 "JOIN deliveries d ON e.delivery_guid = d.delivery_guid "
+                "LEFT JOIN pr_review_comments r ON r.delivery_guid = d.delivery_guid "
                 "WHERE e.parcel_id = ? AND e.accepted = 1 "
                 "AND e.kind IN (SELECT value FROM json_each(?)) "
                 "AND e.source_time_us >= ? ORDER BY e.sequence",
@@ -413,14 +423,17 @@ class ServiceDispatchDirectory:
         )
         comments: list[dict[str, Any]] = []
         for row in rows:
-            text = _comment_body(row[3])
-            if text is not None:
+            found = _feedback_text(row[3], row[5])
+            if found is not None:
+                source, pr_number, text = found
                 comments.append(
                     {
                         "event_id": str(row[0]),
                         "kind": str(row[1]),
                         "at_us": int(row[2]),
                         "sequence": int(row[4]),
+                        "source": source,
+                        "pr_number": pr_number,
                         "text": text,
                     }
                 )
@@ -950,16 +963,51 @@ def _root_nonce(parcel: Parcel, session: StageSession) -> str | None:
     return None
 
 
-def _comment_body(raw: object) -> str | None:
+def _feedback_text(raw: object, review_comments: object) -> tuple[str, int | None, str] | None:
+    """(source, PR number, text) of an owner comment/review delivery body.
+
+    ``source`` is ``issue`` (issue comment), ``pr_comment`` (PR conversation comment) or
+    ``pr_review`` (a review: its body, then each inline comment as ``path:line: text``).
+    """
     if not isinstance(raw, bytes | bytearray | memoryview | str):
         return None
     try:
         payload = json.loads(raw if isinstance(raw, str) else bytes(raw))
     except (ValueError, TypeError):
         return None
-    comment = payload.get("comment") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    review = payload.get("review")
+    pr = payload.get("pull_request")
+    if isinstance(review, dict) and isinstance(pr, dict):
+        number = pr.get("number") if isinstance(pr.get("number"), int) else None
+        state = str(review.get("state") or "").lower().replace("_", " ")
+        lines = [f"PR #{number} review ({state})"]
+        if isinstance(review.get("body"), str) and review["body"].strip():
+            lines.append(review["body"])
+        for c in _json_list(review_comments):
+            where = f"{c.get('path') or '?'}:{c.get('line')}" if c.get("line") else c.get("path")
+            lines.append(f"- {where or 'PR'}: {c.get('body') or ''}")
+        return "pr_review", number, "\n".join(lines)
+    comment = payload.get("comment")
     text = comment.get("body") if isinstance(comment, dict) else None
-    return text if isinstance(text, str) else None
+    if not isinstance(text, str):
+        return None
+    issue = payload.get("issue")
+    if isinstance(issue, dict) and "pull_request" in issue:
+        number = issue.get("number") if isinstance(issue.get("number"), int) else None
+        return "pr_comment", number, text
+    return "issue", None, text
+
+
+def _json_list(raw: object) -> list[dict[str, Any]]:
+    if not isinstance(raw, str):
+        return []
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return []
+    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
 
 
 def untrusted_block(text: str, boundary: str, label: str = "UNTRUSTED DATA") -> str:
@@ -987,6 +1035,7 @@ _FIRST_TEMPLATES = {
     SessionKind.BUILD: "build-v4.txt",
 }
 _RETRIAGE_TEMPLATE = "triage-feedback-v1.txt"
+_REWORK_TEMPLATE = "build-rework-v1.txt"
 
 
 def _template(name: str) -> str:

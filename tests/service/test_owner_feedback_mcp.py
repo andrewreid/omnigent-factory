@@ -118,6 +118,7 @@ async def test_A_stage_templates_point_at_owner_feedback():
         "build-v4.txt",
         "feedback-v3.txt",
         "build-feedback-v2.txt",
+        "build-rework-v1.txt",
         "triage-comment-v1.txt",
         "continuation-v2.txt",
     ):

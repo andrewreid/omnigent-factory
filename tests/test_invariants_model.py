@@ -826,7 +826,7 @@ class FactoryModel(RuleBasedStateMachine):
                 if cur is not None and cur.lifecycle != Lifecycle.RETIRED:
                     s2 = after.session(cur.session_id)
                     assert s2 is not None and FenceKind.SAFETY in s2.fences
-        # (F3) stage allow-lists; Ready rework stays behind the phase-4 row.
+        # (F3) stage allow-lists; Ready takes rework (a build), never triage or a plan.
         if result.audit.accepted and event.kind == EventKind.REQUEST_TRIAGE:
             assert before.stage in (None, Stage.INBOX) or (
                 before.holds & {Hold.STOPPED, Hold.SAFETY}

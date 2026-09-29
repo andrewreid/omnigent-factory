@@ -206,22 +206,13 @@ def test_D_comment_while_build_turn_runs_is_recorded_only():
 # ------------------------------------------------------------------ E: elsewhere
 
 
-def test_E_comments_in_inbox_ready_or_opted_out_start_nothing():
+def test_E_comments_in_inbox_or_opted_out_start_nothing():
+    # (A comment on a Ready card is rework: tests/test_rework.py.)
     h = Harness()
     h.eligible()
     r = comment(h, "note for later")
     assert r.audit.accepted and r.effects == ()  # recorded for later stages
-    h2 = Harness()
-    b = _waiting_build(h2)
-    h2.send(P, ev.PRObserved(pr_number=7, head_sha=HEAD, bot_authored=True, parcel_branch=True))
-    h2.send(
-        P, ev.ReadinessEvidence(session_id=b.session_id, pr_number=7, head_sha=HEAD, verified=True)
-    )
-    h2.quiesce(P, b.session_id)
-    assert h2.p().stage == Stage.READY
-    r = comment(h2, "looks good")
-    assert r.audit.accepted and not [e for e in r.effects if e.kind in WORK_BEARING_KINDS]
-    assert not starts_run(r) and h2.p().stage == Stage.READY
+    assert not [e for e in r.effects if e.kind in WORK_BEARING_KINDS]
     h3 = Harness()
     h3.triage()
     h3.send(P, ev.AssignedHuman())

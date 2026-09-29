@@ -66,11 +66,11 @@ A triage/report/status publication that failed definitively leaves the card at
 ### Card status vs. comments
 
 Bot comments notify the owner, so the factory comments only when he must read or act:
-triage, plan, Ready report, agent questions, checkpoint (`/continue`) and blocks that need
-owner action (agent blocked, restart exhausted, create refused, stop unverified, ambiguous
-adoption, PR not Ready with no fix attempt left). Everything else (queued, stopped,
-approval acknowledged/invalidated, Ready withdrawn, PR closed unmerged, refused commands,
-invalid result, ...) is the card's `Factory note` text field: one line with the latest
+triage, plan, Ready report (again after a rework), agent questions, checkpoint
+(`/continue`) and blocks that need owner action (agent blocked, restart exhausted, create
+refused, stop unverified, ambiguous adoption, PR not Ready with no fix attempt left). Everything else (queued, stopped,
+approval acknowledged/invalidated, Ready withdrawn, rework, PR closed unmerged, refused
+commands, invalid result, ...) is the card's `Factory note` text field: one line with the latest
 reason, written only when it changes and cleared when the card moves on. Blocked,
 Checkpoint, Needs you and Queued cards without a specific reason get a derived note.
 `Bot: Queued` marks an approved build waiting for capacity; its note (`Queued: 2nd in line`)
@@ -103,17 +103,32 @@ and a dry compile of the identity policy. The factory clone's `info/exclude` ign
 
 ### Steering by comment
 
-Every plain (non-command) comment from an owner is recorded, and `factory_get_feedback`
-serves all of them to every later run, oldest first, flagged `new` since the session's
-last result for that stage. In Triaged a comment re-runs triage in the issue session (a
-revised triage comment follows); in Scoped it revises the plan; in Building it is relayed
-to a build waiting on checks without touching the approval. Elsewhere it only waits for
-later stages. A run whose turn ended without a result (its tree is idle) gets the comment
+Every plain (non-command) comment from an owner is recorded, and so is, on the parcel's
+PR, every owner conversation comment and every owner review that says something (request
+changes, comment, or an approval with text; inline comments are read from GitHub when the
+review arrives). `factory_get_feedback` serves all of them to every later run, oldest
+first, flagged `new` since the session's last result for that stage. Commands work on the
+issue only; reactions and other people's comments never count. In Triaged a comment
+re-runs triage in the issue session (a revised triage comment follows); in Scoped it
+revises the plan; in Building it is relayed to a build waiting on checks without touching
+the approval. Elsewhere it only waits for later stages. A run whose turn ended without a result (its tree is idle) gets the comment
 as one message, even if it reported blocked; a comment that arrives mid-turn is relayed when
 that turn ends without a result (periodic tree scans can be incomplete, so this is the
 fallback). Further comments wait until the run is idle again.
 A run that is mid-turn gets no extra message: its result is refused until
 it has read every comment, so a burst of comments folds into the run in progress.
+
+**Rework.** Owner feedback on a Ready card (an issue comment, a PR comment or review, or
+dragging the card back to Building) moves it to Building with the note `Rework: owner
+feedback` and starts a new build run under the same approval: it is admitted like any
+build (`Bot: Queued` while no build slot is free), runs in the same issue session (or a
+fresh one with a summary), changes the same branch and PR, and gets a fresh time block and
+a fresh fix budget. Feedback beyond the approved plan is asked back with
+`factory_ask_owner`; to replan, drag the card to Scoped. A Building card left at Needs you
+after its build finished (for example "no fix attempt left") is reworked the same way by
+an owner comment. Ready is then re-evaluated as usual and a new Ready report is posted.
+Not after `/stop` or once the PR is merged. A burst of feedback is one rework: later
+comments fold into the queued or running rework run.
 
 ### Review bots
 

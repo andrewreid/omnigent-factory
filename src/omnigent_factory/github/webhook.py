@@ -154,6 +154,9 @@ class DeliveryNormalizer:
         issue = payload.get("issue")
         issue_number = issue.get("number") if isinstance(issue, dict) else None
         parcel_id = issue.get("node_id") if isinstance(issue, dict) else None
+        if isinstance(issue, dict) and "pull_request" in issue:
+            # A PR conversation comment: the parcel is resolved from the PR number.
+            issue_number = parcel_id = None
         if event_name == "projects_v2_item":
             item = payload.get("projects_v2_item")
             if isinstance(item, dict):
@@ -252,6 +255,10 @@ class DeliveryNormalizer:
             comment = payload.get("comment")
             if isinstance(comment, dict):
                 return _timestamp_us(comment.get("created_at"), fallback)
+        if event_name == "pull_request_review":
+            review = payload.get("review")
+            if isinstance(review, dict) and review.get("submitted_at"):
+                return _timestamp_us(review.get("submitted_at"), fallback)
         for key in ("projects_v2_item", "issue", "pull_request", "review", "check_suite"):
             value = payload.get(key)
             if isinstance(value, dict):
@@ -268,10 +275,10 @@ class DeliveryNormalizer:
             if action != "created":
                 return ()
             issue = payload.get("issue")
-            if isinstance(issue, dict) and "pull_request" in issue:
-                return ()
             comment = payload.get("comment")
             text = comment.get("body") if isinstance(comment, dict) else None
+            if isinstance(issue, dict) and "pull_request" in issue:
+                return self._pr_comment(str(text or ""), actor_id, issue.get("number"))
             return self._comment(str(text or ""), actor_id)
         if event_name == "issues":
             if action in {"assigned", "closed", "deleted", "transferred"}:
@@ -296,7 +303,7 @@ class DeliveryNormalizer:
         if event_name == "pull_request":
             return self._pull_request(payload)
         if event_name == "pull_request_review":
-            return self._review(payload)
+            return self._owner_review(payload, actor_id) or self._review(payload)
         if event_name in {"check_suite", "workflow_run"}:
             return self._checks(payload, event_name)
         return ()
@@ -336,6 +343,41 @@ class DeliveryNormalizer:
                 ),
             )
         return ()
+
+    def _pr_comment(self, text: str, actor_id: int, number: object) -> tuple[ev.EventBody, ...]:
+        """Owner conversation comment on a PR: feedback on the parcel's PR (commands are
+        issue-only; a command on a PR is ignored)."""
+        if actor_id == self.identity.bot_user_id or actor_id not in self.identity.owner_ids:
+            return ()
+        if not isinstance(number, int) or _COMMAND.match(text.strip()) is not None:
+            return ()
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        return (ev.PlanFeedback(text_digest=digest, pr_number=number),)
+
+    def _owner_review(self, payload: dict[str, Any], actor_id: int) -> tuple[ev.EventBody, ...]:
+        """A submitted owner review that says something: feedback on the parcel's PR.
+
+        Changes-requested and commented reviews always carry text or inline comments (one
+        event per review, however many inline comments). An approval counts only with a
+        body. Other reviewers' reviews stay observations (``_review``).
+        """
+        review = payload.get("review")
+        pr = payload.get("pull_request")
+        if payload.get("action") != "submitted" or not isinstance(review, dict):
+            return ()
+        if actor_id == self.identity.bot_user_id or actor_id not in self.identity.owner_ids:
+            return ()
+        number = pr.get("number") if isinstance(pr, dict) else None
+        state = str(review.get("state") or "").lower()
+        text = str(review.get("body") or "")
+        if not isinstance(number, int):
+            return ()
+        if state not in ("changes_requested", "commented") and not (
+            state == "approved" and text.strip()
+        ):
+            return ()
+        digest = hashlib.sha256(f"{review.get('id')}\x1f{text}".encode()).hexdigest()
+        return (ev.PlanFeedback(text_digest=digest, pr_number=number),)
 
     def _issue_safety(self, action: str, payload: dict[str, Any]) -> tuple[ev.EventBody, ...]:
         if action == "assigned":
@@ -484,6 +526,10 @@ class DeliveryNormalizer:
             comment = payload.get("comment")
             if isinstance(comment, dict) and isinstance(comment.get("id"), int):
                 return f"github:comment:{comment['id']}:created"
+        if event_name == "pull_request_review" and body.KIND == ev.EventKind.PLAN_FEEDBACK:
+            review = payload.get("review")
+            if isinstance(review, dict) and isinstance(review.get("id"), int):
+                return f"github:review:{review['id']}:submitted"
         if event_name == "projects_v2_item":
             item = payload.get("projects_v2_item")
             item_id = item.get("node_id") if isinstance(item, dict) else "unknown"

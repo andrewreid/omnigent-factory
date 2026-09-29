@@ -311,6 +311,31 @@ class GitHubAPIAdapter:
         except GitHubAPIError as exc:
             return RetryableReadFailure(str(exc))
 
+    async def review_comments(
+        self, pr_number: int, review_id: int
+    ) -> list[dict[str, Any]] | RetryableReadFailure:
+        """Inline comments of one PR review, oldest first (webhooks carry only its body)."""
+        try:
+            items = await self.client.paginate(
+                f"/repos/{self.repository}/pulls/{pr_number}/reviews/{review_id}"
+                "/comments?per_page=100"
+            )
+        except RateLimited as exc:
+            return RetryableReadFailure(str(exc), exc.retry_after_us)
+        except GitHubAPIError as exc:
+            return RetryableReadFailure(str(exc))
+        comments = [
+            {
+                "path": str(c.get("path") or ""),
+                "line": c.get("line") if isinstance(c.get("line"), int) else None,
+                "body": str(c.get("body") or ""),
+                "created_at": str(c.get("created_at") or ""),
+            }
+            for c in items
+            if isinstance(c, dict)
+        ]
+        return sorted(comments, key=lambda c: c["created_at"])
+
     async def _base_sync_only(self, reviewed: str, head: str, base_ref: str) -> bool:
         """``head`` descends from the reviewed head only through base-branch syncs.
 

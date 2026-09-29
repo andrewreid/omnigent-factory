@@ -166,11 +166,13 @@ class RequestReplan(_Body):
 
 @dataclass(frozen=True, slots=True)
 class PlanFeedback(_Body):
-    """Plain non-command owner text on an issue in Scoped. ``text_digest`` only."""
+    """Plain non-command owner text: an issue comment, or on the parcel's PR a
+    conversation comment or a review with text (``pr_number`` > 0). ``text_digest`` only."""
 
     KIND: ClassVar[EventKind] = EventKind.PLAN_FEEDBACK
     CLASS: ClassVar[EventClass] = EventClass.CONTROL
     text_digest: str = ""
+    pr_number: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,7 +223,7 @@ class Stop(_Body):
 
 @dataclass(frozen=True, slots=True)
 class RequestRework(_Body):
-    """Explicit owner rework command from Ready (phase 4 only)."""
+    """Explicit owner rework control from Ready (same approval, new build episode)."""
 
     KIND: ClassVar[EventKind] = EventKind.REQUEST_REWORK
     CLASS: ClassVar[EventClass] = EventClass.CONTROL

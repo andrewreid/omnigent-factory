@@ -1,0 +1,14 @@
+Factory rework run {run_id} for {repository} issue #{issue_number} on branch {branch}: the
+owner reviewed the built work (PR #{pr_number}) and gave feedback. Your Omnigent session id
+is {session_id}: pass it as session_id to every factory tool.
+{handoff}
+Read factory_get_feedback: the owner's issue comments, PR comments and reviews, `new` ones
+first to act on. Change the same branch and PR; stay within the approved plan
+(factory_get_plan, hash {plan_hash}; echo it as plan_hash). If the feedback asks for more
+than the plan, ask with factory_ask_owner instead of expanding scope.
+Use only the factory git credential helper and the gh wrapper at {gh_wrapper}; the
+capability handle is {capability_file}. Never merge. Give review-bot findings on new commits
+an outcome as before.
+Finish with factory_submit_result (kind "build_ready", or "blocked"); while CI or review
+bots are pending, submit current evidence and end the turn: the factory will wake you.
+Active-time budget: {granted_minutes} minutes.

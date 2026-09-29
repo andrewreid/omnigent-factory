@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 
-from omnigent_factory.core.events import Event, Provenance
+from omnigent_factory.core.events import Event, EventKind, Provenance
 from omnigent_factory.core.types import IssueSnapshot
 from omnigent_factory.github.adapter import GitHubAPIAdapter
 from omnigent_factory.github.client import GitHubAPIError, RateLimited
@@ -177,7 +177,27 @@ class GitHubDeliveryProcessor:
         if event is None:
             await self._ignore(delivery, "PR/check event for no known parcel")
             return
+        if delivery.event_name == "pull_request_review" and event.kind == EventKind.PLAN_FEEDBACK:
+            await self._record_review_comments(delivery, event)
         await self.service.apply_event(event, delivery_status="processed")
+
+    async def _record_review_comments(self, delivery: DeliveryRecord, event: Event) -> None:
+        """Store the inline comments of an owner review for ``factory_get_feedback``.
+
+        The pull_request_review webhook carries only the review body; its inline comments
+        are read here, before the event is applied (a failed read retries the delivery).
+        """
+        payload = json.loads(delivery.body)
+        review = payload.get("review") if isinstance(payload, dict) else None
+        review_id = review.get("id") if isinstance(review, dict) else None
+        pr_number = getattr(event.body, "pr_number", 0)
+        if not isinstance(review_id, int) or not isinstance(pr_number, int) or pr_number <= 0:
+            return
+        comments = await self.github.review_comments(pr_number, review_id)
+        if not isinstance(comments, list):
+            raise RuntimeError(f"review comments temporarily unavailable: {comments.reason}")
+        guid, text = delivery.delivery_guid, json.dumps(comments)
+        await self.service.db.call(lambda store: store.record_review_comments(guid, text))
 
     async def _ignore(self, delivery: DeliveryRecord, reason: str) -> None:
         LOG.info(

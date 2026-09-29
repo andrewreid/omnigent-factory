@@ -123,14 +123,13 @@ def test_approval_acknowledged_is_a_note():
     assert notes(r) == ["Approved: build starts when capacity allows"]
 
 
-def test_unsupported_rework_is_a_note():
+def test_rework_is_a_note_not_a_comment():
     h = Harness()
     h.to_building()
-    h.parcels[P] = replace(h.p(), stage=Stage.READY)
+    h.build_ready()
     r = h.send(P, ev.RequestRework())
-    assert EffectKind.POST_COMMENT not in kinds(r)
-    assert Hold.UNSUPPORTED_REWORK in h.p().holds
-    assert h.p().note.startswith("Rework refused:")
+    assert r.audit.accepted and EffectKind.POST_COMMENT not in kinds(r)
+    assert h.p().stage == Stage.BUILDING and h.p().note == "Rework: owner feedback"
 
 
 def test_invalid_result_is_blocked_with_a_note_not_a_comment():

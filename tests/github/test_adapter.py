@@ -481,3 +481,27 @@ async def test_contract_publication_adopts_exact_bot_fence():
     assert result.contract_section == render_contract_section(GOAL_X)
     assert result.marker_hash == "a" * 12
     assert result.author_is_bot is True
+
+
+@pytest.mark.asyncio
+async def test_review_comments_reads_one_reviews_inline_comments_oldest_first():
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(
+            200,
+            json=[
+                {"path": "b.py", "line": 3, "body": "second", "created_at": "2026-09-29T10:01Z"},
+                {"path": "a.py", "line": None, "body": "first", "created_at": "2026-09-29T10:00Z"},
+            ],
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        comments = await adapter(http).review_comments(685, 9001)
+    assert seen == [f"/repos/{REPOSITORY}/pulls/685/reviews/9001/comments"]
+    assert isinstance(comments, list)
+    assert [(c["path"], c["line"], c["body"]) for c in comments] == [
+        ("a.py", None, "first"),
+        ("b.py", 3, "second"),
+    ]
