@@ -419,6 +419,9 @@ class ReadinessEvidence(_Body):
     merged: bool = False
     #: GitHub's closingIssuesReferences of the PR include the parcel's issue.
     closes_issue: bool = True
+    #: The review bot's latest unanswered trigger on this head (source time), 0 = it
+    #: already answered this head, None = unknown (older reads or no bot configured).
+    review_bot_pending_since_us: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

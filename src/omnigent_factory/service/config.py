@@ -28,6 +28,8 @@ HOT_RELOAD_KEYS = frozenset(
         "checkpoint_grace_minutes",
         "cost_backstop_usd_per_hour",
         "review_bot_grace_minutes",
+        "review_bot_login",
+        "review_bot_mention",
         "independent_reviewer_ids",
         "triage_guidance",
         "engineering_guidance",
@@ -118,8 +120,14 @@ class ServiceConfig(BaseModel):
     checkpoint_block_hours: dict[str, int] = Field(default_factory=lambda: {"S": 2, "M": 4, "L": 6})
     checkpoint_grace_minutes: int = Field(default=15, ge=1, le=120)
     cost_backstop_usd_per_hour: int = Field(default=35, ge=1, le=1000)
-    #: Minutes review bots get to comment on a new PR head before the card can be Ready.
+    #: Minutes the review bot gets to comment on a PR head before the card can be Ready;
+    #: applies only while it can still respond (it has not answered the head, or was
+    #: re-pinged since its last answer).
     review_bot_grace_minutes: int = Field(default=10, ge=0, le=120)
+    #: The review bot's GitHub login ("" = unknown: the grace always applies).
+    review_bot_login: str = "chatgpt-codex-connector[bot]"
+    #: The mention that asks the review bot for a (re-)review.
+    review_bot_mention: str = "@codex"
     github_config: Path | None = None
     secrets_dir: Path = Field(
         default_factory=lambda: Path.home() / ".config/omnigent-factory/secrets"

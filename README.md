@@ -55,7 +55,7 @@ waits up to 90 s for it instead of failing.
 | `cleanup <parcel> [--merged]` | Remove a finished parcel's factory worktree(s) and local `factory/` branch from the factory clone. |
 | `release-delivery <guid>` | Release one parked webhook delivery for processing. |
 | `pause` / `unpause` | Stop / resume admitting new work repository-wide; in-flight parcels and safety events carry on. |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, cost backstop, `review_bot_grace_minutes`, guidance and `independent_reviewer_ids`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, cost backstop, `review_bot_grace_minutes`, `review_bot_login`, `review_bot_mention`, guidance and `independent_reviewer_ids`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.
@@ -140,9 +140,15 @@ resolves only threads it replied to: readiness counts a bot thread as handled wh
 factory bot replied or a person resolved it, and a thread the bot resolved without a reply
 stays open. The agent's shell policy allows `gh issue create`, thread replies and
 `resolveReviewThread`, and denies closing, deleting, transferring or locking issues and PRs
-(CLI, REST and GraphQL), merging and administration. A PR head is Ready only from a green
-read taken `review_bot_grace_minutes` (default 10) after the build reported it, so late bot
-comments are handled by the build's one readiness wake instead of pulling a Ready card back.
+(CLI, REST and GraphQL), merging and administration. While the review bot
+(`review_bot_login`, default `chatgpt-codex-connector[bot]`) can still respond to the PR
+head, the head is Ready only from a green read taken `review_bot_grace_minutes` (default
+10) after the later of the build report and the trigger (the head push or PR opening, or a
+`review_bot_mention` re-ping after its last answer), so late bot comments are handled by
+the build's one readiness wake instead of pulling a Ready card back. The bot can still
+respond until it has answered that head (a review of the commit, a verdict naming it, or a
++1 on the PR after the push); once it has and nothing re-pinged it, readiness is judged on
+current evidence at once. When the bot's state cannot be read, the grace applies.
 
 ### Finished parcels
 

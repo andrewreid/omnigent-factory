@@ -100,3 +100,32 @@ def test_missing_closing_reference_reaches_the_reducer_and_the_build_template_re
     assert event.body.closes_issue is False
     build = (files("omnigent_factory.service") / "templates" / "build-v4.txt").read_text("utf-8")
     assert "`Closes #{issue_number}`" in build
+
+
+@pytest.mark.parametrize(
+    ("value", "carried"), [(0, 0), (1_790_664_471_000_000, 1_790_664_471_000_000), (None, None)]
+)
+def test_review_bot_pending_time_reaches_the_reducer(
+    service_config: ServiceConfig, value: int | None, carried: int | None
+) -> None:
+    executor = EffectExecutor(
+        None,  # type: ignore[arg-type]
+        service_config.trusted,
+        FakeClock(),
+        (),
+        ParcelSerializers(),
+        poll_seconds=1,
+    )
+    fetch = EffectIntent(
+        "ef_f",
+        EffectKind.FETCH_PR_EVIDENCE,
+        "I_1",
+        "I_1",
+        Preconditions(1, 0),
+        {"pr_number": 686, "head_sha": HEAD, "session_id": "ss_b"},
+    )
+    detail = {"head_sha": HEAD, "checks": "green", "verified": True}
+    detail["review_bot_pending_since_us"] = value
+    event = executor._ack_event(fetch, Ack("686", detail))
+    assert event is not None and isinstance(event.body, ev.ReadinessEvidence)
+    assert event.body.review_bot_pending_since_us == carried

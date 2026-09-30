@@ -537,6 +537,9 @@ class EffectExecutor:
                 pr_open=detail.get("open") is not False,
                 merged=detail.get("merged") is True,
                 closes_issue=detail.get("closes_issue") is not False,
+                review_bot_pending_since_us=_optional_int(
+                    detail.get("review_bot_pending_since_us")
+                ),
             )
         elif effect.kind == EffectKind.RESOLVE_ELICITATION:
             body = ev.ElicitationResolved(
@@ -602,6 +605,10 @@ def _checks_state(value: object) -> ev.ChecksState | None:
 
 def _json_int(value: object, default: int) -> int:
     return value if isinstance(value, int) else default
+
+
+def _optional_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 _ACK_EVENT_REQUIRED = frozenset(

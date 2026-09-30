@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass
@@ -101,6 +102,8 @@ class GitHubAPIAdapter:
         parcel_resolver: ParcelResolver | None = None,
         triage_fields: TriageFieldSource | None = None,
         cross_vendor_review: Callable[[EffectIntent], Awaitable[bool]] | None = None,
+        review_bot_login: str = "",
+        review_bot_mention: str = "",
     ) -> None:
         self.client = client
         self.repository = repository
@@ -126,6 +129,11 @@ class GitHubAPIAdapter:
             raise ValueError("independent reviewers cannot include owners or the factory bot")
         self.independent_reviewer_ids = independent_reviewer_ids
         self.owner_ids = owner_ids
+        #: The review bot whose late comments the readiness grace waits for ("" = none
+        #: configured: its state is unknown, so the grace always applies).
+        self.review_bot_login = review_bot_login
+        #: The mention that asks it for a review (e.g. "@codex"); "" = none recognised.
+        self.review_bot_mention = review_bot_mention
 
     @property
     def handled_kinds(self) -> frozenset[EffectKind]:
@@ -292,6 +300,7 @@ class GitHubAPIAdapter:
                 review_accepted = self._review_accepted(reviews, head_sha)
             findings_dispositioned = await self._bot_threads_settled(pr_number)
             closes_issue = await self._closes_issue(pr_number, ref.parcel_id)
+            review_bot_since = await self._review_bot_pending_since(pr, pr_number, head_sha)
             author = pr.get("user")
             return PullRequestEvidence(
                 pr_number=pr_number,
@@ -305,11 +314,84 @@ class GitHubAPIAdapter:
                 review_accepted=review_accepted,
                 findings_dispositioned=findings_dispositioned,
                 checks_summary=self._last_checks_summary,
+                review_bot_pending_since_us=review_bot_since,
             )
         except RateLimited as exc:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
         except GitHubAPIError as exc:
             return RetryableReadFailure(str(exc))
+
+    async def _review_bot_pending_since(
+        self, pr: dict[str, Any], pr_number: int, head_sha: str
+    ) -> int | None:
+        """When the review bot can still respond to ``head_sha`` (see
+        ``PullRequestEvidence.review_bot_pending_since_us``).
+
+        It answered the head with a review of that commit, a comment naming it as the
+        reviewed commit, or a +1 on the PR taken after the head was pushed (committer date
+        and PR creation, whichever is later). An explicit mention by anyone else after its
+        last answer re-pings it. None whenever this cannot be told.
+        """
+        login = self.review_bot_login
+        if not login:
+            return None
+        try:
+            commit: Any = await self.client.get_json(f"/repos/{self.repository}/commits/{head_sha}")
+        except GitHubRejected:
+            return None
+        detail = commit.get("commit") if isinstance(commit, dict) else None
+        committer = detail.get("committer") if isinstance(detail, dict) else None
+        committed = self._parse_time_us(committer.get("date")) if isinstance(committer, dict) else 0
+        opened = self._parse_time_us(pr.get("created_at"))
+        if not committed or not opened:
+            return None
+        pushed = max(committed, opened)
+        answers: list[int] = []
+        pings: list[int] = []
+        reviews = await self.client.paginate(
+            f"/repos/{self.repository}/pulls/{pr_number}/reviews?per_page=100"
+        )
+        comments = await self.client.paginate(
+            f"/repos/{self.repository}/issues/{pr_number}/comments?per_page=100"
+        )
+        reactions = await self.client.paginate(
+            f"/repos/{self.repository}/issues/{pr_number}/reactions?per_page=100"
+        )
+        for item, at_key in (
+            *((r, "submitted_at") for r in reviews),
+            *((c, "created_at") for c in comments),
+        ):
+            if not isinstance(item, dict):
+                continue
+            user = item.get("user")
+            author = user.get("login") if isinstance(user, dict) else None
+            body = str(item.get("body") or "")
+            at = self._parse_time_us(item.get(at_key))
+            if author == login:
+                if at and (item.get("commit_id") == head_sha or self._names_commit(body, head_sha)):
+                    answers.append(at)
+            elif self.review_bot_mention and self.review_bot_mention.lower() in body.lower():
+                if not at:
+                    return None  # an undatable re-ping could be the latest one
+                pings.append(at)
+        for reaction in reactions:
+            if not isinstance(reaction, dict) or reaction.get("content") != "+1":
+                continue
+            user = reaction.get("user")
+            at = self._parse_time_us(reaction.get("created_at"))
+            if isinstance(user, dict) and user.get("login") == login and at > pushed:
+                answers.append(at)
+        if not answers:
+            return max([pushed, *pings])
+        answered = max(answers)
+        later = [at for at in pings if at > answered]
+        return max(later) if later else 0
+
+    @staticmethod
+    def _names_commit(body: str, head_sha: str) -> bool:
+        """A verdict comment's "Reviewed commit: `<sha prefix>`" names ``head_sha``."""
+        match = _REVIEWED_COMMIT.search(body)
+        return match is not None and head_sha.startswith(match.group(1).lower())
 
     async def review_comments(
         self, pr_number: int, review_id: int
@@ -1337,6 +1419,9 @@ def _publication_matches(
     )
 
 
+#: A review bot's clean verdict names the commit it reviewed, e.g.
+#: "**Reviewed commit:** `9929332e9c`".
+_REVIEWED_COMMIT = re.compile(r"Reviewed commit:[*\s`]*([0-9a-f]{7,40})", re.IGNORECASE)
 _SUCCEEDED = frozenset({"success", "neutral", "skipped"})
 
 

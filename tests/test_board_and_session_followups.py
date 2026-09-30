@@ -148,6 +148,79 @@ def test_findings_inside_the_grace_wake_the_build_instead_of_needs_you():
     assert Hold.READINESS_FAILED not in h.p().holds
 
 
+def test_bot_already_reviewed_the_unchanged_head_and_no_re_ping_means_no_wait():
+    """#651/PR #686: the build only replied to and resolved a thread; codex had reviewed
+    the unchanged head and nothing re-pinged it, so no new review can arrive."""
+    h = grace_harness()
+    h.to_building()
+    build_ready(h)
+    h.send(
+        P, evidence(h, verified=True, checks=ev.ChecksState.GREEN, review_bot_pending_since_us=0)
+    )
+    h.quiesce(P, h.cur().session_id)
+    assert h.p().stage == Stage.READY and h.p().readiness.ready
+    assert EffectKind.FETCH_PR_EVIDENCE not in kinds(h.send(P, ev.ReconcileDue()))
+
+
+def test_new_commit_the_bot_has_not_reviewed_waits_for_the_grace():
+    h = grace_harness()
+    h.to_building()
+    build_ready(h)
+    new_head = "b" * 40
+    h.send(P, evidence(h, observed_head_sha=new_head, checks=ev.ChecksState.GREEN))
+    pushed = h.f(P).now
+    r = h.p().readiness
+    fresh = ev.ReadinessEvidence(
+        session_id=r.session_id,
+        pr_number=PR,
+        head_sha=new_head,
+        verified=True,
+        checks=ev.ChecksState.GREEN,
+        review_bot_pending_since_us=pushed,
+    )
+    h.send(P, fresh)
+    h.quiesce(P, h.cur().session_id)
+    assert h.p().stage == Stage.BUILDING and not h.p().readiness.ready
+    h.f(P).tick(10 * MICROS_PER_MINUTE)
+    h.send(P, fresh)
+    assert h.p().stage == Stage.READY
+
+
+def test_re_ping_after_the_last_review_waits_from_the_re_ping():
+    """An `@codex review` after the build result restarts the grace from the request."""
+    h = grace_harness()
+    h.to_building()
+    build_ready(h)
+    h.quiesce(P, h.cur().session_id)
+    h.f(P).tick(3 * MICROS_PER_MINUTE)
+    pinged = h.f(P).now
+    green = {"verified": True, "checks": ev.ChecksState.GREEN}
+    h.send(P, evidence(h, **green, review_bot_pending_since_us=pinged))
+    assert h.p().stage == Stage.BUILDING
+    h.f(P).tick(8 * MICROS_PER_MINUTE)  # 11 min after the build result, 8 after the ping
+    h.send(P, evidence(h, **green, review_bot_pending_since_us=pinged))
+    assert h.p().stage == Stage.BUILDING
+    assert EffectKind.FETCH_PR_EVIDENCE in kinds(h.send(P, ev.ReconcileDue()))
+    h.f(P).tick(2 * MICROS_PER_MINUTE)
+    h.send(P, evidence(h, **green, review_bot_pending_since_us=pinged))
+    assert h.p().stage == Stage.READY
+
+
+def test_unknown_review_bot_state_keeps_the_wait():
+    h = grace_harness()
+    h.to_building()
+    build_ready(h)
+    h.send(
+        P,
+        evidence(h, verified=True, checks=ev.ChecksState.GREEN, review_bot_pending_since_us=None),
+    )
+    h.quiesce(P, h.cur().session_id)
+    assert h.p().stage == Stage.BUILDING and not h.p().readiness.ready
+    h.f(P).tick(10 * MICROS_PER_MINUTE)
+    h.send(P, evidence(h, verified=True, checks=ev.ChecksState.GREEN))
+    assert h.p().stage == Stage.READY
+
+
 def test_no_grace_configured_is_ready_at_once():
     h = Harness()
     h.to_building()

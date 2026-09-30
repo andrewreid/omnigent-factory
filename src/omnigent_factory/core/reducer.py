@@ -944,8 +944,8 @@ def _maybe_ready(ctx: _Ctx) -> None:
         return
     if _completed(ctx):
         return
-    if r.verified_at_us < r.settle_at_us:
-        return  # review bots still have time to comment on this head
+    if _in_review_grace(r):
+        return  # the review bot still has time to comment on this head
     s = ctx.p.session(r.session_id)
     if s is None or s.session_id != ctx.p.current_session_id:
         return
@@ -2060,6 +2060,7 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
     if observed != r.head_sha:
         _head_changed(ctx, r, observed)
         return
+    r = _review_bot_window(ctx, r, body.review_bot_pending_since_us)
     if body.remediation_exhausted:
         ctx.hold(Hold.REMEDIATION_EXHAUSTED)
     in_ready = ctx.p.stage == Stage.READY and (r.ready or _refreshing(ctx))
@@ -2107,6 +2108,32 @@ def _settle_at(ctx: _Ctx, head: str) -> int:
     return ctx.now + ctx.config.review_grace_us
 
 
+def _review_bot_window(ctx: _Ctx, r: Readiness, since: int | None) -> Readiness:
+    """Wait for the review bot only while it can still respond to this head.
+
+    ``since`` 0: it already answered this head and nothing re-pinged it, so readiness is
+    judged on current evidence at once. A trigger time (push, PR open or re-ping) runs
+    the grace from the later of that trigger and the build result. None (unknown) keeps
+    the wait: an unreadable bot state is never taken as answered.
+    """
+    if since == 0:
+        window = replace(r, review_bot_done=True)
+    elif since is None:
+        window = replace(r, review_bot_done=False)
+    else:
+        trigger_end = min(since, ctx.now) + ctx.config.review_grace_us
+        window = replace(r, review_bot_done=False, settle_at_us=max(r.settle_at_us, trigger_end))
+    if window != r:
+        ctx.update(readiness=window)
+    return window
+
+
+def _in_review_grace(r: Readiness) -> bool:
+    """The review bot may still comment on ``head_sha``: no green read before
+    ``settle_at_us`` makes the parcel Ready."""
+    return not r.review_bot_done and r.verified_at_us < r.settle_at_us
+
+
 def _refreshing(ctx: _Ctx) -> bool:
     """The card is in Ready while a new head or a check re-run is re-evaluated."""
     r = ctx.p.readiness
@@ -2130,6 +2157,7 @@ def _head_changed(ctx: _Ctx, r: Readiness, head: str) -> None:
         checks_summary="",
         settle_at_us=ctx.now + ctx.config.review_grace_us,
         verified_at_us=0,
+        review_bot_done=False,
     )
     ctx.update(readiness=r)
     ctx.unhold(Hold.CHECKS_FAILED, Hold.READINESS_FAILED)
@@ -3150,7 +3178,7 @@ def _awaiting_evidence(ctx: _Ctx) -> bool:
     r = ctx.p.readiness
     return (
         r is not None
-        and (not r.verified or (not r.ready and r.verified_at_us < r.settle_at_us))
+        and (not r.verified or (not r.ready and _in_review_grace(r)))
         and not _completed(ctx)
         and Hold.PR_CLOSED not in ctx.p.holds
     )

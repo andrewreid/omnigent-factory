@@ -112,6 +112,10 @@ class PullRequestEvidence:
     review_accepted: bool  # independent opposite-vendor review of this head chain
     findings_dispositioned: bool
     checks_summary: str = ""
+    #: When the configured review bot can still respond to ``head_sha``: the source time
+    #: of the latest trigger it has not answered (a push/PR open or an explicit re-ping),
+    #: 0 when it already answered this head and nothing re-pinged it, None when unknown.
+    review_bot_pending_since_us: int | None = None
 
     @property
     def verified(self) -> bool:

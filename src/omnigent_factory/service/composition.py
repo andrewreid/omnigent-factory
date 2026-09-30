@@ -269,6 +269,8 @@ async def build_production(
         parcel_resolver=ServiceParcelResolver(service.db),
         triage_fields=publications.triage_fields,
         cross_vendor_review=publications.cross_vendor_review,
+        review_bot_login=config.review_bot_login,
+        review_bot_mention=config.review_bot_mention,
     )
     identity = DeliveryIdentity(
         app_id=config.github_app_id,
@@ -370,6 +372,8 @@ async def build_production(
         directory.config = new
         publications.config = new
         github.independent_reviewer_ids = new.independent_reviewer_ids
+        github.review_bot_login = new.review_bot_login
+        github.review_bot_mention = new.review_bot_mention
 
     service.config_listeners.append(adopt_reloaded)
     cleaner = WorkspaceCleaner(directory, workspaces, config.worktree_root)

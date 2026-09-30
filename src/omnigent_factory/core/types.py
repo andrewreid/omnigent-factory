@@ -505,6 +505,9 @@ class Readiness:
     settle_at_us: int = 0
     #: Source time of the read that set ``verified`` (0 = unknown, older records).
     verified_at_us: int = 0
+    #: The latest read showed the review bot already answered ``head_sha`` with no
+    #: re-ping since: nothing can still arrive, so there is no grace wait.
+    review_bot_done: bool = False
 
 
 @dataclass(frozen=True, slots=True)
