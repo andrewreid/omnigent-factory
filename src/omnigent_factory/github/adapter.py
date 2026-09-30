@@ -1358,7 +1358,7 @@ class GitHubAPIAdapter:
             f"{key}={value}" for key, value in sorted(effect.args.items()) if key != "template"
         )
         suffix = f" ({details})" if details else ""
-        return f"Factory: {template.replace('-', ' ')}{suffix}."
+        return f"Status: {template.replace('-', ' ')}{suffix}."
 
     @staticmethod
     def _effect_marker(effect_id: str) -> str:

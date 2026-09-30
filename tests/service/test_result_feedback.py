@@ -84,7 +84,7 @@ def test_blocked_result_validates_for_any_stage():
     from omnigent_factory.service.directory import _public_result
 
     text = _public_result(body)
-    assert "> broker refused: core-work-gate-closed" in text and "Codex review" in text
+    assert "\n\nbroker refused: core-work-gate-closed" in text and "Codex review" in text
 
 
 @pytest.mark.asyncio

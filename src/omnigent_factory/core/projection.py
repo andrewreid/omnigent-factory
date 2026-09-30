@@ -18,7 +18,9 @@ from omnigent_factory.core.types import (
     QueueEntry,
     QueueStatus,
     Stage,
+    StageSession,
     TrustedConfig,
+    WaitReason,
 )
 
 _SETTLED = frozenset({Lifecycle.RETIRED, Lifecycle.FENCED})
@@ -75,10 +77,15 @@ def project_bot(p: Parcel, *, queued: bool = False) -> BotState:
         and Hold.COMPLETED not in p.holds
     ):
         return BotState.WORKING  # in Ready, waiting on a new head's or re-run's checks
-    # A safety/stop drain is never Idle until the tree is observed quiescent.
-    if lifecycles & _WORKING:
+    # A safety/stop drain is never Idle until the tree is observed quiescent. A plan run
+    # waiting for approval has finished its stage: the next move is the owner's (Idle).
+    if any(s.lifecycle in _WORKING and not _awaiting_approval(s) for s in p.sessions):
         return BotState.WORKING
     return BotState.IDLE
+
+
+def _awaiting_approval(s: StageSession) -> bool:
+    return s.lifecycle == Lifecycle.WAITING and s.wait_reason == WaitReason.PLAN_APPROVAL
 
 
 #: Longest "Factory note" the board gets (one short line).
@@ -93,7 +100,6 @@ _HOLD_TEXT = {
     Hold.RESTART_EXHAUSTED: "session could not be restarted",
     Hold.INBOX: "webhook delivery held",
     Hold.AGENT_BLOCKED: "agent reported blocked",
-    Hold.AWAITING_OWNER: "awaiting owner",
     Hold.CHECKS_FAILED: "checks failed",
     Hold.READINESS_FAILED: "PR not Ready, no fix attempt left",
     Hold.REMEDIATION_EXHAUSTED: "fix budget used up",

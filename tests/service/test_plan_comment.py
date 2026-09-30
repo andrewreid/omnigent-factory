@@ -86,7 +86,7 @@ def test_677_hash_is_unchanged_and_comment_is_readable_markdown_only(
     assert "   Verify: Run the api vitest tier" in text
     assert "#### Context (not part of the approved contract)" in text
     assert FIXTURE["plan_result"]["risks"][0][:60] in text
-    assert "`/approve 7a44c7aa30d6`" in text
+    assert "/approve" not in text  # no how-to block (owner request 2026-09-30)
     # The context sits outside the hash-bound section.
     section = extract_contract_section(text)
     assert section == render_contract_section(CANONICAL)
@@ -123,7 +123,8 @@ def test_neutraliser_applies_to_context_only_and_contract_escapes_are_part_of_it
     }
     text = _render(service_config, plan)
     context = text[text.index("Context (not part") :]
-    assert "@\u200bowner" in context and "```" not in context and "<!--" not in context
+    assert "@\u200bowner" in context and "<!--" not in context
+    assert "```parcel-contract\n{}\n```" in context  # Markdown kept; nothing parses it
     # The spoofed marker in the context does not create a second section.
     assert text.count(SECTION_BEGIN) == 1
     canonical = json.dumps({**json.loads(CANONICAL), "goal": "Bump @types/node <b>x</b>"})
@@ -208,41 +209,27 @@ def test_status_comments_are_sentences_not_template_names():
     from omnigent_factory.service.directory import _status_text
 
     assert _status_text("restart-exhausted", {"session_id": "s_1"}) == (
-        "Factory: the session stopped and could not be restarted automatically; "
-        "the parcel is Blocked."
+        "The session stopped and couldn't be restarted automatically, so this is blocked."
     )
-    assert "`/decide dc_1 <answer>`" in _status_text(
-        "decision", {"decision_id": "dc_1", "impact": "plan_revision"}
-    )
-    assert _status_text("unknown-template", {}) == "Factory status: unknown template."
+    decision = _status_text("decision", {"decision_id": "dc_1", "impact": "plan_revision"})
+    assert "dc_1" not in decision and "/decide" not in decision
+    assert _status_text("unknown-template", {}) == "Status: unknown template."
 
 
-def test_decision_relay_says_what_is_asked_and_links_the_prompt_holder(
-    service_config: ServiceConfig,
-):
-    from omnigent_factory.service.directory import PublicationRenderer
+def test_decision_comment_is_the_agents_own_question():
+    from omnigent_factory.service.directory import _decision_text
 
-    renderer = PublicationRenderer(None, service_config)  # type: ignore[arg-type]
-    effect = EffectIntent(
-        effect_id="ef_q",
-        kind=EffectKind.POST_COMMENT,
-        parcel_id=PARCEL_ID,
-        target=PARCEL_ID,
-        preconditions=Preconditions(1, 0),
-        args={
+    text = _decision_text(
+        {
             "template": "decision",
             "decision_id": "de_1",
             "summary": "Molly asks: keep the harness change or drop it?",
             "node_id": "e724833307bb43279d8b0f76ff47bc53",
             "root_id": "53085a291e43487cb8fa288501a95ec9",
-        },
+        }
     )
-    text = renderer._decision_text(effect)
-    base = service_config.omnigent_base_url.rstrip("/")
-    assert "> Molly asks: keep the harness change or drop it?" in text
-    assert f"[open the prompt in Omnigent]({base}/c/e724833307bb43279d8b0f76ff47bc53)" in text
-    assert f"[issue session]({base}/c/53085a291e43487cb8fa288501a95ec9)" in text
-    assert "`/decide de_1 <answer>`" in text and "returns to Working" in text
+    # Rosie's own reply: no quote block, decision id, Omnigent link or /decide how-to.
+    assert text == "Molly asks: keep the harness change or drop it?"
 
 
 def test_omnigent_link_is_derived_from_config_and_rejects_odd_ids():
@@ -253,10 +240,14 @@ def test_omnigent_link_is_derived_from_config_and_rejects_odd_ids():
     assert omnigent_link("https://omni.example", None) is None
 
 
-def test_plan_comment_link_stays_outside_the_approved_section(service_config: ServiceConfig):
+def test_plan_comment_has_no_link_or_how_to_and_keeps_the_hash(service_config: ServiceConfig):
     parcel, contract = _parcel()
-    link = "https://omnigent.reid.ee/c/02ddb5c28de743ac90821c51cf2c3ae8"
-    text = render_contract_comment(parcel, contract, FIXTURE["plan_result"], service_config, link)
-    assert text is not None and f"[Open in Omnigent]({link})" in text
+    text = render_contract_comment(parcel, contract, FIXTURE["plan_result"], service_config)
+    assert text is not None
+    assert "Open in Omnigent" not in text and "/c/" not in text
+    for how_to in ("How to respond", "/approve", "drag the card", "/decide", "approving binds"):
+        assert how_to not in text
+    assert "### Plan for #677 (size S) · hash `7a44c7aa30d6" in text  # short hash kept
+    # The hash-bound section is byte-identical: the approval target is unchanged.
     assert extract_contract_section(text) == render_contract_section(CANONICAL)
-    assert text.index(SECTION_END) < text.index(link)
+    assert marker_hash(text) is not None and FULL_HASH.startswith(marker_hash(text) or "-")

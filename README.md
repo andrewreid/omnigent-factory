@@ -78,6 +78,23 @@ follows the queue as builds ahead are admitted (refreshed by the periodic reconc
 reaction: 👍 accepted, 😕 refused (the reason is in the note). Config keys:
 `note_field_node_id` and `bot_options.Queued`; `doctor` checks both exist.
 
+Comments read like a fellow developer's: plain GitHub Markdown in the agent's own words
+(its summaries, reasons and questions are published as written, with only mentions and
+HTML comments neutralised, credentials blocked and an 8000-character cap), no Omnigent
+links, internal ids or labels, and no how-to lines. Hidden markers stay.
+
+`Bot: Needs you` means the current stage cannot continue without the owner: an open
+question, or a hold that needs his decision (e.g. PR not Ready with no fix attempt left).
+A stage that finished with the owner's move next is `Idle`: triage posted, plan posted
+awaiting approval, Ready.
+
+**Questions.** While an agent question is open, the owner's next plain (non-`/`) comment
+on the issue or its PR is the answer: the question is resolved with that comment, the
+answer is sent to the run that asked, and the card returns to Working. On a Building card
+at Needs you with no fix attempt left the reply instead starts a rework (below), which
+reads the answer with the comment. `/decide <id> <answer>` and answering in Omnigent still
+work.
+
 ### Issue sessions and the factory MCP endpoint
 
 Each issue gets one Omnigent session (the configured `omnigent_agent_id`, default
@@ -125,8 +142,8 @@ build (`Bot: Queued` while no build slot is free), runs in the same issue sessio
 fresh one with a summary), changes the same branch and PR, and gets a fresh time block and
 a fresh fix budget. Feedback beyond the approved plan is asked back with
 `factory_ask_owner`; to replan, drag the card to Scoped. A Building card left at Needs you
-after its build finished (for example "no fix attempt left") is reworked the same way by
-an owner comment. Ready is then re-evaluated as usual and a new Ready report is posted.
+with no fix attempt left (its run closed, or idle and waiting, which is then retired) is
+reworked the same way by an owner comment. Ready is then re-evaluated as usual and a new Ready report is posted.
 Not after `/stop` or once the PR is merged. A burst of feedback is one rework: later
 comments fold into the queued or running rework run.
 

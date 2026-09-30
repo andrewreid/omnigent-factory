@@ -15,7 +15,6 @@ from typing import Any
 from omnigent_factory.core.codec import parcel_from_json
 from omnigent_factory.core.contract_view import (
     ContractViewError,
-    escape_inline,
     parcel_marker,
     render_contract_section,
 )
@@ -32,6 +31,7 @@ from omnigent_factory.core.types import (
     MICROS_PER_MINUTE,
     ApprovalKind,
     Contract,
+    Decision,
     IssueSnapshot,
     Parcel,
     SessionKind,
@@ -184,10 +184,11 @@ class ServiceDispatchDirectory:
             return _template("continuation-v2.txt").format(grant_id=spec.grant_id)
         if purpose == "answer_relay":
             decision = parcel.decision(str(effect.args.get("decision_id") or ""))
-            if decision is None or decision.answer is None:
+            answer = await self.decision_answer(decision) if decision is not None else None
+            if decision is None or answer is None:
                 return None
             return _template("answer-v1.txt").format(
-                decision_id=decision.decision_id, answer=decision.answer
+                decision_id=decision.decision_id, answer=answer
             )
         if purpose == "feedback":
             if spec.kind == SessionKind.BUILD:
@@ -285,14 +286,15 @@ class ServiceDispatchDirectory:
         if parcel is None:
             return None
         decision = parcel.decision(str(effect.args.get("decision_id") or ""))
-        if decision is None or decision.answer is None:
+        answer = await self.decision_answer(decision) if decision is not None else None
+        if answer is None:
             return None
         try:
-            value: Any = json.loads(decision.answer)
+            value: Any = json.loads(answer)
         except ValueError:
-            return {"answer": decision.answer}
+            return {"answer": answer}
         if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
-            return {"answer": decision.answer}
+            return {"answer": answer}
         if any(
             (item is not None and not isinstance(item, str | int | float | bool | list))
             or (isinstance(item, list) and not all(isinstance(v, str) for v in item))
@@ -393,6 +395,25 @@ class ServiceDispatchDirectory:
                 ]
         return None
 
+    async def decision_answer(self, decision: Decision) -> str | None:
+        """The owner's answer: the ``/decide`` text, else the plain comment that answered."""
+        if decision.answer is not None:
+            return decision.answer
+        event_id = decision.answer_event_id
+        if not event_id:
+            return None
+        rows = await self.db.call(
+            lambda store: store.query(
+                "SELECT d.body, r.comments_json FROM events e "
+                "JOIN deliveries d ON e.delivery_guid = d.delivery_guid "
+                "LEFT JOIN pr_review_comments r ON r.delivery_guid = d.delivery_guid "
+                "WHERE e.event_id = ?",
+                (event_id,),
+            )
+        )
+        found = _feedback_text(rows[0][0], rows[0][1]) if rows else None
+        return found[2] if found is not None else None
+
     async def owner_comments(
         self, parcel: Parcel, *, since_us: int = 0, kinds: tuple[EventKind, ...] = ()
     ) -> list[dict[str, Any]]:
@@ -412,7 +433,7 @@ class ServiceDispatchDirectory:
         rows = await self.db.call(
             lambda store: store.query(
                 "SELECT e.event_id, e.kind, e.source_time_us, d.body, e.sequence, "
-                "r.comments_json FROM events e "
+                "r.comments_json, d.delivery_guid FROM events e "
                 "JOIN deliveries d ON e.delivery_guid = d.delivery_guid "
                 "LEFT JOIN pr_review_comments r ON r.delivery_guid = d.delivery_guid "
                 "WHERE e.parcel_id = ? AND e.accepted = 1 "
@@ -422,7 +443,11 @@ class ServiceDispatchDirectory:
             )
         )
         comments: list[dict[str, Any]] = []
+        seen: set[str] = set()
         for row in rows:
+            if row[6] in seen:
+                continue  # one comment per delivery (an operator re-application repeats it)
+            seen.add(row[6])
             found = _feedback_text(row[3], row[5])
             if found is not None:
                 source, pr_number, text = found
@@ -569,8 +594,7 @@ class PublicationRenderer:
             if contract is None:
                 return None
             plan = self.directory.plan_result_for(contract.source_session_id, contract.canonical)
-            link = self._stage_link(parcel, contract.source_session_id)
-            return render_contract_comment(parcel, contract, plan, self.config, link)
+            return render_contract_comment(parcel, contract, plan, self.config)
         if effect.kind == EffectKind.PUBLISH_REPORT and effect.args.get("report") == "ready":
             build = (
                 self.directory.latest_result(parcel.readiness.session_id)
@@ -591,49 +615,22 @@ class PublicationRenderer:
                 return None
             text = _public_result(body, agent_display_name(self.config))
         elif effect.kind == EffectKind.POST_COMMENT and effect.args.get("template") == "decision":
-            return _safe_publication(self._decision_text(effect), self.config)
+            text = _decision_text(effect.args)
         elif effect.kind == EffectKind.POST_COMMENT:
             template = str(effect.args.get("template") or "status")
             text = _status_text(template, effect.args, agent_display_name(self.config))
         else:
             return None
-        sid = effect.args.get("session_id") or effect.preconditions.session_id
-        if effect.args.get("report") == "ready" and parcel.readiness is not None:
-            sid = parcel.readiness.session_id
-        link = self._stage_link(parcel, str(sid) if sid else None)
-        if link is not None:
-            text = f"{text}\n\n[Open in Omnigent]({link})"
         return _safe_publication(text, self.config)
 
-    def _stage_link(self, parcel: Parcel, session_id: str | None) -> str | None:
-        """Deeplink to the stage's root Omnigent session (the named one, else current)."""
-        session = parcel.session(session_id) if session_id else parcel.current_session
-        if session is None:
-            session = parcel.current_session
-        return omnigent_link(self.config.omnigent_base_url, session.root_id if session else None)
 
-    def _decision_text(self, effect: EffectIntent) -> str:
-        """What the agent is asking, where to answer it, and the ``/decide`` fallback."""
-        args = effect.args
-        decision_id = str(args.get("decision_id") or "")
-        summary = str(args.get("summary") or "").strip()
-        node = omnigent_link(self.config.omnigent_base_url, _text_or_none(args.get("node_id")))
-        root = omnigent_link(self.config.omnigent_base_url, _text_or_none(args.get("root_id")))
-        lines = [f"**Factory: the agent is waiting for an answer** (decision `{decision_id}`)."]
-        if summary:
-            lines += ["", *(f"> {line}" for line in summary.splitlines())]
-        where: list[str] = []
-        if node is not None:
-            where.append(f"[open the prompt in Omnigent]({node})")
-        if root is not None and root != node:
-            where.append(f"[issue session]({root})")
-        answer = "Answer it in Omnigent" + (f" ({', '.join(where)})" if where else "")
-        lines += [
-            "",
-            f"{answer}, or comment `/decide {decision_id} <answer>`. The card returns to "
-            "Working once the prompt is answered.",
-        ]
-        return "\n".join(lines)
+def _decision_text(args: Mapping[str, Any]) -> str:
+    """The agent's question as its own reply: the owner answers by replying to it.
+
+    Answering in Omnigent or with ``/decide`` still works, but is never advertised.
+    """
+    summary = str(args.get("summary") or "").strip()
+    return summary or "I have a question before I can go on."
 
 
 _OMNIGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
@@ -646,23 +643,19 @@ def omnigent_link(base_url: str, session_id: str | None) -> str | None:
     return f"{base_url.rstrip('/')}/c/{session_id}"
 
 
-def _text_or_none(value: object) -> str | None:
-    return value if isinstance(value, str) and value else None
-
-
 def _ready_text(
     args: Mapping[str, Any],
     result: dict[str, Any] | None,
     checks_summary: str,
     repository: str,
 ) -> str:
-    """Ready report: what changed, CI, the cross-vendor review, findings and next step."""
+    """Ready report: what changed, CI, the cross-vendor review and findings."""
     number = args.get("pr_number")
     head = str(args.get("head_sha") or "")
     url = f"https://github.com/{repository}/pull/{number}"
-    lines = [f"### Factory: PR #{number} is Ready", ""]
+    lines = [f"### PR #{number} is Ready", ""]
     if result is not None and result.get("head_sha") == head and result.get("summary"):
-        lines += [" ".join(str(result["summary"]).split())[:1200], ""]
+        lines += [str(result["summary"]).strip(), ""]  # the agent's Markdown, as written
     lines.append(f"**PR:** {url} (head `{head[:12]}`)")
     lines.append(f"**CI:** {checks_summary or 'required checks green'}")
     review = result.get("review") if result is not None else None
@@ -679,14 +672,14 @@ def _ready_text(
         for f in findings[:20]:
             if not isinstance(f, dict):
                 continue
+            # One list item each (no internal finding label): its evidence stays on one line.
             note = " ".join(str(f.get("evidence") or "").split())[:300]
             lines.append(
-                f"- `{f.get('id')}` {f.get('severity')} ({f.get('source')}): "
-                f"{f.get('disposition')}" + (f" — {note}" if note else "")
+                f"- {f.get('severity')} ({f.get('source')}): {f.get('disposition')}"
+                + (f" — {note}" if note else "")
             )
     else:
         lines.append("**Findings:** none reported")
-    lines += ["", f"**Next:** review and merge PR #{number}."]
     return "\n".join(lines)
 
 
@@ -706,7 +699,6 @@ def render_contract_comment(
     contract: Contract,
     plan: dict[str, Any] | None,
     config: ServiceConfig,
-    session_link: str | None = None,
 ) -> str | None:
     """Readable plan comment: parcel marker, deterministic contract section, context.
 
@@ -719,35 +711,19 @@ def render_contract_comment(
         section = render_contract_section(contract.canonical)
     except ContractViewError:
         return None
+    # The heading and context sit outside the hash-bound section: only the section between
+    # its markers (and the parcel marker's hash) is verified, so they never change it.
     heading = (
         f"{parcel_marker(parcel.issue_number or 0, contract.prefix)}\n"
         f"### Plan for #{parcel.issue_number or 0} (size {contract.size.value})"
-        f" · hash `{contract.prefix}`\n\n"
-        "The approved contract is the section below; approving binds to exactly this text "
-        f"(hash `{contract.prefix}`)."
+        f" · hash `{contract.prefix}`"
     )
-    respond = (
-        "**How to respond:** drag the card to Building to approve this exact plan (or "
-        f"comment `/approve {contract.prefix}`), or reply with feedback for a revision."
-    )
-    if session_link is not None:
-        # Outside the hash-bound section: the link never affects the approval target.
-        respond += f"\n\n[Open in Omnigent]({session_link})"
-    open_ids = [d.decision_id for d in parcel.open_decisions]
-    if open_ids:
-        respond = (
-            "**Open decisions** (answer in Omnigent or `/decide <id> <answer>`; approval "
-            "waits for them):\n\n"
-            + "\n".join(f"- `{escape_inline(i)}`" for i in open_ids)
-            + "\n\n"
-            + respond
-        )
     blocked = _credential_block(
         contract.canonical + "\n" + json.dumps(plan or {}, ensure_ascii=False), config
     )
     if blocked is not None:
         return blocked
-    fixed = len(heading) + len(section) + len(respond) + 64
+    fixed = len(heading) + len(section) + 64
     if fixed > _CANONICAL_PUBLICATION_LIMIT:
         return None
     context = _neutralise(_plan_context(plan))
@@ -755,16 +731,7 @@ def render_contract_comment(
     if len(context) > budget:
         note = "\n\n[context truncated]"
         context = context[: max(budget - len(note), 0)].rstrip() + note
-    parts = (
-        [heading, section, "---", context, respond]
-        if context
-        else [
-            heading,
-            section,
-            "---",
-            respond,
-        ]
-    )
+    parts = [heading, section, "---", context] if context else [heading, section]
     return "\n\n".join(parts)
 
 
@@ -782,21 +749,20 @@ def _plan_context(plan: dict[str, Any] | None) -> str:
 
 #: Status comments: only what the owner must read or act on (each one notifies him).
 #: Informational status goes to the card's "Factory note" field instead (reducer).
+#: Plain sentences, no internal ids or how-to lines (a plain reply is enough).
 _STATUS_TEXT = {
-    "checkpoint": "Factory checkpoint: the granted time is used up and {agent} is wrapping up. "
-    "Comment `/continue` (optionally with a duration, e.g. `/continue 2h`) to grant more.",
-    "ready-blocked": "Factory: PR #{pr_number} at `{head_sha}` is not Ready: {reason}. "
-    "No automatic fix attempt remains; the parcel needs an owner decision.",
-    "create-rejected": "Factory: Omnigent refused to create the session ({reason}); "
-    "the parcel is Blocked.",
-    "adoption-ambiguous": "Factory: could not tell which Omnigent session is ours "
-    "({matches} matches); the parcel is Blocked for operator review.",
-    "decision": "Factory: {agent} needs a decision (`{decision_id}`, impact {impact}). "
-    "Answer it in Omnigent or comment `/decide {decision_id} <answer>`.",
-    "stop-unverified": "Factory: a stop could not be verified; the parcel is Blocked until "
-    "the session tree is confirmed idle.",
-    "restart-exhausted": "Factory: the session stopped and could not be restarted "
-    "automatically; the parcel is Blocked.",
+    "checkpoint": "I've used the time I was given and I'm wrapping up. "
+    "`/continue` (or e.g. `/continue 2h`) gives me more.",
+    "ready-blocked": "PR #{pr_number} isn't Ready at `{head_sha}`: {reason}. "
+    "I have no automatic fix attempt left, so I need your call.",
+    "create-rejected": "Omnigent refused to create the session ({reason}), so this is blocked.",
+    "adoption-ambiguous": "I couldn't tell which Omnigent session is mine ({matches} matches), "
+    "so this is blocked for operator review.",
+    "decision": "I have a question for you (impact {impact}).",
+    "stop-unverified": "A stop couldn't be verified, so this is blocked until the session is "
+    "confirmed idle.",
+    "restart-exhausted": "The session stopped and couldn't be restarted automatically, so this "
+    "is blocked.",
 }
 
 
@@ -807,7 +773,7 @@ def agent_display_name(config: ServiceConfig) -> str:
 
 
 def _status_text(template: str, args: Mapping[str, Any], agent: str = "The factory agent") -> str:
-    fallback = f"Factory status: {template.replace('-', ' ')}."
+    fallback = f"Status: {template.replace('-', ' ')}."
     pattern = _STATUS_TEXT.get(template)
     if pattern is None:
         return fallback
@@ -821,13 +787,12 @@ def _status_text(template: str, args: Mapping[str, Any], agent: str = "The facto
 
 
 def _neutralise(text: str) -> str:
-    """Model text published as the bot: no mentions, fences or hidden HTML comments.
+    """Model text published as the bot: no mentions or hidden HTML comments.
 
-    A fence could mimic the canonical ``parcel-contract`` block and an HTML comment could
-    mimic an effect marker, so both are broken while staying legible.
+    An HTML comment could mimic an effect or contract marker, so it is broken while
+    staying legible. Everything else (code fences included) is the agent's Markdown.
     """
     text = re.sub(r"(?<![\w@])@(?=[A-Za-z0-9])", "@\u200b", text)
-    text = text.replace("```", "`\u200b``").replace("~~~", "~\u200b~~")
     return text.replace("<!--", "&lt;!--")
 
 
@@ -840,9 +805,9 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
     if kind == "triage":
         recommendation = str(result.get("recommendation") or "").replace("_", " ")
         lines = [
-            "### Factory triage",
+            "### Triage",
             "",
-            str(result.get("summary", "")),
+            str(result.get("summary", "")).strip(),
             "",
             f"**Recommendation:** {recommendation}",
             f"**Priority:** {result.get('priority')} · **Size:** {result.get('size')}",
@@ -855,14 +820,13 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
         missing = _bullets(result.get("missing_information"))
         if missing:
             lines += ["", "**Missing information:**", missing]
-        lines += ["", "Move the card to Scoped to request a plan, or Building to waive it."]
         return "\n".join(lines)
     if kind == "plan":
         contract = result.get("contract")
         contract = contract if isinstance(contract, dict) else {}
         criteria = contract.get("acceptance_criteria")
         lines = [
-            "### Factory plan (informational)",
+            "### Plan",
             "",
             f"**Goal:** {contract.get('goal', '')}",
             f"**Approach:** {result.get('approach', '')}",
@@ -877,22 +841,13 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
             lines += ["", "**Risks:**", risks]
         return "\n".join(lines)
     if kind == "blocked":
-        lines = [
-            f"### Factory: {agent} stopped and needs the owner",
-            "",
-            f"> {' '.join(str(result.get('reason', '')).split())}",
-        ]
+        lines = [f"### {agent} is blocked", "", str(result.get("reason", "")).strip()]
         done = _bullets(result.get("done"))
         if done:
             lines += ["", "**Done so far:**", done]
-        lines += [
-            "",
-            "The card is Blocked. Fix the cause, then resume this session "
-            "(`omnigent-factory resume <parcel> --message ...`) or give a new stage control.",
-        ]
         return "\n".join(lines)
     if kind == "checkpoint":
-        lines = ["### Factory checkpoint"]
+        lines = ["### Checkpoint"]
         for title, key in (("Done", "done"), ("Remaining", "remaining"), ("Risks", "risks")):
             section = _bullets(result.get(key))
             if section:
@@ -900,15 +855,18 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
         return "\n".join(lines)
     if kind == "build_ready":
         return (
-            f"Factory build report: {result.get('summary', '')}\n\n"
+            f"{str(result.get('summary', '')).strip()}\n\n"
             f"PR #{result.get('pr_number')} at `{result.get('head_sha')}`; "
             f"release readiness: {result.get('release_readiness')}."
         )
-    return "Factory report recorded."
+    return "Report recorded."
 
 
 def _safe_publication(text: str, config: ServiceConfig) -> str:
-    """Free-form publication only: block credentials, neutralise mentions, bound length."""
+    """Free-form publication only: block credentials, neutralise mentions, bound length.
+
+    The agent's Markdown is kept as written (paragraphs, lists, headings, code).
+    """
     blocked = _credential_block(text, config)
     if blocked is not None:
         return blocked
@@ -917,7 +875,7 @@ def _safe_publication(text: str, config: ServiceConfig) -> str:
     text = _neutralise(text)
     limit = 8_000
     if len(text) > limit:
-        text = text[: limit - 30].rstrip() + "\n\n[factory output truncated]"
+        text = text[: limit - 30].rstrip() + "\n\n[truncated]"
     return text
 
 
@@ -935,10 +893,7 @@ def _credential_block(text: str, config: ServiceConfig) -> str | None:
         if len(value) >= 8:
             fingerprints.append(value)
     if _TOKEN.search(text) or any(value in text for value in fingerprints):
-        return (
-            "Factory publication blocked: the result contained credential-like material. "
-            "Provide a redacted result before continuing."
-        )
+        return "Publication blocked: the result contained credential-like material."
     return None
 
 
@@ -1030,12 +985,12 @@ def _new_boundary() -> str:
 
 #: First-message template of each stage run (the dispatch snapshot pins name and bytes).
 _FIRST_TEMPLATES = {
-    SessionKind.TRIAGE: "triage-v3.txt",
-    SessionKind.PLAN: "plan-v3.txt",
-    SessionKind.BUILD: "build-v4.txt",
+    SessionKind.TRIAGE: "triage-v4.txt",
+    SessionKind.PLAN: "plan-v4.txt",
+    SessionKind.BUILD: "build-v5.txt",
 }
-_RETRIAGE_TEMPLATE = "triage-feedback-v1.txt"
-_REWORK_TEMPLATE = "build-rework-v1.txt"
+_RETRIAGE_TEMPLATE = "triage-feedback-v2.txt"
+_REWORK_TEMPLATE = "build-rework-v2.txt"
 
 
 def _template(name: str) -> str:

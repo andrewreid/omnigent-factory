@@ -52,13 +52,13 @@ def test_ready_report_tells_the_owner_what_to_merge_and_why():
         "17 checks: 13 success, 4 skipped",
         "SA-Ambulance/timesheets",
     )
-    assert text.startswith("### Factory: PR #682 is Ready")
+    assert text.startswith("### PR #682 is Ready")
     assert "Route guard proven in isolation." in text
     assert "https://github.com/SA-Ambulance/timesheets/pull/682 (head `4950075d373b`)" in text
     assert "**CI:** 17 checks: 13 success, 4 skipped" in text
     assert "**Cross-vendor review:** anthropic → openai: clean" in text
-    assert "- `A1` ADVISORY (codex): advisory — disabled-user cases pass" in text
-    assert text.endswith("**Next:** review and merge PR #682.")
+    assert "- ADVISORY (codex): advisory — disabled-user cases pass" in text
+    assert "A1" not in text and "Next:" not in text and "merge PR" not in text
 
 
 # ------------------------------------------------------------------ 3. Omnigent login

@@ -1292,14 +1292,59 @@ def _h_plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
     _control(ctx)
     _require_eligible(ctx)
     stage = ctx.origin_stage
-    if stage == Stage.SCOPED:
+    answered = _answer_questions(ctx)
+    if stage == Stage.BUILDING:
+        _build_feedback(ctx, body, answered=answered)
+    elif stage == Stage.READY and _feedback_rework(ctx):
+        return
+    elif answered:
+        _deliver_answers(ctx)  # the comment was the answer, not also stage feedback
+    elif stage == Stage.SCOPED:
         _plan_feedback(ctx, body)
     elif stage == Stage.TRIAGED:
         _triage_feedback(ctx)
-    elif stage == Stage.BUILDING:
-        _build_feedback(ctx, body)
-    elif stage == Stage.READY:
-        _feedback_rework(ctx)
+
+
+def _answer_questions(ctx: _Ctx) -> bool:
+    """While owner questions are open, the owner's next plain comment answers them.
+
+    Each open question is answered with the whole comment (its text is served from the
+    comment's delivery, see ``answer_event_id``) and relayed to its run like ``/decide``,
+    except that a build is never revoked: the reply is taken within the approval.
+    """
+    open_ = ctx.p.open_decisions
+    if not open_:
+        return False
+    for d in open_:
+        ctx.put_decision(
+            replace(d, status=DecisionStatus.ANSWERED, answer_event_id=ctx.event.event_id)
+        )
+    return True
+
+
+def _deliver_answers(ctx: _Ctx) -> None:
+    """Relay the answers this comment recorded to the runs that asked."""
+    asked = [d.session_id for d in ctx.p.decisions if d.answer_event_id == ctx.event.event_id]
+    for sid in dict.fromkeys(asked):
+        s = ctx.p.session(sid)
+        if s is not None:
+            _deliver_answer(ctx, s)
+
+
+def _deliver_answer(ctx: _Ctx, s: StageSession) -> None:
+    """Relay recorded answers to ``s``; a plan answer is a plan revision."""
+    if s.kind == SessionKind.PLAN:
+        ctx.update(revision=ctx.p.revision + 1, revision_pending=True)
+        _void_approval(ctx, "plan-decision")
+        s = ctx.put_session(replace(s, revision=ctx.p.revision))
+    _relay_answers(ctx, s)
+
+
+def _fold_answers(ctx: _Ctx) -> None:
+    """Answers taken by a rework: its run reads them with the comment (factory_get_feedback)."""
+    for d in ctx.p.decisions:
+        if d.status == DecisionStatus.ANSWERED and d.answer_event_id == ctx.event.event_id:
+            ctx.put_decision(replace(d, status=DecisionStatus.RELAYED))
 
 
 def _plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
@@ -1386,47 +1431,51 @@ def _triage_feedback(ctx: _Ctx) -> None:
     _start_stage(ctx, SessionKind.TRIAGE, ctx.config.block_us(ctx.p.size or Size.S))
 
 
-def _build_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
-    """Building: relay the comment to an idle build within its approval (never voids it)."""
+def _build_feedback(ctx: _Ctx, body: ev.PlanFeedback, *, answered: bool = False) -> None:
+    """Building: relay the comment to an idle build within its approval (never voids it).
+
+    A comment that answers an open question is relayed as that answer. On Needs you with
+    no fix attempt left (``readiness_failed``) or a closed run, it starts a rework instead
+    (the answer then reaches the rework run with the comment).
+    """
     cur = ctx.p.current_session
+    build = cur if cur is not None and cur.kind == SessionKind.BUILD else None
+    busy = build is not None and build.lifecycle == Lifecycle.ACTIVE and not _idle_run(build)
+    if (
+        not busy
+        and (_build_ended(ctx) or Hold.READINESS_FAILED in ctx.p.holds)
+        and _feedback_rework(ctx)  # e.g. Needs you with no fix attempt left
+    ):
+        return
+    if answered:
+        _deliver_answers(ctx)
+        return
+    if busy:
+        assert build is not None  # noqa: S101 - busy implies a build
+        ctx.put_session(replace(build, comment_pending=True))  # see _h_tree_quiescent
+        return
     waiting = (
-        cur is not None
-        and cur.lifecycle == Lifecycle.WAITING
-        and cur.wait_reason == WaitReason.CHECKS
+        build is not None
+        and build.lifecycle == Lifecycle.WAITING
+        and build.wait_reason == WaitReason.CHECKS
     )
     if (
-        cur is not None
-        and cur.kind == SessionKind.BUILD
-        and cur.lifecycle == Lifecycle.ACTIVE
-        and not _idle_run(cur)
-    ):
-        ctx.put_session(replace(cur, comment_pending=True))  # see _h_tree_quiescent
-        return
-    if _build_ended(ctx):
-        _feedback_rework(ctx)  # e.g. Needs you with no fix attempt left, run closed
-        return
-    if (
-        cur is None
-        or cur.kind != SessionKind.BUILD
-        or not (waiting or _idle_run(cur))
+        build is None
+        or not (waiting or _idle_run(build))
         or ctx.p.open_decisions
         or not approval_ok(ctx.p)
-        or not work_allowed(ctx.p, cur)
+        or not work_allowed(ctx.p, build)
     ):
         return  # recorded: a running, queued or paused build reads it before submitting
-    if Hold.READINESS_FAILED in ctx.p.holds:
-        # Needs you on readiness: the owner's steer restarts the loop with a fresh fix budget.
-        ctx.unhold(Hold.READINESS_FAILED, Hold.REWORK_CONTROL_REQUIRED)
-        ctx.update(readiness_wakes=0)
-    cur = ctx.put_session(
+    build = ctx.put_session(
         replace(
-            cur,
+            build,
             lifecycle=Lifecycle.ACTIVE,
             wait_reason=None,
-            feedback_wakes=cur.feedback_wakes + 1,
+            feedback_wakes=build.feedback_wakes + 1,
         )
     )
-    _relay_comment(ctx, cur, body.text_digest)
+    _relay_comment(ctx, build, body.text_digest)
 
 
 def _idle_run(s: StageSession) -> bool:
@@ -1467,30 +1516,55 @@ def _build_ended(ctx: _Ctx) -> bool:
     )
 
 
-def _rework_refusal(ctx: _Ctx) -> str | None:
-    """Why a rework cannot start now (None: it can)."""
+def _rework_refusal(ctx: _Ctx, *, live_ok: bool = False) -> str | None:
+    """Why a rework cannot start now (None: it can). ``live_ok``: the current build run is
+    idle at Needs you and is retired to make way."""
     if _completed(ctx):
         return "PR merged or issue closed"
     if not approval_ok(ctx.p):
         return "the approval is no longer valid"
+    if live_ok:
+        return None
     if _approval_active(ctx):
         return "a build is already queued or running"
     return None
 
 
-def _feedback_rework(ctx: _Ctx) -> None:
-    """An owner comment or review on a finished build (Ready, or Needs you in Building).
+def _feedback_rework(ctx: _Ctx) -> bool:
+    """An owner comment or review on a finished build (Ready, or Needs you in Building:
+    a closed run, or an idle run with no fix attempt left, which is retired for it).
 
     Not after ``/stop`` (a stopped parcel resumes only by an explicit control) nor once
     merged/closed. A comment during a rework already queued or running only steers it.
     """
-    if Hold.STOPPED in ctx.p.holds or _completed(ctx) or _approval_active(ctx):
-        return
-    reason = _rework_refusal(ctx)
+    if Hold.STOPPED in ctx.p.holds or _completed(ctx) or _rework_queued(ctx):
+        return False
+    cur = ctx.p.current_session
+    idle = cur is not None and cur.kind == SessionKind.BUILD and _approval_active(ctx)
+    if idle and Hold.READINESS_FAILED not in ctx.p.holds:
+        return False  # a live build only takes the comment as steering
+    reason = _rework_refusal(ctx, live_ok=idle)
     if reason is not None:
         ctx.note(f"Rework refused: {reason}")
-        return
+        return False
+    _fold_answers(ctx)
     _rework(ctx, None)
+    if idle and cur is not None and not settled(cur) and cur.lifecycle != Lifecycle.DRAINING:
+        _begin_drain(ctx, cur)  # the idle run at Needs you makes way for the rework run
+    return True
+
+
+def _rework_queued(ctx: _Ctx) -> bool:
+    """A build episode for the current approval is waiting for a slot (an admitted one has
+    a live current run, see ``_approval_active``)."""
+    a = ctx.p.current_approval
+    entry = ctx.admission.queue_entry(ctx.p.parcel_id)
+    return (
+        a is not None
+        and entry is not None
+        and entry.approval_id == a.approval_id
+        and entry.status == QueueStatus.QUEUED
+    )
 
 
 def _rework(ctx: _Ctx, via: Via | None) -> None:
@@ -1603,15 +1677,11 @@ def _h_decide(ctx: _Ctx, body: ev.Decide) -> None:
     ctx.put_decision(d)
     s = _session(ctx, d.session_id)
     within = body.within_contract and d.impact == DecisionImpact.WITHIN_CONTRACT
-    if s.kind == SessionKind.PLAN:
-        ctx.update(revision=ctx.p.revision + 1, revision_pending=True)
-        _void_approval(ctx, "plan-decision")
-        s = ctx.put_session(replace(s, revision=ctx.p.revision))
-    elif s.kind == SessionKind.BUILD and not within:
+    if s.kind == SessionKind.BUILD and not within:
         # Answer may change the contract: revoke the build and carry it into a replan.
         _replan(ctx, None)
         return
-    _relay_answers(ctx, s)
+    _deliver_answer(ctx, s)
 
 
 def _h_continue(ctx: _Ctx, body: ev.Continue) -> None:
@@ -2691,7 +2761,7 @@ def _h_owner_question(ctx: _Ctx, body: ev.OwnerQuestion) -> None:
         decision_id=decision.decision_id,
         impact=body.impact.value,
         contract_hash=ctx.p.current_contract.full_hash if ctx.p.current_contract else None,
-        summary=body.summary[:1500],
+        summary=body.summary[:4000],
         node_id=None,
         root_id=s.root_id,
     )

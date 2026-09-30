@@ -466,7 +466,7 @@ def test_B07_triage_final_publishes_and_retires_after_quiescence():
             comment_id="c-1",
         ),
     )
-    assert h.p().bot == BotState.NEEDS_YOU
+    assert h.p().bot == BotState.IDLE  # triage posted: the owner's move
 
 
 @pytest.mark.parametrize(
@@ -596,7 +596,7 @@ def test_B09_B10_plan_result_then_verified_publication():
     )
     p = h.p()
     assert not p.revision_pending and p.current_contract_id == cid
-    assert Hold.PUBLICATION_FAILED not in p.holds and p.bot == BotState.NEEDS_YOU
+    assert Hold.PUBLICATION_FAILED not in p.holds and p.bot == BotState.IDLE
 
 
 def test_B10_new_publication_supersedes_prior_and_voids_approval():

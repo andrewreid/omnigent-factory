@@ -452,8 +452,9 @@ async def test_ask_owner_posts_once_and_answer_flows_back(service_config: Servic
 
         text = await PublicationRenderer(rig.tools.directory, service_config)(comments[0])
         assert text is not None
-        assert "> Keep the v1 API?" in text and "> Options: keep | drop" in text
-        assert f"/c/{root})" in text and f"/decide {decision.decision_id}" in text
+        assert text.startswith("Keep the v1 API?\n\n- keep\n- drop")
+        assert "/c/" not in text and decision.decision_id not in text and ">" not in text
+        assert text.endswith("\n\nI recommend: keep")
         await rig.send(ev.Decide(decision_id=decision.decision_id, answer="keep"))
 
         async def relayed() -> bool:

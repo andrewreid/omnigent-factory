@@ -432,7 +432,7 @@ async def test_contract_is_published_byte_exact_and_verifies(
     # The hash-bound section is exactly the deterministic rendering of the stored
     # contract (mentions escaped by the renderer itself), never truncated; no JSON.
     assert render_contract_section(canonical) in posted
-    assert "parcel-contract" not in posted and "[factory output truncated]" not in posted
+    assert "parcel-contract" not in posted and "[truncated]" not in posted
     digest = hashlib.sha256(canonical.encode()).hexdigest()
     assert digest == effect.args["full_hash"]
     assert f"hash={digest[:12]} -->" in posted

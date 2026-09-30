@@ -112,20 +112,35 @@ async def test_A_result_is_refused_until_every_comment_is_read(service_config: S
 async def test_A_stage_templates_point_at_owner_feedback():
     root = files("omnigent_factory.service") / "templates"
     for name in (
-        "triage-v3.txt",
-        "triage-feedback-v1.txt",
-        "plan-v3.txt",
-        "build-v4.txt",
+        "triage-v4.txt",
+        "triage-feedback-v2.txt",
+        "plan-v4.txt",
+        "build-v5.txt",
         "feedback-v3.txt",
         "build-feedback-v2.txt",
-        "build-rework-v1.txt",
+        "build-rework-v2.txt",
         "triage-comment-v1.txt",
         "continuation-v2.txt",
     ):
         text = (root / name).read_text("utf-8")
         assert "factory_get_feedback" in text, name
         assert len(text) < 1200, name
+    for name in (
+        "triage-v4.txt",
+        "triage-feedback-v2.txt",
+        "plan-v4.txt",
+        "build-v5.txt",
+        "build-rework-v2.txt",
+    ):
+        # The stage prompts say results are written for a human reading GitHub.
+        text = " ".join((root / name).read_text("utf-8").split())
+        assert "posted for a human: GitHub Markdown, short paragraphs" in text, name
     for gone in (
+        "triage-v3.txt",
+        "triage-feedback-v1.txt",
+        "plan-v3.txt",
+        "build-v4.txt",
+        "build-rework-v1.txt",
         "triage-v2.txt",
         "plan-v2.txt",
         "build-v2.txt",
@@ -238,3 +253,61 @@ async def test_F_command_comments_do_not_gate_or_rerun(service_config: ServiceCo
         assert (await rig.submit(root, "plan", PLAN))["accepted"] is True
         assert await submits_messages(rig, "feedback") == []
         assert (await rig.run()).session_id == run.session_id
+
+
+# ------------------------------------------------------------------ reply answers
+
+
+async def test_owner_reply_is_the_answer_relayed_to_the_run(service_config: ServiceConfig):
+    """A plain owner comment while a question is open answers it: the relayed message and
+    factory_get_feedback carry the comment's own text (the decision stores no copy)."""
+    async with started(service_config) as rig:
+        root = await planning(rig)
+        asked = await rig.ask(root, "Keep the v1 API?", options=["keep", "drop"])
+        await rig.quiesce()
+        rig.factory.tick(10_000_000)
+        result = await say(rig, "Keep it.\n\n- v1 stays for a release")
+        assert result.accepted
+        parcel = await rig.parcel()
+        decision = parcel.decision(asked["decision_id"])
+        assert decision is not None and decision.answer is None
+        assert decision.status.value == "relayed" and not parcel.open_decisions
+
+        async def relayed() -> bool:
+            return bool(await submits_messages(rig, "answer_relay"))
+
+        await eventually(relayed)
+        [relay] = await submits_messages(rig, "answer_relay")
+        text = await rig.tools.directory.message_text(relay)
+        assert text is not None and "Keep it.\n\n- v1 stays for a release" in text
+        assert not await submits_messages(rig, "feedback")  # not also relayed as feedback
+        feedback = await rig.tools.get_feedback(root)
+        [answer] = [d for d in feedback["decisions"] if d["decision_id"] == decision.decision_id]
+        assert "Keep it." in answer["answer"]
+
+
+async def test_a_reapplied_comment_delivery_is_listed_once(service_config: ServiceConfig):
+    """Operator recovery re-applies a recorded comment's delivery under a new logical id
+    (e.g. #477 comment 5903549471 as the answer): the comment is still one comment."""
+    async with started(service_config) as rig:
+        root = await planning(rig)
+        await rig.ask(root, "Keep the v1 API?")
+        await rig.quiesce()
+        rig.factory.tick(10_000_000)
+        guid = f"d-comment-{rig.factory.now + 1}"
+        payload = {"action": "created", "comment": {"body": "keep it"}}
+        await rig.service.db.call(
+            lambda store: store.append_delivery(
+                DeliveryRecord(guid, "issue_comment", json.dumps(payload).encode(), {})
+            )
+        )
+        first = rig.factory.make(ev.PlanFeedback(text_digest="keep it"))
+        again = replace(
+            rig.factory.make(ev.PlanFeedback(text_digest="keep it")),
+            event_id="recovery:comment:answer",
+            provenance=ev.Provenance.RECOVERY,
+        )
+        for event in (first, again):
+            await rig.service.apply_event(replace(event, delivery_guid=guid))
+        feedback = await rig.tools.get_feedback(root)
+        assert [t for t, _ in texts(feedback)].count("keep it") == 1

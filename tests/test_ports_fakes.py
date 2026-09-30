@@ -151,7 +151,7 @@ def test_bot_projection_precedence():
     cp = replace(p, sessions=tuple(s if x.session_id == s.session_id else x for x in p.sessions))
     assert project_bot(cp) == BotState.CHECKPOINT
     assert project_bot(replace(cp, holds=frozenset({Hold.STOP_UNVERIFIED}))) == BotState.BLOCKED
-    assert project_bot(replace(p, holds=frozenset({Hold.AWAITING_OWNER}))) == BotState.NEEDS_YOU
+    assert project_bot(replace(p, holds=frozenset({Hold.AWAITING_OWNER}))) == BotState.WORKING
     fenced = replace(b, lifecycle=Lifecycle.FENCED, fences=frozenset({FenceKind.STOPPED}))
     idle = replace(
         p, sessions=tuple(fenced if x.session_id == b.session_id else x for x in p.sessions)

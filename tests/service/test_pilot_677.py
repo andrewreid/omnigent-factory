@@ -316,7 +316,7 @@ async def _state(service: FactoryService, effect_id: str) -> tuple[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_transient_publication_failure_retries_then_needs_you(service_config):
+async def test_transient_publication_failure_retries_then_idle(service_config):
     github = FakeGitHub()
     github.script(
         EffectKind.PUBLISH_TRIAGE, RetryableReadFailure("rate limited", 1), Ack("comment-1")
@@ -332,7 +332,7 @@ async def test_transient_publication_failure_retries_then_needs_you(service_conf
         await eventually(done)
         _, parcel = await _state(service, effect_id)
         assert len(github.executed(EffectKind.PUBLISH_TRIAGE)) == 2
-        assert parcel.bot == BotState.NEEDS_YOU and Hold.AWAITING_OWNER in parcel.holds
+        assert parcel.bot == BotState.IDLE and Hold.AWAITING_OWNER in parcel.holds
     finally:
         await service.stop()
 
@@ -365,7 +365,7 @@ async def test_definitive_publication_failure_is_blocked_and_operator_retry_reco
 
         await eventually(done)
         _, parcel = await _state(service, effect_id)
-        assert parcel.bot == BotState.NEEDS_YOU
+        assert parcel.bot == BotState.IDLE
         assert Hold.PUBLICATION_FAILED not in parcel.holds
         assert len(parcel.sessions) == sessions_before
         assert [e.effect_id for e in github.executed(EffectKind.PUBLISH_TRIAGE)] == [

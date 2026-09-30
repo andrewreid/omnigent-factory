@@ -277,17 +277,22 @@ class FactoryTools:
             run_id, newest = run.session_id, max(int(c["sequence"]) for c in comments)
             await self.service.db.call(lambda store: store.record_feedback_read(run_id, newest))
         boundary = self._boundary(run)
-        answers = [
-            {
-                "decision_id": d.decision_id,
-                "status": d.status.value,
-                "answer": untrusted_block(d.answer, boundary, "OWNER ANSWER")
-                if d.answer is not None
-                else None,
-            }
-            for d in parcel.decisions
-            if run is not None and d.session_id == run.session_id
-        ]
+        answers = []
+        for d in parcel.decisions:
+            # This run's questions, and any answered from an owner comment (a rework run
+            # takes over the questions of the run it replaced).
+            if run is None or not (d.session_id == run.session_id or d.answer_event_id):
+                continue
+            answer = await self.directory.decision_answer(d)
+            answers.append(
+                {
+                    "decision_id": d.decision_id,
+                    "status": d.status.value,
+                    "answer": untrusted_block(answer, boundary, "OWNER ANSWER")
+                    if answer is not None
+                    else None,
+                }
+            )
         return {
             **self._header(caller),
             "new_since_us": since,
@@ -387,7 +392,8 @@ class FactoryTools:
         impact: str = "unknown",
     ) -> dict[str, Any]:
         caller = await self.resolve(session_id)
-        question = " ".join(question.split()) if isinstance(question, str) else ""
+        # Markdown as written (paragraphs, lists): it is posted as the agent's own reply.
+        question = question.strip() if isinstance(question, str) else ""
         if not question or len(question) > 2000:
             raise FactoryToolError("question: required, at most 2000 characters")
         opts = [" ".join(str(o).split())[:200] for o in (options or []) if str(o).strip()]
@@ -402,7 +408,12 @@ class FactoryTools:
         # One open question per canonical fingerprint (run + normalized text + options),
         # whatever the caller retries with: an equivalent retry returns the original.
         fingerprint = _digest(
-            _canonical({"question": question.lower(), "options": [o.lower() for o in opts]})
+            _canonical(
+                {
+                    "question": " ".join(question.lower().split()),
+                    "options": [o.lower() for o in opts],
+                }
+            )
         )[:16]
         run, stale = self._expected_run(caller, run_id)
         existing = _question_keys(caller.parcel, run, fingerprint)
@@ -419,14 +430,14 @@ class FactoryTools:
         request = {
             "question": question,
             "options": opts,
-            "recommendation": " ".join((recommendation or "").split())[:500],
+            "recommendation": (recommendation or "").strip()[:500],
             "impact": decision_impact.value,
         }
         summary = question
         if opts:
-            summary += "\nOptions: " + " | ".join(opts)
+            summary += "\n\n" + "\n".join(f"- {o}" for o in opts)
         if request["recommendation"]:
-            summary += f"\nRecommendation: {request['recommendation']}"
+            summary += f"\n\nI recommend: {request['recommendation']}"
         body = ev.OwnerQuestion(
             session_id=run.session_id,
             question_key=question_key,
@@ -954,8 +965,9 @@ def build_mcp_server(tools: FactoryTools, config: ServiceConfig) -> FastMCP:
     @server.tool(
         name="factory_ask_owner",
         description="Ask the owner one material question (scope, behaviour, cost, risk). "
-        "Posts it on the issue and marks the card Needs you; the answer is sent to this "
-        "session. run_id is required (your run, from the start message or "
+        "Posts it on the issue as your own reply (GitHub Markdown; options become a list) "
+        "and marks the card Needs you; the owner's reply is sent to this session as the "
+        "answer. run_id is required (your run, from the start message or "
         "factory_get_status). Asking the same question again while it is open returns the "
         "original receipt. Then end your turn. "
         'Example: {"session_id": "conv_123", "run_id": "ss_abc", '
@@ -986,7 +998,9 @@ def build_mcp_server(tools: FactoryTools, config: ServiceConfig) -> FastMCP:
         "(stage-appropriate; at a checkpoint only blocked). run_id is required and must be "
         "your current run (start message or factory_get_status). result holds the fields "
         "for the kind; build_ready also needs plan_hash from factory_get_plan. Errors list "
-        "exactly what to fix. Exact retries return the original receipt. Example: "
+        "exactly what to fix. Exact retries return the original receipt. Summaries and "
+        "reasons are posted as GitHub Markdown for a human: short paragraphs, lists where "
+        "they help. Example: "
         '{"session_id": "conv_123", "run_id": "ss_abc", "kind": "blocked", '
         '"result": {"reason": "tests need a DB", "done": ["wrote migration"]}}',
     )

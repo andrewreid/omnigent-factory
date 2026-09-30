@@ -208,9 +208,10 @@ BLOCKING_HOLDS = frozenset(
     }
 )
 
+#: The current stage cannot continue without the owner. ``AWAITING_OWNER`` (triage or
+#: plan posted, the next move is the owner's) is not one of them: that card is Idle.
 NEEDS_YOU_HOLDS = frozenset(
     {
-        Hold.AWAITING_OWNER,
         Hold.CHECKS_FAILED,
         Hold.READINESS_FAILED,
         Hold.REMEDIATION_EXHAUSTED,
