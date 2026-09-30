@@ -311,3 +311,43 @@ async def test_a_reapplied_comment_delivery_is_listed_once(service_config: Servi
             await rig.service.apply_event(replace(event, delivery_guid=guid))
         feedback = await rig.tools.get_feedback(root)
         assert [t for t, _ in texts(feedback)].count("keep it") == 1
+
+
+async def test_a_reapplied_comment_delivery_does_not_gate_a_read_run(
+    service_config: ServiceConfig,
+):
+    """#477: the owner's comment was read, then operator recovery re-applied its delivery
+    under a new logical id. The re-application is not a new comment: it must not refuse
+    build_ready, before or after another factory_get_feedback."""
+    async with started(service_config) as rig:
+        root, plan_hash = await building(rig)
+        await rig.tools.get_plan(root)
+        rig.factory.tick(10_000_000)
+        guid = f"d-comment-{rig.factory.now + 1}"
+        payload = {"action": "created", "comment": {"body": "keep it"}}
+        await rig.service.db.call(
+            lambda store: store.append_delivery(
+                DeliveryRecord(guid, "issue_comment", json.dumps(payload).encode(), {})
+            )
+        )
+        first = rig.factory.make(ev.PlanFeedback(text_digest="keep it"))
+        await rig.service.apply_event(replace(first, delivery_guid=guid))
+        await rig.tools.get_feedback(root)
+        again = replace(
+            rig.factory.make(ev.PlanFeedback(text_digest="keep it")),
+            event_id="recovery:github:comment:1:answer",
+            provenance=ev.Provenance.RECOVERY,
+            delivery_guid=guid,
+        )
+        assert (await rig.service.apply_event(again)).accepted
+        receipt = await rig.submit(root, "build_ready", build_ready(), plan_hash=plan_hash)
+        assert receipt["accepted"] is True
+        # A fresh read covers the re-application too: the next result is not gated.
+        feedback = await rig.tools.get_feedback(root)
+        assert [t for t, _ in texts(feedback)] == ["keep it"]
+        await say(rig, "hmm")  # a genuinely new owner comment still gates
+        with pytest.raises(FactoryToolError, match="factory_get_feedback"):
+            await rig.submit(root, "build_ready", build_ready("f" * 40), plan_hash=plan_hash)
+        await rig.tools.get_feedback(root)
+        receipt = await rig.submit(root, "build_ready", build_ready("f" * 40), plan_hash=plan_hash)
+        assert receipt["accepted"] is True

@@ -69,7 +69,7 @@ from omnigent_factory.service.directory import (
     untrusted_block,
 )
 from omnigent_factory.service.runtime import FactoryService
-from omnigent_factory.store.sqlite import McpReceipt, SqliteStore
+from omnigent_factory.store.sqlite import McpReceipt
 
 TOOL_NAMES = (
     "factory_get_issue",
@@ -329,19 +329,15 @@ class FactoryTools:
         return auth.source_time_us if auth is not None else 0
 
     async def _unread_feedback(self, parcel: Parcel, run: StageSession) -> bool:
-        """An owner comment was recorded after the newest one ``run`` has read."""
-        run_id, parcel_id = run.session_id, parcel.parcel_id
-
-        def unread(store: SqliteStore) -> bool:
-            seen = store.feedback_read(run_id)
-            rows = store.query(
-                "SELECT 1 FROM events WHERE parcel_id = ? AND kind = ? AND accepted = 1 "
-                "AND sequence > ? LIMIT 1",
-                (parcel_id, EventKind.PLAN_FEEDBACK.value, seen),
-            )
-            return bool(rows)
-
-        return bool(await self.service.db.call(unread))
+        """An owner feedback comment ``run`` has not been shown: judged on the same
+        comments factory_get_feedback serves, so a re-applied delivery (its first event
+        already read) or a control event with no comment text never gates."""
+        run_id = run.session_id
+        seen = await self.service.db.call(lambda store: store.feedback_read(run_id))
+        return any(
+            c["kind"] == EventKind.PLAN_FEEDBACK.value and int(c["sequence"]) > seen
+            for c in await self.directory.owner_comments(parcel)
+        )
 
     async def get_status(self, session_id: str) -> dict[str, Any]:
         caller = await self.resolve(session_id)
