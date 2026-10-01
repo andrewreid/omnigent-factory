@@ -59,6 +59,7 @@ def render_app_manifest(
             "statuses": "read",
             "actions": "read",
             "metadata": "read",
+            "workflows": "write",
             "organization_projects": "write",
         },
         "default_events": [
@@ -251,7 +252,7 @@ def render_setup(
 def validate_setup(bundle: SetupBundle) -> None:
     permissions = bundle.app_manifest.get("default_permissions")
     if not isinstance(permissions, dict) or any(
-        key in permissions for key in ("administration", "workflows", "members", "secrets")
+        key in permissions for key in ("administration", "members", "secrets")
     ):
         raise ValueError("App manifest exceeds the approved permission boundary")
     options = bundle.project_migration["update_status"]["input"]["singleSelectOptions"]

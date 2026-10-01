@@ -43,8 +43,9 @@ from omnigent_factory.credentials.capabilities import CapabilityRecord, Capabili
 from omnigent_factory.ports.clock import Clock
 from omnigent_factory.ports.credentials import CREDENTIAL_EFFECT_KINDS, TokenGrant, TokenRefusal
 
-#: Installation-token permissions per fixed profile (§6.1). No Workflows, Administration
-#: or organization Projects for any stage profile.
+#: Installation-token permissions per fixed profile (§6.1). Only BUILD may write Workflows
+#: (owner decision 2026-10-01: a build may change ``.github/workflows/*`` on its own parcel
+#: branch). No Administration or organization Projects for any stage profile.
 PROFILE_PERMISSIONS: Mapping[CredentialProfile, Mapping[str, str]] = {
     CredentialProfile.READ_ONLY: {
         "contents": "read",
@@ -63,6 +64,7 @@ PROFILE_PERMISSIONS: Mapping[CredentialProfile, Mapping[str, str]] = {
         "statuses": "read",
         "actions": "read",
         "metadata": "read",
+        "workflows": "write",
     },
 }
 

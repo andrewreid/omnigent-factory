@@ -103,8 +103,23 @@ async def test_profile_permissions_are_fixed_and_requested_exactly(setup) -> Non
     assert minter.minted[-1][1] == PROFILE_PERMISSIONS[CredentialProfile.READ_ONLY]
     assert all(v == "read" for v in minter.minted[-1][1].values())
     build = PROFILE_PERMISSIONS[CredentialProfile.BUILD]
-    assert build["contents"] == "write" and "workflows" not in build
+    assert build["contents"] == "write" and build["workflows"] == "write"
     assert "administration" not in build and "organization_projects" not in build
+    assert "workflows" not in PROFILE_PERMISSIONS[CredentialProfile.READ_ONLY]
+
+
+@pytest.mark.asyncio
+async def test_build_token_requests_workflows_write_and_read_only_does_not(setup) -> None:
+    """Owner decision 2026-10-01 (#694): only BUILD may push ``.github/workflows/*``."""
+    broker, gate, minter, _ = setup
+    build_secret = await _enable(broker, "BUILD", CredentialProfile.BUILD)
+    gate.open("BUILD", CredentialProfile.BUILD)
+    assert isinstance(await broker.request_token("BUILD", build_secret, REPO), TokenGrant)
+    assert minter.minted[-1][1]["workflows"] == "write"
+    plan_secret = await _enable(broker, "PLAN", CredentialProfile.READ_ONLY)
+    gate.open("PLAN", CredentialProfile.READ_ONLY)
+    assert isinstance(await broker.request_token("PLAN", plan_secret, REPO), TokenGrant)
+    assert "workflows" not in minter.minted[-1][1]
 
 
 @pytest.mark.asyncio

@@ -105,7 +105,50 @@ async def test_build_token_has_only_approved_repository_permissions():
         "metadata": "read",
         "pull_requests": "write",
         "statuses": "read",
+        "workflows": "write",
     }
+
+
+@pytest.mark.asyncio
+async def test_workflows_write_is_build_only_and_must_be_granted_exactly():
+    """Owner decision 2026-10-01 (#694): BUILD requests workflows:write; nothing else does."""
+    bodies: list[dict] = []
+    drop_workflows = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        granted = dict(body["permissions"])
+        if drop_workflows:
+            granted.pop("workflows", None)
+        return httpx.Response(
+            201,
+            json={
+                "token": "opaque",
+                "expires_at": "2030-01-01T00:00:00Z",
+                "permissions": granted,
+                "repositories": [{"full_name": "SA-Ambulance/timesheets"}],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        service = InstallationTokenService(
+            http, AppAuthenticator(1, private_key()), 99, "SA-Ambulance/timesheets"
+        )
+        build = await service.mint("SA-Ambulance/timesheets", CredentialProfile.BUILD)
+        read_only = await service.mint("SA-Ambulance/timesheets", CredentialProfile.READ_ONLY)
+        daemon = await service.mint_daemon()
+        drop_workflows = True
+        short = await service.mint("SA-Ambulance/timesheets", CredentialProfile.BUILD)
+    assert isinstance(build, TokenGrant) and isinstance(read_only, TokenGrant)
+    assert bodies[0]["permissions"]["workflows"] == "write"
+    assert "workflows" not in bodies[1]["permissions"]
+    assert "workflows" not in bodies[2]["permissions"]
+    assert not isinstance(daemon, TokenRefusal) and "workflows" not in daemon.permissions
+    # An installation that has not accepted workflows:write yields a narrower token; the
+    # exact-scope check refuses it rather than handing out a token that cannot push.
+    assert isinstance(short, TokenRefusal)
+    assert "differ from the requested" in short.reason
 
 
 @pytest.mark.asyncio

@@ -65,6 +65,21 @@ def test_guard_allows_only_the_parcel_branch_including_force(git_env: GitEnv) ->
     assert git("rev-parse", "main", cwd=remote) != git("rev-parse", "HEAD", cwd=wt)
 
 
+def test_guard_allows_workflow_file_changes_on_the_parcel_branch_only(git_env: GitEnv) -> None:
+    """Owner decision 2026-10-01 (#694): workflow edits ride the parcel branch like any file."""
+    _, wt = _wired(git_env)
+    workflow = wt / ".github" / "workflows" / "deploy-staging.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("on: push\n", encoding="utf-8")
+    git("add", ".github/workflows/deploy-staging.yml", cwd=wt)
+    git("commit", "-m", "ci: workflow", cwd=wt)
+    assert _push(wt, git_env.remote, f"HEAD:refs/heads/{BRANCH}").returncode == 0
+    pushed = git("ls-tree", "-r", "--name-only", BRANCH, cwd=git_env.remote)
+    assert ".github/workflows/deploy-staging.yml" in pushed
+    for refspec in ("HEAD:main", "HEAD:refs/heads/other"):
+        assert _push(wt, git_env.remote, refspec).returncode != 0, refspec
+
+
 def test_harness_settings_are_written_ignored_and_never_committed(git_env: GitEnv) -> None:
     ws, wt = _wired(git_env)
     settings = json.loads((wt / ".claude" / "settings.local.json").read_text())

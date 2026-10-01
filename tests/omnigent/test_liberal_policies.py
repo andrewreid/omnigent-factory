@@ -74,6 +74,12 @@ NORMAL = [
     'input: {pullRequestReviewThreadId: "PRRT_x", body: "FOLLOW_UP: #700"}) { comment { id } } }\'',
     "gh api graphql -f query='mutation { resolveReviewThread("
     'input: {threadId: "PRRT_kwDOTC12Fs6m_Zg1"}) { thread { isResolved } } }\'',
+    # Workflow files on the parcel's own branch (owner decision 2026-10-01, #694).
+    "sed -i 's/node 20/node 22/' .github/workflows/deploy-staging.yml",
+    "git add .github/workflows/deploy-staging.yml && git commit -m 'ci: bump node'"
+    " && git push origin factory/issue-677",
+    "git push origin HEAD:refs/heads/factory/issue-677",
+    "gh run list --workflow deploy-staging.yml --branch factory/issue-677",
 ]
 
 FORBIDDEN = [
@@ -101,6 +107,11 @@ FORBIDDEN = [
     "gh repo delete SA-Ambulance/timesheets --yes",
     "gh repo edit --enable-auto-merge",
     "gh workflow disable ci.yml",
+    "gh workflow enable deploy-staging.yml",
+    "gh api -X PUT repos/SA-Ambulance/timesheets/actions/workflows/123/enable",
+    "gh api -X PUT repos/SA-Ambulance/timesheets/actions/workflows/ci.yml/disable",
+    "gh api -X PUT repos/SA-Ambulance/timesheets/actions/permissions -F enabled=true",
+    "git add .github/workflows/ci.yml && git commit -m ci && git push origin HEAD:main",
     "gh issue close 462",
     "gh issue delete 462 --yes",
     "gh api -X PATCH repos/SA-Ambulance/timesheets/issues/462 -f state=closed",
@@ -166,6 +177,20 @@ def test_file_content_mentioning_commands_is_not_scanned(cel: Any) -> None:
         },
     }
     assert _result(cel(event)) == "ALLOW"
+
+
+def test_mcp_workflow_file_write_is_allowed_on_the_parcel_branch_only(cel: Any) -> None:
+    def push(branch: str) -> dict[str, Any]:
+        args = {
+            "owner": "SA-Ambulance",
+            "repo": "timesheets",
+            "branch": branch,
+            "files": [{"path": ".github/workflows/deploy-staging.yml", "content": "on: push"}],
+        }
+        return {"type": "tool_call", "data": {"name": "mcp__github__push_files", "arguments": args}}
+
+    assert _result(cel(push(BRANCH))) == "ALLOW"
+    assert _result(cel(push("main"))) == "DENY"
 
 
 def test_mcp_merge_and_admin_tools_are_denied(cel: Any) -> None:

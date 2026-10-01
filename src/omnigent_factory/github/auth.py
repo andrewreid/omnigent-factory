@@ -31,6 +31,7 @@ _BUILD_PERMISSIONS: Mapping[str, str] = {
     "contents": "write",
     "issues": "write",
     "pull_requests": "write",
+    "workflows": "write",
 }
 _DAEMON_PERMISSIONS: Mapping[str, str] = {
     **_READ_ONLY_PERMISSIONS,

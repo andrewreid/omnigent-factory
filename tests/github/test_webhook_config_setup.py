@@ -11,7 +11,12 @@ from omnigent_factory.core import events as ev
 from omnigent_factory.core.events import Provenance
 from omnigent_factory.core.types import Stage
 from omnigent_factory.github.client import GitHubClient
-from omnigent_factory.github.setup import REQUIRED_CHECKS, render_setup
+from omnigent_factory.github.setup import (
+    REQUIRED_CHECKS,
+    SetupBundle,
+    render_setup,
+    validate_setup,
+)
 from omnigent_factory.github.webhook import (
     DeliveryIdentity,
     DeliveryNormalizer,
@@ -269,3 +274,19 @@ def test_setup_payloads_preserve_ids_and_render_native_review_rule():
     assert [check["context"] for check in checks] == list(REQUIRED_CHECKS)
     assert "human-review-gate" not in str(bundle)
     assert "administration" not in bundle.app_manifest["default_permissions"]
+
+
+def test_app_manifest_allows_workflows_but_not_admin_members_or_secrets():
+    """Owner decision 2026-10-01 (#694): the App may hold workflows:write, nothing broader."""
+    bundle = render_setup()
+    permissions = bundle.app_manifest["default_permissions"]
+    assert permissions["workflows"] == "write"
+    validate_setup(bundle)
+    for forbidden in ("administration", "members", "secrets"):
+        manifest = {
+            **bundle.app_manifest,
+            "default_permissions": {**permissions, forbidden: "write"},
+        }
+        widened = SetupBundle(manifest, bundle.project_migration, bundle.ruleset)
+        with pytest.raises(ValueError, match="approved permission boundary"):
+            validate_setup(widened)

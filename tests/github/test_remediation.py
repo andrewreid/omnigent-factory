@@ -506,6 +506,7 @@ def test_S7_manifest_is_exact_allowlist():
         "statuses": "read",
         "actions": "read",
         "metadata": "read",
+        "workflows": "write",
         "organization_projects": "write",
     }
     assert manifest["default_events"] == [
@@ -571,6 +572,7 @@ async def test_advisory_daemon_token_is_not_labelled_read_only():
         ).mint_daemon()
     assert not hasattr(grant, "profile")
     assert grant.permissions["organization_projects"] == "write"
+    assert "workflows" not in grant.permissions  # only BUILD stage tokens write workflows
 
 
 def _identity() -> DeliveryIdentity:

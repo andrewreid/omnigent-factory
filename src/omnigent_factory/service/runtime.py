@@ -285,6 +285,9 @@ class FactoryService:
                 # recovered unknown rows and closes this crash window without another call.
                 await self.db.call(partial(_complete_effect, effect_id=effect.effect_id))
                 continue
+            # A later reconciliation (its own effect's ack) or adoption already resolved it.
+            if await self.db.call(partial(_close_reconciled, effect_id=effect.effect_id)):
+                continue
             unknown_event = Event(
                 event_id=f"effect:{effect.effect_id}:unknown",
                 repo_id=self.config.repo_id,
@@ -1015,6 +1018,10 @@ def _has_event(store: SqliteStore, *, event_id: str) -> bool:
 
 def _complete_effect(store: SqliteStore, *, effect_id: str) -> bool:
     return store.complete_effect(effect_id)
+
+
+def _close_reconciled(store: SqliteStore, *, effect_id: str) -> bool:
+    return store.close_reconciled_unknown(effect_id)
 
 
 def _fail_effect(store: SqliteStore, *, effect_id: str) -> bool:

@@ -38,7 +38,7 @@ from pathlib import Path
 
 from omnigent_factory.core import codec
 from omnigent_factory.core.effects import EffectIntent, EffectKind
-from omnigent_factory.core.events import Event, EventKind
+from omnigent_factory.core.events import EffectReconciled, Event, EventKind, MessageAck
 from omnigent_factory.core.reducer import TransitionResult, transition
 from omnigent_factory.core.types import (
     FENCE_BITS,
@@ -192,6 +192,16 @@ def _digest(text: str | None) -> str | None:
     if text is None:
         return None
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _resolution(event: Event) -> tuple[str, bool, str] | None:
+    """``(effect_id, delivered, item_id)`` when ``event`` resolves an ambiguous write."""
+    body = event.body
+    if isinstance(body, EffectReconciled) and body.effect_id:
+        return body.effect_id, body.delivered, body.item_id
+    if isinstance(body, MessageAck) and body.effect_id:
+        return body.effect_id, True, body.item_id
+    return None
 
 
 class SqliteStore:
@@ -709,6 +719,10 @@ class SqliteStore:
             ),
         )
         self._hook("after-event-insert")
+        if result.audit.accepted:
+            resolution = _resolution(event)
+            if resolution is not None:
+                self._close_unknown(conn, *resolution)
         if new.parcel is not None:
             self._project(conn, old_parcel, new.parcel, event, now)
         self._write_admission(conn, new.admission, now)
@@ -1204,6 +1218,54 @@ class SqliteStore:
         return self._finish_effect(
             effect_id, "done", from_states=("claimed", "unknown"), remote_id=remote_id, reason=None
         )
+
+    def _close_unknown(
+        self, conn: sqlite3.Connection, effect_id: str, delivered: bool, item_id: str
+    ) -> bool:
+        """Close an ``unknown`` row the reducer resolved by a later, separate event.
+
+        Only ``unknown`` rows move, and only to ``done`` or ``failed``: never ``pending``,
+        so a resolution can never cause the original write to be sent again.
+        """
+        if delivered:
+            return self._update_effect(
+                conn,
+                effect_id,
+                "done",
+                from_states=("unknown",),
+                remote_id=item_id or None,
+                reason="reconciled: delivered",
+            )
+        return self._update_effect(
+            conn,
+            effect_id,
+            "failed",
+            from_states=("unknown",),
+            remote_id=None,
+            reason="reconciled: not delivered",
+        )
+
+    def close_reconciled_unknown(self, effect_id: str) -> bool:
+        """Startup: close an ``unknown`` row whose resolution event is already persisted.
+
+        Repairs rows left ``unknown`` before resolutions closed them in the same
+        transaction. Reads accepted ``EffectReconciled`` / ``MessageAck`` events only.
+        """
+        row = self._conn.execute(
+            "SELECT kind, payload_json FROM events WHERE accepted = 1 AND kind IN (?, ?) "
+            "AND json_extract(payload_json, '$.body.effect_id') = ? "
+            "ORDER BY sequence DESC LIMIT 1",
+            (EventKind.EFFECT_RECONCILED.value, EventKind.MESSAGE_ACK.value, effect_id),
+        ).fetchone()
+        if row is None:
+            return False
+        body = json.loads(row["payload_json"]).get("body") or {}
+        delivered = row["kind"] == EventKind.MESSAGE_ACK.value or body.get("delivered") is True
+        item_id = body.get("item_id")
+        with self._txn() as conn:
+            return self._close_unknown(
+                conn, effect_id, delivered, item_id if isinstance(item_id, str) else ""
+            )
 
     def mark_effect_unknown(self, effect_id: str, reason: str) -> bool:
         """Ambiguous write: never returns to ``pending`` automatically."""
