@@ -18,3 +18,6 @@ test) is not yours to fix: name the check and the cause in a PR comment and in t
 build_ready summary, and submit build_ready; the factory parks the card for the owner with
 that check named. Submit kind "blocked" only if a required defect in this change cannot be
 fixed within scope.
+The build_ready summary says what changed, the decisions you made and any follow-ups. Leave
+out CI and review-bot status (pending, passed, reacted): the factory reports those from its
+own reads.

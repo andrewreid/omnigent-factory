@@ -97,7 +97,8 @@ def test_651_base_sync_red_check_keeps_the_card_in_ready_blocked_then_green_is_i
     h = Harness()
     ready(h)
     update_branch(h)
-    assert h.p().stage == Stage.READY and h.p().bot == BotState.WORKING
+    assert h.p().stage == Stage.READY and h.p().bot == BotState.IDLE
+    assert h.p().board_note == f"Checks running on `{SYNC[:7]}`"
     r = h.send(P, red(h))
     assert r.audit.accepted
     assert_quiet(r)
@@ -130,11 +131,11 @@ def test_a_later_owner_sync_head_re_evaluates_and_its_green_read_restores_idle()
     # The owner fixes main and updates the branch again: waiting, then green.
     update_branch(h, SYNC2)
     p = h.p()
-    assert p.stage == Stage.READY and not p.readiness.sync_red and p.bot == BotState.WORKING
-    assert p.board_note == ""
+    assert p.stage == Stage.READY and not p.readiness.sync_red and p.bot == BotState.IDLE
+    assert p.board_note == f"Checks running on `{SYNC2[:7]}`"
     r = h.send(P, evidence(h, SYNC2, checks=ev.ChecksState.PENDING, base_sync=True))
     assert_quiet(r)
-    assert h.p().bot == BotState.WORKING
+    assert h.p().bot == BotState.IDLE
     r = h.send(P, evidence(h, SYNC2, verified=True, checks=ev.ChecksState.GREEN, base_sync=True))
     assert_quiet(r)
     assert h.p().readiness.ready and h.p().bot == BotState.IDLE and h.p().board_note == ""
@@ -149,7 +150,7 @@ def test_a_re_run_pending_after_the_red_read_is_waiting_not_blocked():
     assert_quiet(r)
     p = h.p()
     assert p.stage == Stage.READY and not p.readiness.sync_red
-    assert p.bot == BotState.WORKING and p.board_note == ""
+    assert p.bot == BotState.IDLE and p.board_note == f"Checks running on `{SYNC[:7]}`"
 
 
 def test_a_sync_head_with_another_failure_keeps_the_existing_rule():

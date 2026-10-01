@@ -35,6 +35,9 @@ class EffectKind(enum.StrEnum):
     PUBLISH_CONTRACT = "publish_contract"
     PUBLISH_TRIAGE = "publish_triage"
     PUBLISH_REPORT = "publish_report"
+    #: Keep the factory lines of a posted Ready report current: edit the comment its
+    #: PUBLISH_REPORT marker finds (``args.report_effect_id``) in place; never posts.
+    EDIT_REPORT = "edit_report"
     ENSURE_PROJECT_ITEM = "ensure_project_item"
     FETCH_PR_EVIDENCE = "fetch_pr_evidence"
     RECONCILE_PARCEL = "reconcile_parcel"

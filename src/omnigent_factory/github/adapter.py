@@ -126,6 +126,10 @@ class GitHubAPIAdapter:
         self.cross_vendor_review = cross_vendor_review
         self._last_checks_summary = ""
         self._last_failing_checks = ""
+        #: Kind of the review bot's latest answer to the head last read ("" = none).
+        self._last_bot_answer = ""
+        #: Commit of each review thread the review bot opened, from the last thread read.
+        self._last_bot_thread_commits: tuple[str, ...] = ()
         if independent_reviewer_ids & (owner_ids | {bot_user_id}):
             raise ValueError("independent reviewers cannot include owners or the factory bot")
         self.independent_reviewer_ids = independent_reviewer_ids
@@ -304,6 +308,7 @@ class GitHubAPIAdapter:
             findings_dispositioned = await self._bot_threads_settled(pr_number)
             closes_issue = await self._closes_issue(pr_number, ref.parcel_id)
             review_bot_since = await self._review_bot_pending_since(pr, pr_number, head_sha)
+            verdict = self._review_bot_verdict(head_sha, review_bot_since, findings_dispositioned)
             author = pr.get("user")
             return PullRequestEvidence(
                 pr_number=pr_number,
@@ -320,6 +325,7 @@ class GitHubAPIAdapter:
                 review_bot_pending_since_us=review_bot_since,
                 base_sync=base_sync,
                 failing_checks=self._last_failing_checks,
+                review_bot_verdict=verdict,
             )
         except RateLimited as exc:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
@@ -337,6 +343,7 @@ class GitHubAPIAdapter:
         and PR creation, whichever is later). An explicit mention by anyone else after its
         last answer re-pings it. None whenever this cannot be told.
         """
+        self._last_bot_answer = ""
         login = self.review_bot_login
         if not login:
             return None
@@ -351,7 +358,7 @@ class GitHubAPIAdapter:
         if not committed or not opened:
             return None
         pushed = max(committed, opened)
-        answers: list[int] = []
+        answers: list[tuple[int, str]] = []
         pings: list[int] = []
         reviews = await self.client.paginate(
             f"/repos/{self.repository}/pulls/{pr_number}/reviews?per_page=100"
@@ -362,9 +369,9 @@ class GitHubAPIAdapter:
         reactions = await self.client.paginate(
             f"/repos/{self.repository}/issues/{pr_number}/reactions?per_page=100"
         )
-        for item, at_key in (
-            *((r, "submitted_at") for r in reviews),
-            *((c, "created_at") for c in comments),
+        for item, at_key, kind in (
+            *((r, "submitted_at", "review") for r in reviews),
+            *((c, "created_at", "comment") for c in comments),
         ):
             if not isinstance(item, dict):
                 continue
@@ -374,7 +381,7 @@ class GitHubAPIAdapter:
             at = self._parse_time_us(item.get(at_key))
             if author == login:
                 if at and (item.get("commit_id") == head_sha or self._names_commit(body, head_sha)):
-                    answers.append(at)
+                    answers.append((at, kind))
             elif self.review_bot_mention and self.review_bot_mention.lower() in body.lower():
                 if not at:
                     return None  # an undatable re-ping could be the latest one
@@ -385,12 +392,30 @@ class GitHubAPIAdapter:
             user = reaction.get("user")
             at = self._parse_time_us(reaction.get("created_at"))
             if isinstance(user, dict) and user.get("login") == login and at > pushed:
-                answers.append(at)
+                answers.append((at, "reaction"))
         if not answers:
             return max([pushed, *pings])
-        answered = max(answers)
+        answered, self._last_bot_answer = max(answers)
         later = [at for at in pings if at > answered]
         return max(later) if later else 0
+
+    def _review_bot_verdict(self, head_sha: str, since: int | None, settled: bool) -> str:
+        """The review bot's answer to ``head_sha`` for the Ready report ("" = none yet).
+
+        A +1 is a clean verdict; a review (or verdict comment) of the head counts the
+        review threads the bot opened on that commit, with or without outcomes.
+        """
+        if since != 0 or not self._last_bot_answer:
+            return ""
+        short = head_sha[:7]
+        if self._last_bot_answer == "reaction":
+            return f"👍 on `{short}`"
+        if not settled:
+            return f"reviewed `{short}`, findings without outcomes"
+        count = sum(1 for oid in self._last_bot_thread_commits if oid == head_sha)
+        if not count:
+            return f"reviewed `{short}`, no findings"
+        return f"reviewed `{short}`, {count} finding{'s' if count != 1 else ''}, all with outcomes"
 
     @staticmethod
     def _names_commit(body: str, head_sha: str) -> bool:
@@ -680,7 +705,10 @@ class GitHubAPIAdapter:
     async def _bot_threads_settled(self, pr_number: int) -> bool:
         """Every review thread opened by a bot has an outcome: answered by the factory bot,
         or resolved by a person. A thread the factory bot resolved without replying
-        (``resolvedBy`` is a user, so a bot resolver reads as null) is still open."""
+        (``resolvedBy`` is a user, so a bot resolver reads as null) is still open.
+
+        A complete read also records the commit of each thread the review bot opened
+        (its findings count in the Ready report)."""
         owner, _, name = self.repository.partition("/")
         query = """
         query($owner: String!, $name: String!, $number: Int!, $after: String) {
@@ -691,7 +719,10 @@ class GitHubAPIAdapter:
                   isResolved
                   resolvedBy { login }
                   comments(first: 50) {
-                    nodes { author { __typename ... on Bot { databaseId } } }
+                    nodes {
+                      author { __typename login ... on Bot { databaseId } }
+                      originalCommit { oid }
+                    }
                   }
                 }
                 pageInfo { hasNextPage endCursor }
@@ -701,6 +732,9 @@ class GitHubAPIAdapter:
         }
         """
         after: str | None = None
+        self._last_bot_thread_commits = ()
+        bot_login = self.review_bot_login.removesuffix("[bot]")  # GraphQL omits "[bot]"
+        bot_commits: list[str] = []
         while True:
             data = await self.client.graphql(
                 query, {"owner": owner, "name": name, "number": pr_number, "after": after}
@@ -714,9 +748,12 @@ class GitHubAPIAdapter:
             for thread in nodes:
                 if not isinstance(thread, dict):
                     continue
+                comments = thread.get("comments")
+                oid = _bot_thread_commit(comments, bot_login)
+                if oid is not None:
+                    bot_commits.append(oid)
                 if thread.get("isResolved") is True and thread.get("resolvedBy"):
                     continue  # a person resolved it
-                comments = thread.get("comments")
                 authors = [
                     c.get("author") or {}
                     for c in (comments.get("nodes") if isinstance(comments, dict) else None) or []
@@ -732,6 +769,7 @@ class GitHubAPIAdapter:
                     return False
             page = threads.get("pageInfo") if isinstance(threads, dict) else None
             if not isinstance(page, dict) or not page.get("hasNextPage"):
+                self._last_bot_thread_commits = tuple(bot_commits)
                 return True
             cursor = page.get("endCursor")
             if not isinstance(cursor, str):
@@ -807,6 +845,8 @@ class GitHubAPIAdapter:
                 EffectKind.PUBLISH_REPORT,
             }:
                 return await self._post_comment(effect)
+            if effect.kind == EffectKind.EDIT_REPORT:
+                return await self._edit_report(effect)
             if effect.kind in {EffectKind.MOVE_CARD, EffectKind.SET_BOT}:
                 return await self._write_board(effect)
             if effect.kind in {EffectKind.SET_NOTE, EffectKind.REACT_COMMENT}:
@@ -1123,13 +1163,20 @@ class GitHubAPIAdapter:
     async def _find_marked_comment(
         self, ref: IssueRef, effect_id: str
     ) -> str | RetryableReadFailure | None:
+        found = await self._marked_comment(ref, effect_id)
+        return found[0] if isinstance(found, tuple) else found
+
+    async def _marked_comment(
+        self, ref: IssueRef, effect_id: str
+    ) -> tuple[str, str] | RetryableReadFailure | None:
+        """(id, body) of the one bot comment carrying ``effect_id``'s marker."""
         marker = self._effect_marker(effect_id)
         try:
             comments = await self.client.paginate(
                 f"/repos/{self.repository}/issues/{ref.issue_number}/comments?per_page=100"
             )
             matches = [
-                str(comment.get("id"))
+                (str(comment.get("id")), str(comment.get("body", "")))
                 for comment in comments
                 if isinstance(comment, dict)
                 and marker in str(comment.get("body", ""))
@@ -1143,6 +1190,45 @@ class GitHubAPIAdapter:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
         except GitHubAPIError as exc:
             return RetryableReadFailure(str(exc))
+
+    async def _edit_report(self, effect: EffectIntent) -> AdapterOutcome:
+        """Bring a posted Ready report's factory lines up to date, in place.
+
+        Finds the comment by its PUBLISH_REPORT marker (never posts one) and rewrites it
+        only when the text differs and everything before the factory lines (the heading
+        and the agent's summary) is unchanged. A PATCH of the same body is idempotent, so
+        an unclear outcome is retried as a read.
+        """
+        report_id = effect.args.get("report_effect_id")
+        ref = await self._issue_ref(effect, require_parcel=False)
+        text = await self._render_publication(effect)
+        if not isinstance(report_id, str) or not report_id or ref is None:
+            return DefinitiveFailure("report edit could not resolve its comment")
+        if not isinstance(text, str):
+            return DefinitiveFailure("report edit could not render its body")
+        found = await self._marked_comment(ref, report_id)
+        if isinstance(found, RetryableReadFailure):
+            return found
+        if found is None:
+            return DefinitiveFailure("no bot comment carries the report marker")
+        comment_id, current = found
+        body = f"{text}\n\n{self._effect_marker(report_id)}"
+        if current == body:
+            return Ack(comment_id, {"edited": False})
+        cut = text.find(_REPORT_FACTORY_LINES)
+        if cut < 0 or not current.startswith(text[:cut]):
+            LOG.warning("ready report edit skipped: its summary differs comment=%s", comment_id)
+            return Ack(comment_id, {"edited": False, "reason": "summary-differs"})
+        try:
+            await self.client.request(
+                "PATCH",
+                f"/repos/{self.repository}/issues/comments/{comment_id}",
+                json_body={"body": body},
+                expected=frozenset({200}),
+            )
+        except AmbiguousRequest as exc:
+            return RetryableReadFailure(str(exc))
+        return Ack(comment_id, {"edited": True})
 
     async def _write_board(self, effect: EffectIntent) -> AdapterOutcome:
         item_id = effect.args.get("item_id")
@@ -1383,6 +1469,22 @@ class GitHubAPIAdapter:
             return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1e6)
         except ValueError:
             return 0
+
+
+#: Where a Ready report's factory lines begin (see ``service.directory._ready_text``).
+_REPORT_FACTORY_LINES = "\n**PR:** "
+
+
+def _bot_thread_commit(comments: object, bot_login: str) -> str | None:
+    """The commit of a review thread the review bot opened (None: not its thread)."""
+    nodes = comments.get("nodes") if isinstance(comments, dict) else None
+    first = nodes[0] if isinstance(nodes, list) and nodes else None
+    author = first.get("author") if isinstance(first, dict) else None
+    if not bot_login or not isinstance(author, dict) or author.get("login") != bot_login:
+        return None
+    commit = first.get("originalCommit") if isinstance(first, dict) else None
+    oid = commit.get("oid") if isinstance(commit, dict) else None
+    return oid if isinstance(oid, str) else None
 
 
 def _status_options(schema: BoardSchema | None) -> dict[Stage, str]:

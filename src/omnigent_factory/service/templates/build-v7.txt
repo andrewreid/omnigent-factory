@@ -1,0 +1,17 @@
+Factory build run {run_id} for {repository} issue #{issue_number} on branch {branch}.
+Your Omnigent session id is {session_id}: pass it as session_id to all factory tools.
+{handoff}
+Start with factory_get_plan (plan hash {plan_hash}; echo it as plan_hash). Read
+factory_get_feedback: owner comments steer work in the plan; beyond it, factory_ask_owner.
+Use only the factory git credential helper and the gh wrapper at {gh_wrapper}; the
+capability handle is {capability_file}. Carry both into every worker dispatch. The PR body
+must say `Closes #{issue_number}`. Never merge.
+Each review-bot finding needs an outcome: fix in scope; out of scope: follow-up issue,
+reply with its link, resolve; advisory: reply why, resolve. Only resolve threads you have
+replied to.
+Finish with factory_submit_result (kind "build_ready" or "blocked"); while CI or bots are
+pending, submit current evidence and end the turn (you are woken).
+The summary: what changed, decisions, follow-ups; no CI or review-bot status (the factory
+reports it). Text is posted for a human: GitHub Markdown, short paragraphs, lists, no
+internal labels or IDs (de_..., ef_...).
+Active-time budget: {granted_minutes} minutes.

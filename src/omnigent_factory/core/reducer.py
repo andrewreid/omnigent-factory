@@ -66,6 +66,7 @@ from omnigent_factory.core.projection import (
     project_bot,
     project_note,
     queue_head,
+    ready_bot_ok,
     sync_red_note,
 )
 from omnigent_factory.core.types import (
@@ -163,6 +164,7 @@ _DEFAULT_RETRY: dict[EffectKind, RetryClass] = {
     EffectKind.PUBLISH_CONTRACT: RetryClass.ADOPTABLE_WRITE,
     EffectKind.PUBLISH_TRIAGE: RetryClass.ADOPTABLE_WRITE,
     EffectKind.PUBLISH_REPORT: RetryClass.ADOPTABLE_WRITE,
+    EffectKind.EDIT_REPORT: RetryClass.READ,  # idempotent PATCH of a marked comment
     EffectKind.ENSURE_PROJECT_ITEM: RetryClass.ADOPTABLE_WRITE,
     EffectKind.FETCH_PR_EVIDENCE: RetryClass.READ,
     EffectKind.RECONCILE_PARCEL: RetryClass.READ,
@@ -831,6 +833,12 @@ def _observe_stage(ctx: _Ctx, observed: Stage) -> None:
         # authority and must not split the desired column from the queued target.
         return
     ctx.update(stage=observed)  # rightward/unknown observation: never authority
+    if not ready_bot_ok(ctx.p, project_bot(ctx.p, queued=_queued(ctx))):
+        # Ready never shows the bot working: work still running (or queued) puts the
+        # card back where it was, with the reason.
+        _emit_move(ctx, current, source=observed)
+        ctx.note(f"Kept in {current.value}: the bot is still working")
+        return
     r = ctx.p.readiness
     if (
         current == Stage.BUILDING
@@ -978,10 +986,7 @@ def _maybe_ready(ctx: _Ctx) -> None:
     ctx.emit(EffectKind.DISABLE_ISSUANCE, session=s)
     _release_build(ctx, keep_pr=True)
     _move(ctx, Stage.READY)
-    ctx.emit(
-        EffectKind.PUBLISH_REPORT,
-        args={"report": "ready", "pr_number": r.pr_number, "head_sha": r.head_sha},
-    )
+    _publish_ready_report(ctx, r.checks_summary)
 
 
 def _replace_after_crash(ctx: _Ctx, old: StageSession) -> None:
@@ -2064,7 +2069,17 @@ def _invalidate_ready(ctx: _Ctx, reason: str) -> None:
         return  # merged/closed wins over any late negative evidence
     r = ctx.p.readiness
     if r is not None:
-        ctx.update(readiness=replace(r, ready=False, verified=False, sync_red=False, red_checks=""))
+        ctx.update(
+            readiness=replace(
+                r,
+                ready=False,
+                verified=False,
+                sync_red=False,
+                red_checks="",
+                report_effect_id="",  # a later Ready posts a new report
+                report_key="",
+            )
+        )
     _move(ctx, Stage.BUILDING)
     ctx.hold(Hold.REWORK_CONTROL_REQUIRED)
     head = r.head_sha[:7] if r is not None and r.head_sha else ""
@@ -2142,7 +2157,7 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
     if observed != r.head_sha:
         _head_changed(ctx, r, observed)
         return
-    r = _review_bot_window(ctx, r, body.review_bot_pending_since_us)
+    r = _review_bot_window(ctx, r, body.review_bot_pending_since_us, body.review_bot_verdict)
     if body.remediation_exhausted:
         ctx.hold(Hold.REMEDIATION_EXHAUSTED)
     r = _restore_withdrawn(ctx, r, body)
@@ -2174,6 +2189,7 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
                 # The bot's work is done; a red required check only decides Bot (Blocked):
                 # no comment, no rework hold, no wake.
                 _mark_red(ctx, r, body)
+                _refresh_ready_report(ctx, body.checks_summary)
                 return
             ctx.hold(Hold.READINESS_FAILED)
             reason = (
@@ -2202,6 +2218,81 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
             sync_red=False,
             red_checks="",
         )
+    )
+    _refresh_ready_report(ctx, body.checks_summary)
+
+
+#: The review-bot line of a Ready report reached with the bot silent (grace passed).
+_NO_BOT_RESPONSE = "no response within the grace window"
+#: The review bot was (re-)asked and its grace is still running.
+_BOT_ASKED = "asked, no response yet"
+
+#: How long after the review grace a Ready card whose review-bot line is not final
+#: (no response yet) is still re-read each reconcile: a +1 reaction sends no webhook.
+_REPORT_POLL_CAP_US = 24 * 60 * 60 * 1_000_000
+
+
+def _ready_report_args(r: Readiness, checks_summary: str) -> dict[str, JsonValue]:
+    """What the Ready report's factory lines show: CI, red checks, the review bot."""
+    args: dict[str, JsonValue] = {
+        "report": "ready",
+        "pr_number": r.pr_number,
+        "head_sha": r.head_sha,
+        "checks_summary": checks_summary[:200],
+        "review_bot": r.review_bot,
+    }
+    if r.sync_red:
+        args["red_checks"] = r.red_checks
+    return args
+
+
+def _report_key(args: Mapping[str, JsonValue]) -> str:
+    keys = ("checks_summary", "red_checks", "review_bot")
+    return "\x1f".join(f"{k}={args[k]}" if k in args else k for k in keys)
+
+
+def _publish_ready_report(ctx: _Ctx, checks_summary: str) -> None:
+    """Post the Ready report for the current head and remember it for in-place updates."""
+    r = ctx.p.readiness
+    assert r is not None  # noqa: S101 - callers hold a readiness record
+    args = _ready_report_args(r, checks_summary)
+    effect = ctx.emit(EffectKind.PUBLISH_REPORT, args=args)
+    ctx.update(
+        readiness=replace(r, report_effect_id=effect.effect_id, report_key=_report_key(args))
+    )
+
+
+def _refresh_ready_report(ctx: _Ctx, checks_summary: str) -> None:
+    """Ready on the same head with a settled read (green, or parked red): when the
+    report's factory lines would now read differently (a late bot verdict, the check
+    summary, a red check gone or added), edit that comment in place (edits do not
+    notify). Never a second comment; the agent's summary is not touched."""
+    r = ctx.p.readiness
+    if (
+        r is None
+        or not r.report_effect_id
+        or ctx.p.stage != Stage.READY
+        or not (r.ready or r.sync_red)
+    ):
+        return
+    args = _ready_report_args(r, checks_summary)
+    key = _report_key(args)
+    if key == r.report_key:
+        return
+    ctx.emit(EffectKind.EDIT_REPORT, args={**args, "report_effect_id": r.report_effect_id})
+    ctx.update(readiness=replace(r, report_key=key))
+
+
+def _report_line_pending(ctx: _Ctx, r: Readiness) -> bool:
+    """A Ready card whose report still says the review bot gave no response: re-read on
+    each reconcile (reactions send no webhook) for up to a day after the grace."""
+    return (
+        ctx.p.stage == Stage.READY
+        and r.ready
+        and bool(r.report_effect_id)
+        and not r.review_bot_done
+        and r.review_bot in (_NO_BOT_RESPONSE, _BOT_ASKED)
+        and ctx.now < r.settle_at_us + _REPORT_POLL_CAP_US
     )
 
 
@@ -2317,19 +2408,9 @@ def _park_red(ctx: _Ctx, r: Readiness, s: StageSession, body: ev.ReadinessEviden
     ctx.unhold(*_READY_CLEARED_HOLDS)
     _move(ctx, Stage.READY)
     _mark_red(ctx, r, body)
-    red = ctx.p.readiness
-    assert red is not None  # noqa: S101 - set by _mark_red
     if report:
-        ctx.emit(
-            EffectKind.PUBLISH_REPORT,
-            args={
-                "report": "ready",
-                "pr_number": r.pr_number,
-                "head_sha": r.head_sha,
-                "red_checks": red.red_checks,
-                "checks_summary": body.checks_summary[:200],
-            },
-        )  # once: parking retires the run it needs; retries adopt the effect marker
+        # Once: parking retires the run it needs; retries adopt the effect marker.
+        _publish_ready_report(ctx, body.checks_summary)
 
 
 #: The withdrawal note of ``_invalidate_ready``, current and as earlier releases wrote it.
@@ -2405,21 +2486,31 @@ def _settle_at(ctx: _Ctx, head: str) -> int:
     return ctx.now + ctx.config.review_grace_us
 
 
-def _review_bot_window(ctx: _Ctx, r: Readiness, since: int | None) -> Readiness:
+def _review_bot_window(ctx: _Ctx, r: Readiness, since: int | None, verdict: str = "") -> Readiness:
     """Wait for the review bot only while it can still respond to this head.
 
     ``since`` 0: it already answered this head and nothing re-pinged it, so readiness is
     judged on current evidence at once. A trigger time (push, PR open or re-ping) runs
     the grace from the later of that trigger and the build result. None (unknown) keeps
     the wait: an unreadable bot state is never taken as answered.
+
+    ``review_bot`` keeps the Ready report's review-bot line: the verdict as read, or no
+    response (Ready is then only reached once the grace has passed).
     """
     if since == 0:
-        window = replace(r, review_bot_done=True)
+        line = verdict[:200] or f"responded on `{r.head_sha[:7]}`"
+        window = replace(r, review_bot_done=True, review_bot=line)
     elif since is None:
-        window = replace(r, review_bot_done=False)
+        window = replace(r, review_bot_done=False, review_bot="")
     else:
         trigger_end = min(since, ctx.now) + ctx.config.review_grace_us
-        window = replace(r, review_bot_done=False, settle_at_us=max(r.settle_at_us, trigger_end))
+        settle_at = max(r.settle_at_us, trigger_end)
+        window = replace(
+            r,
+            review_bot_done=False,
+            settle_at_us=settle_at,
+            review_bot=_NO_BOT_RESPONSE if ctx.now >= settle_at else _BOT_ASKED,
+        )
     if window != r:
         ctx.update(readiness=window)
     return window
@@ -2457,6 +2548,9 @@ def _head_changed(ctx: _Ctx, r: Readiness, head: str) -> None:
         review_bot_done=False,
         sync_red=False,
         red_checks="",
+        review_bot="",
+        report_effect_id="",  # the posted report is for the old head: never edited now
+        report_key="",
     )
     ctx.update(readiness=r)
     ctx.unhold(Hold.CHECKS_FAILED, Hold.READINESS_FAILED)
@@ -3472,6 +3566,10 @@ def _h_operator_resume(ctx: _Ctx, body: ev.OperatorResume) -> None:
         raise Rejected("no-current-session")
     if s.fences or s.lifecycle not in _RESUMABLE or s.execution_closed:
         raise Rejected("session-not-resumable")
+    if ctx.p.stage == Stage.READY:
+        # Ready never shows the bot working (and a board move would gate the note):
+        # the card goes back to Building first, e.g. by the owner.
+        raise Rejected("card-in-ready", explain=True)
     if not body.text.strip():
         raise Rejected("empty-note")
     _close_stale_decisions(ctx)
@@ -3495,7 +3593,9 @@ def _awaiting_evidence(ctx: _Ctx) -> bool:
     r = ctx.p.readiness
     return (
         r is not None
-        and (not r.verified or (not r.ready and _in_review_grace(r)))
+        and (
+            not r.verified or (not r.ready and _in_review_grace(r)) or _report_line_pending(ctx, r)
+        )
         and not _completed(ctx)
         and Hold.PR_CLOSED not in ctx.p.holds
     )

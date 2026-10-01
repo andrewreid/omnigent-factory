@@ -400,11 +400,12 @@ def test_update_branch_on_a_ready_pr_is_re_evaluated_in_ready_without_rework():
     assert fetch.args["head_sha"] == NEW and fetch.args["reviewed_head"] == OLD
     p = h.p()
     assert p.stage == Stage.READY and Hold.REWORK_CONTROL_REQUIRED not in p.holds
-    assert p.bot == BotState.WORKING  # waiting on the new head's checks
+    assert p.bot == BotState.IDLE  # waiting on the new head's checks: nothing to do
+    assert p.board_note == f"Checks running on `{NEW[:7]}`"
     for _ in range(2):  # pending, pending: still waiting, no comment spam
         r = h.send(P, evidence(h, NEW, checks=ev.ChecksState.PENDING))
         _no_regression(r)
-        assert h.p().stage == Stage.READY and h.p().bot == BotState.WORKING
+        assert h.p().stage == Stage.READY and h.p().bot == BotState.IDLE
     r = h.send(P, evidence(h, NEW, verified=True, checks=ev.ChecksState.GREEN))
     _no_regression(r)
     p = h.p()
@@ -419,9 +420,11 @@ def test_same_head_check_rerun_on_a_ready_card_waits_in_ready():
     assert fetch_head(r) == OLD
     r = h.send(P, evidence(h, OLD, checks=ev.ChecksState.PENDING))
     _no_regression(r)
-    assert h.p().stage == Stage.READY and h.p().bot == BotState.WORKING
+    assert h.p().stage == Stage.READY and h.p().bot == BotState.IDLE
+    assert h.p().board_note == f"Checks running on `{OLD[:7]}`"
     h.send(P, evidence(h, OLD, verified=True, checks=ev.ChecksState.GREEN))
     assert h.p().readiness.ready and h.p().bot == BotState.IDLE
+    assert h.p().board_note == ""  # green: the note is cleared
 
 
 def test_red_unreviewed_new_head_on_a_ready_card_needs_you_with_the_reason():
@@ -524,7 +527,7 @@ def test_catch_up_read_returns_a_ready_card_to_ready_without_a_completion_webhoo
     h.send(P, ev.PRObserved(pr_number=PR, head_sha=NEW, bot_authored=True, parcel_branch=True))
     h.send(P, evidence(h, OLD, observed_head_sha=NEW, checks=ev.ChecksState.PENDING))
     h.send(P, evidence(h, NEW, checks=ev.ChecksState.PENDING))
-    assert h.p().stage == Stage.READY and h.p().bot == BotState.WORKING
+    assert h.p().stage == Stage.READY and h.p().bot == BotState.IDLE
     # The completion webhook never arrives: the periodic reconcile re-reads the head.
     r = h.send(P, ev.ReconcileDue())
     assert fetch_head(r) == NEW

@@ -1,8 +1,9 @@
 """GitHub port (implemented by Task 2).
 
 Effect kinds handled by the GitHub adapter: ``MOVE_CARD``, ``SET_BOT``, ``POST_COMMENT``,
-``PUBLISH_CONTRACT``, ``PUBLISH_TRIAGE``, ``PUBLISH_REPORT``, ``ENSURE_PROJECT_ITEM``,
-``FETCH_PR_EVIDENCE``, ``RECONCILE_PARCEL`` (see :data:`GITHUB_EFFECT_KINDS`).
+``PUBLISH_CONTRACT``, ``PUBLISH_TRIAGE``, ``PUBLISH_REPORT``, ``EDIT_REPORT``,
+``ENSURE_PROJECT_ITEM``, ``FETCH_PR_EVIDENCE``, ``RECONCILE_PARCEL`` (see
+:data:`GITHUB_EFFECT_KINDS`).
 
 Every bot-authored write carries a unique effect marker (the ``effect_id``) so a lost
 acknowledgement can be adopted by listing comments; a marker posted by another actor is
@@ -58,6 +59,7 @@ GITHUB_EFFECT_KINDS = frozenset(
         EffectKind.PUBLISH_CONTRACT,
         EffectKind.PUBLISH_TRIAGE,
         EffectKind.PUBLISH_REPORT,
+        EffectKind.EDIT_REPORT,
         EffectKind.ENSURE_PROJECT_ITEM,
         EffectKind.FETCH_PR_EVIDENCE,
         EffectKind.RECONCILE_PARCEL,
@@ -128,6 +130,8 @@ class PullRequestEvidence:
     base_sync: bool = False
     #: Names of the failing (required, when a required set exists) checks, "; "-joined.
     failing_checks: str = ""
+    #: How the review bot answered ``head_sha`` (only when it did), for the Ready report.
+    review_bot_verdict: str = ""
 
     @property
     def verified(self) -> bool:

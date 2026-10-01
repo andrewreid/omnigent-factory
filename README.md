@@ -93,8 +93,11 @@ awaiting approval, Ready.
 **Ready means the bot's work is done**: the PR is open and closes the issue, the
 cross-vendor review is accepted for the head (or carried to an owner/base sync of it),
 every review-bot finding has an outcome and the bot has nothing left to do. Required
-checks then only set `Bot`: green `Idle`, pending `Working`, red `Blocked` with the note
-`Required check red: <check>; <check>` (no comment, no wake). A red check sends a Building
+checks then only set `Bot`: green `Idle`, pending `Idle` with the note `Checks running on
+<sha>`, red `Blocked` with the note `Required check red: <check>; <check>` (no comment, no
+wake). Ready and `Working`/`Queued`/`Checkpoint` never go together: any work for a Ready
+card (rework, an operator note) moves it to Building with that work, and an owner drag to
+Ready while the bot is still working is moved back (`Kept in Building: ...`). A red check sends a Building
 card back to its run with the one readiness wake only while that wake is unused and the
 head has the bot's own commits; once it is spent (the agent re-submits when the red check
 is outside the change), or the head only syncs the base branch, the card goes to Ready,
@@ -181,6 +184,16 @@ the build's one readiness wake instead of pulling a Ready card back. The bot can
 respond until it has answered that head (a review of the commit, a verdict naming it, or a
 +1 on the PR after the push); once it has and nothing re-pinged it, readiness is judged on
 current evidence at once. When the bot's state cannot be read, the grace applies.
+
+The Ready report is the agent's summary (what changed, decisions, follow-ups; no CI or
+review-bot status) followed by the factory's lines from the read that decided Ready: PR,
+CI and `Review bot` (e.g. `Codex: 👍 on <sha>`, `Codex: reviewed <sha>, 2 findings, all
+with outcomes`, or `Codex: no response within the grace window`). While the card stays in
+Ready on that head, a later read that changes those lines (a late verdict, the check
+summary, a red check) edits the report in place (found by its marker; edits do not
+notify), never posting a second one. GitHub sends no webhook for a +1 reaction, so a
+Ready card whose report still shows no bot response is re-read on each reconcile, for up
+to 24 hours after the grace. A new head, withdrawal or rework never edits it.
 
 ### Finished parcels
 

@@ -327,14 +327,16 @@ def test_owner_drag_to_ready_with_red_checks_is_accepted_as_blocked():
     assert h.p().readiness_wakes == 0
 
 
-def test_owner_drag_to_ready_with_pending_checks_is_accepted_as_working():
+def test_owner_drag_to_ready_with_pending_checks_is_accepted_as_idle():
     h = Harness()
     built(h)
     drag_to_ready(h)
     r = h.send(P, evidence(h, BUILT, checks=ev.ChecksState.PENDING))
     assert_quiet(r) and EffectKind.MOVE_CARD not in kinds(r)
     p = h.p()
-    assert p.stage == Stage.READY and p.bot == BotState.WORKING
+    # Ready is never Working: the bot waits on CI, with the note saying so.
+    assert p.stage == Stage.READY and p.bot == BotState.IDLE
+    assert p.board_note == f"Checks running on `{BUILT[:7]}`"
     assert h.cur().lifecycle == Lifecycle.RETIRED
     h.send(P, evidence(h, BUILT, verified=True, checks=ev.ChecksState.GREEN))
     assert h.p().readiness.ready and h.p().bot == BotState.IDLE
@@ -361,12 +363,14 @@ def test_owner_drag_while_the_build_run_is_working_is_refused_with_the_reason():
     h = Harness()
     built(h)
     h.send(P, red(h, BUILT))  # the wake: the run is working again
-    drag_to_ready(h)  # before its tree is seen busy: the wake still counts as work
-    r = h.send(P, red(h, BUILT))
-    assert EffectKind.MOVE_CARD in kinds(r)
+    # Before its tree is seen busy: the wake still counts as work. Ready never shows
+    # the bot working, so the drag itself is answered with a move back.
+    r = drag_to_ready(h)
+    [move] = [e for e in r.effects if e.kind == EffectKind.MOVE_CARD]
+    assert move.args == {"to": "Building", "expected_from": "Ready"}
     p = h.p()
-    assert p.stage == Stage.BUILDING
-    assert p.board_note == "Kept in Building: the build run is still working"
+    assert p.stage == Stage.BUILDING and p.bot == BotState.WORKING
+    assert p.board_note == "Kept in Building: the bot is still working"
 
 
 def test_owner_drag_without_an_accepted_review_names_the_head():

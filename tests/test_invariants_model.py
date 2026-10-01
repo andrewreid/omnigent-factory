@@ -30,6 +30,7 @@ from omnigent_factory.core.predicates import (
     message_uncertain,
     settled,
 )
+from omnigent_factory.core.projection import project_bot, ready_bot_ok
 from omnigent_factory.core.reducer import TransitionResult
 from omnigent_factory.core.types import (
     ApprovalKind,
@@ -1037,6 +1038,16 @@ class FactoryModel(RuleBasedStateMachine):
                 assert p.readiness.verified
                 s = p.session(p.readiness.session_id)
                 assert s is not None and s.lifecycle == Lifecycle.RETIRED
+
+    @invariant()
+    def ready_is_never_working(self) -> None:
+        """Ready and Bot Working/Queued/Checkpoint are mutually exclusive (#461)."""
+        for pid in PIDS:
+            p = self.h.p(pid)
+            assert ready_bot_ok(p, p.bot), (p.stage, p.bot)
+            entry = self.h.admission.queue_entry(pid)
+            queued = entry is not None and entry.status.value == "QUEUED"
+            assert ready_bot_ok(p, project_bot(p, queued=queued)), (p.stage, p.bot)
 
     @invariant()
     def building_slot_matches_live_build(self) -> None:

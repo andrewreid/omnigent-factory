@@ -34,11 +34,11 @@ def test_blocked_report_and_status_comments_name_the_configured_agent():
 
 def test_build_prompts_carry_the_review_bot_disposition_rule():
     root = files("omnigent_factory.service") / "templates"
-    for name in ("build-v6.txt", "readiness-wake-v5.txt"):
+    for name in ("build-v7.txt", "readiness-wake-v6.txt"):
         text = " ".join((root / name).read_text("utf-8").split())
         assert "follow-up issue" in text and "resolve" in text, name
         assert "Only resolve threads you have replied to." in text, name
-    wake = " ".join((root / "readiness-wake-v5.txt").read_text("utf-8").split())
+    wake = " ".join((root / "readiness-wake-v6.txt").read_text("utf-8").split())
     assert "submit build_ready, not blocked" in wake
 
 
@@ -49,8 +49,8 @@ def test_stage_prompts_keep_internal_ids_out_of_github_prose():
         "triage-v5.txt",
         "triage-feedback-v3.txt",
         "plan-v5.txt",
-        "build-v6.txt",
-        "build-rework-v3.txt",
+        "build-v7.txt",
+        "build-rework-v4.txt",
     ):
         text = " ".join((root / name).read_text("utf-8").split())
         assert "no internal labels or IDs (de_..., ef_...)" in text, name
@@ -58,7 +58,7 @@ def test_stage_prompts_keep_internal_ids_out_of_github_prose():
 
 def test_readiness_wake_says_not_ready_for_review_not_the_column_name():
     wake = " ".join(
-        (files("omnigent_factory.service") / "templates" / "readiness-wake-v5.txt")
+        (files("omnigent_factory.service") / "templates" / "readiness-wake-v6.txt")
         .read_text("utf-8")
         .split()
     )
@@ -68,7 +68,7 @@ def test_readiness_wake_says_not_ready_for_review_not_the_column_name():
 def test_readiness_wake_says_red_checks_outside_the_change_are_build_ready_not_blocked():
     """#461: Rosie reported "blocked" for red checks from main and a flaky test."""
     wake = " ".join(
-        (files("omnigent_factory.service") / "templates" / "readiness-wake-v5.txt")
+        (files("omnigent_factory.service") / "templates" / "readiness-wake-v6.txt")
         .read_text("utf-8")
         .split()
     )

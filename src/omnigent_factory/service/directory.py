@@ -197,7 +197,7 @@ class ServiceDispatchDirectory:
                 return _template("triage-comment-v1.txt").format(run_id=sid)
             return _template("feedback-v3.txt").format(revision=parcel.revision, run_id=sid)
         if purpose == "readiness_wake":
-            return _template("readiness-wake-v5.txt").format(
+            return _template("readiness-wake-v6.txt").format(
                 pr_number=int(str(effect.args.get("pr_number") or 0)),
                 head_sha=str(effect.args.get("head_sha") or ""),
                 reason=str(effect.args.get("reason") or "")[:500],
@@ -595,7 +595,9 @@ class PublicationRenderer:
                 return None
             plan = self.directory.plan_result_for(contract.source_session_id, contract.canonical)
             return render_contract_comment(parcel, contract, plan, self.config)
-        if effect.kind == EffectKind.PUBLISH_REPORT and effect.args.get("report") == "ready":
+        if (
+            effect.kind == EffectKind.PUBLISH_REPORT and effect.args.get("report") == "ready"
+        ) or effect.kind == EffectKind.EDIT_REPORT:
             build = (
                 self.directory.latest_result(parcel.readiness.session_id)
                 if parcel.readiness is not None
@@ -608,6 +610,7 @@ class PublicationRenderer:
                 result if isinstance(result, dict) else None,
                 parcel.readiness.checks_summary if parcel.readiness is not None else "",
                 self.config.repository,
+                review_bot_name(self.config),
             )
         elif effect.kind in {EffectKind.PUBLISH_TRIAGE, EffectKind.PUBLISH_REPORT}:
             body = self._stored_result(effect)
@@ -643,13 +646,26 @@ def omnigent_link(base_url: str, session_id: str | None) -> str | None:
     return f"{base_url.rstrip('/')}/c/{session_id}"
 
 
+def review_bot_name(config: ServiceConfig) -> str:
+    """The review bot's name for owner-facing text: "@codex" reads "Codex"."""
+    name = config.review_bot_mention.strip().lstrip("@") or config.review_bot_login.removesuffix(
+        "[bot]"
+    )
+    name = " ".join(name.split())
+    return name[:1].upper() + name[1:] if name else "Review bot"
+
+
 def _ready_text(
     args: Mapping[str, Any],
     result: dict[str, Any] | None,
     checks_summary: str,
     repository: str,
+    bot_name: str = "Review bot",
 ) -> str:
-    """Ready report: what changed, CI, the cross-vendor review and findings."""
+    """Ready report: what changed (the agent's summary, as written), then the factory's
+    lines from the evidence the Ready decision used: PR, CI, the review bot (all kept
+    current in place while the card stays in Ready on this head), the cross-vendor
+    review and findings."""
     number = args.get("pr_number")
     head = str(args.get("head_sha") or "")
     url = f"https://github.com/{repository}/pull/{number}"
@@ -660,6 +676,9 @@ def _ready_text(
     lines.append(f"**PR:** {url} (head `{head[:12]}`)")
     summary = str(args.get("checks_summary") or checks_summary)
     lines.append(f"**CI:** {summary or 'required checks green'}")
+    bot = str(args.get("review_bot") or "")
+    if bot:
+        lines.append(f"**Review bot:** {bot_name}: {bot}")
     if "red_checks" in args:
         # Parked with red required checks: the agent attributes them to causes outside
         # the change (its summary above says why); merging waits for them.
@@ -994,10 +1013,10 @@ def _new_boundary() -> str:
 _FIRST_TEMPLATES = {
     SessionKind.TRIAGE: "triage-v5.txt",
     SessionKind.PLAN: "plan-v5.txt",
-    SessionKind.BUILD: "build-v6.txt",
+    SessionKind.BUILD: "build-v7.txt",
 }
 _RETRIAGE_TEMPLATE = "triage-feedback-v3.txt"
-_REWORK_TEMPLATE = "build-rework-v3.txt"
+_REWORK_TEMPLATE = "build-rework-v4.txt"
 
 
 def _template(name: str) -> str:

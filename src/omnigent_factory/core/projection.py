@@ -2,6 +2,9 @@
 
 ``Bot`` is derived from state, never used as authority. Precedence:
 Blocked > Checkpoint > Needs you > Queued > Working > Idle.
+
+A card in Ready is only Idle, Blocked or Needs you: any work for it (rework, a fix wake,
+a replan) moves it to Building first (``ready_bot_ok``).
 """
 
 from __future__ import annotations
@@ -72,18 +75,37 @@ def project_bot(p: Parcel, *, queued: bool = False) -> BotState:
         return BotState.NEEDS_YOU
     if queued:
         return BotState.QUEUED
-    if (
-        p.stage == Stage.READY
-        and p.readiness is not None
-        and not p.readiness.ready
-        and Hold.COMPLETED not in p.holds
-    ):
-        return BotState.WORKING  # in Ready, waiting on a new head's or re-run's checks
+    # In Ready waiting on a new head's or a re-run's checks the bot has nothing to do:
+    # Idle, with the note saying checks are running (``checks_running``).
     # A safety/stop drain is never Idle until the tree is observed quiescent. A plan run
     # waiting for approval has finished its stage: the next move is the owner's (Idle).
-    if any(s.lifecycle in _WORKING and not _awaiting_approval(s) for s in p.sessions):
+    if any(
+        s.lifecycle in _WORKING and not _awaiting_approval(s) and not _ready_waiting(p, s)
+        for s in p.sessions
+    ):
         return BotState.WORKING
     return BotState.IDLE
+
+
+#: Bot values a card in the Ready column may show: no work runs while it is there.
+READY_BOT_STATES = frozenset({BotState.IDLE, BotState.BLOCKED, BotState.NEEDS_YOU})
+
+
+def ready_bot_ok(p: Parcel, bot: BotState) -> bool:
+    """Ready and Working/Queued/Checkpoint are mutually exclusive."""
+    return p.stage != Stage.READY or bot in READY_BOT_STATES
+
+
+def checks_running(p: Parcel) -> bool:
+    """In Ready while a new head's or a re-run's checks are evaluated (not red)."""
+    r = p.readiness
+    return (
+        p.stage == Stage.READY
+        and r is not None
+        and not r.ready
+        and not r.sync_red
+        and Hold.COMPLETED not in p.holds
+    )
 
 
 def sync_red(p: Parcel) -> bool:
@@ -100,6 +122,17 @@ def sync_red(p: Parcel) -> bool:
 
 def sync_red_note(red_checks: str) -> str:
     return f"Required check red: {red_checks or 'see the PR checks'}"[:NOTE_MAX]
+
+
+def _ready_waiting(p: Parcel, s: StageSession) -> bool:
+    """In Ready, a build run that submitted and only waits on checks does no work (the
+    next evidence read retires it or moves the card back to Building)."""
+    return (
+        p.stage == Stage.READY
+        and s.lifecycle == Lifecycle.WAITING
+        and s.wait_reason == WaitReason.CHECKS
+        and not s.fences
+    )
 
 
 def _awaiting_approval(s: StageSession) -> bool:
@@ -153,6 +186,9 @@ def project_note(p: Parcel, bot: BotState) -> str:
         text = f"Needs you: {', '.join(why) or 'owner decision'}"
     elif bot == BotState.QUEUED:
         text = "Queued: waiting for build capacity"
+    elif bot == BotState.IDLE and checks_running(p):
+        assert p.readiness is not None  # noqa: S101 - checks_running checks it
+        text = f"Checks running on `{p.readiness.head_sha[:7]}`"
     else:
         text = ""
     return text[:NOTE_MAX]

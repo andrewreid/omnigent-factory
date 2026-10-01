@@ -115,10 +115,10 @@ async def test_A_stage_templates_point_at_owner_feedback():
         "triage-v5.txt",
         "triage-feedback-v3.txt",
         "plan-v5.txt",
-        "build-v6.txt",
+        "build-v7.txt",
         "feedback-v3.txt",
         "build-feedback-v2.txt",
-        "build-rework-v3.txt",
+        "build-rework-v4.txt",
         "triage-comment-v1.txt",
         "continuation-v2.txt",
     ):
@@ -129,8 +129,8 @@ async def test_A_stage_templates_point_at_owner_feedback():
         "triage-v5.txt",
         "triage-feedback-v3.txt",
         "plan-v5.txt",
-        "build-v6.txt",
-        "build-rework-v3.txt",
+        "build-v7.txt",
+        "build-rework-v4.txt",
     ):
         # The stage prompts say results are written for a human reading GitHub.
         text = " ".join((root / name).read_text("utf-8").split())
@@ -155,6 +155,9 @@ async def test_A_stage_templates_point_at_owner_feedback():
         "triage-feedback-v2.txt",
         "readiness-wake-v3.txt",
         "readiness-wake-v4.txt",
+        "build-v6.txt",
+        "build-rework-v3.txt",
+        "readiness-wake-v5.txt",
     ):
         assert not (root / gone).is_file()
 

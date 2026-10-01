@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.effects import EffectIntent, EffectKind
 from omnigent_factory.core.events import Event, Provenance
+from omnigent_factory.core.projection import ready_bot_ok
 from omnigent_factory.core.reducer import TransitionResult, transition
 from omnigent_factory.core.types import (
     AdmissionSnapshot,
@@ -85,6 +86,9 @@ class Harness:
             )
         result = transition(State(parcel, self.admission, self.cfg), event)
         if result.state.parcel is not None:
+            # Projection invariant on every transition: Ready is never Working/Queued.
+            after = result.state.parcel
+            assert ready_bot_ok(after, after.bot), (event.kind, after.stage, after.bot)
             self.parcels[result.state.parcel.parcel_id] = result.state.parcel
         self.admission = result.state.admission
         self.log.append((event, result))

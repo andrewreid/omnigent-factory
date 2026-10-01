@@ -542,6 +542,7 @@ class EffectExecutor:
                 ),
                 base_sync=detail.get("base_sync") is True,
                 failing_checks=str(detail.get("failing_checks") or "")[:200],
+                review_bot_verdict=str(detail.get("review_bot_verdict") or "")[:200],
             )
         elif effect.kind == EffectKind.RESOLVE_ELICITATION:
             body = ev.ElicitationResolved(

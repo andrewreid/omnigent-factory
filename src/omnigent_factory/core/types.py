@@ -523,6 +523,15 @@ class Readiness:
     #: The failing required checks seen red on this head, "; "-separated (a name may
     #: contain commas), e.g. "api / Dependency audit; web / Typecheck, test, lint".
     red_checks: str = ""
+    #: The review bot's state on ``head_sha`` for the Ready report, e.g. "👍 on `f7493c8`",
+    #: "reviewed `abc1234`, 2 findings, all with outcomes" or "no response within the
+    #: grace window" ("" = no line: no bot configured or its state unknown).
+    review_bot: str = ""
+    #: The PUBLISH_REPORT effect of this head's Ready report ("" = none posted for it):
+    #: its marker finds the comment whose factory lines are kept current in place.
+    report_effect_id: str = ""
+    #: The factory lines that report shows now (CI, red checks, review bot), as a key.
+    report_key: str = ""
 
 
 @dataclass(frozen=True, slots=True)

@@ -427,6 +427,9 @@ class ReadinessEvidence(_Body):
     base_sync: bool = False
     #: Names of the failing required checks, "; "-separated (names may contain commas).
     failing_checks: str = ""
+    #: How the review bot answered this head, when it did (``review_bot_pending_since_us``
+    #: 0), e.g. "👍 on `f7493c8`" ("" = no answer or not told).
+    review_bot_verdict: str = ""
 
 
 @dataclass(frozen=True, slots=True)
