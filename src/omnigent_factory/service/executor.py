@@ -540,6 +540,8 @@ class EffectExecutor:
                 review_bot_pending_since_us=_optional_int(
                     detail.get("review_bot_pending_since_us")
                 ),
+                base_sync=detail.get("base_sync") is True,
+                failing_checks=str(detail.get("failing_checks") or "")[:200],
             )
         elif effect.kind == EffectKind.RESOLVE_ELICITATION:
             body = ev.ElicitationResolved(

@@ -66,6 +66,7 @@ from omnigent_factory.core.projection import (
     project_bot,
     project_note,
     queue_head,
+    sync_red_note,
 )
 from omnigent_factory.core.types import (
     CONTROL_CLEARED_HOLDS,
@@ -2052,7 +2053,7 @@ def _invalidate_ready(ctx: _Ctx, reason: str) -> None:
         return  # merged/closed wins over any late negative evidence
     r = ctx.p.readiness
     if r is not None:
-        ctx.update(readiness=replace(r, ready=False, verified=False))
+        ctx.update(readiness=replace(r, ready=False, verified=False, sync_red=False, red_checks=""))
     _move(ctx, Stage.BUILDING)
     ctx.hold(Hold.REWORK_CONTROL_REQUIRED)
     head = r.head_sha[:7] if r is not None and r.head_sha else ""
@@ -2133,6 +2134,7 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
     r = _review_bot_window(ctx, r, body.review_bot_pending_since_us)
     if body.remediation_exhausted:
         ctx.hold(Hold.REMEDIATION_EXHAUSTED)
+    r = _restore_sync_withdrawn(ctx, r, body)
     in_ready = ctx.p.stage == Stage.READY and (r.ready or _refreshing(ctx))
     if not body.verified:
         ctx.update(readiness=replace(r, verified=False))
@@ -2140,7 +2142,23 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
             if body.checks == ev.ChecksState.PENDING and body.pr_open:
                 # A re-run or a new head's checks: stay in Ready, waiting (Bot Working);
                 # a later green read restores Ready with no owner action or comment.
-                ctx.update(readiness=replace(r, verified=False, ready=False))
+                ctx.update(
+                    readiness=replace(r, verified=False, ready=False, sync_red=False, red_checks="")
+                )
+                return
+            if _base_sync_red(body):
+                # The owner synced the base branch and the base broke a required check:
+                # nothing the build can fix. Stay in Ready, Bot Blocked, no comment/wake.
+                ctx.update(
+                    readiness=replace(
+                        r,
+                        verified=False,
+                        ready=False,
+                        sync_red=True,
+                        red_checks=body.failing_checks,
+                    )
+                )
+                ctx.note(sync_red_note(body.failing_checks))
                 return
             ctx.hold(Hold.READINESS_FAILED)
             reason = (
@@ -2166,8 +2184,83 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
             ready=r.ready or in_ready,
             checks_summary=body.checks_summary[:200],
             verified_at_us=ctx.now,
+            sync_red=False,
+            red_checks="",
         )
     )
+
+
+def _base_sync_red(body: ev.ReadinessEvidence) -> bool:
+    """The only failure is a red required check on a head that merely syncs the base
+    branch onto the accepted head (the review was carried forward)."""
+    return (
+        body.base_sync
+        and body.pr_open
+        and body.checks == ev.ChecksState.FAILED
+        and body.closes_issue
+        and body.review_accepted
+        and not body.findings_open
+        and not body.remediation_exhausted
+    )
+
+
+#: The withdrawal note of ``_invalidate_ready``, current and as earlier releases wrote it.
+_WITHDRAWN_NOTES = ("No longer ready: ", "Ready withdrawn: ")
+
+#: Holds that make a withdrawn Ready card more than the base-sync misclassification.
+_NOT_SYNC_WITHDRAWN = frozenset(
+    {
+        Hold.SAFETY,
+        Hold.STOPPED,
+        Hold.COMPLETED,
+        Hold.PR_CLOSED,
+        Hold.REMEDIATION_EXHAUSTED,
+        Hold.APPROVAL_VOIDED,
+        Hold.UNSUPPORTED_REWORK,
+        Hold.EXTERNAL_ACTIVITY,
+    }
+)
+
+
+def _restore_sync_withdrawn(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> Readiness:
+    """Self-correct a card the old rule withdrew from Ready for a base-sync red check.
+
+    Before ``sync_red`` existed, a red required check on the owner's "Update branch" head
+    moved a Ready card to Building with ``readiness_failed`` + ``rework_control_required``
+    and its build run already retired (#651). Recognised by exactly that shape: the
+    withdrawal note for failed checks, the Ready run retired as current session and a
+    head that this read confirms merely syncs the base onto the accepted head. The card
+    goes back to Ready (no session, no comment); the read is then judged there.
+    """
+    s = ctx.p.session(r.session_id)
+    if not (
+        ctx.p.stage == Stage.BUILDING
+        and not r.ready
+        and {Hold.READINESS_FAILED, Hold.REWORK_CONTROL_REQUIRED} <= ctx.p.holds
+        and not ctx.p.holds & _NOT_SYNC_WITHDRAWN
+        and r.reviewed_head
+        and r.reviewed_head != r.head_sha
+        and ctx.p.note.startswith(_WITHDRAWN_NOTES)
+        and "required checks failed" in ctx.p.note
+        and s is not None
+        and s.session_id == ctx.p.current_session_id
+        and s.lifecycle == Lifecycle.RETIRED
+        and s.execution_closed
+        and not ctx.p.open_decisions
+        and not _rework_queued(ctx)
+        and body.base_sync
+        and body.pr_open
+        and body.checks is not None
+        and body.closes_issue
+        and body.review_accepted
+        and not body.findings_open
+    ):
+        return r
+    ctx.unhold(Hold.READINESS_FAILED, Hold.REWORK_CONTROL_REQUIRED, Hold.CHECKS_FAILED)
+    r = replace(r, ready=False, verified=False)
+    ctx.update(readiness=r)
+    _move(ctx, Stage.READY)
+    return r
 
 
 def _settle_at(ctx: _Ctx, head: str) -> int:
@@ -2228,6 +2321,8 @@ def _head_changed(ctx: _Ctx, r: Readiness, head: str) -> None:
         settle_at_us=ctx.now + ctx.config.review_grace_us,
         verified_at_us=0,
         review_bot_done=False,
+        sync_red=False,
+        red_checks="",
     )
     ctx.update(readiness=r)
     ctx.unhold(Hold.CHECKS_FAILED, Hold.READINESS_FAILED)

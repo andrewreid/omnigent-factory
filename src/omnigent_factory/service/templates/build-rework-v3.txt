@@ -12,5 +12,5 @@ an outcome as before.
 Finish with factory_submit_result (kind "build_ready", or "blocked"); while CI or review
 bots are pending, submit current evidence and end the turn: the factory will wake you.
 What you submit or ask is posted for a human: GitHub Markdown, short paragraphs,
-lists, no internal labels.
+lists, no internal labels or IDs (de_..., ef_...).
 Active-time budget: {granted_minutes} minutes.

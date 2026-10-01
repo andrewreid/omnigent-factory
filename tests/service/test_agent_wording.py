@@ -34,9 +34,32 @@ def test_blocked_report_and_status_comments_name_the_configured_agent():
 
 def test_build_prompts_carry_the_review_bot_disposition_rule():
     root = files("omnigent_factory.service") / "templates"
-    for name in ("build-v5.txt", "readiness-wake-v3.txt"):
+    for name in ("build-v6.txt", "readiness-wake-v4.txt"):
         text = " ".join((root / name).read_text("utf-8").split())
         assert "follow-up issue" in text and "resolve" in text, name
         assert "Only resolve threads you have replied to." in text, name
-    wake = " ".join((root / "readiness-wake-v3.txt").read_text("utf-8").split())
+    wake = " ".join((root / "readiness-wake-v4.txt").read_text("utf-8").split())
     assert "submit build_ready, not blocked" in wake
+
+
+def test_stage_prompts_keep_internal_ids_out_of_github_prose():
+    """Decision/effect IDs (de_..., ef_...) are factory internals, not owner-facing text."""
+    root = files("omnigent_factory.service") / "templates"
+    for name in (
+        "triage-v5.txt",
+        "triage-feedback-v3.txt",
+        "plan-v5.txt",
+        "build-v6.txt",
+        "build-rework-v3.txt",
+    ):
+        text = " ".join((root / name).read_text("utf-8").split())
+        assert "no internal labels or IDs (de_..., ef_...)" in text, name
+
+
+def test_readiness_wake_says_not_ready_for_review_not_the_column_name():
+    wake = " ".join(
+        (files("omnigent_factory.service") / "templates" / "readiness-wake-v4.txt")
+        .read_text("utf-8")
+        .split()
+    )
+    assert "is not ready for review:" in wake and "not Ready" not in wake

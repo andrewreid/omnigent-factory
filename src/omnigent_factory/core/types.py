@@ -515,6 +515,12 @@ class Readiness:
     #: The latest read showed the review bot already answered ``head_sha`` with no
     #: re-ping since: nothing can still arrive, so there is no grace wait.
     review_bot_done: bool = False
+    #: In Ready, ``head_sha`` merely syncs the base branch onto the accepted head and a
+    #: required check is red: the failure came from the base, so the card stays in Ready
+    #: with Bot Blocked (no rework, no wake) until a green read or a newer head.
+    sync_red: bool = False
+    #: The failing required checks of that read, e.g. "api / Dependency audit".
+    red_checks: str = ""
 
 
 @dataclass(frozen=True, slots=True)

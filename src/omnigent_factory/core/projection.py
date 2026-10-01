@@ -61,6 +61,8 @@ def project_bot(p: Parcel, *, queued: bool = False) -> BotState:
         }
     ):
         return BotState.BLOCKED
+    if sync_red(p):
+        return BotState.BLOCKED  # the base branch broke a required check: owner fixes main
     if cur is not None and (
         cur.lifecycle in (Lifecycle.CHECKPOINT_GRACE, Lifecycle.CHECKPOINT_WAIT)
         or (cur.fences == frozenset({FenceKind.CHECKPOINT}) and cur.lifecycle != Lifecycle.RETIRED)
@@ -82,6 +84,22 @@ def project_bot(p: Parcel, *, queued: bool = False) -> BotState:
     if any(s.lifecycle in _WORKING and not _awaiting_approval(s) for s in p.sessions):
         return BotState.WORKING
     return BotState.IDLE
+
+
+def sync_red(p: Parcel) -> bool:
+    """In Ready on a base-sync head whose required check is red (see ``Readiness``)."""
+    r = p.readiness
+    return (
+        p.stage == Stage.READY
+        and r is not None
+        and r.sync_red
+        and not r.ready
+        and Hold.COMPLETED not in p.holds
+    )
+
+
+def sync_red_note(red_checks: str) -> str:
+    return f"Required check red: {red_checks or 'see the PR checks'}"[:NOTE_MAX]
 
 
 def _awaiting_approval(s: StageSession) -> bool:
@@ -120,6 +138,9 @@ def project_note(p: Parcel, bot: BotState) -> str:
         why = [_HOLD_TEXT[h] for h in sorted(p.holds & BLOCKING_HOLDS) if h in _HOLD_TEXT]
         if p.unknown_effects:
             why.append("unconfirmed write")
+        if not why and sync_red(p):
+            assert p.readiness is not None  # noqa: S101 - sync_red checks it
+            return sync_red_note(p.readiness.red_checks)
         if not why:
             why.append("session failed")
         text = f"Blocked: {', '.join(why)}"

@@ -123,6 +123,11 @@ class PullRequestEvidence:
     #: of the latest trigger it has not answered (a push/PR open or an explicit re-ping),
     #: 0 when it already answered this head and nothing re-pinged it, None when unknown.
     review_bot_pending_since_us: int | None = None
+    #: ``review_accepted`` holds only because every commit after the reviewed head
+    #: merely syncs the base branch (e.g. the owner's "Update branch").
+    base_sync: bool = False
+    #: Names of the failing (required, when a required set exists) checks, comma-joined.
+    failing_checks: str = ""
 
     @property
     def verified(self) -> bool:

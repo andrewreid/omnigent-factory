@@ -70,6 +70,9 @@ async def review_accepted(handler: Any) -> bool:
         )
     assert isinstance(outcome, Ack), outcome
     assert outcome.detail["verified"] == outcome.detail["review_accepted"]
+    # The carried-forward review is reported as a base sync (the reducer keeps a Ready
+    # card in Ready when only a required check is red on such a head, #651).
+    assert outcome.detail["base_sync"] is outcome.detail["review_accepted"]
     return bool(outcome.detail["review_accepted"])
 
 

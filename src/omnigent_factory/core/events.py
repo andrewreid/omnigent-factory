@@ -422,6 +422,11 @@ class ReadinessEvidence(_Body):
     #: The review bot's latest unanswered trigger on this head (source time), 0 = it
     #: already answered this head, None = unknown (older reads or no bot configured).
     review_bot_pending_since_us: int | None = None
+    #: The review was carried to this head only because every newer commit merely
+    #: syncs the base branch (owner "Update branch"): a red check came from the base.
+    base_sync: bool = False
+    #: Names of the failing required checks, e.g. "api / Dependency audit".
+    failing_checks: str = ""
 
 
 @dataclass(frozen=True, slots=True)

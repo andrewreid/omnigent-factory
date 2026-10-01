@@ -7,5 +7,5 @@ a revised triage with factory_submit_result (kind "triage"). A later comment ove
 earlier one. If a comment only directs later stages (for example what to fix and what to
 leave out), still resubmit the triage adjusted to reflect it. Triage stays read-only.
 What you submit or ask is posted for a human: GitHub Markdown, short paragraphs,
-lists, no internal labels.
+lists, no internal labels or IDs (de_..., ef_...).
 Active-time budget: {granted_minutes} minutes.

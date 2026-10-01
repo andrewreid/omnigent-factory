@@ -149,3 +149,26 @@ async def test_app_pinned_check_is_not_satisfied_by_an_unpinned_legacy_status():
     # Required "ci" from the pinned app; only a commit status (no app) named "ci" exists.
     result = await checks(PASSING, [*REQUIRED, "ci"], [(1, "ci", "success")])
     assert result != ChecksState.GREEN
+
+
+async def failing_names(
+    runs: list[tuple[int, str, str]],
+    protection: int | list[str | tuple[str, int | None]] = 404,
+) -> tuple[ChecksState, str]:
+    handler = server(runs, protection)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        gh = adapter(http)
+        state = await gh._checks_state(HEAD, "main")
+        return state, gh._last_failing_checks
+
+
+@pytest.mark.asyncio
+async def test_failing_required_checks_are_named_for_the_board_note():
+    """#651: the note names the red required check ("api / Dependency audit")."""
+    audit = "api / Dependency audit"
+    runs = [*PASSING, (20, audit, "failure"), (21, "optional lint", "failure")]
+    assert await failing_names(runs, [*REQUIRED, audit]) == (ChecksState.FAILED, audit)
+    assert await failing_names(PASSING, REQUIRED) == (ChecksState.GREEN, "")
+    # Without a required set every failing check counts.
+    state, names = await failing_names([*PASSING, (20, audit, "failure")])
+    assert state == ChecksState.FAILED and names == audit

@@ -1,5 +1,5 @@
 Factory readiness check for run {run_id}: fresh GitHub evidence for PR #{pr_number} at head
-`{head_sha}` is not Ready: {reason}.
+`{head_sha}` is not ready for review: {reason}.
 
 This is the one automatic wake for this build (factory_get_status lists the gaps). Within
 your existing shared allowance (at most one fix batch and one targeted recheck across the

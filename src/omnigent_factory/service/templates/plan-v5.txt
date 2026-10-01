@@ -6,5 +6,5 @@ directions (a later one overrides an earlier one) and the plan must honour them.
 read-only: do not edit, push, comment or open a pull request. Ask material owner questions
 with factory_ask_owner. Finish with factory_submit_result (kind "plan", or "blocked").
 What you submit or ask is posted for a human: GitHub Markdown, short paragraphs,
-lists, no internal labels.
+lists, no internal labels or IDs (de_..., ef_...).
 Active-time budget: {granted_minutes} minutes.

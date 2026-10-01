@@ -3,10 +3,10 @@
 A GitHub-issue and GitHub Projects driven "agentic software factory" built on
 [Omnigent](https://github.com/omnigent-ai/omnigent).
 
-Issues move left to right across a project board (Inbox → Triaged → Scoped →
-Building → Ready; these are the stage identities and default column names: the board is
-read and written by Status option ID, and the displayed names come from
-`[service.status_names]` in the host config). A human drag authorises each stage; a deterministic daemon
+Issues move left to right across a project board (Inbox → Triage → Planning →
+Building → Ready). The board is read and written by Status option ID and the displayed
+names come from `[service.status_names]` in the host config; the persisted stage
+identities of Triage and Planning stay `Triaged` and `Scoped`. A human drag authorises each stage; a deterministic daemon
 receives the GitHub App's webhooks and starts Omnigent agent sessions that triage,
 plan and build. A human always merges and closes.
 
@@ -127,8 +127,8 @@ PR, every owner conversation comment and every owner review that says something 
 changes, comment, or an approval with text; inline comments are read from GitHub when the
 review arrives). `factory_get_feedback` serves all of them to every later run, oldest
 first, flagged `new` since the session's last result for that stage. Commands work on the
-issue only; reactions and other people's comments never count. In Triaged a comment
-re-runs triage in the issue session (a revised triage comment follows); in Scoped it
+issue only; reactions and other people's comments never count. In Triage a comment
+re-runs triage in the issue session (a revised triage comment follows); in Planning it
 revises the plan; in Building it is relayed to a build waiting on checks without touching
 the approval. Elsewhere it only waits for later stages. A run whose turn ended without a result (its tree is idle) gets the comment
 as one message, even if it reported blocked; a comment that arrives mid-turn is relayed when
@@ -143,7 +143,7 @@ feedback` and starts a new build run under the same approval: it is admitted lik
 build (`Bot: Queued` while no build slot is free), runs in the same issue session (or a
 fresh one with a summary), changes the same branch and PR, and gets a fresh time block and
 a fresh fix budget. Feedback beyond the approved plan is asked back with
-`factory_ask_owner`; to replan, drag the card to Scoped. A Building card left at Needs you
+`factory_ask_owner`; to replan, drag the card to Planning. A Building card left at Needs you
 with no fix attempt left (its run closed, or idle and waiting, which is then retired) is
 reworked the same way by an owner comment. Ready is then re-evaluated as usual and a new Ready report is posted.
 Not after `/stop` or once the PR is merged. A burst of feedback is one rework: later

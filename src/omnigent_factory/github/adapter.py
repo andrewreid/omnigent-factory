@@ -125,6 +125,7 @@ class GitHubAPIAdapter:
         #: Molly's reported opposite-vendor review of the effect's PR head (service-side).
         self.cross_vendor_review = cross_vendor_review
         self._last_checks_summary = ""
+        self._last_failing_checks = ""
         if independent_reviewer_ids & (owner_ids | {bot_user_id}):
             raise ValueError("independent reviewers cannot include owners or the factory bot")
         self.independent_reviewer_ids = independent_reviewer_ids
@@ -289,10 +290,12 @@ class GitHubAPIAdapter:
                 head_sha, base_ref if isinstance(base_ref, str) else None
             )
             review_accepted = cross_vendor_review
+            base_sync = False
             if review_accepted and reviewed_head and reviewed_head != head_sha:
                 review_accepted = isinstance(base_ref, str) and await self._base_sync_only(
                     reviewed_head, head_sha, base_ref
                 )
+                base_sync = review_accepted
             if review_accepted and self.independent_reviewer_ids:
                 reviews = await self.client.paginate(
                     f"/repos/{self.repository}/pulls/{pr_number}/reviews?per_page=100"
@@ -315,6 +318,8 @@ class GitHubAPIAdapter:
                 findings_dispositioned=findings_dispositioned,
                 checks_summary=self._last_checks_summary,
                 review_bot_pending_since_us=review_bot_since,
+                base_sync=base_sync,
+                failing_checks=self._last_failing_checks,
             )
         except RateLimited as exc:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
@@ -612,12 +617,14 @@ class GitHubAPIAdapter:
             runs.append((context, None, state))
             labels.append(label)
         self._last_checks_summary = _checks_summary(labels)
+        self._last_failing_checks = ""
         required: set[tuple[str, int | None]] = set(self.required_checks)
         if not required and base_ref is not None:
             required = await self._derived_required_checks(base_ref)
         if required:
             states = []
-            for name, app_id in required:
+            failing: list[str] = []
+            for name, app_id in sorted(required, key=lambda c: (c[0], c[1] or 0)):
                 # A pinned requirement is satisfied only by that exact app's latest run.
                 found = [
                     state
@@ -627,7 +634,11 @@ class GitHubAPIAdapter:
                 if app_id is None and name in legacy:
                     found.append(legacy[name])
                 states.append(_combine(found) if found else "pending")
+                if states[-1] == "failed":
+                    failing.append(name)
+            self._last_failing_checks = _names(failing)
             return _checks_from(states)
+        self._last_failing_checks = _names([name for name, _, state in runs if state == "failed"])
         return _checks_from([state for _, _, state in runs]) if runs else ChecksState.PENDING
 
     async def _derived_required_checks(self, base_ref: str) -> set[tuple[str, int | None]]:
@@ -1448,6 +1459,11 @@ def _checks_from(states: list[str]) -> ChecksState:
     if combined == "failed":
         return ChecksState.FAILED
     return ChecksState.PENDING if combined == "pending" else ChecksState.GREEN
+
+
+def _names(names: list[str]) -> str:
+    """Distinct check names in first-seen order, e.g. "api / Dependency audit, lint"."""
+    return ", ".join(dict.fromkeys(names))[:200]
 
 
 def _checks_summary(labels: list[str]) -> str:
