@@ -90,6 +90,19 @@ question, or a hold that needs his decision (e.g. PR not Ready with no fix attem
 A stage that finished with the owner's move next is `Idle`: triage posted, plan posted
 awaiting approval, Ready.
 
+**Ready means the bot's work is done**: the PR is open and closes the issue, the
+cross-vendor review is accepted for the head (or carried to an owner/base sync of it),
+every review-bot finding has an outcome and the bot has nothing left to do. Required
+checks then only set `Bot`: green `Idle`, pending `Working`, red `Blocked` with the note
+`Required check red: <check>; <check>` (no comment, no wake). A red check sends a Building
+card back to its run with the one readiness wake only while that wake is unused and the
+head has the bot's own commits; once it is spent (the agent re-submits when the red check
+is outside the change), or the head only syncs the base branch, the card goes to Ready,
+`Blocked`. A blocked report for a defect in the change stays with the owner. An owner drag
+from Building to Ready is accepted on the same terms (Bot by the checks, the run is
+closed); otherwise the card returns to Building with the reason in the note
+(`Kept in Building: ...`).
+
 **Questions.** While an agent question is open, the owner's next plain (non-`/`) comment
 on the issue or its PR is the answer: the question is resolved with that comment, the
 answer is sent to the run that asked, and the card returns to Working. On a Building card

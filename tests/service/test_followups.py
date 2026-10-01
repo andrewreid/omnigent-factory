@@ -61,6 +61,31 @@ def test_ready_report_tells_the_owner_what_to_merge_and_why():
     assert "A1" not in text and "Next:" not in text and "merge PR" not in text
 
 
+def test_parked_ready_report_names_the_red_required_checks_and_the_agents_cause():
+    """#461: parked in Ready with red checks; the summary carries the agent's cause."""
+    result = {**BUILD_READY, "summary": "Red checks come from main (audit) and flaky #712."}
+    text = _ready_text(
+        {
+            "pr_number": 682,
+            "head_sha": HEAD,
+            "red_checks": "api / Dependency audit; web / Typecheck, test, lint",
+            "checks_summary": "17 checks: 9 success, 6 skipped, 2 failure",
+        },
+        result,
+        "",
+        "SA-Ambulance/timesheets",
+    )
+    assert "Red checks come from main (audit) and flaky #712." in text
+    assert "**CI:** 17 checks: 9 success, 6 skipped, 2 failure" in text
+    assert (
+        "**Required check red:** `api / Dependency audit`, `web / Typecheck, test, lint`"
+        " (cause: see the summary above)"
+    ) in text
+    # A normal (green) Ready report has no such line.
+    green = _ready_text({"pr_number": 682, "head_sha": HEAD}, BUILD_READY, "", "o/r")
+    assert "Required check red" not in green
+
+
 # ------------------------------------------------------------------ 3. Omnigent login
 
 

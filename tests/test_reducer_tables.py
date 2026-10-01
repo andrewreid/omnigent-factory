@@ -1250,8 +1250,13 @@ def test_E06_ready_invalidated_by_observation_without_new_episode(body):
             ),
         )
     p = h.p()
-    assert p.stage == Stage.BUILDING and Hold.REWORK_CONTROL_REQUIRED in p.holds
     assert not work(r) and EffectKind.CREATE_SESSION not in kinds(r)
+    if isinstance(body, ev.ChecksChanged):
+        # A red check alone: the bot's work is done, so Ready stays, Bot Blocked (#461).
+        assert p.stage == Stage.READY and p.bot == BotState.BLOCKED
+        assert Hold.REWORK_CONTROL_REQUIRED not in p.holds
+        return
+    assert p.stage == Stage.BUILDING and Hold.REWORK_CONTROL_REQUIRED in p.holds
 
 
 def test_E07_pr_closed_unmerged():

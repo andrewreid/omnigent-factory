@@ -126,7 +126,7 @@ class PullRequestEvidence:
     #: ``review_accepted`` holds only because every commit after the reviewed head
     #: merely syncs the base branch (e.g. the owner's "Update branch").
     base_sync: bool = False
-    #: Names of the failing (required, when a required set exists) checks, comma-joined.
+    #: Names of the failing (required, when a required set exists) checks, "; "-joined.
     failing_checks: str = ""
 
     @property

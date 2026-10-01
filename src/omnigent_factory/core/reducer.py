@@ -831,6 +831,17 @@ def _observe_stage(ctx: _Ctx, observed: Stage) -> None:
         # authority and must not split the desired column from the queued target.
         return
     ctx.update(stage=observed)  # rightward/unknown observation: never authority
+    r = ctx.p.readiness
+    if (
+        current == Stage.BUILDING
+        and observed == Stage.READY
+        and r is not None
+        and not r.ready
+        and not _completed(ctx)
+    ):
+        # E.g. the owner drags a finished build to Ready: a fresh read accepts it (Bot
+        # by the checks) or moves it back with the reason (see ``_h_readiness``).
+        _fetch_evidence(ctx, r)
 
 
 def _leftward_negative(
@@ -2134,8 +2145,21 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
     r = _review_bot_window(ctx, r, body.review_bot_pending_since_us)
     if body.remediation_exhausted:
         ctx.hold(Hold.REMEDIATION_EXHAUSTED)
-    r = _restore_sync_withdrawn(ctx, r, body)
+    r = _restore_withdrawn(ctx, r, body)
     in_ready = ctx.p.stage == Stage.READY and (r.ready or _refreshing(ctx))
+    run = _open_run(ctx, r) if in_ready else None
+    if run is not None:
+        # The owner moved the card to Ready while its build run was still open.
+        why = _run_unfinished(ctx, run, owner_moved=True) or _unfinished_reason(
+            r, body, ctx.p.issue_number
+        )
+        if why:
+            ctx.update(readiness=replace(r, verified=False))
+            _move(ctx, Stage.BUILDING)
+            ctx.note(f"Kept in Building: {why}")
+            return
+        _retire_ready_run(ctx, run, r)
+        ctx.unhold(*_READY_CLEARED_HOLDS, Hold.AGENT_BLOCKED)
     if not body.verified:
         ctx.update(readiness=replace(r, verified=False))
         if in_ready:
@@ -2146,19 +2170,10 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
                     readiness=replace(r, verified=False, ready=False, sync_red=False, red_checks="")
                 )
                 return
-            if _base_sync_red(body):
-                # The owner synced the base branch and the base broke a required check:
-                # nothing the build can fix. Stay in Ready, Bot Blocked, no comment/wake.
-                ctx.update(
-                    readiness=replace(
-                        r,
-                        verified=False,
-                        ready=False,
-                        sync_red=True,
-                        red_checks=body.failing_checks,
-                    )
-                )
-                ctx.note(sync_red_note(body.failing_checks))
+            if _red_only(body):
+                # The bot's work is done; a red required check only decides Bot (Blocked):
+                # no comment, no rework hold, no wake.
+                _mark_red(ctx, r, body)
                 return
             ctx.hold(Hold.READINESS_FAILED)
             reason = (
@@ -2190,13 +2205,13 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
     )
 
 
-def _base_sync_red(body: ev.ReadinessEvidence) -> bool:
-    """The only failure is a red required check on a head that merely syncs the base
-    branch onto the accepted head (the review was carried forward)."""
+def _done_apart_from_checks(body: ev.ReadinessEvidence) -> bool:
+    """Everything but the check colour says the bot's work is done: an open PR that
+    closes the issue, an accepted cross-vendor review of this head (or carried to an
+    owner/base sync of it) and an outcome for every review-bot finding."""
     return (
-        body.base_sync
-        and body.pr_open
-        and body.checks == ev.ChecksState.FAILED
+        body.pr_open
+        and body.checks is not None
         and body.closes_issue
         and body.review_accepted
         and not body.findings_open
@@ -2204,11 +2219,124 @@ def _base_sync_red(body: ev.ReadinessEvidence) -> bool:
     )
 
 
+def _red_only(body: ev.ReadinessEvidence) -> bool:
+    """The only failure is a red required check."""
+    return body.checks == ev.ChecksState.FAILED and _done_apart_from_checks(body)
+
+
+def _unfinished_reason(r: Readiness, body: ev.ReadinessEvidence, issue: int | None) -> str:
+    """Short reasons (for the card note) why the work is not done, check colour aside."""
+    if not body.pr_open:
+        return f"PR #{r.pr_number} is not open"
+    if body.checks is None:
+        return "the PR checks could not be read"
+    parts = []
+    if not body.closes_issue:
+        parts.append(f"PR #{r.pr_number} does not close #{issue}")
+    if not body.review_accepted:
+        parts.append(f"no accepted cross-vendor review of {r.head_sha[:7]}")
+    if body.findings_open:
+        parts.append("review-bot findings have no outcome")
+    if body.remediation_exhausted:
+        parts.append("fix budget used up")
+    return "; ".join(parts)
+
+
+def _open_run(ctx: _Ctx, r: Readiness) -> StageSession | None:
+    """The build run that reported ``r``, while it is the current run and not retired."""
+    s = ctx.p.session(r.session_id)
+    if s is None or s.session_id != ctx.p.current_session_id or s.lifecycle == Lifecycle.RETIRED:
+        return None
+    return s
+
+
+def _run_unfinished(ctx: _Ctx, s: StageSession, *, owner_moved: bool = False) -> str:
+    """Why the open build run still has something to do ("" = its turn is over: it
+    submitted build_ready and waits on checks, or reported blocked and went idle; with
+    no open question or unconfirmed write).
+
+    ``owner_moved``: the owner put the card in Ready. A run waiting on checks after
+    build_ready then counts as done even without a complete idle scan (#461: tree scans
+    alternate complete/incomplete, and an incomplete one clears ``quiescent``).
+    """
+    waiting = s.lifecycle == Lifecycle.WAITING and s.wait_reason == WaitReason.CHECKS
+    reported = _idle_run(s) and Hold.AGENT_BLOCKED in ctx.p.holds
+    if s.fences or not ((waiting and (s.quiescent or owner_moved)) or reported):
+        return "the build run is still working"
+    if ctx.p.open_decisions:
+        return "an open question needs your answer"
+    if uncertain(ctx.p) or message_uncertain(ctx.p, s):
+        return "a factory write is unconfirmed"
+    return ""
+
+
+def _retire_ready_run(ctx: _Ctx, s: StageSession, r: Readiness) -> None:
+    """Close the finished build run for Ready (as ``_maybe_ready`` does), keeping the PR."""
+    s = ctx.put_session(replace(s, lifecycle=Lifecycle.RETIRED, execution_closed=True))
+    ctx.emit(EffectKind.DISABLE_ISSUANCE, session=s)
+    _release_build(ctx, keep_pr=True)
+    ctx.update(pr_number=r.pr_number)
+
+
+#: Readiness holds that a card entering Ready with the bot's work done no longer needs.
+_READY_CLEARED_HOLDS = (
+    Hold.READINESS_FAILED,
+    Hold.REWORK_CONTROL_REQUIRED,
+    Hold.CHECKS_FAILED,
+)
+
+
+def _mark_red(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
+    """Ready with a red required check: Bot Blocked, the note names the checks.
+
+    GitHub's check rollup for one head can differ from read to read (#461: 17 vs 18
+    runs, one failure hidden in alternate reads), so the names accumulate while the
+    same head stays red; a pending or green read or a new head starts afresh.
+    """
+    names = [n for n in body.failing_checks.split(_CHECK_SEP) if n]
+    if r.sync_red:
+        names += [n for n in r.red_checks.split(_CHECK_SEP) if n]
+    red_checks = _CHECK_SEP.join(sorted(set(names)))[:200]
+    ctx.update(
+        readiness=replace(r, verified=False, ready=False, sync_red=True, red_checks=red_checks)
+    )
+    ctx.note(sync_red_note(red_checks))
+
+
+#: Separator of check names (a name may contain commas: "web / Typecheck, test, lint").
+_CHECK_SEP = "; "
+
+
+def _park_red(ctx: _Ctx, r: Readiness, s: StageSession, body: ev.ReadinessEvidence) -> None:
+    """Building, the bot's work done, only a required check red and no fix wake left (or
+    none applicable): the card goes to Ready with Bot Blocked and no wake. The owner gets
+    the Ready report once (to review and merge), naming the red checks; the agent's
+    summary gives its cause. A card the old rule withdrew is restored without one."""
+    report = not _withdrawn_for_checks(ctx)
+    _retire_ready_run(ctx, s, r)
+    ctx.unhold(*_READY_CLEARED_HOLDS)
+    _move(ctx, Stage.READY)
+    _mark_red(ctx, r, body)
+    red = ctx.p.readiness
+    assert red is not None  # noqa: S101 - set by _mark_red
+    if report:
+        ctx.emit(
+            EffectKind.PUBLISH_REPORT,
+            args={
+                "report": "ready",
+                "pr_number": r.pr_number,
+                "head_sha": r.head_sha,
+                "red_checks": red.red_checks,
+                "checks_summary": body.checks_summary[:200],
+            },
+        )  # once: parking retires the run it needs; retries adopt the effect marker
+
+
 #: The withdrawal note of ``_invalidate_ready``, current and as earlier releases wrote it.
 _WITHDRAWN_NOTES = ("No longer ready: ", "Ready withdrawn: ")
 
-#: Holds that make a withdrawn Ready card more than the base-sync misclassification.
-_NOT_SYNC_WITHDRAWN = frozenset(
+#: Holds that make a withdrawn Ready card more than the red-check misclassification.
+_NOT_CHECKS_WITHDRAWN = frozenset(
     {
         Hold.SAFETY,
         Hold.STOPPED,
@@ -2218,45 +2346,51 @@ _NOT_SYNC_WITHDRAWN = frozenset(
         Hold.APPROVAL_VOIDED,
         Hold.UNSUPPORTED_REWORK,
         Hold.EXTERNAL_ACTIVITY,
+        Hold.AGENT_BLOCKED,
     }
 )
 
 
-def _restore_sync_withdrawn(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> Readiness:
-    """Self-correct a card the old rule withdrew from Ready for a base-sync red check.
+def _withdrawn_for_checks(ctx: _Ctx) -> bool:
+    """The card left Ready only because a required check was red (the old rule): the
+    withdrawal note names that one reason (several are "; "-joined)."""
+    return (
+        Hold.REWORK_CONTROL_REQUIRED in ctx.p.holds
+        and ctx.p.note.startswith(_WITHDRAWN_NOTES)
+        and "required checks failed" in ctx.p.note
+        and "; " not in ctx.p.note
+    )
 
-    Before ``sync_red`` existed, a red required check on the owner's "Update branch" head
-    moved a Ready card to Building with ``readiness_failed`` + ``rework_control_required``
-    and its build run already retired (#651). Recognised by exactly that shape: the
-    withdrawal note for failed checks, the Ready run retired as current session and a
-    head that this read confirms merely syncs the base onto the accepted head. The card
-    goes back to Ready (no session, no comment); the read is then judged there.
+
+def _restore_withdrawn(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> Readiness:
+    """Self-correct a card the old rule withdrew from Ready for a red required check.
+
+    Before this rule a red required check moved a Ready card to Building with
+    ``readiness_failed`` + ``rework_control_required`` and the withdrawal note (#651:
+    an owner base sync with its Ready run retired; #461: an owner drag to Ready with
+    the build run still waiting on checks). When this read shows the bot's work done
+    apart from the check colour, the card goes back to Ready (no session, no comment)
+    and the read is judged there.
     """
     s = ctx.p.session(r.session_id)
     if not (
         ctx.p.stage == Stage.BUILDING
         and not r.ready
-        and {Hold.READINESS_FAILED, Hold.REWORK_CONTROL_REQUIRED} <= ctx.p.holds
-        and not ctx.p.holds & _NOT_SYNC_WITHDRAWN
-        and r.reviewed_head
-        and r.reviewed_head != r.head_sha
-        and ctx.p.note.startswith(_WITHDRAWN_NOTES)
-        and "required checks failed" in ctx.p.note
+        and Hold.READINESS_FAILED in ctx.p.holds
+        and _withdrawn_for_checks(ctx)
+        and not ctx.p.holds & _NOT_CHECKS_WITHDRAWN
         and s is not None
         and s.session_id == ctx.p.current_session_id
-        and s.lifecycle == Lifecycle.RETIRED
-        and s.execution_closed
+        and (
+            (s.lifecycle == Lifecycle.RETIRED and s.execution_closed)
+            or not _run_unfinished(ctx, s, owner_moved=True)
+        )
         and not ctx.p.open_decisions
         and not _rework_queued(ctx)
-        and body.base_sync
-        and body.pr_open
-        and body.checks is not None
-        and body.closes_issue
-        and body.review_accepted
-        and not body.findings_open
+        and _done_apart_from_checks(body)
     ):
         return r
-    ctx.unhold(Hold.READINESS_FAILED, Hold.REWORK_CONTROL_REQUIRED, Hold.CHECKS_FAILED)
+    ctx.unhold(*_READY_CLEARED_HOLDS)
     r = replace(r, ready=False, verified=False)
     ctx.update(readiness=r)
     _move(ctx, Stage.READY)
@@ -2335,7 +2469,8 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
     Pending checks are waiting, never a failure. A genuine failure (red checks, open
     review-bot findings, no accepted review of this head) wakes the idle build session
     once per approval, within its existing fix-batch/recheck allowance; after that the
-    owner decides with the reason recorded.
+    owner decides with the reason recorded. Only red required checks with that wake
+    spent (or not applicable: a base-sync head) put the card in Ready, Bot Blocked.
     """
     s = ctx.p.session(r.session_id)
     if body.checks == ev.ChecksState.PENDING:
@@ -2348,6 +2483,23 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
         )
         if busy:
             return  # re-evaluated by the next reconcile read or a new result
+    if (
+        _red_only(body)
+        and (ctx.p.readiness_wakes >= 1 or body.base_sync)
+        and s is not None
+        and s.session_id == ctx.p.current_session_id
+        and s.lifecycle != Lifecycle.RETIRED
+        and not _run_unfinished(ctx, s)
+        and not ctx.p.holds & _NOT_CHECKS_WITHDRAWN
+        and (Hold.REWORK_CONTROL_REQUIRED not in ctx.p.holds or _withdrawn_for_checks(ctx))
+        and not board_pending(ctx.p)
+    ):
+        # The bot has nothing left to do: its one fix wake is spent, or the head only
+        # syncs the base onto the reviewed head (nothing of its own to fix).
+        if not r.review_bot_done and ctx.now < r.settle_at_us:
+            return  # the review bot may still comment on this head
+        _park_red(ctx, r, s, body)
+        return
     reason = _failure_reason(r, body, ctx.p.issue_number)
     if (
         ctx.p.readiness_wakes < 1

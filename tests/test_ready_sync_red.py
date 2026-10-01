@@ -1,5 +1,7 @@
 """Ready + owner "Update branch" + a red required check from the base branch (#651).
 
+#461 generalised this to any red-check-only read in Ready (tests/test_ready_red_checks.py).
+
 The owner merged main into a Ready PR; the review was carried forward (base sync only),
 but a required check that main itself broke went red. Nothing the build can fix: the
 card stays in Ready with Bot Blocked and a note naming the check, no comment, no rework
@@ -160,20 +162,31 @@ def test_a_sync_head_with_another_failure_keeps_the_existing_rule():
     assert p.stage == Stage.BUILDING and p.holds >= REWORK_HOLDS and not p.readiness.sync_red
 
 
-# ------------------------------------------------------- 3. non-sync heads unchanged
+# ------------------------------------------------------- 3. non-sync heads (#461)
 
 
-def test_red_check_on_a_head_with_bot_commits_still_withdraws_ready():
+def test_red_check_alone_on_a_reviewed_non_sync_head_also_stays_in_ready_blocked():
+    """#461 generalised the rule: the Ready run is retired, so there is no wake to use;
+    with the review accepted for the head a red check only makes Bot Blocked."""
     h = Harness()
     ready(h)
     update_branch(h)
     r = h.send(P, red(h, base_sync=False))
+    assert_quiet(r)
+    assert_sync_blocked(h)
+
+
+def test_red_check_on_an_unreviewed_non_sync_head_still_withdraws_ready():
+    h = Harness()
+    ready(h)
+    update_branch(h)
+    r = h.send(P, replace(red(h, base_sync=False), review_accepted=False))
     p = h.p()
     assert p.stage == Stage.BUILDING and p.holds >= REWORK_HOLDS
     assert p.bot == BotState.NEEDS_YOU and not p.readiness.sync_red
     assert p.note.startswith("No longer ready: ") and "required checks failed" in p.note
     assert EffectKind.SEND_MESSAGE not in kinds(r)
-    # A later read never "self-corrects" it: the head is not a base sync.
+    # A later read never "self-corrects" it: two reasons, not just the checks.
     h.send(P, red(h, base_sync=False))
     assert h.p().stage == Stage.BUILDING and h.p().bot == BotState.NEEDS_YOU
 
@@ -211,20 +224,25 @@ LIVE_NOTE = (
 )
 
 
+#: The note the old rule wrote for #651 under the current wording.
+OLD_RULE_NOTE = (
+    "No longer ready: required checks failed (20 checks: 19 success, 1 failure) on fffffff"
+)
+
+
 def stuck_651(h: Harness, note: str | None = None) -> None:
-    """The live #651 shape, as the old rule left it (no base_sync on the read)."""
+    """The live #651 shape, as the old rule left it: withdrawn to Building for the red
+    check alone, Ready run retired, persisted before the new Readiness fields existed."""
     ready(h)
     update_branch(h)
-    h.send(P, red(h, base_sync=False))
+    h.send(P, replace(red(h, base_sync=False), review_accepted=False))  # a withdrawal
     p = h.p()
     assert p.stage == Stage.BUILDING and p.holds >= REWORK_HOLDS
     assert p.bot == BotState.NEEDS_YOU and h.cur().lifecycle == Lifecycle.RETIRED
-    # Persisted before the new Readiness fields existed.
     data = json.loads(parcel_to_json(p))
     for key in ("sync_red", "red_checks"):
         data["parcel"]["readiness"].pop(key)
-    if note is not None:
-        data["parcel"]["note"] = note
+    data["parcel"]["note"] = OLD_RULE_NOTE if note is None else note
     h.parcels[P] = parcel_from_json(json.dumps(data))
 
 
@@ -261,10 +279,22 @@ def test_stuck_651_card_whose_checks_are_already_green_returns_to_ready_idle():
     assert p.bot == BotState.IDLE and p.board_note == ""
 
 
-def test_stuck_shape_without_a_base_sync_read_is_left_alone():
+def test_stuck_shape_returns_on_a_reviewed_non_sync_read_too():
     h = Harness()
     stuck_651(h)
     r = h.send(P, red(h, base_sync=False))
+    assert not comments(r) and EffectKind.SEND_MESSAGE not in kinds(r)
+    assert EffectKind.CREATE_SESSION not in kinds(r)
+    assert [e.args for e in r.effects if e.kind == EffectKind.MOVE_CARD] == [
+        {"to": "Ready", "expected_from": "Building"}
+    ]
+    assert_sync_blocked(h)
+
+
+def test_stuck_shape_with_an_unaccepted_review_read_is_left_alone():
+    h = Harness()
+    stuck_651(h)
+    r = h.send(P, replace(red(h, base_sync=False), review_accepted=False))
     assert EffectKind.MOVE_CARD not in kinds(r)
     assert h.p().stage == Stage.BUILDING and h.p().bot == BotState.NEEDS_YOU
 

@@ -87,8 +87,13 @@ def ready(h: Harness):
             verified=True,
             remediation_exhausted=True,
         ),
+        # A red check alone keeps Ready (Bot Blocked, #461); with open findings it does not.
         lambda b: ev.ReadinessEvidence(
-            session_id=b.session_id, pr_number=7, head_sha=HEAD, checks=ev.ChecksState.FAILED
+            session_id=b.session_id,
+            pr_number=7,
+            head_sha=HEAD,
+            checks=ev.ChecksState.FAILED,
+            findings_open=True,
         ),
         lambda b: ev.PRObserved(
             pr_number=7,
@@ -99,7 +104,7 @@ def ready(h: Harness):
             parcel_branch=True,
         ),
     ],
-    ids=["D2-unverified", "remediation-exhausted", "checks-failed", "pr-closed-unmerged"],
+    ids=["D2-unverified", "remediation-exhausted", "checks-failed-findings", "pr-closed-unmerged"],
 )
 def test_D2_evidence_falsifying_a_ready_precondition_invalidates_ready(body_for):
     h = Harness()

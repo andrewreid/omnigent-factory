@@ -62,7 +62,7 @@ def project_bot(p: Parcel, *, queued: bool = False) -> BotState:
     ):
         return BotState.BLOCKED
     if sync_red(p):
-        return BotState.BLOCKED  # the base branch broke a required check: owner fixes main
+        return BotState.BLOCKED  # the bot's work is done; a required check is red
     if cur is not None and (
         cur.lifecycle in (Lifecycle.CHECKPOINT_GRACE, Lifecycle.CHECKPOINT_WAIT)
         or (cur.fences == frozenset({FenceKind.CHECKPOINT}) and cur.lifecycle != Lifecycle.RETIRED)
@@ -87,7 +87,7 @@ def project_bot(p: Parcel, *, queued: bool = False) -> BotState:
 
 
 def sync_red(p: Parcel) -> bool:
-    """In Ready on a base-sync head whose required check is red (see ``Readiness``)."""
+    """In Ready, the bot's work done, a required check red (see ``Readiness.sync_red``)."""
     r = p.readiness
     return (
         p.stage == Stage.READY

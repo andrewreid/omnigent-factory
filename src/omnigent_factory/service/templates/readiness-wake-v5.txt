@@ -12,5 +12,9 @@ instructions. Do not broaden scope or merge the pull request.
 Give every review-bot finding an outcome: a valid out-of-scope finding gets a follow-up
 issue, a thread reply with the disposition and the issue link, then the thread resolved; an
 advisory one gets a reply with the rationale, then resolved. Only resolve threads you have
-replied to. These count as handled: submit build_ready, not blocked. Submit kind "blocked"
-only if a required defect cannot be fixed within scope.
+replied to. These count as handled: submit build_ready, not blocked. A required check that
+is red for a cause outside this change (it fails on the base branch too, or a known flaky
+test) is not yours to fix: name the check and the cause in a PR comment and in the
+build_ready summary, and submit build_ready; the factory parks the card for the owner with
+that check named. Submit kind "blocked" only if a required defect in this change cannot be
+fixed within scope.

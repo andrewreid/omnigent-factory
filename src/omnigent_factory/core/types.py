@@ -515,11 +515,13 @@ class Readiness:
     #: The latest read showed the review bot already answered ``head_sha`` with no
     #: re-ping since: nothing can still arrive, so there is no grace wait.
     review_bot_done: bool = False
-    #: In Ready, ``head_sha`` merely syncs the base branch onto the accepted head and a
-    #: required check is red: the failure came from the base, so the card stays in Ready
-    #: with Bot Blocked (no rework, no wake) until a green read or a newer head.
+    #: In Ready with the bot's work done and only a required check red (a base sync,
+    #: a flake or main broken; or the one fix wake already spent): the card stays in
+    #: Ready with Bot Blocked (no rework, no wake) until a pending/green read or a newer
+    #: head. (Named for the first case, the owner's base sync; kept for stored state.)
     sync_red: bool = False
-    #: The failing required checks of that read, e.g. "api / Dependency audit".
+    #: The failing required checks seen red on this head, "; "-separated (a name may
+    #: contain commas), e.g. "api / Dependency audit; web / Typecheck, test, lint".
     red_checks: str = ""
 
 

@@ -424,15 +424,34 @@ def test_same_head_check_rerun_on_a_ready_card_waits_in_ready():
     assert h.p().readiness.ready and h.p().bot == BotState.IDLE
 
 
-def test_red_new_head_on_a_ready_card_needs_you_with_the_reason():
+def test_red_unreviewed_new_head_on_a_ready_card_needs_you_with_the_reason():
+    """New commits the accepted review does not cover (not a base sync) leave Ready. A
+    red check alone on a reviewed head stays in Ready, Bot Blocked (#461)."""
+    h = Harness()
+    _ready(h)
+    h.send(P, evidence(h, OLD, observed_head_sha=NEW, checks=ev.ChecksState.PENDING))
+    r = h.send(
+        P,
+        evidence(
+            h, NEW, checks=ev.ChecksState.FAILED, checks_summary="1 failure", review_accepted=False
+        ),
+    )
+    assert not comments(r, "ready-invalidated")  # informational: the card's note, no comment
+    p = h.p()
+    assert p.note.startswith("No longer ready: ") and "required checks failed" in p.note
+    assert "no accepted cross vendor review" in p.note
+    assert p.stage == Stage.BUILDING and p.bot == BotState.NEEDS_YOU and not sends(r)
+
+
+def test_red_check_alone_on_a_reviewed_new_head_stays_in_ready_blocked():
     h = Harness()
     _ready(h)
     h.send(P, evidence(h, OLD, observed_head_sha=NEW, checks=ev.ChecksState.PENDING))
     r = h.send(P, evidence(h, NEW, checks=ev.ChecksState.FAILED, checks_summary="1 failure"))
-    assert not comments(r, "ready-invalidated")  # informational: the card's note, no comment
+    assert not comments(r, "ready-invalidated") and not sends(r)
     p = h.p()
-    assert p.note.startswith("No longer ready: ") and "required checks failed" in p.note
-    assert p.stage == Stage.BUILDING and p.bot == BotState.NEEDS_YOU and not sends(r)
+    assert p.stage == Stage.READY and p.bot == BotState.BLOCKED
+    assert p.note == "Required check red: see the PR checks"
 
 
 def test_owner_approval_of_the_new_head_is_not_a_rework_instruction():
@@ -520,7 +539,8 @@ def test_catch_up_read_returns_a_ready_card_to_ready_without_a_completion_webhoo
 def test_catch_up_read_covers_needs_you_without_a_live_build_session():
     h = Harness()
     _ready(h)
-    h.send(P, evidence(h, OLD, checks=ev.ChecksState.FAILED))  # Ready -> Needs you
+    # Ready -> Needs you (a red check alone would stay in Ready, Bot Blocked: #461)
+    h.send(P, evidence(h, OLD, checks=ev.ChecksState.FAILED, findings_open=True))
     p = h.p()
     assert p.stage == Stage.BUILDING and p.bot == BotState.NEEDS_YOU
     assert p.session(p.readiness.session_id).lifecycle == Lifecycle.RETIRED

@@ -172,3 +172,14 @@ async def test_failing_required_checks_are_named_for_the_board_note():
     # Without a required set every failing check counts.
     state, names = await failing_names([*PASSING, (20, audit, "failure")])
     assert state == ChecksState.FAILED and names == audit
+
+
+@pytest.mark.asyncio
+async def test_failing_check_names_are_semicolon_separated_since_names_contain_commas():
+    """#461: "web / Typecheck, test, lint" must stay one name in the note."""
+    audit, web = "api / Dependency audit", "web / Typecheck, test, lint"
+    runs = [*PASSING, (20, web, "failure"), (21, audit, "failure")]
+    state, names = await failing_names(runs, [*REQUIRED, audit, web])
+    assert state == ChecksState.FAILED
+    assert names == f"{audit}; {web}"  # required names in sorted order
+    assert names.split("; ") == [audit, web]

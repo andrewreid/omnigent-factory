@@ -34,11 +34,11 @@ def test_blocked_report_and_status_comments_name_the_configured_agent():
 
 def test_build_prompts_carry_the_review_bot_disposition_rule():
     root = files("omnigent_factory.service") / "templates"
-    for name in ("build-v6.txt", "readiness-wake-v4.txt"):
+    for name in ("build-v6.txt", "readiness-wake-v5.txt"):
         text = " ".join((root / name).read_text("utf-8").split())
         assert "follow-up issue" in text and "resolve" in text, name
         assert "Only resolve threads you have replied to." in text, name
-    wake = " ".join((root / "readiness-wake-v4.txt").read_text("utf-8").split())
+    wake = " ".join((root / "readiness-wake-v5.txt").read_text("utf-8").split())
     assert "submit build_ready, not blocked" in wake
 
 
@@ -58,8 +58,20 @@ def test_stage_prompts_keep_internal_ids_out_of_github_prose():
 
 def test_readiness_wake_says_not_ready_for_review_not_the_column_name():
     wake = " ".join(
-        (files("omnigent_factory.service") / "templates" / "readiness-wake-v4.txt")
+        (files("omnigent_factory.service") / "templates" / "readiness-wake-v5.txt")
         .read_text("utf-8")
         .split()
     )
     assert "is not ready for review:" in wake and "not Ready" not in wake
+
+
+def test_readiness_wake_says_red_checks_outside_the_change_are_build_ready_not_blocked():
+    """#461: Rosie reported "blocked" for red checks from main and a flaky test."""
+    wake = " ".join(
+        (files("omnigent_factory.service") / "templates" / "readiness-wake-v5.txt")
+        .read_text("utf-8")
+        .split()
+    )
+    assert "red for a cause outside this change" in wake
+    assert "name the check and the cause in a PR comment and in the build_ready summary" in wake
+    assert 'Submit kind "blocked" only if a required defect in this change' in wake

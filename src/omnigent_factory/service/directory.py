@@ -197,7 +197,7 @@ class ServiceDispatchDirectory:
                 return _template("triage-comment-v1.txt").format(run_id=sid)
             return _template("feedback-v3.txt").format(revision=parcel.revision, run_id=sid)
         if purpose == "readiness_wake":
-            return _template("readiness-wake-v4.txt").format(
+            return _template("readiness-wake-v5.txt").format(
                 pr_number=int(str(effect.args.get("pr_number") or 0)),
                 head_sha=str(effect.args.get("head_sha") or ""),
                 reason=str(effect.args.get("reason") or "")[:500],
@@ -653,11 +653,18 @@ def _ready_text(
     number = args.get("pr_number")
     head = str(args.get("head_sha") or "")
     url = f"https://github.com/{repository}/pull/{number}"
+    red = str(args.get("red_checks") or "")
     lines = [f"### PR #{number} is ready for review", ""]
     if result is not None and result.get("head_sha") == head and result.get("summary"):
         lines += [str(result["summary"]).strip(), ""]  # the agent's Markdown, as written
     lines.append(f"**PR:** {url} (head `{head[:12]}`)")
-    lines.append(f"**CI:** {checks_summary or 'required checks green'}")
+    summary = str(args.get("checks_summary") or checks_summary)
+    lines.append(f"**CI:** {summary or 'required checks green'}")
+    if "red_checks" in args:
+        # Parked with red required checks: the agent attributes them to causes outside
+        # the change (its summary above says why); merging waits for them.
+        names = ", ".join(f"`{n}`" for n in red.split("; ") if n) or "see the PR checks"
+        lines.append(f"**Required check red:** {names} (cause: see the summary above)")
     review = result.get("review") if result is not None else None
     if isinstance(review, dict):
         lines.append(

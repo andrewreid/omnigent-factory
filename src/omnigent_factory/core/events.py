@@ -425,7 +425,7 @@ class ReadinessEvidence(_Body):
     #: The review was carried to this head only because every newer commit merely
     #: syncs the base branch (owner "Update branch"): a red check came from the base.
     base_sync: bool = False
-    #: Names of the failing required checks, e.g. "api / Dependency audit".
+    #: Names of the failing required checks, "; "-separated (names may contain commas).
     failing_checks: str = ""
 
 

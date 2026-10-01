@@ -154,6 +154,7 @@ async def test_A_stage_templates_point_at_owner_feedback():
         "build-rework-v2.txt",
         "triage-feedback-v2.txt",
         "readiness-wake-v3.txt",
+        "readiness-wake-v4.txt",
     ):
         assert not (root / gone).is_file()
 

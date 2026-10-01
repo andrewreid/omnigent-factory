@@ -1462,8 +1462,9 @@ def _checks_from(states: list[str]) -> ChecksState:
 
 
 def _names(names: list[str]) -> str:
-    """Distinct check names in first-seen order, e.g. "api / Dependency audit, lint"."""
-    return ", ".join(dict.fromkeys(names))[:200]
+    """Distinct check names in first-seen order, "; "-separated (a name may contain
+    commas), e.g. "api / Dependency audit; web / Typecheck, test, lint"."""
+    return "; ".join(dict.fromkeys(names))[:200]
 
 
 def _checks_summary(labels: list[str]) -> str:
