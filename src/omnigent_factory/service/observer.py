@@ -125,6 +125,20 @@ class OmnigentObserver:
         if session is None or session.root_id is None:
             return
         observation = await self.adapter.observe_tree(session.root_id)
+        # The tree read is slow and successive runs share the root: a run admitted
+        # meanwhile owns what was observed. Crediting its activity to the stale run
+        # (settled, so "external") would hold the parcel; the next pass reads it fresh.
+        fresh = await self._load_parcel(parcel.parcel_id)
+        current = fresh.current_session if fresh is not None else None
+        if (
+            fresh is None
+            or current is None
+            or current.session_id != session.session_id
+            or current.root_id != session.root_id
+            or current.execution_closed
+        ):
+            return
+        parcel, session = fresh, current
         tracker = self._tracker(
             session.session_id, session.grant.grant_id, session.grant.consumed_us
         )

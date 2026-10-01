@@ -88,7 +88,10 @@ links, internal ids or labels, and no how-to lines. Hidden markers stay.
 `Bot: Needs you` means the current stage cannot continue without the owner: an open
 question, or a hold that needs his decision (e.g. PR not Ready with no fix attempt left).
 A stage that finished with the owner's move next is `Idle`: triage posted, plan posted
-awaiting approval, Ready.
+awaiting approval, Ready. Activity in a stopped run's issue session from outside the
+factory (someone typing in Omnigent) holds the next run until the session is idle again;
+that asks nothing of the owner, so the note reads `Waiting: the Omnigent session is busy
+outside the factory; ...` and `Bot` stays as derived.
 
 **Ready means the bot's work is done**: the PR is open and closes the issue, the
 cross-vendor review is accepted for the head (or carried to an owner/base sync of it),

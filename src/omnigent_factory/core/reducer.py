@@ -68,6 +68,7 @@ from omnigent_factory.core.projection import (
     queue_head,
     ready_bot_ok,
     sync_red_note,
+    work_live,
 )
 from omnigent_factory.core.types import (
     CONTROL_CLEARED_HOLDS,
@@ -833,7 +834,10 @@ def _observe_stage(ctx: _Ctx, observed: Stage) -> None:
         # authority and must not split the desired column from the queued target.
         return
     ctx.update(stage=observed)  # rightward/unknown observation: never authority
-    if not ready_bot_ok(ctx.p, project_bot(ctx.p, queued=_queued(ctx))):
+    queued = _queued(ctx)
+    if not ready_bot_ok(ctx.p, project_bot(ctx.p, queued=queued)) or (
+        observed == Stage.READY and work_live(ctx.p, queued=queued)
+    ):
         # Ready never shows the bot working: work still running (or queued) puts the
         # card back where it was, with the reason.
         _emit_move(ctx, current, source=observed)
@@ -3005,10 +3009,22 @@ def _resolve_unknown(ctx: _Ctx, effect_id: str, session_id: str | None, item_id:
     ctx.put_session(replace(s, own_items=items, message_unknown=still))
 
 
+def _root_owner(ctx: _Ctx, s: StageSession) -> StageSession:
+    """The run that owns activity observed on ``s``'s root: successive runs share the
+    issue session, so it is the current run when that one executes in the same root."""
+    cur = ctx.p.current_session
+    if cur is not None and s.root_id is not None and cur.root_id == s.root_id:
+        return cur
+    return s
+
+
 def _h_runtime_activity(ctx: _Ctx, body: ev.RuntimeActivity) -> None:
     s = _session(ctx, body.session_id)
     if not body.busy:
         return  # idle is not quiescence evidence
+    # A late observation labelled with an earlier run of the same root (e.g. read
+    # before the build run was admitted) is the current run's own work, not external.
+    s = _root_owner(ctx, s)
     if settled(s) or s.lifecycle in (Lifecycle.FENCED, Lifecycle.RETIRED):
         s = ctx.put_session(replace(s, external_active=True, quiescent=False))
         ctx.hold(Hold.EXTERNAL_ACTIVITY)
@@ -3318,6 +3334,11 @@ def _h_tree_quiescent(ctx: _Ctx, body: ev.TreeQuiescent) -> None:
     if s.root_id is None and s.lifecycle not in (Lifecycle.FENCED, Lifecycle.RETIRED):
         raise Rejected("no-root-to-scan")
     s = ctx.put_session(replace(s, quiescent=True, external_active=False))
+    # A complete idle read of the root is quiescence for every run in it: an earlier
+    # run's activity flag would otherwise never clear (only the current run is observed).
+    for other in ctx.p.sessions:
+        if other.external_active and other.root_id is not None and other.root_id == s.root_id:
+            ctx.put_session(replace(other, external_active=False))
     if not any(x.external_active for x in ctx.p.sessions):
         ctx.unhold(Hold.EXTERNAL_ACTIVITY)
     if s.lifecycle == Lifecycle.DRAINING or (

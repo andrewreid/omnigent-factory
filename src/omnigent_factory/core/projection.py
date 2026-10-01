@@ -75,16 +75,29 @@ def project_bot(p: Parcel, *, queued: bool = False) -> BotState:
         return BotState.NEEDS_YOU
     if queued:
         return BotState.QUEUED
-    # In Ready waiting on a new head's or a re-run's checks the bot has nothing to do:
-    # Idle, with the note saying checks are running (``checks_running``).
-    # A safety/stop drain is never Idle until the tree is observed quiescent. A plan run
-    # waiting for approval has finished its stage: the next move is the owner's (Idle).
-    if any(
-        s.lifecycle in _WORKING and not _awaiting_approval(s) and not _ready_waiting(p, s)
-        for s in p.sessions
-    ):
+    if _running(p):
         return BotState.WORKING
     return BotState.IDLE
+
+
+def _running(p: Parcel) -> bool:
+    """A stage run is doing work.
+
+    In Ready waiting on a new head's or a re-run's checks the bot has nothing to do:
+    Idle, with the note saying checks are running (``checks_running``).
+    A safety/stop drain is never Idle until the tree is observed quiescent. A plan run
+    waiting for approval has finished its stage: the next move is the owner's (Idle).
+    """
+    return any(
+        s.lifecycle in _WORKING and not _awaiting_approval(s) and not _ready_waiting(p, s)
+        for s in p.sessions
+    )
+
+
+def work_live(p: Parcel, *, queued: bool = False) -> bool:
+    """Work for the card runs or waits for capacity, whatever ``Bot`` shows: Blocked and
+    Needs you outrank Working, so the Bot value alone cannot say a run is live."""
+    return queued or _running(p)
 
 
 #: Bot values a card in the Ready column may show: no work runs while it is there.
@@ -162,6 +175,11 @@ _HOLD_TEXT = {
     Hold.EXTERNAL_ACTIVITY: "external session activity",
 }
 
+#: Not an owner action: the hold clears by itself once the issue session goes idle.
+_EXTERNAL_ACTIVITY_NOTE = (
+    "Waiting: the Omnigent session is busy outside the factory; work resumes when it is idle"
+)
+
 
 def project_note(p: Parcel, bot: BotState) -> str:
     """The board's "Factory note": the latest status reason, else one derived from ``bot``."""
@@ -186,6 +204,8 @@ def project_note(p: Parcel, bot: BotState) -> str:
         text = f"Needs you: {', '.join(why) or 'owner decision'}"
     elif bot == BotState.QUEUED:
         text = "Queued: waiting for build capacity"
+    elif bot in (BotState.IDLE, BotState.WORKING) and Hold.EXTERNAL_ACTIVITY in p.holds:
+        text = _EXTERNAL_ACTIVITY_NOTE
     elif bot == BotState.IDLE and checks_running(p):
         assert p.readiness is not None  # noqa: S101 - checks_running checks it
         text = f"Checks running on `{p.readiness.head_sha[:7]}`"

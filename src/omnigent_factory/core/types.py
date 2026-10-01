@@ -226,9 +226,10 @@ NEEDS_YOU_HOLDS = frozenset(
         Hold.PR_CLOSED,
         Hold.NO_PROJECT_ITEM,
         Hold.APPROVAL_VOIDED,
-        Hold.EXTERNAL_ACTIVITY,
     }
 )
+#: ``EXTERNAL_ACTIVITY`` is in neither set: it clears by itself once the issue session is
+#: observed idle, so it asks nothing of the owner (the derived note says it is waiting).
 
 #: Holds cleared by any accepted fresh owner stage control.
 CONTROL_CLEARED_HOLDS = frozenset(
