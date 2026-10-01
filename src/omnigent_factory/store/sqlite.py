@@ -62,6 +62,9 @@ _QUIET_KINDS = frozenset(
     {EventKind.ACTIVE_TIME_SAMPLE, EventKind.COST_SAMPLE, EventKind.RUNTIME_ACTIVITY}
 )
 
+#: Decoded parcel aggregates kept by :meth:`SqliteStore.load_parcel` (cleared when full).
+_PARCEL_CACHE_LIMIT = 1024
+
 Reducer = Callable[[State, Event], TransitionResult]
 FaultHook = Callable[[str], None]
 
@@ -202,6 +205,7 @@ class SqliteStore:
         self._conn = conn
         self._clock = clock
         self._fault = fault_hook
+        self._parcel_cache: dict[str, tuple[tuple[int, int], str, Parcel]] = {}
 
     # ------------------------------------------------------------ lifecycle
 
@@ -400,8 +404,11 @@ class SqliteStore:
         return outcome
 
     def pending_deliveries(self) -> list[DeliveryRecord]:
+        # ``status IN ('pending', 'unresolved')`` must match ix_deliveries_inbox exactly.
         rows = self._conn.execute(
-            "SELECT * FROM deliveries WHERE status IN ('pending', 'unresolved') "
+            "SELECT delivery_guid, event_name, body, headers_json, provenance, action, app_id, "
+            "installation_id, source_time_us FROM deliveries "
+            "WHERE status IN ('pending', 'unresolved') "
             "AND (resolution_retry_at_us IS NULL OR resolution_retry_at_us <= ?) "
             "ORDER BY received_at_us, delivery_guid",
             (self._clock.now_utc_us(),),
@@ -420,6 +427,43 @@ class SqliteStore:
             )
             for r in rows
         ]
+
+    def has_pending_delivery(self) -> bool:
+        """Whether any delivery is ``pending`` (an indexed probe, never a table scan)."""
+        row = self._conn.execute(
+            "SELECT 1 FROM deliveries WHERE status IN ('pending', 'unresolved') "
+            "AND status = 'pending' LIMIT 1"
+        ).fetchone()
+        return row is not None
+
+    def inbox_due(self) -> list[tuple[str, int | None]]:
+        """``(delivery_guid, resolution_retry_at_us)`` of every pending/unresolved row."""
+        rows = self._conn.execute(
+            "SELECT delivery_guid, resolution_retry_at_us FROM deliveries "
+            "WHERE status IN ('pending', 'unresolved')"
+        ).fetchall()
+        return [(str(r[0]), r[1]) for r in rows]
+
+    def prune_delivery_bodies(self, before_us: int, *, limit: int = 500) -> int:
+        """Empty the body and headers of old processed deliveries no event references.
+
+        Only ``processed`` rows finished before ``before_us`` are touched, and never one an
+        event points at: the directory reads those bodies back as parcel context (owner
+        comments, decision answers, labels). The row, GUID and ``body_sha256`` stay, so
+        duplicate and recovery matching keep working. Returns the rows pruned (at most
+        ``limit``, one short transaction; call again until it returns fewer).
+        """
+        with self._txn() as conn:
+            cur = conn.execute(
+                "UPDATE deliveries SET body = X'', headers_json = '{}', body_pruned_at_us = ? "
+                "WHERE delivery_guid IN (SELECT d.delivery_guid FROM deliveries d "
+                "WHERE d.status = 'processed' AND d.body_pruned_at_us IS NULL "
+                "AND COALESCE(d.processed_at_us, d.received_at_us) < ? "
+                "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.delivery_guid = d.delivery_guid) "
+                "LIMIT ?)",
+                (self._clock.now_utc_us(), before_us, limit),
+            )
+        return cur.rowcount
 
     def mark_delivery(self, delivery_guid: str, status: str) -> None:
         with self._txn() as conn:
@@ -461,10 +505,33 @@ class SqliteStore:
     # -------------------------------------------------------- application
 
     def load_parcel(self, parcel_id: str) -> Parcel | None:
+        # Background loops reload every parcel each second; read and decode only what may
+        # have changed. While no row changed through this connection (total_changes) or
+        # another one (data_version), the cached aggregate is current; otherwise the
+        # stored text is compared, so no write path can leave the cache stale. Parcel
+        # aggregates are frozen dataclasses, safe to share between callers.
+        epoch = (
+            self._conn.total_changes,
+            int(self._conn.execute("PRAGMA data_version").fetchone()[0]),
+        )
+        cached = self._parcel_cache.get(parcel_id)
+        if cached is not None and cached[0] == epoch:
+            return cached[2]
         row = self._conn.execute(
             "SELECT aggregate_json FROM parcels WHERE parcel_id = ?", (parcel_id,)
         ).fetchone()
-        return None if row is None else codec.parcel_from_json(row["aggregate_json"])
+        if row is None:
+            self._parcel_cache.pop(parcel_id, None)
+            return None
+        text = row["aggregate_json"]
+        if cached is not None and cached[1] == text:
+            parcel = cached[2]
+        else:
+            parcel = codec.parcel_from_json(text)
+        if len(self._parcel_cache) >= _PARCEL_CACHE_LIMIT:
+            self._parcel_cache.clear()
+        self._parcel_cache[parcel_id] = (epoch, text, parcel)
+        return parcel
 
     def has_event(self, event_id: str) -> bool:
         row = self._conn.execute(

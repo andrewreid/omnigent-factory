@@ -147,6 +147,11 @@ class ServiceConfig(BaseModel):
     reconcile_interval_seconds: float = Field(default=120.0, gt=0)
     clock_interval_seconds: float = Field(default=1.0, gt=0)
     effect_poll_seconds: float = Field(default=0.05, gt=0)
+    #: Longest the delivery loop sleeps with nothing due. A committed webhook delivery or
+    #: an operator release wakes it at once; this only bounds a missed wake-up.
+    delivery_idle_poll_seconds: float = Field(default=5.0, gt=0)
+    #: Days a processed delivery keeps its body/headers when no event references it.
+    delivery_body_retention_days: float = Field(default=14.0, gt=0)
     background_error_backoff_seconds: float = Field(default=0.05, gt=0)
     background_failure_limit: int = Field(default=10, ge=1)
     delivery_retry_backoff_seconds: float = Field(default=1.0, gt=0)

@@ -31,7 +31,7 @@ from omnigent_factory.ports.adapter import EffectAdapter
 from omnigent_factory.ports.clock import Clock
 from omnigent_factory.ports.scheduler import SCHEDULER_EFFECT_KINDS
 from omnigent_factory.service.db import StoreWorker
-from omnigent_factory.store.sqlite import Lease, LeaseHeld, SqliteStore, StoredEffect
+from omnigent_factory.store.sqlite import Lease, LeaseHeld, StoredEffect
 
 LOG = logging.getLogger(__name__)
 
@@ -189,7 +189,7 @@ class EffectExecutor:
             return
         effect = current.effect
         if _inbox_gated(effect):
-            pending = await self._db.call(_has_pending_delivery)
+            pending = await self._db.call(lambda store: store.has_pending_delivery())
             if pending or self._parked_blocks(effect.parcel_id):
                 return
         if _pause_sensitive(effect):
@@ -676,10 +676,6 @@ def _pause_sensitive(effect: EffectIntent) -> bool:
         effect.kind == EffectKind.SEND_MESSAGE
         and effect.args.get("purpose") == MessagePurpose.FIRST.value
     )
-
-
-def _has_pending_delivery(store: SqliteStore) -> bool:
-    return bool(store.query("SELECT 1 FROM deliveries WHERE status = 'pending' LIMIT 1"))
 
 
 def _never_blocks(parcel_id: str | None) -> bool:

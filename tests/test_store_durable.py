@@ -73,7 +73,7 @@ def test_v1_database_upgrades_to_v2_preserving_data_and_reopens(db: Path):
     v1.close()
 
     upgraded = open_store(db)
-    assert upgraded.schema_version() == LATEST == 7
+    assert upgraded.schema_version() == LATEST == 8
     names = {r[0] for r in upgraded.query("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"own_sends", "capability_records", "worker_grants", "parked_deliveries"} <= names
     assert "mcp_feedback_reads" in names

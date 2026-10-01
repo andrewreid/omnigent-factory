@@ -504,6 +504,23 @@ CREATE TABLE pr_review_comments (
 );
 """
 
+# Idle cost and inbox retention.
+#
+# * ix_deliveries_inbox: the delivery loop's pending/unresolved lookup (and its ORDER BY)
+#   no longer scans every delivery row, whose bodies sit before ``status`` and so force a
+#   walk of each body's overflow pages. Queries must repeat the index's exact
+#   ``status IN ('pending', 'unresolved')`` term for SQLite to choose it.
+# * ix_events_delivery: the retention sweep proves a delivery has no event (whose body
+#   the directory still reads as parcel context) without scanning ``events``.
+# * body_pruned_at_us: when retention emptied an old processed delivery's body/headers;
+#   the row, GUID and body_sha256 stay for duplicate and recovery matching.
+V8_SQL = """
+CREATE INDEX ix_deliveries_inbox ON deliveries (received_at_us, delivery_guid)
+    WHERE status IN ('pending', 'unresolved');
+CREATE INDEX ix_events_delivery ON events (delivery_guid) WHERE delivery_guid IS NOT NULL;
+ALTER TABLE deliveries ADD COLUMN body_pruned_at_us INTEGER;
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -512,4 +529,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(5, "issue-sessions-and-mcp", V5_SQL),
     Migration(6, "mcp-feedback-reads", V6_SQL),
     Migration(7, "pr-review-comments", V7_SQL),
+    Migration(8, "inbox-index-and-body-retention", V8_SQL),
 )

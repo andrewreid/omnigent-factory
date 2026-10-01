@@ -53,7 +53,13 @@ from omnigent_factory.service.parked import (
     inbox_release_event,
 )
 from omnigent_factory.service.redaction import install_redaction_filter, redact_text
-from omnigent_factory.store.sqlite import ApplyResult, DeliveryRecord, SqliteStore, StoredEffect
+from omnigent_factory.store.sqlite import (
+    ApplyResult,
+    DeliveryOutcome,
+    DeliveryRecord,
+    SqliteStore,
+    StoredEffect,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -68,6 +74,11 @@ RERENDERABLE_KINDS = frozenset(
         EffectKind.POST_COMMENT.value,
     }
 )
+
+#: Delivery-loop cadence while a delivery is due now but left pending by its pass.
+DELIVERY_BUSY_POLL_SECONDS = 0.05
+#: How often the clock loop sweeps old processed delivery bodies.
+RETENTION_SWEEP_INTERVAL_SECONDS = 3600.0
 
 RETRYABLE_PUBLICATION_KINDS = frozenset(
     {
@@ -104,6 +115,10 @@ class FactoryService:
         self._delivery_failures: dict[str, int] = {}
         self._delivery_retry_at: dict[str, float] = {}
         self._delivery_lock = asyncio.Lock()
+        #: Set whenever inbox work may have appeared (a committed delivery, an operator
+        #: release, shutdown). Only a hint: the delivery loop re-reads the durable inbox.
+        self._delivery_wake = asyncio.Event()
+        self._next_retention_at: float | None = None
         self._last_admission_attempt: tuple[object, ...] | None = None
         self.parked = ParkedDeliveries(self.db, config.state_dir, config.trusted, self.clock)
         self.executor = EffectExecutor(
@@ -192,6 +207,7 @@ class FactoryService:
         self.ready = False
         self.accepting_admission = False
         self._stop.set()
+        self._delivery_wake.set()
         if self.config_path is not None:
             asyncio.get_running_loop().remove_signal_handler(signal.SIGHUP)
         await self.executor.stop()
@@ -226,7 +242,10 @@ class FactoryService:
         self.process_lock.close()
 
     async def persist_delivery(self, delivery: DeliveryRecord) -> str:
-        return await self.db.call(lambda store: store.append_delivery(delivery))
+        outcome = await self.db.call(lambda store: store.append_delivery(delivery))
+        if outcome == DeliveryOutcome.INSERTED:
+            self._delivery_wake.set()
+        return outcome
 
     async def _requeue_unknown_reads(self, unknown: list[StoredEffect]) -> list[StoredEffect]:
         """A read has no side effect: an ambiguous one is simply fetched again."""
@@ -318,11 +337,14 @@ class FactoryService:
         failures = 0
         while not self._stop.is_set():
             try:
+                # Cleared before the inbox is read: a delivery committed from here on sets
+                # it again, so the wait below cannot miss it.
+                self._delivery_wake.clear()
                 # Also retires holds left by a crash between a delivery's facts and its
                 # hold release, so it runs even while no processor is bound.
                 await self.release_resolved_inbox_holds()
                 if self.delivery_processor is None:
-                    await self._wait(0.1)
+                    await self._wait_for_deliveries(await self._next_delivery_wait())
                     failures = 0
                     continue
                 deliveries = await self.db.call(lambda store: store.pending_deliveries())
@@ -332,11 +354,35 @@ class FactoryService:
                         await self._process_delivery(delivery, loop_now)
                 await self.release_resolved_inbox_holds()
                 failures = 0
-                await self._wait(0.05)
+                await self._wait_for_deliveries(await self._next_delivery_wait())
             except asyncio.CancelledError:
                 raise
             except Exception:
                 failures = await self._background_error("deliveries", failures)
+
+    async def _next_delivery_wait(self) -> float:
+        """Seconds until the inbox next has due work, bounded by the idle poll.
+
+        A row due now (no durable or in-memory retry gate) keeps the busy cadence; a
+        gated row wakes the loop when its gate lapses. Nothing due: the idle poll.
+        """
+        rows = await self.db.call(lambda store: store.inbox_due())
+        loop_now = asyncio.get_running_loop().time()
+        now_us = self.clock.now_utc_us()
+        wait = self.config.delivery_idle_poll_seconds
+        for delivery_guid, retry_at_us in rows:
+            due = max(
+                self._delivery_retry_at.get(delivery_guid, loop_now) - loop_now,
+                ((retry_at_us or now_us) - now_us) / 1_000_000,
+            )
+            wait = min(wait, max(due, DELIVERY_BUSY_POLL_SECONDS))
+        return wait
+
+    async def _wait_for_deliveries(self, seconds: float) -> None:
+        if self._stop.is_set():
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._delivery_wake.wait(), seconds)
 
     async def _process_delivery(self, delivery: DeliveryRecord, loop_now: float) -> None:
         if self._delivery_retry_at.get(delivery.delivery_guid, 0) > loop_now:
@@ -529,7 +575,7 @@ class FactoryService:
             return
         head = None
         for candidate in queued:
-            inbox_pending = await self.db.call(_has_pending_delivery)
+            inbox_pending = await self.db.call(lambda store: store.has_pending_delivery())
             if not inbox_pending and not self.parked.blocks(candidate.parcel_id):
                 head = candidate
                 break
@@ -593,12 +639,36 @@ class FactoryService:
                     parcel = await self.db.call(partial(_load_parcel, parcel_id=parcel_id))
                     if parcel is not None:
                         await self._sample_clock(parcel)
+                loop_now = asyncio.get_running_loop().time()
+                if self._next_retention_at is None or loop_now >= self._next_retention_at:
+                    self._next_retention_at = loop_now + RETENTION_SWEEP_INTERVAL_SECONDS
+                    try:
+                        await self.prune_delivery_bodies()
+                    except Exception:
+                        # Housekeeping only: retried next sweep, never a clock-loop failure.
+                        LOG.warning("delivery body retention sweep failed")
                 failures = 0
                 await self._wait(self.config.clock_interval_seconds)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 failures = await self._background_error("clock", failures)
+
+    async def prune_delivery_bodies(self) -> int:
+        """Empty bodies of processed deliveries past retention, in short batches."""
+        retention_us = int(self.config.delivery_body_retention_days * 86_400 * 1_000_000)
+        before_us = self.clock.now_utc_us() - retention_us
+        pruned = 0
+        while True:
+            batch = await self.db.call(
+                lambda store: store.prune_delivery_bodies(before_us, limit=100)
+            )
+            pruned += batch
+            if batch < 100:
+                break
+        if pruned:
+            LOG.info("delivery bodies pruned count=%s", pruned)
+        return pruned
 
     async def _sample_clock(self, parcel: Parcel) -> None:
         session = parcel.current_session
@@ -767,6 +837,7 @@ class FactoryService:
                 await self.parked.release(delivery_guid)
                 self._delivery_failures.pop(delivery_guid, None)
                 self._delivery_retry_at.pop(delivery_guid, None)
+                self._delivery_wake.set()
                 return {"released": delivery_guid, **await self._status()}
         raise ValueError("unknown command")
 
@@ -956,10 +1027,6 @@ def _cancel_effect(store: SqliteStore, *, effect_id: str) -> bool:
 
 def _mark_delivery(store: SqliteStore, *, delivery_guid: str, status: str) -> None:
     store.mark_delivery(delivery_guid, status)
-
-
-def _has_pending_delivery(store: SqliteStore) -> bool:
-    return bool(store.query("SELECT 1 FROM deliveries WHERE status = 'pending' LIMIT 1"))
 
 
 def _delivery_status(store: SqliteStore, *, delivery_guid: str) -> str | None:
