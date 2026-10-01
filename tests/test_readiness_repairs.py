@@ -431,7 +431,7 @@ def test_red_new_head_on_a_ready_card_needs_you_with_the_reason():
     r = h.send(P, evidence(h, NEW, checks=ev.ChecksState.FAILED, checks_summary="1 failure"))
     assert not comments(r, "ready-invalidated")  # informational: the card's note, no comment
     p = h.p()
-    assert p.note.startswith("Ready withdrawn: ") and "required checks failed" in p.note
+    assert p.note.startswith("No longer ready: ") and "required checks failed" in p.note
     assert p.stage == Stage.BUILDING and p.bot == BotState.NEEDS_YOU and not sends(r)
 
 

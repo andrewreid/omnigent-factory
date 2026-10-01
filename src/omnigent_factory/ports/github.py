@@ -28,7 +28,8 @@ executor ``MessageAck`` (issued effect, exact session, real item ID) or
 Status identity (T2 F3): the Status column is read and written by *option ID*, never by
 option name. Renaming an option therefore cannot silently change a parcel's stage; an
 unknown option ID reads as "no known stage". :data:`STATUS_OPTION_IDS` preserves the live
-board's IDs (the setup renderer keeps them on migration).
+board's IDs (the setup renderer keeps them on migration). Column display names come from
+host config (``status_names``); :data:`DEFAULT_STATUS_NAMES` is only its default.
 
 PR linkage (T2 F1): :meth:`GitHubReader.pull_request` receives the parcel's
 :class:`IssueRef`; ``closes_issue`` is true only when GitHub's own closing-issue
@@ -77,6 +78,12 @@ STATUS_OPTION_IDS: Mapping[Stage, str] = MappingProxyType(
         Stage.READY: "6df89cbb",
         Stage.DONE: "4980e49d",
     }
+)
+
+#: Default Status option display names per stage; host config ``status_names`` overrides
+#: them. Only the setup renderer and ``doctor`` read names; logic never does.
+DEFAULT_STATUS_NAMES: Mapping[Stage, str] = MappingProxyType(
+    {stage: stage.value for stage in STATUS_OPTION_IDS}
 )
 
 

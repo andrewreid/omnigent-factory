@@ -653,7 +653,7 @@ def _ready_text(
     number = args.get("pr_number")
     head = str(args.get("head_sha") or "")
     url = f"https://github.com/{repository}/pull/{number}"
-    lines = [f"### PR #{number} is Ready", ""]
+    lines = [f"### PR #{number} is ready for review", ""]
     if result is not None and result.get("head_sha") == head and result.get("summary"):
         lines += [str(result["summary"]).strip(), ""]  # the agent's Markdown, as written
     lines.append(f"**PR:** {url} (head `{head[:12]}`)")
@@ -753,7 +753,7 @@ def _plan_context(plan: dict[str, Any] | None) -> str:
 _STATUS_TEXT = {
     "checkpoint": "I've used the time I was given and I'm wrapping up. "
     "`/continue` (or e.g. `/continue 2h`) gives me more.",
-    "ready-blocked": "PR #{pr_number} isn't Ready at `{head_sha}`: {reason}. "
+    "ready-blocked": "PR #{pr_number} isn't ready at `{head_sha}`: {reason}. "
     "I have no automatic fix attempt left, so I need your call.",
     "create-rejected": "Omnigent refused to create the session ({reason}), so this is blocked.",
     "adoption-ambiguous": "I couldn't tell which Omnigent session is mine ({matches} matches), "

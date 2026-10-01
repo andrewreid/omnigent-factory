@@ -52,7 +52,7 @@ def test_ready_report_tells_the_owner_what_to_merge_and_why():
         "17 checks: 13 success, 4 skipped",
         "SA-Ambulance/timesheets",
     )
-    assert text.startswith("### PR #682 is Ready")
+    assert text.startswith("### PR #682 is ready for review")
     assert "Route guard proven in isolation." in text
     assert "https://github.com/SA-Ambulance/timesheets/pull/682 (head `4950075d373b`)" in text
     assert "**CI:** 17 checks: 13 success, 4 skipped" in text

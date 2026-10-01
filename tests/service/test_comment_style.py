@@ -131,7 +131,9 @@ async def test_ready_report_is_plain_markdown_with_the_agents_summary_as_written
         head_sha=HEAD,
     )
     _plain(text)
-    assert text.startswith("### PR #7 is Ready\n\n" + SUMMARY + "\n")  # B8: not flattened
+    assert text.startswith(
+        "### PR #7 is ready for review\n\n" + SUMMARY + "\n"
+    )  # B8: not flattened
     assert "F2" not in text and "- minor (codex): advisory — not reachable" in text
 
 

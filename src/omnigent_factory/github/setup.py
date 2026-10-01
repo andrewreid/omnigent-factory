@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from omnigent_factory.ports.github import STATUS_OPTION_IDS
+from omnigent_factory.core.types import Stage
+from omnigent_factory.ports.github import DEFAULT_STATUS_NAMES, STATUS_OPTION_IDS
 
 OWNER_ID = 114979
 PROJECT_NODE_ID = "PVT_kwDOEanNes4BkJhb"
 STATUS_FIELD_NODE_ID = "PVTSSF_lADOEanNes4BkJhbzhi7I9w"
 STATUS_FIELD_DATABASE_ID = 414917596
+
+#: Status option color and description per stage (the name comes from ``status_names``).
+_STATUS_STYLE: Mapping[Stage, tuple[str, str]] = {
+    Stage.INBOX: ("GRAY", "Not started"),
+    Stage.TRIAGED: ("BLUE", "Triage requested or complete"),
+    Stage.SCOPED: ("PURPLE", "Plan requested or awaiting approval"),
+    Stage.BUILDING: ("YELLOW", "Build queued or underway"),
+    Stage.READY: ("GREEN", "Ready for owner review and merge"),
+    Stage.DONE: ("GREEN", "Merged / closed"),
+}
 
 REQUIRED_CHECKS = (
     "api / Lint / Typecheck / Test",
@@ -72,20 +84,19 @@ def _option(
 
 
 def render_project_migration(
-    *, created_field_database_ids: dict[str, int] | None = None
+    *,
+    created_field_database_ids: dict[str, int] | None = None,
+    status_names: Mapping[Stage, str] = DEFAULT_STATUS_NAMES,
 ) -> dict[str, Any]:
     """Render replace-all Status and additive field/view operations.
 
     View creation is withheld until GitHub returns the new fields' integer IDs; this is
-    represented as a prerequisite, never an invented ID.
+    represented as a prerequisite, never an invented ID. Status option names come from
+    ``status_names`` (host config); their IDs are always preserved.
     """
     status_options = [
-        _option("Inbox", "GRAY", "Not started", "915abb46"),
-        _option("Triaged", "BLUE", "Triage requested or complete", "43889573"),
-        _option("Scoped", "PURPLE", "Plan requested or awaiting approval", "3a7f779a"),
-        _option("Building", "YELLOW", "Build queued or underway", "ba3c85dd"),
-        _option("Ready", "GREEN", "Ready for owner review and merge", "6df89cbb"),
-        _option("Done", "GREEN", "Merged / closed", "4980e49d"),
+        _option(status_names[stage], *_STATUS_STYLE[stage], option_id)
+        for stage, option_id in STATUS_OPTION_IDS.items()
     ]
     fields: list[dict[str, Any]] = [
         {
@@ -177,7 +188,7 @@ def render_project_migration(
         "post_apply_verification": [
             "persist every returned node and database id",
             "verify every preserved option id and existing item value",
-            "keep item-added to Inbox and disable PR-driven moves",
+            f"keep item-added to {status_names[Stage.INBOX]} and disable PR-driven moves",
             "retire Agent/Audit and old views only after new views verify",
         ],
     }
@@ -221,10 +232,16 @@ def render_ruleset() -> dict[str, Any]:
     }
 
 
-def render_setup(*, created_field_database_ids: dict[str, int] | None = None) -> SetupBundle:
+def render_setup(
+    *,
+    created_field_database_ids: dict[str, int] | None = None,
+    status_names: Mapping[Stage, str] = DEFAULT_STATUS_NAMES,
+) -> SetupBundle:
     bundle = SetupBundle(
         render_app_manifest(),
-        render_project_migration(created_field_database_ids=created_field_database_ids),
+        render_project_migration(
+            created_field_database_ids=created_field_database_ids, status_names=status_names
+        ),
         render_ruleset(),
     )
     validate_setup(bundle)
@@ -238,8 +255,8 @@ def validate_setup(bundle: SetupBundle) -> None:
     ):
         raise ValueError("App manifest exceeds the approved permission boundary")
     options = bundle.project_migration["update_status"]["input"]["singleSelectOptions"]
-    preserved = {option.get("name"): option.get("id") for option in options if "id" in option}
-    if preserved != {stage.value: option_id for stage, option_id in STATUS_OPTION_IDS.items()}:
+    preserved = [option.get("id") for option in options if "id" in option]
+    if len(options) != len(preserved) or sorted(preserved) != sorted(STATUS_OPTION_IDS.values()):
         raise ValueError("Status migration does not preserve existing option IDs")
     bypass = bundle.ruleset.get("bypass_actors")
     if bypass != [{"actor_id": OWNER_ID, "actor_type": "User", "bypass_mode": "pull_request"}]:

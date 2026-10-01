@@ -2056,7 +2056,7 @@ def _invalidate_ready(ctx: _Ctx, reason: str) -> None:
     _move(ctx, Stage.BUILDING)
     ctx.hold(Hold.REWORK_CONTROL_REQUIRED)
     head = r.head_sha[:7] if r is not None and r.head_sha else ""
-    ctx.note(f"Ready withdrawn: {_words(reason)}" + (f" on {head}" if head else ""))
+    ctx.note(f"No longer ready: {_words(reason)}" + (f" on {head}" if head else ""))
 
 
 def _fetch_evidence(ctx: _Ctx, r: Readiness) -> None:
@@ -2283,7 +2283,7 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
     if Hold.READINESS_FAILED not in ctx.p.holds:
         ctx.hold(Hold.READINESS_FAILED)
         ctx.comment("ready-blocked", pr_number=r.pr_number, head_sha=r.head_sha, reason=reason)
-        ctx.note(f"Needs you: PR #{r.pr_number} not Ready on {r.head_sha[:7]}: {reason}")
+        ctx.note(f"Needs you: PR #{r.pr_number} not ready on {r.head_sha[:7]}: {reason}")
 
 
 def _failure_reason(r: Readiness, body: ev.ReadinessEvidence, issue: int | None) -> str:

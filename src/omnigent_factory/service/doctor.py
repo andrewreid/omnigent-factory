@@ -253,23 +253,36 @@ async def _check_project(config: ServiceConfig, client: GitHubClient, report: Do
         report.fail("github_project", "project fields unavailable")
         return
     by_id = {row.get("id"): row for row in rows if isinstance(row, dict)}
-    for name, field_id, expected in (
-        ("Status", config.status_field_node_id, config.status_options),
-        ("Bot", config.bot_field_node_id, config.bot_options),
+    observed: dict[str, list[tuple[str, str]]] = {}
+    for name, field_id in (
+        ("Status", config.status_field_node_id),
+        ("Bot", config.bot_field_node_id),
     ):
         field_value = by_id.get(field_id)
-        options = field_value.get("options") if isinstance(field_value, dict) else None
-        observed = {
-            str(option.get("name")): str(option.get("id"))
-            for option in options or []
-            if isinstance(option, dict)
-        }
         if not isinstance(field_value, dict) or field_value.get("name") != name:
             report.fail("github_project", f"{name} field ID does not match")
             return
-        if observed != expected:
-            report.fail("github_project", f"{name} option IDs differ from configuration")
-            return
+        options = field_value.get("options")
+        observed[name] = [
+            (str(option.get("name")), str(option.get("id")))
+            for option in options or []
+            if isinstance(option, dict)
+        ]
+    if dict(observed["Bot"]) != config.bot_options:
+        report.fail("github_project", "Bot option IDs differ from configuration")
+        return
+    # Status is keyed by option ID; names are display only (checked separately below).
+    live_status = {option_id: name for name, option_id in observed["Status"]}
+    configured = set(config.status_options.values())
+    if set(live_status) != configured:
+        missing = sorted(configured - set(live_status))
+        extra = sorted(set(live_status) - configured)
+        report.fail(
+            "github_project",
+            f"Status option IDs differ from configuration (missing {missing}, unexpected {extra})",
+        )
+        return
+    _check_status_names(config, live_status, report)
     note = by_id.get(config.note_field_node_id)
     if (
         not isinstance(note, dict)
@@ -279,6 +292,23 @@ async def _check_project(config: ServiceConfig, client: GitHubClient, report: Do
         report.fail("github_project", "Factory note text field ID does not match")
         return
     report.pass_check("github_project", "project and live field/option IDs match")
+
+
+def _check_status_names(
+    config: ServiceConfig, live_status: dict[str, str], report: DoctorReport
+) -> None:
+    """Advisory: the configured column names match the live names of the configured IDs."""
+    mismatches = [
+        f"{stage} option {option_id} is {live_status[option_id]!r} on the board but "
+        f"{config.status_names[stage]!r} in status_names"
+        for stage, option_id in config.status_options.items()
+        if live_status[option_id] != config.status_names[stage]
+    ]
+    if mismatches:
+        report.warn("status_names", "; ".join(mismatches))
+    else:
+        names = ", ".join(config.status_names[stage] for stage in config.status_options)
+        report.pass_check("status_names", f"configured names match the board: {names}")
 
 
 def _check_login_expiry(config: ServiceConfig, report: DoctorReport) -> None:

@@ -11,7 +11,11 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from omnigent_factory.core.types import MICROS_PER_MINUTE, Size, TrustedConfig
-from omnigent_factory.ports.github import STATUS_FIELD_NODE_ID, STATUS_OPTION_IDS
+from omnigent_factory.ports.github import (
+    DEFAULT_STATUS_NAMES,
+    STATUS_FIELD_NODE_ID,
+    STATUS_OPTION_IDS,
+)
 
 
 class ConfigError(RuntimeError):
@@ -33,6 +37,7 @@ HOT_RELOAD_KEYS = frozenset(
         "independent_reviewer_ids",
         "triage_guidance",
         "engineering_guidance",
+        "status_names",
     }
 )
 
@@ -60,6 +65,11 @@ class ServiceConfig(BaseModel):
     status_field_node_id: str = STATUS_FIELD_NODE_ID
     status_options: dict[str, str] = Field(
         default_factory=lambda: {stage.value: option for stage, option in STATUS_OPTION_IDS.items()}
+    )
+    #: Status column display names keyed like ``status_options`` (stage identity). Only
+    #: ``doctor`` and the setup renderer read them; omitted stages keep their defaults.
+    status_names: dict[str, str] = Field(
+        default_factory=lambda: {stage.value: name for stage, name in DEFAULT_STATUS_NAMES.items()}
     )
     bot_field_node_id: str = "PVTSSF_lADOEanNes4BkJhbzhjgMaM"
     bot_options: dict[str, str] = Field(
@@ -165,6 +175,19 @@ class ServiceConfig(BaseModel):
     @classmethod
     def blank_omnigent_id_is_unset(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value
+
+    @field_validator("status_names")
+    @classmethod
+    def status_names_complete(cls, value: dict[str, str]) -> dict[str, str]:
+        unknown = set(value) - {stage.value for stage in DEFAULT_STATUS_NAMES}
+        if unknown:
+            raise ValueError(f"status_names has unknown stages: {sorted(unknown)}")
+        names = {stage.value: name for stage, name in DEFAULT_STATUS_NAMES.items()} | value
+        if any(not name.strip() for name in names.values()) or len(set(names.values())) != len(
+            names
+        ):
+            raise ValueError("status_names must be unique and non-blank")
+        return names
 
     @model_validator(mode="after")
     def trusted_identities_are_consistent(self) -> ServiceConfig:

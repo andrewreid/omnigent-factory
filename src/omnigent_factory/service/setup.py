@@ -110,6 +110,16 @@ Building = "ba3c85dd"
 Ready = "6df89cbb"
 Done = "4980e49d"
 
+# Column display names for the option IDs above (keys are stage identities). Hot-reloadable;
+# `omnigent-factory doctor` warns when a live name differs. Omitted stages keep these defaults.
+[service.status_names]
+Inbox = "Inbox"
+Triaged = "Triaged"
+Scoped = "Scoped"
+Building = "Building"
+Ready = "Ready"
+Done = "Done"
+
 [service.bot_options]
 Working = "18ff4a7c"
 "Needs you" = "b1767cfa"

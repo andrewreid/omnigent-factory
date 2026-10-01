@@ -251,7 +251,7 @@ def test_rework_resets_the_fix_budget_and_ends_with_a_new_ready_report():
 
 def needs_you_after_budget(h: Harness) -> Harness:
     """#477: Ready withdrawn to Building, the build run closed, then Needs you with no fix
-    attempt left ("PR not Ready ... no fix attempt left")."""
+    attempt left ("PR not ready ... no fix attempt left")."""
     ready(h)
     h.send(P, ev.ReviewChanged(pr_number=7, head_sha=HEAD, changes_requested=True))
     _not_ready(h)

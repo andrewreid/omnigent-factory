@@ -4,7 +4,9 @@ A GitHub-issue and GitHub Projects driven "agentic software factory" built on
 [Omnigent](https://github.com/omnigent-ai/omnigent).
 
 Issues move left to right across a project board (Inbox → Triaged → Scoped →
-Building → Ready). A human drag authorises each stage; a deterministic daemon
+Building → Ready; these are the stage identities and default column names: the board is
+read and written by Status option ID, and the displayed names come from
+`[service.status_names]` in the host config). A human drag authorises each stage; a deterministic daemon
 receives the GitHub App's webhooks and starts Omnigent agent sessions that triage,
 plan and build. A human always merges and closes.
 
@@ -55,7 +57,7 @@ waits up to 90 s for it instead of failing.
 | `cleanup <parcel> [--merged]` | Remove a finished parcel's factory worktree(s) and local `factory/` branch from the factory clone. |
 | `release-delivery <guid>` | Release one parked webhook delivery for processing. |
 | `pause` / `unpause` | Stop / resume admitting new work repository-wide; in-flight parcels and safety events carry on. |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, cost backstop, `review_bot_grace_minutes`, `review_bot_login`, `review_bot_mention`, guidance and `independent_reviewer_ids`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, cost backstop, `review_bot_grace_minutes`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids` and `status_names`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.

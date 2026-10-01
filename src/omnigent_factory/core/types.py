@@ -20,7 +20,13 @@ MICROS_PER_HOUR = 60 * MICROS_PER_MINUTE
 
 
 class Stage(enum.StrEnum):
-    """Board ``Status`` column. ``DONE`` is a retained legacy value, never a dispatch stage."""
+    """Board ``Status`` column identity. ``DONE`` is a retained legacy value, never a
+    dispatch stage.
+
+    Values are persisted identity keys (and the host config ``status_options`` keys), not
+    display names: the live column names come from host config ``status_names`` and the
+    board is read and written by option ID only. Never rename a value without a migration.
+    """
 
     INBOX = "Inbox"
     TRIAGED = "Triaged"

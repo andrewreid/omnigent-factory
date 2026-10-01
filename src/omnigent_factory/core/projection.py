@@ -101,7 +101,7 @@ _HOLD_TEXT = {
     Hold.INBOX: "webhook delivery held",
     Hold.AGENT_BLOCKED: "agent reported blocked",
     Hold.CHECKS_FAILED: "checks failed",
-    Hold.READINESS_FAILED: "PR not Ready, no fix attempt left",
+    Hold.READINESS_FAILED: "PR not ready, no fix attempt left",
     Hold.REMEDIATION_EXHAUSTED: "fix budget used up",
     Hold.REWORK_CONTROL_REQUIRED: "needs a new stage control",
     Hold.UNSUPPORTED_REWORK: "rework not supported",
