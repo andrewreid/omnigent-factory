@@ -504,3 +504,94 @@ def test_auto_park_waits_for_an_idle_scan_of_the_run():
     r = h.send(P, red(h, BUILT, base_sync=True))
     assert len(ready_reports(r)) == 1
     assert_ready_blocked(h)
+
+
+# ------------------------------------- 7. a woken run that ends without a result (#675)
+
+#: #675 / PR #723: Rosie's rework head, approved by the owner, only the audit red.
+REWORKED = "917a8f97231335b0bc7da8718fdae93da67b171e"
+
+
+def reworked_and_woken(h: Harness) -> None:
+    """#675 up to 12:22 ACST: Ready, the owner's review starts a rework, the rework run
+    submits build_ready, the read shows only the audit red (outside the change), and the
+    one readiness wake goes to the idle run."""
+    built(h)
+    h.send(P, evidence(h, BUILT, verified=True, checks=ev.ChecksState.GREEN))
+    assert h.p().stage == Stage.READY
+    # 02:16Z the owner's PR review: rework in the same issue session.
+    h.send(P, ev.PlanFeedback(text_digest="generate the route list", pr_number=PR))
+    assert h.p().stage == Stage.BUILDING and h.p().readiness is None
+    h.send(P, ev.CapacityAvailable())
+    h.create_ok()
+    # 02:47Z push, 02:51Z build_ready; the first read lands before the turn ends.
+    h.send(P, ev.PRObserved(pr_number=PR, head_sha=REWORKED, bot_authored=True, parcel_branch=True))
+    submit_ready(h, REWORKED)
+    h.send(P, red(h, REWORKED))
+    h.quiesce(P, h.cur().session_id)
+    r = h.send(P, red(h, REWORKED))
+    assert [e.args["purpose"] for e in r.effects if e.kind == EffectKind.SEND_MESSAGE] == [
+        "readiness_wake"
+    ]
+    assert h.p().readiness_wakes == 1
+
+
+def test_675_wake_answered_without_a_new_result_parks_ready_blocked():
+    """Live #675: woken, Rosie explained the red audit on the PR, her same-head
+    build_ready was refused (spent slot) and her turn ended. Base: Building, Bot Working
+    on every reconcile forever. Now: Ready, Bot Blocked, one Ready report, no new run."""
+    h = Harness()
+    reworked_and_woken(h)
+    run = h.cur()
+    sessions = len(h.p().sessions)
+    # A read before the woken run starts its turn does not take it as finished.
+    r = h.send(P, red(h, REWORKED))
+    assert h.p().stage == Stage.BUILDING and not ready_reports(r)
+    h.send(P, ev.RuntimeActivity(session_id=run.session_id, busy=True))
+    h.quiesce(P, run.session_id)  # turn over, no result
+    h.send(P, ev.ReconcileDue())
+    r = h.send(P, red(h, REWORKED))
+    assert EffectKind.POST_COMMENT not in kinds(r) and EffectKind.SEND_MESSAGE not in kinds(r)
+    assert len(ready_reports(r)) == 1
+    assert_ready_blocked(h)
+    assert h.cur().session_id == run.session_id and len(h.p().sessions) == sessions
+    for _ in range(3):  # later reconcile reads: quiet, still one report
+        r = h.send(P, red(h, REWORKED))
+        assert_quiet(r) and not ready_reports(r)
+    assert_ready_blocked(h)
+
+
+def test_wake_answered_without_a_result_and_now_green_lands_in_ready_idle():
+    h = Harness()
+    reworked_and_woken(h)
+    h.send(P, ev.RuntimeActivity(session_id=h.cur().session_id, busy=True))
+    h.quiesce(P, h.cur().session_id)
+    r = h.send(P, evidence(h, REWORKED, verified=True, checks=ev.ChecksState.GREEN))
+    assert len(ready_reports(r)) == 1
+    p = h.p()
+    assert p.stage == Stage.READY and p.readiness.ready and p.bot == BotState.IDLE
+    assert h.cur().lifecycle == Lifecycle.RETIRED
+
+
+def test_comment_relay_answered_without_a_result_needs_you_not_working():
+    """An owner comment relayed to the waiting run; its turn ends without a new
+    build_ready. Its last build_ready may not reflect the comment: Needs you, never an
+    endless Working."""
+    h = Harness()
+    built(h)
+    r = h.send(P, ev.PlanFeedback(text_digest="is the audit ours?"))
+    assert "feedback" in [e.args.get("purpose") for e in r.effects]
+    h.send(P, ev.RuntimeActivity(session_id=h.cur().session_id, busy=True))
+    h.quiesce(P, h.cur().session_id)
+    h.send(P, evidence(h, BUILT, verified=True, checks=ev.ChecksState.GREEN))
+    p = h.p()
+    assert p.stage == Stage.BUILDING and p.bot == BotState.NEEDS_YOU
+    assert p.board_note.endswith("without submitting a new build_ready")
+    # A red read says the same, with the not-ready comment once.
+    r = h.send(P, red(h, BUILT))
+    assert h.p().bot == BotState.NEEDS_YOU and EffectKind.SEND_MESSAGE not in kinds(r)
+    # The run then re-submits: back on the normal path (green: Ready).
+    submit_ready(h, BUILT)
+    h.quiesce(P, h.cur().session_id)
+    h.send(P, evidence(h, BUILT, verified=True, checks=ev.ChecksState.GREEN))
+    assert h.p().stage == Stage.READY and h.p().bot == BotState.IDLE

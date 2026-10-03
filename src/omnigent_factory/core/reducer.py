@@ -71,6 +71,7 @@ from omnigent_factory.core.projection import (
     work_live,
 )
 from omnigent_factory.core.types import (
+    BLOCKING_HOLDS,
     CONTROL_CLEARED_HOLDS,
     STAGE_ORDER,
     AdmissionSnapshot,
@@ -973,10 +974,11 @@ def _maybe_ready(ctx: _Ctx) -> None:
     s = ctx.p.session(r.session_id)
     if s is None or s.session_id != ctx.p.current_session_id:
         return
+    waiting = (
+        s.lifecycle == Lifecycle.WAITING and s.wait_reason == WaitReason.CHECKS and s.quiescent
+    )
     if (
-        s.lifecycle != Lifecycle.WAITING
-        or s.wait_reason != WaitReason.CHECKS
-        or not s.quiescent
+        not (waiting or _wake_answered(ctx, s))
         or s.fences
         or ctx.p.open_decisions
         or Hold.REMEDIATION_EXHAUSTED in ctx.p.holds
@@ -1508,6 +1510,28 @@ def _idle_run(s: StageSession) -> bool:
         and not s.fences
         and not s.execution_closed
     )
+
+
+def _ended_without_result(ctx: _Ctx, s: StageSession) -> bool:
+    """The build run submitted build_ready (the readiness record is its own), was woken
+    again (readiness wake or owner comment) and ended that turn idle with no new result.
+    A run that reported blocked (or whose result was refused) is Bot Blocked already."""
+    r = ctx.p.readiness
+    return (
+        r is not None
+        and r.session_id == s.session_id
+        and _idle_run(s)
+        and not s.comment_pending
+        and not ctx.p.holds & BLOCKING_HOLDS
+    )
+
+
+def _wake_answered(ctx: _Ctx, s: StageSession) -> bool:
+    """The run's last wake was the one readiness wake (no owner comment relayed to it) and
+    its turn ended with no new result: its build_ready stands and it has nothing left to
+    do (#675: it named a red check outside the change on the PR; a re-submission of the
+    same head was refused)."""
+    return _ended_without_result(ctx, s) and ctx.p.readiness_wakes >= 1 and not s.feedback_wakes
 
 
 def _relay_comment(ctx: _Ctx, s: StageSession, digest: str = "") -> None:
@@ -2224,7 +2248,16 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
         )
     )
     _refresh_ready_report(ctx, body.checks_summary)
+    run = None if in_ready else _open_run(ctx, r)
+    if run is not None and _ended_without_result(ctx, run) and not _wake_answered(ctx, run):
+        # Woken by an owner comment, it ended its turn without re-submitting: never left
+        # as Working; the owner decides (a later build_ready clears this on a green read).
+        ctx.hold(Hold.READINESS_FAILED)
+        ctx.note(f"Needs you: PR #{r.pr_number} on {r.head_sha[:7]}: {_NO_NEW_RESULT}")
 
+
+#: Why a woken build run that ended its turn idle is not taken as finished.
+_NO_NEW_RESULT = "the build run ended its turn without submitting a new build_ready"
 
 #: The review-bot line of a Ready report reached with the bot silent (grace passed).
 _NO_BOT_RESPONSE = "no response within the grace window"
@@ -2355,7 +2388,7 @@ def _run_unfinished(ctx: _Ctx, s: StageSession, *, owner_moved: bool = False) ->
     alternate complete/incomplete, and an incomplete one clears ``quiescent``).
     """
     waiting = s.lifecycle == Lifecycle.WAITING and s.wait_reason == WaitReason.CHECKS
-    reported = _idle_run(s) and Hold.AGENT_BLOCKED in ctx.p.holds
+    reported = (_idle_run(s) and Hold.AGENT_BLOCKED in ctx.p.holds) or _wake_answered(ctx, s)
     if s.fences or not ((waiting and (s.quiescent or owner_moved)) or reported):
         return "the build run is still working"
     if ctx.p.open_decisions:
@@ -2574,7 +2607,7 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
     if body.checks == ev.ChecksState.PENDING:
         return
     if s is not None and s.session_id == ctx.p.current_session_id and not s.fences:
-        busy = s.lifecycle == Lifecycle.ACTIVE or (
+        busy = (s.lifecycle == Lifecycle.ACTIVE and not _ended_without_result(ctx, s)) or (
             s.lifecycle == Lifecycle.WAITING
             and s.wait_reason == WaitReason.CHECKS
             and not s.quiescent
@@ -2599,6 +2632,8 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
         _park_red(ctx, r, s, body)
         return
     reason = _failure_reason(r, body, ctx.p.issue_number)
+    if s is not None and _ended_without_result(ctx, s) and not _wake_answered(ctx, s):
+        reason += f"; {_NO_NEW_RESULT}"
     if (
         ctx.p.readiness_wakes < 1
         and s is not None
@@ -2612,7 +2647,10 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
         and work_allowed(ctx.p, s)
     ):
         ctx.update(readiness_wakes=ctx.p.readiness_wakes + 1)
-        s = ctx.put_session(replace(s, lifecycle=Lifecycle.ACTIVE, wait_reason=None))
+        # Not quiescent until a scan sees this new turn end (as for a comment relay).
+        s = ctx.put_session(
+            replace(s, lifecycle=Lifecycle.ACTIVE, wait_reason=None, quiescent=False)
+        )
         _ensure_issuance(ctx, s)
         ctx.emit(
             EffectKind.SEND_MESSAGE,

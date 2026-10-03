@@ -354,6 +354,44 @@ async def test_build_ready_must_echo_the_plan_hash_it_fetched(service_config: Se
         assert len(rig.executed(EffectKind.CREATE_SESSION)) == 1
 
 
+async def test_build_ready_for_the_same_head_after_the_readiness_wake_is_accepted(
+    service_config: ServiceConfig,
+):
+    """#675: the readiness wake asks for build_ready again, for the same head when the
+    red check is outside the change; that opens a fresh slot instead of being refused
+    as "a different submission was already accepted for this slot"."""
+    async with started(service_config) as rig:
+        root, plan_hash = await building(rig)
+        await rig.tools.get_plan(root)
+        first = await rig.submit(root, "build_ready", build_ready(), plan_hash=plan_hash)
+        assert first["slot"] == f"build-{SHA}"
+        run = await rig.run()
+        await rig.quiesce()
+        await rig.send(
+            ev.ReadinessEvidence(
+                session_id=run.session_id,
+                pr_number=7,
+                head_sha=SHA,
+                checks=ev.ChecksState.FAILED,
+                checks_summary="18 checks: 17 success, 1 failure",
+                failing_checks="api / Dependency audit",
+            )
+        )
+        parcel = await rig.parcel()
+        assert parcel.readiness_wakes == 1 and (await rig.run()).lifecycle == Lifecycle.ACTIVE
+        again = {
+            **build_ready(),
+            "branch": f"factory/issue-{parcel.issue_number}",
+            "summary": "The audit fails on main too; not this change.",
+        }
+        receipt = await rig.submit(root, "build_ready", again, plan_hash=plan_hash)
+        assert receipt["accepted"] is True and receipt["slot"] == f"build-{SHA}-w1"
+        assert (await rig.run()).lifecycle == Lifecycle.WAITING
+        # An exact retry replays that receipt; the first submission still replays its own.
+        retry = await rig.submit(root, "build_ready", again, plan_hash=plan_hash)
+        assert retry == {**receipt, "replayed": True}
+
+
 async def test_submission_after_stop_is_rejected_but_exact_retry_replays(
     service_config: ServiceConfig,
 ):

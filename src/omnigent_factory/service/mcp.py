@@ -489,7 +489,7 @@ class FactoryTools:
             raise FactoryToolError("result.kind differs from kind")
         payload: dict[str, Any] = {**result, "kind": kind}
         request = {"kind": kind, "result": payload, "plan_hash": plan_hash}
-        slot = _slot(run, kind, payload)
+        slot = _slot(run, kind, payload, parcel)
         receipt_key = f"{run.session_id}:{slot}"
         # An exact retry of an accepted submission returns its receipt, even after a stop
         # or once a successor run is current; anything else must name the current run.
@@ -778,7 +778,7 @@ def _question_keys(parcel: Parcel, run: StageSession, fingerprint: str) -> list[
     ]
 
 
-def _slot(run: StageSession, kind: str, payload: Mapping[str, Any]) -> str:
+def _slot(run: StageSession, kind: str, payload: Mapping[str, Any], parcel: Parcel) -> str:
     """The idempotency slot of a submission within its run."""
     if run.lifecycle == Lifecycle.CHECKPOINT_GRACE:
         return f"checkpoint-{run.grant.grant_id}"
@@ -790,7 +790,14 @@ def _slot(run: StageSession, kind: str, payload: Mapping[str, Any]) -> str:
         head = payload.get("head_sha")
         slot = f"build-{head}" if isinstance(head, str) and _SHA40.fullmatch(head) else "build"
         # Each owner comment relayed to a waiting build opens a new slot for the same head.
-        return f"{slot}-f{run.feedback_wakes}" if run.feedback_wakes else slot
+        if run.feedback_wakes:
+            slot = f"{slot}-f{run.feedback_wakes}"
+        # So does the readiness wake of the run's own build_ready: it asks for build_ready
+        # again, often for the same head (a red check outside the change, #675).
+        r = parcel.readiness
+        if parcel.readiness_wakes and r is not None and r.session_id == run.session_id:
+            slot = f"{slot}-w{parcel.readiness_wakes}"
+        return slot
     return "blocked"
 
 

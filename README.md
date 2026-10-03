@@ -103,8 +103,9 @@ card (rework, an operator note) moves it to Building with that work, and an owne
 Ready while the bot is still working is moved back (`Kept in Building: ...`). A red check sends a Building
 card back to its run with the one readiness wake only while that wake is unused and the
 head has the bot's own commits; once it is spent (the agent re-submits when the red check
-is outside the change), or the head only syncs the base branch, the card goes to Ready,
-`Blocked`. A blocked report for a defect in the change stays with the owner. An owner drag
+is outside the change, or ends that woken turn without a new result), or the head only
+syncs the base branch, the card goes to Ready, `Blocked`. A run woken by an owner comment
+that ends its turn without re-submitting is `Needs you`, never left `Working`. A blocked report for a defect in the change stays with the owner. An owner drag
 from Building to Ready is accepted on the same terms (Bot by the checks, the run is
 closed); otherwise the card returns to Building with the reason in the note
 (`Kept in Building: ...`).
