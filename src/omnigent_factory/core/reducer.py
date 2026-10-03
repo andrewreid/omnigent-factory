@@ -599,6 +599,10 @@ def _finish_drain(ctx: _Ctx, s: StageSession) -> None:
     )
     if not any(x.lifecycle == Lifecycle.BLOCKED for x in ctx.p.sessions):
         ctx.unhold(Hold.STOP_UNVERIFIED)
+    if _continue_pending(ctx, s):
+        # A /continue accepted mid-drain: its PolicyReady may already have come and gone.
+        # Re-read (never re-write) the policy set; PoliciesVerified then resumes the run.
+        _emit_verify(ctx, s, reconcile=False)
     if target == Lifecycle.RETIRED or s.fences & _HARD_FENCES:
         _end_build_episode(ctx, s)
         _orphan_open_decisions(ctx, s.session_id)
@@ -1735,10 +1739,10 @@ def _h_continue(ctx: _Ctx, body: ev.Continue) -> None:
     s = ctx.p.current_session
     if s is None:
         raise Rejected("nothing-to-continue", explain=True)
-    in_checkpoint = s.lifecycle in (
-        Lifecycle.CHECKPOINT_GRACE,
-        Lifecycle.CHECKPOINT_WAIT,
-    ) or (FenceKind.CHECKPOINT in s.fences)
+    in_checkpoint = s.lifecycle in (Lifecycle.CHECKPOINT_GRACE, Lifecycle.CHECKPOINT_WAIT) or (
+        FenceKind.CHECKPOINT in s.fences
+        and (s.lifecycle == Lifecycle.FENCED or _checkpoint_draining(s))
+    )
     if not in_checkpoint:
         raise Rejected("not-at-checkpoint", explain=True)
     if not only_checkpoint_fenced(s):
@@ -1746,6 +1750,10 @@ def _h_continue(ctx: _Ctx, body: ev.Continue) -> None:
     if s.lifecycle == Lifecycle.RETIRED or s.execution_closed:
         raise Rejected("session-retired", explain=True)
     if not s.grant.ready:
+        if _continue_pending(ctx, s) and all_settled(ctx.p):
+            # Retry the same grant (a resume preflight may have failed): re-read, no new grant.
+            _emit_verify(ctx, s, reconcile=False)
+            return
         raise Rejected("grant-already-preparing")
     if not authority_ok(ctx.p, s):
         raise Rejected("stage-authority-invalid", explain=True)
@@ -2969,6 +2977,12 @@ def _emit_verify(ctx: _Ctx, s: StageSession, *, reconcile: bool) -> None:
 
 def _h_policies_verified(ctx: _Ctx, body: ev.PoliciesVerified) -> None:
     s = _session(ctx, body.session_id)
+    if _continue_pending(ctx, s) and not body.reconciled:
+        if not body.ok:
+            # Not yet this grant's generation: its own PolicyReady completes the resume.
+            raise Rejected("continue-policy-not-yet-applied")
+        _resume_checkpoint(ctx, s)
+        return
     if s.policy_ready or s.root_id is None or s.fences or s.execution_closed:
         raise Rejected("no-pending-policy-verification")
     if body.reconciled:
@@ -3449,6 +3463,30 @@ def _h_policy_ready(ctx: _Ctx, body: ev.PolicyReady) -> None:
         raise Rejected("stale-or-ready-grant")
     if not only_checkpoint_fenced(s) or s.execution_closed:
         raise Rejected("hard-fence-present", explain=True)
+    if _checkpoint_draining(s):
+        raise Rejected("resume-deferred-until-tree-stops")  # see _finish_drain
+    _resume_checkpoint(ctx, s)
+
+
+def _checkpoint_draining(s: StageSession) -> bool:
+    """A checkpoint fence's drain is still stopping the tree (it ends FENCED)."""
+    return s.lifecycle in (Lifecycle.DRAINING, Lifecycle.BLOCKED) and (
+        s.drain_target == Lifecycle.FENCED
+    )
+
+
+def _continue_pending(ctx: _Ctx, s: StageSession) -> bool:
+    """A /continue grant awaits its resume on a settled checkpoint fence."""
+    return (
+        not s.grant.ready
+        and s.lifecycle == Lifecycle.FENCED
+        and s.fences == frozenset({FenceKind.CHECKPOINT})
+        and not s.execution_closed
+        and s.session_id == ctx.p.current_session_id
+    )
+
+
+def _resume_checkpoint(ctx: _Ctx, s: StageSession) -> None:
     if s.lifecycle not in (Lifecycle.CHECKPOINT_GRACE, Lifecycle.CHECKPOINT_WAIT, Lifecycle.FENCED):
         raise Rejected("not-at-checkpoint")
     if not dispatchable(ctx.p) or not authority_ok(ctx.p, s) or ctx.p.open_decisions:

@@ -1056,11 +1056,78 @@ def test_D10_continue_then_policy_ready_clears_only_checkpoint():
     s = h.cur()
     assert not s.grant.ready and FenceKind.CHECKPOINT in s.fences
     assert kinds(r)[0] == EffectKind.REPLACE_COST_POLICY and not work(r)
-    assert not h.send(P, ev.Continue()).audit.accepted  # no extra grant while preparing
+    again = h.send(P, ev.Continue())  # no extra grant or policy write while preparing
+    assert h.cur().grant == s.grant and not Harness.of(again, EffectKind.REPLACE_COST_POLICY)
     r = h.send(P, ev.PolicyReady(session_id=b.session_id, grant_id=s.grant.grant_id))
     s = h.cur()
     assert s.lifecycle == Lifecycle.ACTIVE and not s.fences and s.grant.ready
     assert EffectKind.ENABLE_ISSUANCE in kinds(r) and EffectKind.SEND_MESSAGE in kinds(r)
+
+
+def test_D10_continue_during_checkpoint_drain_resumes_once_the_tree_stops():
+    """#627: grace expired with a busy tree (DRAINING, fence {checkpoint}); /continue was
+    accepted, its PolicyReady arrived while still draining and was dropped, leaving the
+    grant unready forever. The accepted grant must resume once the drain settles."""
+    h = Harness()
+    b = checkpointed(h)
+    h.send(P, ev.GraceExpired(session_id=b.session_id, grant_id=b.grant.grant_id))
+    busy = ev.TreeQuiescent(session_id=b.session_id, complete=True, busy=True)
+    assert EffectKind.INTERRUPT_TREE in kinds(h.send(P, busy))
+    assert h.cur().lifecycle == Lifecycle.DRAINING
+    r = h.send(P, ev.Continue(duration_us=2 * MICROS_PER_HOUR))
+    assert r.audit.accepted
+    g = h.cur().grant
+    assert not g.ready and kinds(r)[0] == EffectKind.REPLACE_COST_POLICY
+    # The policy lands before the tree stops: nothing resumes yet, nothing is lost.
+    r = h.send(P, ev.PolicyReady(session_id=b.session_id, grant_id=g.grant_id))
+    assert not work(r) and h.cur().lifecycle == Lifecycle.DRAINING
+    again = h.send(P, ev.Continue())
+    assert not again.audit.accepted and h.cur().grant == g  # no second grant
+    # The drain settles: the pending grant's policy is re-verified (a read), then resumes.
+    r = h.quiesce(P, b.session_id)
+    s = h.cur()
+    assert s.lifecycle == Lifecycle.FENCED and not s.grant.ready
+    assert len(Harness.of(r, EffectKind.VERIFY_POLICIES)) == 1
+    assert not Harness.of(r, EffectKind.REPLACE_COST_POLICY)
+    r = h.send(P, ev.PoliciesVerified(session_id=b.session_id, ok=True))
+    s = h.cur()
+    assert s.lifecycle == Lifecycle.ACTIVE and not s.fences and s.grant == replace(g, ready=True)
+    assert EffectKind.ENABLE_ISSUANCE in kinds(r)
+    assert len(Harness.of(r, EffectKind.SEND_MESSAGE)) == 1
+    assert h.p().bot == BotState.WORKING
+
+
+def test_D10_pending_grant_waits_for_its_policy_after_the_drain():
+    """Drain settles before the replacement policy lands: verification fails quietly and
+    the policy's own PolicyReady completes the resume."""
+    h = Harness()
+    b = checkpointed(h)
+    h.send(P, ev.GraceExpired(session_id=b.session_id, grant_id=b.grant.grant_id))
+    h.send(P, ev.Continue())
+    g = h.cur().grant
+    h.quiesce(P, b.session_id)
+    r = h.send(P, ev.PoliciesVerified(session_id=b.session_id, ok=False))
+    assert not work(r) and Hold.PREPARE_FAILED not in h.p().holds
+    assert h.cur().lifecycle == Lifecycle.FENCED and not h.cur().grant.ready
+    r = h.send(P, ev.PolicyReady(session_id=b.session_id, grant_id=g.grant_id))
+    assert h.cur().lifecycle == Lifecycle.ACTIVE and EffectKind.SEND_MESSAGE in kinds(r)
+
+
+def test_D10_repeat_continue_retries_a_half_prepared_grant_without_a_new_one():
+    h = Harness()
+    b = checkpointed(h)
+    h.send(P, ev.GraceExpired(session_id=b.session_id, grant_id=b.grant.grant_id))
+    h.send(P, ev.Continue())
+    g = h.cur().grant
+    h.quiesce(P, b.session_id)
+    h.send(P, ev.PoliciesVerified(session_id=b.session_id, ok=False))  # lost/early read
+    r = h.send(P, ev.Continue())
+    assert r.audit.accepted and h.cur().grant == g
+    assert EffectKind.VERIFY_POLICIES in kinds(r)
+    assert not Harness.of(r, EffectKind.REPLACE_COST_POLICY) and not work(r)
+    r = h.send(P, ev.PoliciesVerified(session_id=b.session_id, ok=True))
+    assert h.cur().lifecycle == Lifecycle.ACTIVE and h.cur().grant == replace(g, ready=True)
+    assert len(Harness.of(r, EffectKind.SEND_MESSAGE)) == 1
 
 
 def test_D10_continue_resolves_surviving_cost_prompt():
