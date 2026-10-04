@@ -17,9 +17,13 @@ Any failed read or the node ceiling makes the scan incomplete: quiescence is the
 unknown, never idle. Archived does not mean quiescent.
 
 Busy (work running or able to relaunch): ``launching``; ``running``/``waiting`` unless the
-node is parked on a native prompt; non-terminal background tasks; queued native pending
-inputs; a non-terminal latest task. A node parked on an elicitation is a *waiter*, not
-busy by itself - but its running siblings/children still are.
+node is parked on a native prompt; non-terminal background tasks while a turn may be live;
+queued native pending inputs; a non-terminal latest task. A node parked on an elicitation
+is a *waiter*, not busy by itself - but its running siblings/children still are.
+
+The server never refreshes a node's ``background_tasks`` once its turn ends: exited shells
+stay ``running`` in the snapshot forever, even after a later turn or archiving (#627). So
+an ``idle`` node with no active task (terminal or none) does not count them.
 """
 
 from __future__ import annotations
@@ -68,8 +72,20 @@ class NodeState:
         return bool(self.elicitations)
 
     @property
+    def turn_active(self) -> bool:
+        """A turn may be live (anything but ``idle``, or a non-terminal task)."""
+        return self.status != "idle" or (
+            self.task_status is not None and self.task_status not in TERMINAL_TASK_STATUSES
+        )
+
+    @property
+    def background_live(self) -> bool:
+        """Background tasks count only while a turn may be live (see module docstring)."""
+        return self.background_active and self.turn_active
+
+    @property
     def busy(self) -> bool:
-        if self.status == "launching" or self.background_active or self.pending_inputs:
+        if self.status == "launching" or self.background_live or self.pending_inputs:
             return True
         if self.status in ("running", "waiting") and not self.parked:
             return True
@@ -82,7 +98,7 @@ class NodeState:
     @property
     def productive(self) -> bool:
         """Counts toward active time (measured lower bound)."""
-        return self.background_active or (self.status == "running" and not self.parked)
+        return self.background_live or (self.status == "running" and not self.parked)
 
     @property
     def maybe_productive(self) -> bool:

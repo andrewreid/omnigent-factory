@@ -565,6 +565,7 @@ def _begin_drain(
             drain_target=target,
             quiescent=False,
             wait_reason=None,
+            drain_started_us=s.drain_started_us or ctx.now,
         )
     )
     if new_fences:
@@ -595,6 +596,7 @@ def _finish_drain(ctx: _Ctx, s: StageSession) -> None:
             quiescent=True,
             execution_closed=s.execution_closed or target == Lifecycle.RETIRED,
             external_active=False,
+            drain_started_us=0,
         )
     )
     if not any(x.lifecycle == Lifecycle.BLOCKED for x in ctx.p.sessions):
@@ -2762,7 +2764,13 @@ def _adopt(ctx: _Ctx, s: StageSession, root_id: str, nonce: str) -> None:
     s = replace(s, root_id=root_id)
     _bind_issue_session(ctx, s, root_id)
     if s.fences or s.lifecycle == Lifecycle.DRAINING or s.session_id != ctx.p.current_session_id:
-        s = ctx.put_session(replace(s, lifecycle=Lifecycle.DRAINING))
+        s = ctx.put_session(
+            replace(
+                s,
+                lifecycle=Lifecycle.DRAINING,
+                drain_started_us=s.drain_started_us or ctx.now,
+            )
+        )
         ctx.emit(EffectKind.INTERRUPT_TREE, session=s, args={"root_id": root_id})
         ctx.emit(EffectKind.SCAN_TREE, session=s, args={"root_id": root_id})
         return
@@ -3414,9 +3422,19 @@ def _h_tree_quiescent(ctx: _Ctx, body: ev.TreeQuiescent) -> None:
 
 
 def _h_stop_timeout(ctx: _Ctx, body: ev.StopTimeout) -> None:
+    """The drain timed out without quiescence evidence.
+
+    A hard-fenced drain (stop, safety, revocation) must not release work it could not
+    verify stopped: it blocks and keeps scanning. Any other drain (checkpoint, retire,
+    hand-over) finishes as if quiescent, exactly as a quiescent scan would finish it, so
+    a stale busy node never parks the parcel forever (#627).
+    """
     s = _session(ctx, body.session_id)
     if s.lifecycle != Lifecycle.DRAINING:
         raise Rejected("session-not-draining")
+    if not s.fences & _HARD_FENCES:
+        _finish_drain(ctx, s)
+        return
     s = ctx.put_session(replace(s, lifecycle=Lifecycle.BLOCKED))
     ctx.hold(Hold.STOP_UNVERIFIED)
     ctx.comment("stop-unverified", session_id=s.session_id)

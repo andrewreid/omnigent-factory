@@ -366,6 +366,7 @@ async def build_production(
         omnigent_adapter=omnigent_adapter,
     )
     service.comment_rerenderer = github.rerender_comment
+    service.busy_nodes = omnigent_adapter.busy_nodes
 
     def adopt_reloaded(new: ServiceConfig) -> None:
         # Hot-reloadable keys only (the service rejects any other change).

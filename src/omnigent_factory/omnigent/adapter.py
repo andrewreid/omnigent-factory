@@ -218,6 +218,8 @@ class OmnigentExecutionAdapter:
         self.broker_socket = broker_socket
         self.helper_command = helper_command
         self._known_nodes: dict[str, set[str]] = {}
+        #: Busy node IDs of each root's latest scan (named by the drain-timeout warning).
+        self._busy_nodes: dict[str, tuple[str, ...]] = {}
         # Required safety policy, compiled now so a bad deployment input fails at wiring.
         self._cel: tuple[pol.PolicySpec, ...] = (pol.factory_cel_policy(config.default_branch),)
         if config.cel_expression is not None:
@@ -290,7 +292,12 @@ class OmnigentExecutionAdapter:
             self.rest, root_id, known_ids=tuple(known), max_nodes=self.config.max_tree_nodes
         )
         known.update(obs.nodes)
+        self._busy_nodes[root_id] = tuple(sorted(n.node_id for n in obs.nodes.values() if n.busy))
         return obs
+
+    def busy_nodes(self, root_id: str) -> tuple[str, ...]:
+        """Busy node IDs from the latest scan of ``root_id`` (empty if never scanned)."""
+        return self._busy_nodes.get(root_id, ())
 
     async def scan_tree(self, root_id: str) -> TreeScan:
         return (await self.observe_tree(root_id)).to_scan()

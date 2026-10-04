@@ -30,6 +30,7 @@ HOT_RELOAD_KEYS = frozenset(
         "max_open_bot_prs",
         "checkpoint_block_hours",
         "checkpoint_grace_minutes",
+        "drain_timeout_minutes",
         "cost_backstop_usd_per_hour",
         "review_bot_grace_minutes",
         "review_bot_login",
@@ -129,6 +130,9 @@ class ServiceConfig(BaseModel):
     max_open_bot_prs: int = Field(default=3, ge=1)
     checkpoint_block_hours: dict[str, int] = Field(default_factory=lambda: {"S": 2, "M": 4, "L": 6})
     checkpoint_grace_minutes: int = Field(default=15, ge=1, le=120)
+    #: Minutes a drain waits for its tree to be observed quiescent before it finishes
+    #: anyway (a hard-fenced drain blocks instead), naming the still-busy nodes.
+    drain_timeout_minutes: int = Field(default=30, ge=1, le=1440)
     cost_backstop_usd_per_hour: int = Field(default=35, ge=1, le=1000)
     #: Minutes the review bot gets to comment on a PR head before the card can be Ready;
     #: applies only while it can still respond (it has not answered the head, or was

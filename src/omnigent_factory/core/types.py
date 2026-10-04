@@ -442,6 +442,9 @@ class StageSession:
     feedback_wakes: int = 0
     #: An owner comment arrived mid-turn: relay it if the turn ends without a result.
     comment_pending: bool = False
+    #: When the current drain began (0: not draining, or a drain recorded before this
+    #: field existed). The scheduler ends a drain still waiting after the drain timeout.
+    drain_started_us: int = 0
 
 
 @dataclass(frozen=True, slots=True)

@@ -23,6 +23,7 @@ from omnigent_factory.core.effects import (
 )
 from omnigent_factory.core.events import Event, Provenance
 from omnigent_factory.core.types import (
+    MICROS_PER_MINUTE,
     AdmissionSnapshot,
     InboxHoldReason,
     Lifecycle,
@@ -110,6 +111,9 @@ class FactoryService:
         self.comment_rerenderer: Callable[[EffectIntent], Awaitable[AdapterOutcome]] | None = None
         #: Operator ``cleanup``: finished-parcel worktree/branch removal (composition).
         self.workspace_cleaner: Any = None
+        #: Busy node IDs of a root's latest tree scan, for the drain-timeout warning
+        #: (composition).
+        self.busy_nodes: Callable[[str], tuple[str, ...]] | None = None
         self._fatal_exit = fatal_exit
         self._fatal_reason: str | None = None
         self._delivery_failures: dict[str, int] = {}
@@ -674,6 +678,7 @@ class FactoryService:
         return pruned
 
     async def _sample_clock(self, parcel: Parcel) -> None:
+        await self._expire_drains(parcel)
         session = parcel.current_session
         if session is None:
             return
@@ -701,6 +706,32 @@ class FactoryService:
                     parcel.parcel_id,
                     ev.GraceExpired(session_id=session.session_id, grant_id=grant.grant_id),
                     f"grace:{grant.grant_id}",
+                )
+            )
+
+    async def _expire_drains(self, parcel: Parcel) -> None:
+        """End a drain still waiting for quiescence after ``drain_timeout_minutes``."""
+        timeout_us = self.config.drain_timeout_minutes * MICROS_PER_MINUTE
+        now = self.clock.now_utc_us()
+        for session in parcel.sessions:
+            started = session.drain_started_us
+            if session.lifecycle != Lifecycle.DRAINING or not started or now - started < timeout_us:
+                continue
+            root = session.root_id or ""
+            busy = self.busy_nodes(root) if self.busy_nodes is not None and root else ()
+            LOG.warning(
+                "drain timed out parcel=%s session=%s root=%s minutes=%s busy_nodes=%s",
+                parcel.parcel_id,
+                session.session_id,
+                root or "-",
+                self.config.drain_timeout_minutes,
+                ",".join(busy) or "-",
+            )
+            await self.apply_event(
+                self._event(
+                    parcel.parcel_id,
+                    ev.StopTimeout(session_id=session.session_id),
+                    f"drain-timeout:{session.session_id}:{started}",
                 )
             )
 

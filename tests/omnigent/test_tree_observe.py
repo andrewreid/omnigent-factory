@@ -83,7 +83,12 @@ async def test_idle_root_with_running_child_is_busy() -> None:
     [
         {"status": "launching"},
         {"status": "waiting"},
-        {"background_tasks": [{"id": "t1", "status": "running"}]},
+        # Background tasks count while a turn is live (a parked waiter alone is not busy).
+        {
+            "status": "waiting",
+            "pending_elicitations": [elicitation("elicit_1")],
+            "background_tasks": [{"id": "t1", "status": "running"}],
+        },
         {"pending_inputs": [{"pending_id": "p", "content": []}]},
         {"current_task_status": "in_progress"},
     ],
