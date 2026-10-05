@@ -115,22 +115,22 @@ async def test_A_stage_templates_point_at_owner_feedback():
         "triage-v5.txt",
         "triage-feedback-v3.txt",
         "plan-v5.txt",
-        "build-v7.txt",
+        "build-v8.txt",
         "feedback-v3.txt",
         "build-feedback-v2.txt",
-        "build-rework-v4.txt",
+        "build-rework-v5.txt",
         "triage-comment-v1.txt",
         "continuation-v2.txt",
     ):
         text = (root / name).read_text("utf-8")
         assert "factory_get_feedback" in text, name
-        assert len(text) < 1200, name
+        assert len(text) < 1300, name
     for name in (
         "triage-v5.txt",
         "triage-feedback-v3.txt",
         "plan-v5.txt",
-        "build-v7.txt",
-        "build-rework-v4.txt",
+        "build-v8.txt",
+        "build-rework-v5.txt",
     ):
         # The stage prompts say results are written for a human reading GitHub.
         text = " ".join((root / name).read_text("utf-8").split())
@@ -158,6 +158,9 @@ async def test_A_stage_templates_point_at_owner_feedback():
         "build-v6.txt",
         "build-rework-v3.txt",
         "readiness-wake-v5.txt",
+        "build-v7.txt",
+        "build-rework-v4.txt",
+        "readiness-wake-v6.txt",
     ):
         assert not (root / gone).is_file()
 

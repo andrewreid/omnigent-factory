@@ -80,6 +80,19 @@ NORMAL = [
     " && git push origin factory/issue-677",
     "git push origin HEAD:refs/heads/factory/issue-677",
     "gh run list --workflow deploy-staging.yml --branch factory/issue-677",
+    # Re-running and cancelling CI on the parcel's PR (owner decision 2026-10-06).
+    "gh run rerun 123456",
+    "gh run rerun 123456 --failed",
+    "gh run rerun --job 987654",
+    "gh run cancel 123456",
+    "gh run view 123456 --log-failed | tail -50",
+    "gh run watch 123456 --exit-status",
+    "gh pr checks 12 || gh run rerun 123456 --failed && gh run watch 123456",
+    "gh api -X POST repos/SA-Ambulance/timesheets/actions/runs/123456/rerun",
+    "gh api -X POST repos/SA-Ambulance/timesheets/actions/runs/123456/rerun-failed-jobs",
+    "gh api --method POST repos/SA-Ambulance/timesheets/actions/jobs/987654/rerun",
+    "gh api -X POST repos/SA-Ambulance/timesheets/actions/runs/123456/cancel",
+    "gh workflow list && gh workflow view ci.yml",
 ]
 
 FORBIDDEN = [
@@ -123,6 +136,24 @@ FORBIDDEN = [
     "gh api graphql -F q=@m -f query='mutation { closePullRequest(input: {}) { x } }'",
     "gh api graphql -f query='mutation { transferIssue(input: {}) { clientMutationId } }'",
     "gh ruleset list; gh secret set X",
+    # Dispatching workflows and deleting runs, logs, artifacts or caches stay the owner's.
+    "gh workflow run ci.yml --ref factory/issue-677",
+    "gh run rerun 1 --failed && gh workflow run deploy-staging.yml",
+    "gh api -X POST repos/SA-Ambulance/timesheets/actions/workflows/ci.yml/dispatches"
+    " -f ref=factory/issue-677",
+    "cd api; gh api repos/SA-Ambulance/timesheets/actions/workflows/123/dispatches -f ref=x",
+    "gh api -X POST repos/SA-Ambulance/timesheets/dispatches -f event_type=deploy",
+    "gh run view 1 | head && gh api /repos/SA-Ambulance/timesheets/dispatches -f event_type=x",
+    "gh run delete 123456",
+    "gh run list --limit 1 | gh run delete 123456",
+    "gh cache delete --all",
+    "gh run rerun 1; gh cache delete 42",
+    "gh api -X DELETE repos/SA-Ambulance/timesheets/actions/runs/123456",
+    "gh api -X DELETE repos/SA-Ambulance/timesheets/actions/runs/123456/logs",
+    "gh api -X delete repos/SA-Ambulance/timesheets/actions/runs/123456/logs",
+    "gh api --method=delete repos/SA-Ambulance/timesheets/actions/artifacts/77",
+    "gh api repos/SA-Ambulance/timesheets/actions/caches?key=x --method Delete",
+    "gh run cancel 1 && gh api -X delete repos/SA-Ambulance/timesheets/actions/caches/9",
     # Unparseable text still gets the raw scan.
     "echo 'unbalanced && gh pr merge 12",
 ]

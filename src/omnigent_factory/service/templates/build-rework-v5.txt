@@ -9,6 +9,8 @@ plan, ask with factory_ask_owner.
 Use only the factory git credential helper and the gh wrapper at {gh_wrapper}; the
 capability handle is {capability_file}. Never merge. Give review-bot findings on new commits
 an outcome as before.
+Flaky or unrelated CI failure: `gh run rerun <id> --failed`; never push an empty commit
+to retrigger CI.
 Finish with factory_submit_result (kind "build_ready", or "blocked"); while CI or review
 bots are pending, submit current evidence and end the turn: you are woken.
 The summary: what changed, decisions, follow-ups; no CI or review-bot status (the factory

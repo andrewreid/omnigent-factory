@@ -197,7 +197,7 @@ class ServiceDispatchDirectory:
                 return _template("triage-comment-v1.txt").format(run_id=sid)
             return _template("feedback-v3.txt").format(revision=parcel.revision, run_id=sid)
         if purpose == "readiness_wake":
-            return _template("readiness-wake-v6.txt").format(
+            return _template("readiness-wake-v7.txt").format(
                 pr_number=int(str(effect.args.get("pr_number") or 0)),
                 head_sha=str(effect.args.get("head_sha") or ""),
                 reason=str(effect.args.get("reason") or "")[:500],
@@ -1013,10 +1013,10 @@ def _new_boundary() -> str:
 _FIRST_TEMPLATES = {
     SessionKind.TRIAGE: "triage-v5.txt",
     SessionKind.PLAN: "plan-v5.txt",
-    SessionKind.BUILD: "build-v7.txt",
+    SessionKind.BUILD: "build-v8.txt",
 }
 _RETRIAGE_TEMPLATE = "triage-feedback-v3.txt"
-_REWORK_TEMPLATE = "build-rework-v4.txt"
+_REWORK_TEMPLATE = "build-rework-v5.txt"
 
 
 def _template(name: str) -> str:

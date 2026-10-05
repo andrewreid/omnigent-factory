@@ -153,9 +153,11 @@ def github_policy(kind: SessionKind, repository: str, branch: str) -> PolicySpec
 CEL_REASON = (
     "Denied by factory policy: merging, --admin or hook bypass, pushing the default "
     "branch, repository/ruleset/branch-protection/collaborator/secret/workflow "
-    "administration, closing, deleting, transferring or locking issues and pull requests "
-    "and deleting repositories are the owner's. Everything else is allowed (e.g. opening "
-    "a follow-up issue, replying to and resolving review threads). If this matched text "
+    "administration, dispatching workflows, deleting workflow runs, logs, artifacts or "
+    "caches, closing, deleting, transferring or locking issues and pull requests and "
+    "deleting repositories are the owner's. Everything else is allowed (e.g. opening a "
+    "follow-up issue, replying to and resolving review threads, re-running or cancelling "
+    "CI with gh run rerun / gh run cancel). If this matched text "
     "inside a message, commit body or file content, write that text to a file and pass it "
     "by path (e.g. --body-file / -F) and rerun the command."
 )
@@ -217,9 +219,13 @@ def _shell_pattern(default_branch: str) -> str:
         + r"(-X|--method)[\s=]*(PATCH|PUT)\b"
         + _SEG
         + r"\brepos/[^\s/]+/[^\s/'\"]+/?(\s|$|['\"])",
-        r"\bgh\s+api\b" + _SEG + r"(-X|--method)[\s=]*DELETE\b",
+        r"\bgh\s+api\b" + _SEG + r"(-X|--method)[\s=]*(?i:DELETE)\b",
         r"\bgh\s+(repo\s+(delete|edit|rename|archive|transfer)|ruleset|secret|variable)\b",
-        r"\bgh\s+workflow\s+(enable|disable)\b",
+        r"\bgh\s+workflow\s+(enable|disable|run)\b",
+        # workflow/repository dispatch and deleting runs or caches (re-run and cancel
+        # stay allowed)
+        r"\bgh\s+api\b" + _SEG + r"/dispatches\b",
+        r"\bgh\s+(run|cache)\s+delete\b",
         # closing / deleting issues and pull requests (CLI, REST, GraphQL) and deleting
         # repositories; creating issues, replying to and resolving threads stay allowed
         r"\bgh\s+issue\s+(close|delete|transfer|lock)\b",

@@ -28,6 +28,7 @@ _READ_ONLY_PERMISSIONS: Mapping[str, str] = {
 }
 _BUILD_PERMISSIONS: Mapping[str, str] = {
     **_READ_ONLY_PERMISSIONS,
+    "actions": "write",
     "contents": "write",
     "issues": "write",
     "pull_requests": "write",

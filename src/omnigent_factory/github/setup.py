@@ -57,7 +57,7 @@ def render_app_manifest(
             "pull_requests": "write",
             "checks": "read",
             "statuses": "read",
-            "actions": "read",
+            "actions": "write",
             "metadata": "read",
             "workflows": "write",
             "organization_projects": "write",

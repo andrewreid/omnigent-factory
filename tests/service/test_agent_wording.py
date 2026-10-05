@@ -34,12 +34,34 @@ def test_blocked_report_and_status_comments_name_the_configured_agent():
 
 def test_build_prompts_carry_the_review_bot_disposition_rule():
     root = files("omnigent_factory.service") / "templates"
-    for name in ("build-v7.txt", "readiness-wake-v6.txt"):
+    for name in ("build-v8.txt", "readiness-wake-v7.txt"):
         text = " ".join((root / name).read_text("utf-8").split())
         assert "follow-up issue" in text and "resolve" in text, name
         assert "Only resolve threads you have replied to." in text, name
-    wake = " ".join((root / "readiness-wake-v6.txt").read_text("utf-8").split())
+    wake = " ".join((root / "readiness-wake-v7.txt").read_text("utf-8").split())
     assert "submit build_ready, not blocked" in wake
+
+
+def test_build_prompts_rerun_flaky_ci_instead_of_empty_commits():
+    """Owner decision 2026-10-06: builds hold Actions write and re-run CI themselves."""
+    root = files("omnigent_factory.service") / "templates"
+    for name in ("build-v8.txt", "build-rework-v5.txt"):
+        text = " ".join((root / name).read_text("utf-8").split())
+        assert "`gh run rerun <id> --failed`" in text, name
+        assert "never push an empty commit to retrigger CI" in text, name
+
+
+def test_readiness_wake_reruns_a_flaky_required_check_once_before_reporting_it():
+    """Flaky red checks reach the build through the readiness wake: re-run, then report."""
+    wake = " ".join(
+        (files("omnigent_factory.service") / "templates" / "readiness-wake-v7.txt")
+        .read_text("utf-8")
+        .split()
+    )
+    rerun = "re-run its failed jobs once (`gh run rerun <id> --failed`"
+    assert rerun in wake and "never push an empty commit" in wake
+    report = "if it stays red, name the check and the cause in a PR comment"
+    assert wake.index(rerun) < wake.index(report)
 
 
 def test_stage_prompts_keep_internal_ids_out_of_github_prose():
@@ -49,8 +71,8 @@ def test_stage_prompts_keep_internal_ids_out_of_github_prose():
         "triage-v5.txt",
         "triage-feedback-v3.txt",
         "plan-v5.txt",
-        "build-v7.txt",
-        "build-rework-v4.txt",
+        "build-v8.txt",
+        "build-rework-v5.txt",
     ):
         text = " ".join((root / name).read_text("utf-8").split())
         assert "no internal labels or IDs (de_..., ef_...)" in text, name
@@ -58,7 +80,7 @@ def test_stage_prompts_keep_internal_ids_out_of_github_prose():
 
 def test_readiness_wake_says_not_ready_for_review_not_the_column_name():
     wake = " ".join(
-        (files("omnigent_factory.service") / "templates" / "readiness-wake-v6.txt")
+        (files("omnigent_factory.service") / "templates" / "readiness-wake-v7.txt")
         .read_text("utf-8")
         .split()
     )
@@ -68,7 +90,7 @@ def test_readiness_wake_says_not_ready_for_review_not_the_column_name():
 def test_readiness_wake_says_red_checks_outside_the_change_are_build_ready_not_blocked():
     """#461: Rosie reported "blocked" for red checks from main and a flaky test."""
     wake = " ".join(
-        (files("omnigent_factory.service") / "templates" / "readiness-wake-v6.txt")
+        (files("omnigent_factory.service") / "templates" / "readiness-wake-v7.txt")
         .read_text("utf-8")
         .split()
     )

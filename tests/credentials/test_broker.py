@@ -106,6 +106,9 @@ async def test_profile_permissions_are_fixed_and_requested_exactly(setup) -> Non
     assert build["contents"] == "write" and build["workflows"] == "write"
     assert "administration" not in build and "organization_projects" not in build
     assert "workflows" not in PROFILE_PERMISSIONS[CredentialProfile.READ_ONLY]
+    # Owner decision 2026-10-06: only BUILD may re-run or cancel CI runs.
+    assert build["actions"] == "write"
+    assert PROFILE_PERMISSIONS[CredentialProfile.READ_ONLY]["actions"] == "read"
 
 
 @pytest.mark.asyncio

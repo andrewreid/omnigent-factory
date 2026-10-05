@@ -98,7 +98,7 @@ async def test_build_token_has_only_approved_repository_permissions():
         await service.mint("SA-Ambulance/timesheets", CredentialProfile.BUILD)
     assert body is not None
     assert body["permissions"] == {
-        "actions": "read",
+        "actions": "write",
         "checks": "read",
         "contents": "write",
         "issues": "write",
@@ -147,6 +147,48 @@ async def test_workflows_write_is_build_only_and_must_be_granted_exactly():
     assert not isinstance(daemon, TokenRefusal) and "workflows" not in daemon.permissions
     # An installation that has not accepted workflows:write yields a narrower token; the
     # exact-scope check refuses it rather than handing out a token that cannot push.
+    assert isinstance(short, TokenRefusal)
+    assert "differ from the requested" in short.reason
+
+
+@pytest.mark.asyncio
+async def test_actions_write_is_build_only_and_must_be_granted_exactly():
+    """Owner decision 2026-10-06: BUILD requests actions:write (re-run / cancel CI runs);
+    read-only stage and daemon tokens keep actions:read."""
+    bodies: list[dict] = []
+    downgrade_actions = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        granted = dict(body["permissions"])
+        if downgrade_actions:
+            granted["actions"] = "read"
+        return httpx.Response(
+            201,
+            json={
+                "token": "opaque",
+                "expires_at": "2030-01-01T00:00:00Z",
+                "permissions": granted,
+                "repositories": [{"full_name": "SA-Ambulance/timesheets"}],
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        service = InstallationTokenService(
+            http, AppAuthenticator(1, private_key()), 99, "SA-Ambulance/timesheets"
+        )
+        build = await service.mint("SA-Ambulance/timesheets", CredentialProfile.BUILD)
+        read_only = await service.mint("SA-Ambulance/timesheets", CredentialProfile.READ_ONLY)
+        daemon = await service.mint_daemon()
+        downgrade_actions = True
+        short = await service.mint("SA-Ambulance/timesheets", CredentialProfile.BUILD)
+    assert isinstance(build, TokenGrant) and isinstance(read_only, TokenGrant)
+    assert bodies[0]["permissions"]["actions"] == "write"
+    assert bodies[1]["permissions"]["actions"] == "read"
+    assert bodies[2]["permissions"]["actions"] == "read"
+    assert not isinstance(daemon, TokenRefusal) and daemon.permissions["actions"] == "read"
+    # An installation that has not accepted actions:write is refused, not silently narrowed.
     assert isinstance(short, TokenRefusal)
     assert "differ from the requested" in short.reason
 

@@ -29,15 +29,15 @@ def test_stage_templates_are_short_tool_pointers():
         "plan": "factory_get_issue",
         "build": "factory_get_plan",
     }
-    names = {"triage": "triage-v5.txt", "plan": "plan-v5.txt", "build": "build-v7.txt"}
+    names = {"triage": "triage-v5.txt", "plan": "plan-v5.txt", "build": "build-v8.txt"}
     for stage, tool in first_tool.items():
         text = (root / names[stage]).read_text(encoding="utf-8").format(**values)
         assert f"Start with {tool}" in text
         assert "conv_root" in text and "ss_run" in text and "factory_submit_result" in text
         # No result-format instructions or correction templates in the pointer.
         assert "FACTORY_RESULT" not in text and "```" not in text
-        assert len(text) < 1200
-    build = (root / "build-v7.txt").read_text(encoding="utf-8").format(**values)
+        assert len(text) < 1300
+    build = (root / "build-v8.txt").read_text(encoding="utf-8").format(**values)
     assert "`Closes #1`" in build and "Never merge" in build and "0" * 64 in build
     assert "/factory/gh" in build and "/factory/cap" in build
     assert not (root / "correction-v1.txt").is_file()

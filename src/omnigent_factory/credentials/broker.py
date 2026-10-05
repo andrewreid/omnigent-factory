@@ -45,7 +45,10 @@ from omnigent_factory.ports.credentials import CREDENTIAL_EFFECT_KINDS, TokenGra
 
 #: Installation-token permissions per fixed profile (§6.1). Only BUILD may write Workflows
 #: (owner decision 2026-10-01: a build may change ``.github/workflows/*`` on its own parcel
-#: branch). No Administration or organization Projects for any stage profile.
+#: branch) and Actions (owner decision 2026-10-06: a build may re-run or cancel CI runs on
+#: its own PR; dispatching workflows and deleting runs, logs, artifacts or caches stay
+#: denied by ``factory-cel``). No Administration or organization Projects for any stage
+#: profile.
 PROFILE_PERMISSIONS: Mapping[CredentialProfile, Mapping[str, str]] = {
     CredentialProfile.READ_ONLY: {
         "contents": "read",
@@ -62,7 +65,7 @@ PROFILE_PERMISSIONS: Mapping[CredentialProfile, Mapping[str, str]] = {
         "pull_requests": "write",
         "checks": "read",
         "statuses": "read",
-        "actions": "read",
+        "actions": "write",
         "metadata": "read",
         "workflows": "write",
     },
