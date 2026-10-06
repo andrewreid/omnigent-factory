@@ -392,6 +392,50 @@ async def test_build_ready_for_the_same_head_after_the_readiness_wake_is_accepte
         assert retry == {**receipt, "replayed": True}
 
 
+async def test_build_ready_after_the_findings_wake_opens_its_own_slot(
+    service_config: ServiceConfig,
+):
+    """#745: the check wake was spent, then the findings wake asks for build_ready of the
+    same head again; that re-submission gets a fresh slot, not the check wake's."""
+    async with started(service_config) as rig:
+        root, plan_hash = await building(rig)
+        await rig.tools.get_plan(root)
+        await rig.submit(root, "build_ready", build_ready(), plan_hash=plan_hash)
+        run = await rig.run()
+        await rig.quiesce()
+        await rig.send(
+            ev.ReadinessEvidence(
+                session_id=run.session_id,
+                pr_number=7,
+                head_sha=SHA,
+                checks=ev.ChecksState.FAILED,
+                checks_summary="18 checks: 17 success, 1 failure",
+            )
+        )
+        parcel = await rig.parcel()
+        again = {**build_ready(), "branch": f"factory/issue-{parcel.issue_number}"}
+        receipt = await rig.submit(root, "build_ready", again, plan_hash=plan_hash)
+        assert receipt["slot"] == f"build-{SHA}-w1"
+        await rig.quiesce()
+        await rig.send(
+            ev.ReadinessEvidence(
+                session_id=run.session_id,
+                pr_number=7,
+                head_sha=SHA,
+                checks=ev.ChecksState.GREEN,
+                findings_open=True,
+            )
+        )
+        parcel = await rig.parcel()
+        assert (parcel.readiness_wakes, parcel.findings_wakes) == (1, 1)
+        assert (await rig.run()).lifecycle == Lifecycle.ACTIVE
+        status = await rig.tools.get_status(root)
+        assert status["findings_wakes_used"] == 1 and status["fix_wakes_used"] == 1
+        third = {**again, "summary": "Every review-bot finding has an outcome."}
+        receipt = await rig.submit(root, "build_ready", third, plan_hash=plan_hash)
+        assert receipt["accepted"] is True and receipt["slot"] == f"build-{SHA}-w2"
+
+
 async def test_submission_after_stop_is_rejected_but_exact_retry_replays(
     service_config: ServiceConfig,
 ):

@@ -34,11 +34,11 @@ def test_blocked_report_and_status_comments_name_the_configured_agent():
 
 def test_build_prompts_carry_the_review_bot_disposition_rule():
     root = files("omnigent_factory.service") / "templates"
-    for name in ("build-v8.txt", "readiness-wake-v7.txt"):
+    for name in ("build-v8.txt", "readiness-wake-v8.txt", "readiness-findings-wake-v1.txt"):
         text = " ".join((root / name).read_text("utf-8").split())
         assert "follow-up issue" in text and "resolve" in text, name
         assert "Only resolve threads you have replied to." in text, name
-    wake = " ".join((root / "readiness-wake-v7.txt").read_text("utf-8").split())
+    wake = " ".join((root / "readiness-wake-v8.txt").read_text("utf-8").split())
     assert "submit build_ready, not blocked" in wake
 
 
@@ -54,7 +54,7 @@ def test_build_prompts_rerun_flaky_ci_instead_of_empty_commits():
 def test_readiness_wake_reruns_a_flaky_required_check_once_before_reporting_it():
     """Flaky red checks reach the build through the readiness wake: re-run, then report."""
     wake = " ".join(
-        (files("omnigent_factory.service") / "templates" / "readiness-wake-v7.txt")
+        (files("omnigent_factory.service") / "templates" / "readiness-wake-v8.txt")
         .read_text("utf-8")
         .split()
     )
@@ -80,7 +80,7 @@ def test_stage_prompts_keep_internal_ids_out_of_github_prose():
 
 def test_readiness_wake_says_not_ready_for_review_not_the_column_name():
     wake = " ".join(
-        (files("omnigent_factory.service") / "templates" / "readiness-wake-v7.txt")
+        (files("omnigent_factory.service") / "templates" / "readiness-wake-v8.txt")
         .read_text("utf-8")
         .split()
     )
@@ -90,7 +90,7 @@ def test_readiness_wake_says_not_ready_for_review_not_the_column_name():
 def test_readiness_wake_says_red_checks_outside_the_change_are_build_ready_not_blocked():
     """#461: Rosie reported "blocked" for red checks from main and a flaky test."""
     wake = " ".join(
-        (files("omnigent_factory.service") / "templates" / "readiness-wake-v7.txt")
+        (files("omnigent_factory.service") / "templates" / "readiness-wake-v8.txt")
         .read_text("utf-8")
         .split()
     )

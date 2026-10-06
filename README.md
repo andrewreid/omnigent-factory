@@ -103,11 +103,14 @@ checks then only set `Bot`: green `Idle`, pending `Idle` with the note `Checks r
 wake). Ready and `Working`/`Queued`/`Checkpoint` never go together: any work for a Ready
 card (rework, an operator note) moves it to Building with that work, and an owner drag to
 Ready while the bot is still working is moved back (`Kept in Building: ...`). A red check sends a Building
-card back to its run with the one readiness wake only while that wake is unused and the
+card back to its run with the one check wake only while that wake is unused and the
 head has the bot's own commits; once it is spent (the agent re-submits when the red check
 is outside the change, or ends that woken turn without a new result), or the head only
 syncs the base branch, the card goes to Ready, `Blocked`. A run woken by an owner comment
-that ends its turn without re-submitting is `Needs you`, never left `Working`. A blocked report for a defect in the change stays with the owner. An owner drag
+that ends its turn without re-submitting is `Needs you`, never left `Working`. Review-bot
+findings without an outcome get a wake of their own (once per build or rework, separate
+from the check wake, so findings that arrive after the check wake still reach the run);
+findings still without an outcome after it are `Needs you`. A blocked report for a defect in the change stays with the owner. An owner drag
 from Building to Ready is accepted on the same terms (Bot by the checks, the run is
 closed); otherwise the card returns to Building with the reason in the note
 (`Kept in Building: ...`).
@@ -186,7 +189,7 @@ stays open. The agent's shell policy allows `gh issue create`, thread replies an
 head, the head is Ready only from a green read taken `review_bot_grace_minutes` (default
 10) after the later of the build report and the trigger (the head push or PR opening, or a
 `review_bot_mention` re-ping after its last answer), so late bot comments are handled by
-the build's one readiness wake instead of pulling a Ready card back. The bot can still
+the build's findings wake instead of pulling a Ready card back. The bot can still
 respond until it has answered that head (a review of the commit, a verdict naming it, or a
 +1 on the PR after the push); once it has and nothing re-pinged it, readiness is judged on
 current evidence at once. When the bot's state cannot be read, the grace applies.

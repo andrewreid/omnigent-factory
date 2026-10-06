@@ -373,6 +373,8 @@ class FactoryTools:
             },
             "fix_wakes_used": parcel.readiness_wakes,
             "fix_wakes_max": 1,
+            "findings_wakes_used": parcel.findings_wakes,
+            "findings_wakes_max": 1,
         }
 
     # ------------------------------------------------------------------ mutations
@@ -792,11 +794,12 @@ def _slot(run: StageSession, kind: str, payload: Mapping[str, Any], parcel: Parc
         # Each owner comment relayed to a waiting build opens a new slot for the same head.
         if run.feedback_wakes:
             slot = f"{slot}-f{run.feedback_wakes}"
-        # So does the readiness wake of the run's own build_ready: it asks for build_ready
-        # again, often for the same head (a red check outside the change, #675).
+        # So does each readiness wake (check, then findings) of the run's own build_ready:
+        # it asks for build_ready again, often for the same head (#675, #745).
         r = parcel.readiness
-        if parcel.readiness_wakes and r is not None and r.session_id == run.session_id:
-            slot = f"{slot}-w{parcel.readiness_wakes}"
+        wakes = parcel.readiness_wakes + parcel.findings_wakes
+        if wakes and r is not None and r.session_id == run.session_id:
+            slot = f"{slot}-w{wakes}"
         return slot
     return "blocked"
 
@@ -858,7 +861,8 @@ def _after_submit(kind: str, in_checkpoint: bool) -> str:
         "triage": "End your turn; the factory publishes the triage.",
         "plan": "End your turn; the factory publishes the plan for owner approval.",
         "build_ready": "End your turn; the factory verifies CI and review evidence and "
-        "wakes you once if something needs fixing.",
+        "wakes you if something needs fixing (once for red checks, once for review-bot "
+        "findings).",
         "blocked": "End your turn; the owner has been told.",
     }.get(kind, "End your turn.")
 

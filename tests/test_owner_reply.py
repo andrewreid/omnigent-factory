@@ -233,8 +233,8 @@ def test_readiness_failed_without_a_question_also_reworks_on_a_reply():
         ev.PRObserved(pr_number=7, head_sha=HEAD, open=True, bot_authored=True, parcel_branch=True),
     )
     h.quiesce(P, s.session_id)
-    h.send(P, evidence)  # the one automatic wake
-    assert h.p().readiness_wakes == 1
+    h.send(P, evidence)  # the one automatic findings wake
+    assert (h.p().readiness_wakes, h.p().findings_wakes) == (0, 1)
     h.send(P, submit)
     h.quiesce(P, s.session_id)
     h.send(P, evidence)
@@ -242,6 +242,7 @@ def test_readiness_failed_without_a_question_also_reworks_on_a_reply():
     assert h.cur().lifecycle == Lifecycle.WAITING
     r = reply(h, "leave it")
     assert r.audit.accepted and Hold.READINESS_FAILED not in h.p().holds
-    assert h.p().authorizations[-1].rework and h.p().readiness_wakes == 0
+    assert h.p().authorizations[-1].rework
+    assert (h.p().readiness_wakes, h.p().findings_wakes) == (0, 0)
     assert h.admission.queue_entry(P).status == QueueStatus.QUEUED
     assert not Harness.of(r, EffectKind.SEND_MESSAGE)

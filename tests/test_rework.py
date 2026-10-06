@@ -227,9 +227,9 @@ def _submit(h: Harness, head: str) -> None:
 
 def test_rework_resets_the_fix_budget_and_ends_with_a_new_ready_report():
     h = ready()
-    h.parcels[P] = replace(h.p(), readiness_wakes=1)  # wake used
+    h.parcels[P] = replace(h.p(), readiness_wakes=1, findings_wakes=1)  # both wakes used
     comment(h)
-    assert h.p().readiness_wakes == 0
+    assert (h.p().readiness_wakes, h.p().findings_wakes) == (0, 0)
     h.send(P, ev.CapacityAvailable())
     h.create_ok()
     _submit(h, HEAD2)

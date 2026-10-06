@@ -50,6 +50,7 @@ def test_executor_carries_the_actual_pr_head_and_failure_kind_into_the_reducer(
         "findings_dispositioned": False,
         "verified": False,
         "checks_summary": "3 checks: 2 success, 1 failure",
+        "read_started_us": 1_791_266_459_000_000,
     }
     event = executor._ack_event(fetch, Ack("683", detail))
     assert event is not None and isinstance(event.body, ev.ReadinessEvidence)
@@ -57,6 +58,7 @@ def test_executor_carries_the_actual_pr_head_and_failure_kind_into_the_reducer(
     assert body.head_sha == "2041e6e2" + "0" * 32 and body.observed_head_sha == HEAD
     assert body.checks == ChecksState.FAILED and body.findings_open
     assert not body.review_accepted and body.pr_open and not body.merged
+    assert body.read_started_us == 1_791_266_459_000_000
 
 
 @pytest.mark.asyncio

@@ -430,6 +430,9 @@ class ReadinessEvidence(_Body):
     #: How the review bot answered this head, when it did (``review_bot_pending_since_us``
     #: 0), e.g. "👍 on `f7493c8`" ("" = no answer or not told).
     review_bot_verdict: str = ""
+    #: When the read began (daemon clock; 0 = unknown, older reads): it reflects every
+    #: check webhook received before then.
+    read_started_us: int = 0
 
 
 @dataclass(frozen=True, slots=True)

@@ -536,6 +536,9 @@ class Readiness:
     report_effect_id: str = ""
     #: The factory lines that report shows now (CI, red checks, review bot), as a key.
     report_key: str = ""
+    #: When the newest applied evidence read of ``head_sha`` began (0 = none or older
+    #: records): a check webhook received before then is already reflected in it.
+    read_started_us: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -612,8 +615,14 @@ class Parcel:
     decisions: tuple[Decision, ...] = ()
     holds: frozenset[Hold] = frozenset()
     readiness: Readiness | None = None
-    #: Readiness fix wakes sent to the build session for the current approval (at most 1).
+    #: Readiness fix wakes sent to the build session for the current approval (at most 1)
+    #: for red required checks and other gaps besides review-bot findings (the check wake;
+    #: a wake recorded before the split counts as this one).
     readiness_wakes: int = 0
+    #: Readiness fix wakes sent for review-bot findings without an outcome (at most 1 per
+    #: approval or rework), separate so findings that arrive after the check wake was
+    #: spent still reach the build once (#745).
+    findings_wakes: int = 0
     pr_number: int | None = None
     bot: BotState = BotState.IDLE
     #: Latest informational status reason (replaces status comments; "" when none).

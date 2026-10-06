@@ -274,6 +274,29 @@ def test_another_failure_after_the_spent_wake_still_needs_you():
     h.send(P, ev.RuntimeActivity(session_id=h.cur().session_id, busy=True))
     submit_ready(h, BUILT)
     h.quiesce(P, h.cur().session_id)
+    r = h.send(P, red(h, BUILT, review_accepted=False))
+    assert EffectKind.POST_COMMENT in kinds(r)
+    p = h.p()
+    assert p.stage == Stage.BUILDING and Hold.READINESS_FAILED in p.holds
+    assert p.bot == BotState.NEEDS_YOU
+
+
+def test_findings_after_the_spent_check_wake_get_one_wake_then_need_you():
+    """#745: the findings wake is separate from the check wake; once it is spent too,
+    findings still without an outcome go to the owner."""
+    h = Harness()
+    built(h)
+    h.send(P, red(h, BUILT))
+    h.send(P, ev.RuntimeActivity(session_id=h.cur().session_id, busy=True))
+    submit_ready(h, BUILT)
+    h.quiesce(P, h.cur().session_id)
+    r = h.send(P, red(h, BUILT, findings_open=True))
+    assert EffectKind.POST_COMMENT not in kinds(r)
+    [wake] = [e for e in r.effects if e.kind == EffectKind.SEND_MESSAGE]
+    assert wake.args["wake"] == "findings"
+    assert h.p().bot == BotState.WORKING
+    submit_ready(h, BUILT)
+    h.quiesce(P, h.cur().session_id)
     r = h.send(P, red(h, BUILT, findings_open=True))
     assert EffectKind.POST_COMMENT in kinds(r)
     p = h.p()

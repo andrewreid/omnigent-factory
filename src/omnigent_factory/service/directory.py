@@ -197,7 +197,10 @@ class ServiceDispatchDirectory:
                 return _template("triage-comment-v1.txt").format(run_id=sid)
             return _template("feedback-v3.txt").format(revision=parcel.revision, run_id=sid)
         if purpose == "readiness_wake":
-            return _template("readiness-wake-v7.txt").format(
+            # Findings only (the check wake spent or not needed): ask for an outcome each.
+            findings = effect.args.get("wake") == "findings"
+            name = "readiness-findings-wake-v1.txt" if findings else "readiness-wake-v8.txt"
+            return _template(name).format(
                 pr_number=int(str(effect.args.get("pr_number") or 0)),
                 head_sha=str(effect.args.get("head_sha") or ""),
                 reason=str(effect.args.get("reason") or "")[:500],

@@ -8,11 +8,13 @@ readiness fix wake, and credential issuance re-enabled on every reconcile.
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.codec import parcel_from_json, parcel_to_json
 from omnigent_factory.core.effects import EffectIntent, EffectKind, MessagePurpose, Preconditions
+from omnigent_factory.core.events import Provenance
 from omnigent_factory.core.preconditions import effect_still_valid
 from omnigent_factory.core.types import BotState, Hold, Lifecycle, Size, Stage, Via, WaitReason
 from omnigent_factory.testing.builders import contract_text, result_candidate
@@ -304,20 +306,91 @@ def test_genuine_failure_wakes_the_idle_build_once_then_needs_you_with_the_reaso
     )
     [wake] = sends(r)
     assert wake.args["purpose"] == MessagePurpose.READINESS_WAKE.value
+    assert wake.args["wake"] == "checks"
     assert "required checks failed" in str(wake.args["reason"])
     p = h.p()
     assert p.readiness_wakes == 1 and h.cur(P).lifecycle == Lifecycle.ACTIVE
     assert Hold.READINESS_FAILED not in p.holds and p.bot == BotState.WORKING
     # The fix is pushed and re-reported; still red: no second wake, Needs you + reason.
+    # (Red checks alone with the wake spent park the card in Ready: test_ready_red_checks.)
     _idle_build_ready(h, NEW)
-    r = h.send(P, evidence(h, NEW, checks=ev.ChecksState.GREEN, findings_open=True))
+    r = h.send(P, evidence(h, NEW, checks=ev.ChecksState.GREEN, review_accepted=False))
+    assert not sends(r)
+    [blocked] = comments(r, "ready-blocked")
+    assert "no accepted cross-vendor review" in str(blocked.args["reason"])
+    p = h.p()
+    assert Hold.READINESS_FAILED in p.holds and p.bot == BotState.NEEDS_YOU
+    r = h.send(P, evidence(h, NEW, checks=ev.ChecksState.GREEN, review_accepted=False))
+    assert not sends(r) and not comments(r, "ready-blocked")  # no comment spam
+
+
+def test_findings_after_the_spent_check_wake_get_their_own_wake_once():
+    """#745 replay: the one wake went to a red required check; the review bot's findings
+    arrived while the build was still on that wake, and it re-submitted the same head
+    without addressing them. The findings get their own single wake, not Needs you."""
+    h = Harness()
+    h.to_building()
+    _idle_build_ready(h)
+    r = h.send(
+        P, evidence(h, OLD, checks=ev.ChecksState.FAILED, checks_summary="20 checks: 1 failure")
+    )
+    [check_wake] = sends(r)
+    assert h.p().readiness_wakes == 1
+    # The bot posts findings while the woken run is busy: nothing yet.
+    r = h.send(P, evidence(h, OLD, checks=ev.ChecksState.GREEN, findings_open=True))
+    assert not sends(r) and Hold.READINESS_FAILED not in h.p().holds
+    # The run re-submits the same head and goes idle; the findings still have no outcome.
+    _idle_build_ready(h, OLD)
+    r = h.send(P, evidence(h, OLD, checks=ev.ChecksState.GREEN, findings_open=True))
+    assert not comments(r, "ready-blocked")
+    [wake] = sends(r)
+    p = h.p()
+    assert Hold.READINESS_FAILED not in p.holds and p.bot == BotState.WORKING
+    assert wake.args["purpose"] == MessagePurpose.READINESS_WAKE.value
+    assert "review-bot findings have no outcome" in str(wake.args["reason"])
+    assert (check_wake.args["wake"], wake.args["wake"]) == ("checks", "findings")
+    assert (p.readiness_wakes, p.findings_wakes) == (1, 1)
+    # Still no outcome after the findings wake: the owner decides (Needs you), once.
+    _idle_build_ready(h, OLD)
+    r = h.send(P, evidence(h, OLD, checks=ev.ChecksState.GREEN, findings_open=True))
     assert not sends(r)
     [blocked] = comments(r, "ready-blocked")
     assert "review-bot findings" in str(blocked.args["reason"])
-    p = h.p()
-    assert Hold.READINESS_FAILED in p.holds and p.bot == BotState.NEEDS_YOU
+    assert Hold.READINESS_FAILED in h.p().holds and h.p().bot == BotState.NEEDS_YOU
+    r = h.send(P, evidence(h, OLD, checks=ev.ChecksState.GREEN, findings_open=True))
+    assert not sends(r) and not comments(r, "ready-blocked")
+
+
+def test_findings_first_then_red_checks_each_get_one_wake():
+    h = Harness()
+    h.to_building()
+    _idle_build_ready(h)
+    r = h.send(P, evidence(h, OLD, checks=ev.ChecksState.GREEN, findings_open=True))
+    [wake] = sends(r)
+    assert wake.args["wake"] == "findings"
+    assert (h.p().readiness_wakes, h.p().findings_wakes) == (0, 1)
+    _idle_build_ready(h, NEW)
+    r = h.send(P, evidence(h, NEW, checks=ev.ChecksState.FAILED, review_accepted=False))
+    [wake] = sends(r)
+    assert wake.args["wake"] == "checks"
+    assert (h.p().readiness_wakes, h.p().findings_wakes) == (1, 1)
+
+
+def test_one_wake_for_red_checks_and_findings_together_spends_both():
+    h = Harness()
+    h.to_building()
+    _idle_build_ready(h)
+    r = h.send(
+        P, evidence(h, OLD, checks=ev.ChecksState.FAILED, findings_open=True, checks_summary="x")
+    )
+    [wake] = sends(r)
+    reason = str(wake.args["reason"])
+    assert wake.args["wake"] == "checks"  # the full wake text also covers findings
+    assert "required checks failed" in reason and "review-bot findings" in reason
+    assert (h.p().readiness_wakes, h.p().findings_wakes) == (1, 1)
+    _idle_build_ready(h, NEW)
     r = h.send(P, evidence(h, NEW, checks=ev.ChecksState.GREEN, findings_open=True))
-    assert not sends(r) and not comments(r, "ready-blocked")  # no comment spam
+    assert not sends(r) and comments(r, "ready-blocked")
 
 
 def test_pending_checks_and_a_busy_tree_never_wake_or_need_you():
@@ -346,8 +419,90 @@ def test_missing_current_head_review_after_a_head_change_uses_the_same_single_wa
 def test_wake_count_is_persisted_with_the_parcel():
     h = Harness()
     h.to_building()
-    p = replace(h.p(), readiness_wakes=1)
-    assert parcel_from_json(parcel_to_json(p)).readiness_wakes == 1
+    p = replace(h.p(), readiness_wakes=1, findings_wakes=1)
+    loaded = parcel_from_json(parcel_to_json(p))
+    assert (loaded.readiness_wakes, loaded.findings_wakes) == (1, 1)
+
+
+def test_a_parcel_stored_before_the_split_counts_its_spent_wake_as_the_check_wake():
+    """Stored aggregates have no ``findings_wakes``: they load with the single wake as the
+    check wake, so their findings still get one wake. The live #745 parcel is already
+    Needs you for those findings (the old rule); the next read wakes the run and the
+    card goes back to Working."""
+    h = Harness()
+    h.to_building()
+    _idle_build_ready(h)
+    stored = replace(
+        h.p(),
+        readiness_wakes=1,
+        holds=h.p().holds | {Hold.READINESS_FAILED},
+        bot=BotState.NEEDS_YOU,
+        note="Needs you: PR #7 not ready on aaaaaaa: review-bot findings have no outcome",
+    )
+    data = json.loads(parcel_to_json(stored))
+    del data["parcel"]["findings_wakes"]
+    del data["parcel"]["readiness"]["read_started_us"]
+    h.parcels[P] = parcel_from_json(json.dumps(data))
+    assert (h.p().readiness_wakes, h.p().findings_wakes) == (1, 0)
+    assert h.p().readiness.read_started_us == 0
+    r = h.send(P, evidence(h, OLD, checks=ev.ChecksState.GREEN, findings_open=True))
+    [wake] = sends(r)
+    assert wake.args["wake"] == "findings" and h.p().findings_wakes == 1
+    p = h.p()
+    assert Hold.READINESS_FAILED not in p.holds and p.bot == BotState.WORKING and not p.note
+    assert h.cur(P).lifecycle == Lifecycle.ACTIVE
+
+
+# ------------------------------------------------- 6b. check webhooks vs evidence reads
+
+
+def test_check_webhook_received_before_the_applied_read_began_triggers_no_read():
+    """#745: ~20 suite webhooks for one head queued behind each evidence read; each one,
+    applied after the previous read, issued another read (a ~5s re-read loop until the
+    backlog drained). A read that began after a webhook arrived already reflects it."""
+    h = Harness()
+    h.to_building()
+    _idle_build_ready(h)
+    burst = h.f(P).now  # the webhooks of the burst are received now
+    started = h.f(P).tick()  # a read begins after them
+    r = h.send(
+        P,
+        evidence(h, OLD, checks=ev.ChecksState.PENDING, read_started_us=started),
+    )
+    assert h.p().readiness.read_started_us == started
+    for state in (ev.ChecksState.PENDING, ev.ChecksState.FAILED, ev.ChecksState.GREEN):
+        r = h.send(
+            P,
+            ev.ChecksChanged(pr_number=PR, head_sha=OLD, state=state),
+            provenance=Provenance.WEBHOOK,
+            time_us=burst,
+        )
+        assert r.audit.accepted and EffectKind.FETCH_PR_EVIDENCE not in kinds(r)
+    # A webhook received after that read began is genuinely new: one read.
+    r = h.send(
+        P,
+        ev.ChecksChanged(pr_number=PR, head_sha=OLD, state=ev.ChecksState.FAILED),
+        provenance=Provenance.WEBHOOK,
+    )
+    assert kinds(r).count(EffectKind.FETCH_PR_EVIDENCE) == 1
+
+
+def test_read_start_is_forgotten_on_a_new_head_and_never_moves_back():
+    h = Harness()
+    h.to_building()
+    _idle_build_ready(h)
+    later = h.f(P).now + 10_000_000
+    h.send(P, evidence(h, OLD, checks=ev.ChecksState.PENDING, read_started_us=later))
+    h.send(P, evidence(h, OLD, checks=ev.ChecksState.PENDING, read_started_us=later - 5))
+    assert h.p().readiness.read_started_us == later  # an older read does not move it back
+    r = h.send(P, evidence(h, OLD, observed_head_sha=NEW, checks=ev.ChecksState.PENDING))
+    assert fetch_head(r) == NEW and h.p().readiness.read_started_us == 0
+    r = h.send(
+        P,
+        ev.ChecksChanged(pr_number=PR, head_sha=NEW, state=ev.ChecksState.FAILED),
+        provenance=Provenance.WEBHOOK,
+    )
+    assert EffectKind.FETCH_PR_EVIDENCE in kinds(r)
 
 
 # ------------------------------------------------------------ 7. issuance

@@ -1,7 +1,8 @@
 Factory readiness check for run {run_id}: fresh GitHub evidence for PR #{pr_number} at head
 `{head_sha}` is not ready for review: {reason}.
 
-This is the one automatic wake for this build (factory_get_status lists the gaps). Within
+This is the one automatic wake for red checks and these gaps in this build (review-bot
+findings that arrive later get one wake of their own; factory_get_status lists the gaps). Within
 your existing shared allowance (at most one fix batch and one targeted recheck across the
 build), read the current check results and review threads yourself, fix accepted in-scope
 defects, run the targeted recheck, push, and submit build_ready for the resulting head

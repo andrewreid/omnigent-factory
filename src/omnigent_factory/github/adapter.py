@@ -854,6 +854,7 @@ class GitHubAPIAdapter:
             if effect.kind == EffectKind.ENSURE_PROJECT_ITEM:
                 return await self._ensure_project_item(effect)
             if effect.kind == EffectKind.FETCH_PR_EVIDENCE:
+                read_started_us = self._now_us()  # before any read: covers earlier webhooks
                 number = effect.args.get("pr_number")
                 if not isinstance(number, int):
                     return DefinitiveFailure("FETCH_PR_EVIDENCE requires pr_number")
@@ -882,6 +883,7 @@ class GitHubAPIAdapter:
                 )
                 detail["head_matches"] = head_matches
                 detail["verified"] = evidence.verified and head_matches
+                detail["read_started_us"] = read_started_us
                 return Ack(str(number), detail)
             if effect.kind == EffectKind.RECONCILE_PARCEL:
                 ref = await self._issue_ref(effect)

@@ -154,6 +154,8 @@ async def test_pr_682_as_live_is_verified_without_owner_approval():
     assert outcome.detail["review_accepted"] is True
     assert outcome.detail["verified"] is True
     assert outcome.detail["checks_summary"] == "17 checks: 13 success, 4 skipped"
+    # When the read began: check webhooks received before it are reflected (#745).
+    assert outcome.detail["read_started_us"] == 123_000_000
 
 
 @pytest.mark.asyncio

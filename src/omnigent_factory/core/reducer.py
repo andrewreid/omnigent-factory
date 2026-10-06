@@ -1180,7 +1180,7 @@ def _build_blocked_by_live(ctx: _Ctx) -> bool:
 
 def _after_approval(ctx: _Ctx, approval: Approval, duration_us: int, via: Via) -> None:
     ctx.unhold(*CONTROL_CLEARED_HOLDS)
-    ctx.update(readiness_wakes=0)  # a new approved deliverable gets its own wake
+    ctx.update(readiness_wakes=0, findings_wakes=0)  # a new approved deliverable: own wakes
     _cancel_pending(ctx)
     _move(ctx, Stage.BUILDING, via)
     _enqueue_build(ctx, approval, duration_us)
@@ -1533,11 +1533,15 @@ def _ended_without_result(ctx: _Ctx, s: StageSession) -> bool:
 
 
 def _wake_answered(ctx: _Ctx, s: StageSession) -> bool:
-    """The run's last wake was the one readiness wake (no owner comment relayed to it) and
-    its turn ended with no new result: its build_ready stands and it has nothing left to
-    do (#675: it named a red check outside the change on the PR; a re-submission of the
-    same head was refused)."""
-    return _ended_without_result(ctx, s) and ctx.p.readiness_wakes >= 1 and not s.feedback_wakes
+    """The run's last wake was a readiness wake (check or findings; no owner comment relayed
+    to it) and its turn ended with no new result: its build_ready stands and it has nothing
+    left to do (#675: it named a red check outside the change on the PR; a re-submission of
+    the same head was refused)."""
+    return (
+        _ended_without_result(ctx, s)
+        and (ctx.p.readiness_wakes >= 1 or ctx.p.findings_wakes >= 1)
+        and not s.feedback_wakes
+    )
 
 
 def _relay_comment(ctx: _Ctx, s: StageSession, digest: str = "") -> None:
@@ -1628,7 +1632,7 @@ def _rework(ctx: _Ctx, via: Via | None) -> None:
     a = ctx.p.current_approval
     assert a is not None  # noqa: S101 - approval_ok checked by the caller
     ctx.unhold(*CONTROL_CLEARED_HOLDS, Hold.REMEDIATION_EXHAUSTED)
-    ctx.update(readiness=None, readiness_wakes=0)
+    ctx.update(readiness=None, readiness_wakes=0, findings_wakes=0)
     _cancel_pending(ctx)
     _move(ctx, Stage.BUILDING, via)
     _enqueue_build(ctx, a, ctx.config.block_us(ctx.p.size or Size.M), rework=True)
@@ -2152,8 +2156,15 @@ def _readiness_for(ctx: _Ctx, pr_number: int, unknown: str) -> Readiness:
 
 def _h_checks_changed(ctx: _Ctx, body: ev.ChecksChanged) -> None:
     """A check-suite/workflow webhook is one suite on some head, not the aggregate: it
-    only triggers a fresh current-head read, which alone decides readiness."""
+    only triggers a fresh current-head read, which alone decides readiness.
+
+    A webhook received before the newest applied read began is already reflected in that
+    read: no further read (#745: a burst of ~20 suite webhooks for one head, each applied
+    after the previous read, re-read the PR every ~5s until the backlog drained).
+    """
     r = _readiness_for(ctx, body.pr_number, "checks-before-readiness-recorded")
+    if ctx.now <= r.read_started_us:
+        return
     if ctx.p.stage == Stage.READY and r.ready:
         if body.head_sha == r.head_sha and body.state == ev.ChecksState.GREEN:
             return
@@ -2195,6 +2206,9 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
     if observed != r.head_sha:
         _head_changed(ctx, r, observed)
         return
+    if body.read_started_us > r.read_started_us:
+        r = replace(r, read_started_us=body.read_started_us)
+        ctx.update(readiness=r)
     r = _review_bot_window(ctx, r, body.review_bot_pending_since_us, body.review_bot_verdict)
     if body.remediation_exhausted:
         ctx.hold(Hold.REMEDIATION_EXHAUSTED)
@@ -2598,6 +2612,7 @@ def _head_changed(ctx: _Ctx, r: Readiness, head: str) -> None:
         review_bot="",
         report_effect_id="",  # the posted report is for the old head: never edited now
         report_key="",
+        read_started_us=0,  # no read of the new head applied yet
     )
     ctx.update(readiness=r)
     ctx.unhold(Hold.CHECKS_FAILED, Hold.READINESS_FAILED)
@@ -2605,13 +2620,16 @@ def _head_changed(ctx: _Ctx, r: Readiness, head: str) -> None:
 
 
 def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
-    """Current-head evidence is not green: wait, wake the idle build once, or Needs you.
+    """Current-head evidence is not green: wait, wake the idle build, or Needs you.
 
-    Pending checks are waiting, never a failure. A genuine failure (red checks, open
-    review-bot findings, no accepted review of this head) wakes the idle build session
-    once per approval, within its existing fix-batch/recheck allowance; after that the
-    owner decides with the reason recorded. Only red required checks with that wake
-    spent (or not applicable: a base-sync head) put the card in Ready, Bot Blocked.
+    Pending checks are waiting, never a failure. A genuine failure wakes the idle build
+    session within its existing fix-batch/recheck allowance, at most once per approval
+    (or rework) for each kind: the check wake for red checks and other gaps (no accepted
+    review of this head, no closing reference), the findings wake for review-bot findings
+    without an outcome. Findings that arrive after the check wake was spent still get
+    their wake (#745). With the applicable wake spent the owner decides with the reason
+    recorded. Only red required checks with the check wake spent (or not applicable: a
+    base-sync head) put the card in Ready, Bot Blocked.
     """
     s = ctx.p.session(r.session_id)
     if body.checks == ev.ChecksState.PENDING:
@@ -2644,8 +2662,10 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
     reason = _failure_reason(r, body, ctx.p.issue_number)
     if s is not None and _ended_without_result(ctx, s) and not _wake_answered(ctx, s):
         reason += f"; {_NO_NEW_RESULT}"
+    check_wake = _check_gap(body) and ctx.p.readiness_wakes < 1
+    findings_wake = body.findings_open and ctx.p.findings_wakes < 1
     if (
-        ctx.p.readiness_wakes < 1
+        (check_wake or findings_wake)
         and s is not None
         and s.session_id == ctx.p.current_session_id
         and s.lifecycle == Lifecycle.WAITING
@@ -2656,7 +2676,14 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
         and dispatchable(ctx.p)
         and work_allowed(ctx.p, s)
     ):
-        ctx.update(readiness_wakes=ctx.p.readiness_wakes + 1)
+        # One wake names every current gap; it spends the budget of each kind it covers.
+        ctx.update(
+            readiness_wakes=ctx.p.readiness_wakes + int(check_wake),
+            findings_wakes=ctx.p.findings_wakes + int(findings_wake),
+        )
+        # The run works again: a Needs you from an earlier gap (the findings wake can come
+        # after the check wake's Needs you) no longer stands.
+        ctx.unhold(Hold.READINESS_FAILED)
         # Not quiescent until a scan sees this new turn end (as for a comment relay).
         s = ctx.put_session(
             replace(s, lifecycle=Lifecycle.ACTIVE, wait_reason=None, quiescent=False)
@@ -2670,6 +2697,8 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
                 "reason": reason,
                 "pr_number": r.pr_number,
                 "head_sha": r.head_sha,
+                # Findings only: the message asks for an outcome for each finding.
+                "wake": "checks" if check_wake else "findings",
             },
         )
         return
@@ -2677,6 +2706,18 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
         ctx.hold(Hold.READINESS_FAILED)
         ctx.comment("ready-blocked", pr_number=r.pr_number, head_sha=r.head_sha, reason=reason)
         ctx.note(f"Needs you: PR #{r.pr_number} not ready on {r.head_sha[:7]}: {reason}")
+
+
+def _check_gap(body: ev.ReadinessEvidence) -> bool:
+    """The read shows a gap besides review-bot findings (a red required check, no accepted
+    review of this head, no closing reference, or any other failure): the check wake's
+    kind. Findings alone are the findings wake's."""
+    return (
+        not body.findings_open
+        or body.checks == ev.ChecksState.FAILED
+        or not body.closes_issue
+        or not body.review_accepted
+    )
 
 
 def _failure_reason(r: Readiness, body: ev.ReadinessEvidence, issue: int | None) -> str:
