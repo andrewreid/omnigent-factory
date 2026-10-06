@@ -6,10 +6,10 @@ cap, root excluded from ``subtree_busy``, archived children hidden), so a scan:
 
 1. walks ``GET /v1/sessions/{id}/child_sessions`` for every node, all pages, with a
    visited set (cycle guard);
-2. supplements it with the archive-inclusive inventory
-   ``GET /v1/sessions?kind=any&include_archived=true&visibility=all`` (all pages, no agent
-   or project filter) and closes descendants over ``parent_session_id`` - archived
-   intermediate parents and their children included;
+2. supplements it with the archive-inclusive inventory of every session
+   (:class:`~omnigent_factory.omnigent.inventory.SessionIndex`, refreshed incrementally
+   by a read that starts after the scan does) and closes descendants over
+   ``parent_session_id`` - archived intermediate parents and their children included;
 3. retains previously known node IDs even when a page omits them;
 4. reads every node's current snapshot, root included.
 
@@ -28,13 +28,13 @@ an ``idle`` node with no active task (terminal or none) does not count them.
 
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 from omnigent_client import TERMINAL_TASK_STATUSES
 
+from omnigent_factory.omnigent.inventory import SessionIndex
 from omnigent_factory.omnigent.rest import OmnigentReadError, OmnigentRest
 from omnigent_factory.ports.omnigent import TreeScan
 
@@ -228,10 +228,12 @@ async def scan_tree(
     *,
     known_ids: Iterable[str] = (),
     max_nodes: int = DEFAULT_MAX_NODES,
+    index: SessionIndex | None = None,
 ) -> TreeObservation:
+    """Scan ``root_id``'s tree; ``index`` is shared across scans (a one-off otherwise)."""
     walk = _Walk(parents={root_id: None})
     await _walk_children(rest, root_id, walk, max_nodes)
-    await _close_over_inventory(rest, walk, max_nodes)
+    await _close_over_inventory(index or SessionIndex(rest), walk, max_nodes)
     for kid in known_ids:
         if kid not in walk.parents:
             walk.parents[kid] = None  # retained: parent resolved from its snapshot
@@ -300,24 +302,16 @@ async def _walk_children(rest: OmnigentRest, root_id: str, walk: _Walk, max_node
             frontier.append(child)
 
 
-async def _close_over_inventory(rest: OmnigentRest, walk: _Walk, max_nodes: int) -> None:
+async def _close_over_inventory(index: SessionIndex, walk: _Walk, max_nodes: int) -> None:
     try:
-        rows = await rest.paginate(
-            "/v1/sessions",
-            {"kind": "any", "include_archived": "true", "visibility": "all", "order": "asc"},
-        )
+        await index.refresh()
     except OmnigentReadError as exc:
         walk.errors.append(f"inventory: {exc.reason}")
         return
-    by_parent: dict[str, list[str]] = defaultdict(list)
-    for row in rows:
-        sid, parent = row.get("id"), row.get("parent_session_id")
-        if isinstance(sid, str) and isinstance(parent, str):
-            by_parent[parent].append(sid)
     stack = list(walk.parents)
     while stack and len(walk.parents) <= max_nodes:
         current = stack.pop()
-        for child in by_parent.get(current, ()):
+        for child in index.children(current):
             if child not in walk.parents:
                 walk.parents[child] = current
                 stack.append(child)

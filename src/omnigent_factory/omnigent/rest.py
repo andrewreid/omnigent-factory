@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import enum
 import json
-from collections.abc import AsyncIterator, Generator, Mapping
+from collections.abc import AsyncIterator, Callable, Generator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -137,9 +137,18 @@ class OmnigentRest:
         return body
 
     async def paginate(
-        self, path: str, params: Mapping[str, str | int] | None = None, *, restarts: int = 2
+        self,
+        path: str,
+        params: Mapping[str, str | int] | None = None,
+        *,
+        restarts: int = 2,
+        until: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> list[dict[str, Any]]:
-        """All rows of a cursor-paginated list, or :class:`OmnigentReadError`."""
+        """All rows of a cursor-paginated list, or :class:`OmnigentReadError`.
+
+        ``until``: stop after the first page holding a row it accepts (that whole page is
+        returned). Without it, or when no row matches, every page is read.
+        """
         for _attempt in range(restarts + 1):
             rows: list[dict[str, Any]] = []
             after: str | None = None
@@ -152,8 +161,9 @@ class OmnigentRest:
                     data = body.get("data")
                     if not isinstance(data, list):
                         raise OmnigentReadError(f"GET {path}: missing data list")
-                    rows.extend(d for d in data if isinstance(d, dict))
-                    if not body.get("has_more"):
+                    page = [d for d in data if isinstance(d, dict)]
+                    rows.extend(page)
+                    if not body.get("has_more") or (until is not None and any(map(until, page))):
                         return rows
                     last = body.get("last_id")
                     if not isinstance(last, str) or not last or last == after:

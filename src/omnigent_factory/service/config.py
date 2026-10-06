@@ -178,6 +178,9 @@ class ServiceConfig(BaseModel):
     operator_timeout_seconds: float = Field(default=5.0, gt=0)
     shutdown_timeout_seconds: float = Field(default=5.0, gt=0)
     observation_interval_seconds: float = Field(default=5.0, gt=0)
+    #: Observation cadence of a settled stage session (tree observed quiescent, nothing of
+    #: ours running): it is only watched for external activity.
+    settled_observation_interval_seconds: float = Field(default=60.0, gt=0)
 
     @field_validator("owners")
     @classmethod

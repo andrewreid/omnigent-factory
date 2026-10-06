@@ -48,7 +48,9 @@ Outcome contract per effect kind (``Ack.detail`` keys are stable):
     interrupted/failed nodes. A receipt is never stop evidence; follow with ``SCAN_TREE``.
 ``SCAN_TREE``
     Complete recursive scan; ``detail``: ``complete``, ``busy``, ``pending_waiter``,
-    ``node_ids``, ``errors``, ``pending_elicitations``.
+    ``node_ids``, ``errors``, ``pending_elicitations``. A drain re-scans a busy tree back
+    to back, so a scan of a root whose latest read was not quiescent first waits until
+    ``rescan_min_interval_s`` after that read (a later read, never an older answer).
 ``REPLACE_COST_POLICY``
     New cost generation (threshold = inclusive subtree spend + $35 x granted hours),
     delete older generations, verify final set. ``detail``: ``grant_id``, ``generation``,
@@ -74,7 +76,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -108,6 +110,7 @@ from omnigent_factory.omnigent.directory import (
     OwnSend,
     StageSpec,
 )
+from omnigent_factory.omnigent.inventory import SessionIndex
 from omnigent_factory.omnigent.rest import (
     OmnigentReadError,
     OmnigentRest,
@@ -154,6 +157,8 @@ class OmnigentConfig:
     #: least this fraction of the model's context window (``last_total_tokens`` /
     #: ``context_window`` from the session snapshot; absent telemetry never replaces).
     context_rollover_ratio: float = 0.8
+    #: Least spacing of a ``SCAN_TREE`` after a non-quiescent read of the same root.
+    rescan_min_interval_s: float = 5.0
 
 
 def _message_texts(item: Mapping[str, Any]) -> list[str]:
@@ -206,6 +211,7 @@ class OmnigentExecutionAdapter:
         clock: Clock,
         broker_socket: Path,
         helper_command: str | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.rest = rest
         self.config = config
@@ -217,7 +223,12 @@ class OmnigentExecutionAdapter:
         self.clock = clock
         self.broker_socket = broker_socket
         self.helper_command = helper_command
+        self._sleep = sleep
         self._known_nodes: dict[str, set[str]] = {}
+        #: Archive-inclusive parent map shared by every scan (one incremental read each).
+        self._index = SessionIndex(rest, clock=clock)
+        #: Monotonic time of each root's latest scan that was not quiescent.
+        self._unquiet_at: dict[str, int] = {}
         #: Busy node IDs of each root's latest scan (named by the drain-timeout warning).
         self._busy_nodes: dict[str, tuple[str, ...]] = {}
         # Required safety policy, compiled now so a bad deployment input fails at wiring.
@@ -257,9 +268,16 @@ class OmnigentExecutionAdapter:
         tuple (agent, host, project, workspace, branch); ``SessionMatch`` carries less.
         """
         try:
+            # kind=default is exactly parent_session_id IS NULL (sqlalchemy_store.py:2866-2869
+            # @1c0153aa): roots only, the same rows the filter below keeps.
             rows = await self.rest.paginate(
                 "/v1/sessions",
-                {"kind": "any", "include_archived": "true", "visibility": "all", "order": "asc"},
+                {
+                    "kind": "default",
+                    "include_archived": "true",
+                    "visibility": "all",
+                    "order": "asc",
+                },
             )
         except OmnigentReadError as exc:
             return RetryableReadFailure(f"nonce search incomplete: {exc.reason}")
@@ -289,9 +307,17 @@ class OmnigentExecutionAdapter:
     async def observe_tree(self, root_id: str) -> TreeObservation:
         known = self._known_nodes.setdefault(root_id, {root_id})
         obs = await scan_tree(
-            self.rest, root_id, known_ids=tuple(known), max_nodes=self.config.max_tree_nodes
+            self.rest,
+            root_id,
+            known_ids=tuple(known),
+            max_nodes=self.config.max_tree_nodes,
+            index=self._index,
         )
         known.update(obs.nodes)
+        if obs.quiescent:
+            self._unquiet_at.pop(root_id, None)
+        else:
+            self._unquiet_at[root_id] = self.clock.monotonic_us()
         self._busy_nodes[root_id] = tuple(sorted(n.node_id for n in obs.nodes.values() if n.busy))
         return obs
 
@@ -742,6 +768,12 @@ class OmnigentExecutionAdapter:
         root = effect.args.get("root_id")
         if not isinstance(root, str):
             return DefinitiveFailure("no root to scan")
+        last = self._unquiet_at.get(root)
+        if last is not None:
+            wait_us = last + int(self.config.rescan_min_interval_s * 1e6)
+            wait_us -= self.clock.monotonic_us()
+            if wait_us > 0:
+                await self._sleep(wait_us / 1e6)
         obs = await self.observe_tree(root)
         return Ack(remote_id=root, detail=scan_detail(obs))
 

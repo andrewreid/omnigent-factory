@@ -14,6 +14,7 @@ from typing import Any
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.events import Event, Provenance
+from omnigent_factory.core.predicates import settled
 from omnigent_factory.core.types import DecisionSource, Parcel
 from omnigent_factory.omnigent.activity import ActivityTracker
 from omnigent_factory.omnigent.adapter import OmnigentExecutionAdapter
@@ -37,12 +38,17 @@ class OmnigentObserver:
         clock: Clock,
         *,
         interval_seconds: float,
+        settled_interval_seconds: float | None = None,
     ) -> None:
         self.service = service
         self.adapter = adapter
         self.directory = directory
         self.clock = clock
         self.interval_seconds = interval_seconds
+        #: A settled tree (observed quiescent, nothing of ours running) is only watched for
+        #: external activity, so it is read at this slower cadence; any other is every pass.
+        self.settled_interval_seconds = settled_interval_seconds or interval_seconds
+        self._settled_read_at: dict[str, int] = {}
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._trackers: dict[str, ActivityTracker] = {}
@@ -107,6 +113,8 @@ class OmnigentObserver:
         for parcel in await self._parcels():
             session = parcel.current_session
             if session is None or session.root_id is None or session.execution_closed:
+                continue
+            if not self._due(session.session_id, settled_now=settled(session)):
                 continue
             try:
                 await self._observe(parcel)
@@ -190,6 +198,17 @@ class OmnigentObserver:
                 f"crash:{session.session_id}",
             )
             self._crashed.add(session.session_id)
+
+    def _due(self, session_id: str, *, settled_now: bool) -> bool:
+        if not settled_now:
+            self._settled_read_at.pop(session_id, None)
+            return True
+        now = self.clock.monotonic_us()
+        last = self._settled_read_at.get(session_id)
+        if last is not None and now - last < self.settled_interval_seconds * 1e6:
+            return False
+        self._settled_read_at[session_id] = now
+        return True
 
     def _tracker(self, session_id: str, grant_id: str, baseline_us: int) -> ActivityTracker:
         tracker = self._trackers.get(session_id)

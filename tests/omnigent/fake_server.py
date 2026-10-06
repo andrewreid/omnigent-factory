@@ -304,6 +304,10 @@ class FakeOmnigentServer:
             for s in self.sessions.values()
             if (include_archived or not s.archived) and kind in ("any", s.kind)
         ]
+        # Sort column, then insertion order as the tiebreaker (routes_core.py:1320-1321).
+        rows.sort(key=lambda r: r[params.get("sort_by", "created_at")])
+        if params.get("order", "desc") == "desc":
+            rows.reverse()
         return self._page(rows, params)
 
     def _create(self, body: dict[str, Any], action: Any) -> httpx.Response:

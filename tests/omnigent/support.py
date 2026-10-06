@@ -60,6 +60,8 @@ class Rig:
     broker: LocalCredentialBroker
     adapter: OmnigentExecutionAdapter
     rest: OmnigentRest
+    #: Seconds the adapter slept (pacing); each sleep advances the fake clock instead.
+    sleeps: list[float] = field(default_factory=list)
 
 
 def make_rig(env: GitEnv, *, page_limit: int = 2, **config: Any) -> Rig:
@@ -78,6 +80,12 @@ def make_rig(env: GitEnv, *, page_limit: int = 2, **config: Any) -> Rig:
     rest = OmnigentRest("http://omnigent.test", transport=server.transport(), page_limit=page_limit)
     directory = Directory()
     ledger = MemoryOwnItemLedger(volatile_ok=True)
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock.advance(int(seconds * 1_000_000))
+
     adapter = OmnigentExecutionAdapter(
         rest=rest,
         config=OmnigentConfig(
@@ -90,8 +98,9 @@ def make_rig(env: GitEnv, *, page_limit: int = 2, **config: Any) -> Rig:
         identity=BOT,
         clock=clock,
         broker_socket=socket,
+        sleep=sleep,
     )
-    return Rig(env, server, directory, ledger, clock, broker, adapter, rest)
+    return Rig(env, server, directory, ledger, clock, broker, adapter, rest, sleeps)
 
 
 def spec(

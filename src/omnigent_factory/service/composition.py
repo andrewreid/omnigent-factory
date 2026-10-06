@@ -352,6 +352,7 @@ async def build_production(
         directory,
         clock,
         interval_seconds=config.observation_interval_seconds,
+        settled_interval_seconds=config.settled_observation_interval_seconds,
     )
     runtime = ProductionRuntime(
         service=service,
