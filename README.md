@@ -57,7 +57,9 @@ waits up to 90 s for it instead of failing.
 | `cleanup <parcel> [--merged]` | Remove a finished parcel's factory worktree(s) and local `factory/` branch from the factory clone. |
 | `release-delivery <guid>` | Release one parked webhook delivery for processing. |
 | `pause` / `unpause` | Stop / resume admitting new work repository-wide; in-flight parcels and safety events carry on. |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids` and `status_names`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
+| `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, the reconcile intervals and the retention windows; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.
@@ -206,6 +208,35 @@ local branch once every stage session has retired. Only paths under `worktree_ro
 touched; a worktree with uncommitted changes is kept unless the PR is merged; the local
 branch is deleted only when the PR is merged or its tip is the verified Ready head.
 Skipped items are logged. `cleanup` runs the same step by hand.
+
+### State database size
+
+The parcel aggregate (`parcels.aggregate_json`) is the state; events are history the
+reducer never replays. Retention runs every 15 minutes in the daemon, in short batches:
+
+| `[service]` key | Default | Removes |
+|---|---|---|
+| `observation_retention_hours` | `2` | Periodic observation events (`ReconcileDue`, `GitHubSnapshot`, delivery-keyed `ChecksChanged`, `ReadinessEvidence`, `TreeQuiescent`, cost/runtime samples, `CapacityAvailable`), their audit rows and the settled read/board-drift effects they spawned. |
+| `delivery_body_retention_days` | `1` | Body and headers of processed deliveries that no event, or only check/PR/review observations, references. The row and its GUID stay for duplicate detection. |
+| `completed_reconcile_interval_seconds` | `3600` | Not a deletion: a completed parcel with no live session or open decision is reconciled hourly instead of every `reconcile_interval_seconds`. |
+
+Never removed: each parcel's newest event of each kind (read back as current issue
+evidence and readiness), events referenced by authorizations, fences, approvals or
+decisions, acks of effects still pending/claimed/unknown, events whose effects are
+unsettled, carry a semantic dedupe key, are not reads/board-drift corrections or have a
+dispatch intent, own item or own send, and every control, comment, safety and
+session-lifecycle event. Deleted events have IDs that never recur (clock-stamped,
+one-shot effect acks, or webhook delivery GUIDs the inbox still dedupes), so a restart
+cannot re-apply one.
+
+Freed pages return to the filesystem only once the file uses incremental auto_vacuum
+(new files do). For an existing file, run once with the daemon stopped:
+
+```sh
+systemctl --user stop omnigent-factory
+omnigent-factory prune --dry-run && omnigent-factory prune && omnigent-factory vacuum
+systemctl --user start omnigent-factory
+```
 
 ### Logs
 

@@ -521,6 +521,24 @@ CREATE INDEX ix_events_delivery ON events (delivery_guid) WHERE delivery_guid IS
 ALTER TABLE deliveries ADD COLUMN body_pruned_at_us INTEGER;
 """
 
+# History retention.
+#
+# * ix_effects_event / ix_audit_event: pruning an old observation event finds the effects
+#   it spawned and its audit row without a scan (``foreign_keys=ON`` also probes
+#   ``effects.event_id`` on every event delete).
+# * ix_events_parcel_kind: retention keeps each parcel's newest event of a prunable kind
+#   (the directory reads the latest issue snapshot and readiness evidence back).
+# * applied_event_ids is no longer persisted: the store's ``events.logical_key`` check
+#   runs before the reducer, so the ever-growing set only bloated every aggregate write.
+V9_SQL = """
+CREATE INDEX ix_effects_event ON effects (event_id);
+CREATE INDEX ix_audit_event ON audit (event_id);
+CREATE INDEX ix_events_parcel_kind ON events (parcel_id, kind, sequence);
+UPDATE parcels
+    SET aggregate_json = json_set(aggregate_json, '$.parcel.applied_event_ids', json('[]'))
+    WHERE json_array_length(aggregate_json, '$.parcel.applied_event_ids') > 0;
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -530,4 +548,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(6, "mcp-feedback-reads", V6_SQL),
     Migration(7, "pr-review-comments", V7_SQL),
     Migration(8, "inbox-index-and-body-retention", V8_SQL),
+    Migration(9, "history-retention", V9_SQL),
 )

@@ -39,6 +39,10 @@ HOT_RELOAD_KEYS = frozenset(
         "triage_guidance",
         "engineering_guidance",
         "status_names",
+        "reconcile_interval_seconds",
+        "completed_reconcile_interval_seconds",
+        "delivery_body_retention_days",
+        "observation_retention_hours",
     }
 )
 
@@ -149,13 +153,22 @@ class ServiceConfig(BaseModel):
     webhook_max_bytes: int = Field(default=2 * 1024 * 1024, ge=1)
     operator_socket_name: str = "operator.sock"
     reconcile_interval_seconds: float = Field(default=120.0, gt=0)
+    #: Reconcile cadence of a completed parcel with no live session or open decision (a
+    #: missed reopen webhook is still caught, without a GitHub read every cycle).
+    completed_reconcile_interval_seconds: float = Field(default=3600.0, gt=0)
     clock_interval_seconds: float = Field(default=1.0, gt=0)
     effect_poll_seconds: float = Field(default=0.05, gt=0)
     #: Longest the delivery loop sleeps with nothing due. A committed webhook delivery or
     #: an operator release wakes it at once; this only bounds a missed wake-up.
     delivery_idle_poll_seconds: float = Field(default=5.0, gt=0)
-    #: Days a processed delivery keeps its body/headers when no event references it.
-    delivery_body_retention_days: float = Field(default=14.0, gt=0)
+    #: Days a processed delivery keeps its body/headers when nothing reads it back (no
+    #: event, or only check, pull-request and review observations, references it).
+    delivery_body_retention_days: float = Field(default=1.0, gt=0)
+    #: Hours periodic observation events (reconcile wake-ups, issue snapshots, check,
+    #: readiness and tree reads, cost/runtime samples) are kept with their settled read
+    #: effects and audit rows. Each parcel's newest event of each kind is always kept;
+    #: older ones are diagnostics only (aggregates never replay events).
+    observation_retention_hours: float = Field(default=2.0, gt=0)
     background_error_backoff_seconds: float = Field(default=0.05, gt=0)
     background_failure_limit: int = Field(default=10, ge=1)
     delivery_retry_backoff_seconds: float = Field(default=1.0, gt=0)

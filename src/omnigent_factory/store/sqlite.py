@@ -69,6 +69,60 @@ Reducer = Callable[[State, Event], TransitionResult]
 FaultHook = Callable[[str], None]
 
 
+#: Periodic observation kinds retention may delete, with the event-ID prefixes whose IDs
+#: never recur (a clock timestamp, a sequence-stamped wake-up, ``effect:<id>:<suffix>`` for
+#: a one-shot effect, or a webhook delivery GUID: delivery rows are never deleted, so a
+#: redelivery stays a duplicate at the inbox). ``ActiveTimeSample`` is excluded: its ID
+#: is a usage counter.
+PRUNABLE_OBSERVATIONS: dict[str, tuple[str, ...]] = {
+    EventKind.CHECKS_CHANGED.value: ("github:workflow_run:", "github:check_suite:"),
+    EventKind.RECONCILE_DUE.value: ("reconcile:",),
+    EventKind.GITHUB_SNAPSHOT.value: ("effect:", "startup-github:"),
+    EventKind.READINESS_EVIDENCE.value: ("effect:",),
+    EventKind.TREE_QUIESCENT.value: ("effect:", "tree:"),
+    EventKind.COST_SAMPLE.value: ("cost:",),
+    EventKind.RUNTIME_ACTIVITY.value: ("runtime:",),
+    EventKind.CAPACITY_AVAILABLE.value: ("capacity:",),
+}
+_PRUNABLE_KINDS_JSON = json.dumps(sorted(PRUNABLE_OBSERVATIONS))
+#: Events whose delivery body nothing reads back (the directory reads owner comments,
+#: decision answers and issue labels; check-run and pull-request payloads carry none).
+_BODY_UNREAD_KINDS_JSON = json.dumps(
+    sorted(
+        {
+            EventKind.CHECKS_CHANGED.value,
+            EventKind.PR_OBSERVED.value,
+            EventKind.REVIEW_CHANGED.value,
+        }
+    )
+)
+_SETTLED_EFFECT_STATES = frozenset({"done", "cancelled", "failed"})
+#: Effects pruned with their observation event: reads and board drift corrections, which
+#: nothing (operator retry/re-render, recovery) looks up once settled.
+_PRUNABLE_EFFECT_KINDS = frozenset(
+    {
+        EffectKind.RECONCILE_PARCEL.value,
+        EffectKind.RECONCILE_SESSION.value,
+        EffectKind.FETCH_PR_EVIDENCE.value,
+        EffectKind.SCAN_TREE.value,
+        EffectKind.SET_BOT.value,
+        EffectKind.SET_NOTE.value,
+    }
+)
+_AUTO_VACUUM_INCREMENTAL = 2
+
+
+@dataclass(frozen=True, slots=True)
+class PruneBatch:
+    """One :meth:`SqliteStore.prune_observations` step (counts deleted, or would be)."""
+
+    events: int
+    effects: int
+    audit: int
+    last_sequence: int
+    done: bool
+
+
 class StoreError(RuntimeError):
     pass
 
@@ -188,6 +242,18 @@ class Lease:
     epoch: int
 
 
+def _persisted(parcel: Parcel) -> Parcel:
+    """The aggregate as stored: without the reducer's in-memory duplicate set.
+
+    ``apply_event`` refuses a known ``events.logical_key`` before the reducer runs, so
+    persisting ``applied_event_ids`` (one entry per event ever applied) only grew every
+    aggregate write without bound.
+    """
+    if not parcel.applied_event_ids:
+        return parcel
+    return replace(parcel, applied_event_ids=frozenset())
+
+
 def _digest(text: str | None) -> str | None:
     if text is None:
         return None
@@ -232,6 +298,8 @@ class SqliteStore:
         conn = sqlite3.connect(str(path), isolation_level=None, timeout=busy_timeout_ms / 1000)
         conn.row_factory = sqlite3.Row
         try:
+            # Only takes effect on a new, empty file; an existing one switches in vacuum().
+            conn.execute(f"PRAGMA auto_vacuum={_AUTO_VACUUM_INCREMENTAL}")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA synchronous=FULL")
@@ -454,26 +522,187 @@ class SqliteStore:
         ).fetchall()
         return [(str(r[0]), r[1]) for r in rows]
 
-    def prune_delivery_bodies(self, before_us: int, *, limit: int = 500) -> int:
-        """Empty the body and headers of old processed deliveries no event references.
+    def prune_delivery_bodies(
+        self, before_us: int, *, limit: int = 500, dry_run: bool = False
+    ) -> int:
+        """Empty the body and headers of old processed deliveries nothing reads back.
 
         Only ``processed`` rows finished before ``before_us`` are touched, and never one an
-        event points at: the directory reads those bodies back as parcel context (owner
-        comments, decision answers, labels). The row, GUID and ``body_sha256`` stay, so
-        duplicate and recovery matching keep working. Returns the rows pruned (at most
-        ``limit``, one short transaction; call again until it returns fewer).
+        event outside :data:`_BODY_UNREAD_KINDS_JSON` points at: the directory reads those
+        bodies back as parcel context (owner comments, decision answers, labels). The row,
+        GUID and ``body_sha256`` stay, so duplicate and recovery matching keep working.
+        Returns the rows pruned (at most ``limit``, one short transaction; call again until
+        it returns fewer). ``dry_run`` counts every eligible row instead and changes nothing.
         """
+        eligible = (
+            "SELECT d.delivery_guid FROM deliveries d "
+            "WHERE d.status = 'processed' AND d.body_pruned_at_us IS NULL "
+            "AND COALESCE(d.processed_at_us, d.received_at_us) < ? "
+            "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.delivery_guid = d.delivery_guid "
+            "AND e.kind NOT IN (SELECT value FROM json_each(?)))"
+        )
+        checks = _BODY_UNREAD_KINDS_JSON
+        if dry_run:
+            row = self._conn.execute(
+                f"SELECT COUNT(*) FROM ({eligible})", (before_us, checks)
+            ).fetchone()
+            return int(row[0])
         with self._txn() as conn:
             cur = conn.execute(
                 "UPDATE deliveries SET body = X'', headers_json = '{}', body_pruned_at_us = ? "
-                "WHERE delivery_guid IN (SELECT d.delivery_guid FROM deliveries d "
-                "WHERE d.status = 'processed' AND d.body_pruned_at_us IS NULL "
-                "AND COALESCE(d.processed_at_us, d.received_at_us) < ? "
-                "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.delivery_guid = d.delivery_guid) "
-                "LIMIT ?)",
-                (self._clock.now_utc_us(), before_us, limit),
+                f"WHERE delivery_guid IN ({eligible} LIMIT ?)",
+                (self._clock.now_utc_us(), before_us, checks, limit),
             )
         return cur.rowcount
+
+    def prune_observations(
+        self,
+        before_us: int,
+        *,
+        after_sequence: int = 0,
+        limit: int = 500,
+        dry_run: bool = False,
+    ) -> PruneBatch:
+        """Delete old periodic observation events with their settled effects and audit rows.
+
+        Scans up to ``limit`` events after ``after_sequence`` (keyset: pass the returned
+        ``last_sequence`` back until ``done``) that were applied before ``before_us`` and
+        whose kind and event ID are in :data:`PRUNABLE_OBSERVATIONS`: IDs that never recur
+        (a timestamp or a one-shot effect ack), so losing their duplicate check is safe. A
+        candidate is kept when it is the parcel's newest event of its kind (read back as
+        current evidence), another table references it, it acknowledges an effect that is
+        not settled (startup recovery looks the ack up), or it spawned an effect that is
+        unsettled, not a read or board drift correction, carries a semantic dedupe key, or
+        is referenced by an idempotency row.
+        Aggregates never replay events, so nothing else depends on them. One short
+        transaction per call; ``dry_run`` reports the same counts and deletes nothing.
+        """
+        rows = self._conn.execute(
+            "SELECT event_id, parcel_id, kind, sequence FROM events "
+            "WHERE sequence > ? AND kind IN (SELECT value FROM json_each(?)) "
+            "AND applied_at_us < ? ORDER BY sequence LIMIT ?",
+            (after_sequence, _PRUNABLE_KINDS_JSON, before_us, limit),
+        ).fetchall()
+        if not rows:
+            return PruneBatch(0, 0, 0, after_sequence, done=True)
+        last = int(rows[-1]["sequence"])
+        unsettled = {
+            str(r[0])
+            for r in self._conn.execute(
+                "SELECT effect_id FROM effects WHERE state IN ('pending', 'claimed', 'unknown')"
+            )
+        }
+        newest: dict[tuple[str | None, str], int] = {}
+        candidates: list[str] = []
+        for r in rows:
+            event_id, kind = str(r["event_id"]), str(r["kind"])
+            if not event_id.startswith(PRUNABLE_OBSERVATIONS[kind]):
+                continue
+            if event_id.startswith("effect:") and event_id[7:].rpartition(":")[0] in unsettled:
+                continue
+            key = (r["parcel_id"], kind)
+            if key not in newest:
+                top = self._conn.execute(
+                    "SELECT MAX(sequence) FROM events WHERE parcel_id IS ? AND kind = ?", key
+                ).fetchone()
+                newest[key] = int(top[0])
+            if int(r["sequence"]) < newest[key]:
+                candidates.append(event_id)
+        ids = codec.dumps(candidates)
+        keep = {
+            str(r[0])
+            for r in self._conn.execute(
+                "SELECT source_event_id FROM stage_authorizations "
+                "WHERE source_event_id IN (SELECT value FROM json_each(:ids)) "
+                "UNION SELECT cause_event_id FROM fences "
+                "WHERE cause_event_id IN (SELECT value FROM json_each(:ids)) "
+                "UNION SELECT cleared_by_event_id FROM fences "
+                "WHERE cleared_by_event_id IN (SELECT value FROM json_each(:ids)) "
+                "UNION SELECT source_event_id FROM approvals "
+                "WHERE source_event_id IN (SELECT value FROM json_each(:ids)) "
+                "UNION SELECT answer_event_id FROM decisions "
+                "WHERE answer_event_id IN (SELECT value FROM json_each(:ids))",
+                {"ids": ids},
+            )
+        }
+        effects: dict[str, list[str]] = {}
+        for r in self._conn.execute(
+            "SELECT f.effect_id, f.event_id, f.kind, f.state, f.dedupe_key, "
+            "EXISTS (SELECT 1 FROM dispatch_intents i WHERE i.effect_id = f.effect_id) "
+            "OR EXISTS (SELECT 1 FROM own_items o WHERE o.effect_id = f.effect_id) "
+            "OR EXISTS (SELECT 1 FROM own_sends s WHERE s.effect_id = f.effect_id) AS held "
+            "FROM effects f WHERE f.event_id IN (SELECT value FROM json_each(?))",
+            (ids,),
+        ):
+            event_id = str(r["event_id"])
+            if (
+                r["state"] not in _SETTLED_EFFECT_STATES
+                or r["kind"] not in _PRUNABLE_EFFECT_KINDS
+                or r["dedupe_key"] != r["effect_id"]
+                or r["held"]
+            ):
+                keep.add(event_id)
+            effects.setdefault(event_id, []).append(str(r["effect_id"]))
+        doomed = [e for e in candidates if e not in keep]
+        doomed_effects = [f for e in doomed for f in effects.get(e, ())]
+        audit = 0
+        if doomed and not dry_run:
+            doomed_json = codec.dumps(doomed)
+            with self._txn() as conn:
+                conn.execute(
+                    "DELETE FROM effects WHERE effect_id IN (SELECT value FROM json_each(?))",
+                    (codec.dumps(doomed_effects),),
+                )
+                audit = conn.execute(
+                    "DELETE FROM audit WHERE event_id IN (SELECT value FROM json_each(?))",
+                    (doomed_json,),
+                ).rowcount
+                conn.execute(
+                    "DELETE FROM events WHERE event_id IN (SELECT value FROM json_each(?))",
+                    (doomed_json,),
+                )
+        elif doomed:
+            audit = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) FROM audit WHERE event_id IN (SELECT value FROM json_each(?))",
+                    (codec.dumps(doomed),),
+                ).fetchone()[0]
+            )
+        return PruneBatch(len(doomed), len(doomed_effects), audit, last, done=len(rows) < limit)
+
+    def incremental_vacuum(self, pages: int) -> int:
+        """Return up to ``pages`` free pages to the filesystem (incremental auto_vacuum only).
+
+        Returns the free pages left. A no-op (0 work) unless :meth:`vacuum` enabled
+        ``auto_vacuum=INCREMENTAL``.
+        """
+        if int(self._conn.execute("PRAGMA auto_vacuum").fetchone()[0]) == _AUTO_VACUUM_INCREMENTAL:
+            self._conn.execute(f"PRAGMA incremental_vacuum({int(pages)})").fetchall()
+        return int(self._conn.execute("PRAGMA freelist_count").fetchone()[0])
+
+    def vacuum(self) -> None:
+        """Rebuild the file compactly and switch it to incremental auto_vacuum.
+
+        Takes the write lock for the whole rebuild: run it only with the daemon stopped.
+        Afterwards the periodic sweep returns freed pages with :meth:`incremental_vacuum`.
+        """
+        self._conn.execute(f"PRAGMA auto_vacuum={_AUTO_VACUUM_INCREMENTAL}")
+        self._conn.execute("VACUUM")
+        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+        self._parcel_cache.clear()
+
+    def storage_stats(self) -> dict[str, int]:
+        """Page accounting of the main database file (for operator reports)."""
+
+        def pragma(name: str) -> int:
+            return int(self._conn.execute(f"PRAGMA {name}").fetchone()[0])
+
+        page_size = pragma("page_size")
+        return {
+            "bytes": pragma("page_count") * page_size,
+            "free_bytes": pragma("freelist_count") * page_size,
+            "auto_vacuum": pragma("auto_vacuum"),
+        }
 
     def mark_delivery(self, delivery_guid: str, status: str) -> None:
         with self._txn() as conn:
@@ -689,6 +918,8 @@ class SqliteStore:
         old_parcel = parcel
         result = reducer(State(parcel=parcel, admission=admission, config=config), event)
         new = result.state
+        if new.parcel is not None:
+            new = replace(new, parcel=_persisted(new.parcel))
         self._check_caps(admission, new.admission, config)
         seq_row = conn.execute("SELECT COALESCE(MAX(sequence), 0) + 1 AS s FROM events")
         sequence = int(seq_row.fetchone()["s"])
@@ -735,7 +966,7 @@ class SqliteStore:
             (
                 event.parcel_id,
                 event.event_id,
-                _digest(codec.parcel_to_json(old_parcel)) if old_parcel else None,
+                _digest(codec.parcel_to_json(_persisted(old_parcel))) if old_parcel else None,
                 _digest(codec.parcel_to_json(new.parcel)) if new.parcel else None,
                 int(result.audit.accepted),
                 result.audit.reason,
@@ -813,7 +1044,7 @@ class SqliteStore:
                 p.pending_authorization_id,
                 codec.dumps(sorted(h.value for h in p.holds)),
                 p.bot.value,
-                codec.parcel_to_json(p),
+                codec.parcel_to_json(_persisted(p)),
                 now,
             ),
         )

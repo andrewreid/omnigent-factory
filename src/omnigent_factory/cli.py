@@ -10,8 +10,9 @@ import secrets
 import socket
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 
@@ -21,8 +22,10 @@ from omnigent_factory.service.app import create_app
 from omnigent_factory.service.composition import build_production
 from omnigent_factory.service.config import ServiceConfig, load_config
 from omnigent_factory.service.doctor import run_doctor
+from omnigent_factory.service.locking import AlreadyRunning, ProcessLock
 from omnigent_factory.service.operator import operator_request
 from omnigent_factory.service.redaction import configure_logging
+from omnigent_factory.service.runtime import prune_history
 from omnigent_factory.service.setup import OperationsRenderer, write_rendered
 from omnigent_factory.store.sqlite import SqliteStore
 
@@ -91,6 +94,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rerender.add_argument("effect")
     _config_arg(rerender)
+    prune = sub.add_parser(
+        "prune",
+        help="apply history retention now (through the daemon when it runs, else directly)",
+    )
+    prune.add_argument(
+        "--dry-run", action="store_true", help="report what would be removed; change nothing"
+    )
+    _config_arg(prune)
+    vacuum = sub.add_parser(
+        "vacuum",
+        help="compact the state database and enable incremental auto_vacuum (daemon stopped)",
+    )
+    _config_arg(vacuum)
 
     setup = sub.add_parser("setup", help="render or validate owner-applied setup artifacts")
     setup_sub = setup.add_subparsers(dest="setup_command", required=True)
@@ -122,8 +138,9 @@ def _operator(
     *,
     startup_wait_seconds: float = 90.0,
 ) -> int:
-    # Re-rendering reads, edits and re-verifies a GitHub comment: allow more time.
-    timeout = 60.0 if command in ("rerender-comment", "cleanup") else 5.0
+    # Re-rendering reads, edits and re-verifies a GitHub comment: allow more time; a
+    # first prune of a large history runs many batches.
+    timeout = {"rerender-comment": 60.0, "cleanup": 60.0, "prune": 900.0}.get(command, 5.0)
     deadline = time.monotonic() + startup_wait_seconds
     waiting = False
     while True:
@@ -185,6 +202,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _operator(config, "rerender-comment", {"effect": args.effect})
     if args.command == "retry-effect":
         return _operator(config, "retry-effect", {"effect": args.effect})
+    if args.command == "prune":
+        return _prune(config, dry_run=args.dry_run)
+    if args.command == "vacuum":
+        return _vacuum(config)
     if args.command == "setup" and args.setup_command == "mcp-token":
         path, created = ensure_mcp_token(config)
         print(f"{'created' if created else 'exists'}: {path}")
@@ -236,6 +257,57 @@ async def _serve(config: ServiceConfig, config_path: Path | None = None) -> None
         if production.service.ready or production.service._tasks:
             await production.service.stop()
         production.service.process_lock.close()
+
+
+def _prune(config: ServiceConfig, *, dry_run: bool) -> int:
+    """Retention now: via the running daemon (sole writer), else on the file directly."""
+    lock = ProcessLock(config.state_dir)
+    try:
+        lock.acquire()
+    except AlreadyRunning:
+        return _operator(config, "prune", {"dry_run": dry_run}, startup_wait_seconds=0.0)
+    try:
+        store = SqliteStore.open(config.database_path, SystemClock())
+        try:
+
+            async def call(operation: Callable[[SqliteStore], Any]) -> Any:  # noqa: ANN401
+                return operation(store)
+
+            before = store.storage_stats()
+            result: dict[str, object] = dict(
+                asyncio.run(
+                    prune_history(call, config, SystemClock().now_utc_us(), dry_run=dry_run)
+                )
+            )
+            result.update(ok=True, dry_run=dry_run, before=before, after=store.storage_stats())
+        finally:
+            store.close()
+    finally:
+        lock.close()
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def _vacuum(config: ServiceConfig) -> int:
+    """Rebuild the file compactly; refuses while the daemon holds its process lock."""
+    lock = ProcessLock(config.state_dir)
+    try:
+        lock.acquire()
+    except AlreadyRunning as exc:
+        print(f"{exc}; stop the daemon before vacuum", file=sys.stderr)
+        return 1
+    try:
+        store = SqliteStore.open(config.database_path, SystemClock())
+        try:
+            before = store.storage_stats()
+            store.vacuum()
+            after = store.storage_stats()
+        finally:
+            store.close()
+    finally:
+        lock.close()
+    print(json.dumps({"ok": True, "before": before, "after": after}, indent=2, sort_keys=True))
+    return 0
 
 
 def listener_sockets(config: ServiceConfig) -> list[socket.socket]:

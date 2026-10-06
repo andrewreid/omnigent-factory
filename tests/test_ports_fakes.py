@@ -167,4 +167,4 @@ def test_cli_version_and_db_init(tmp_path, capsys):
     assert cli.main(["version"]) == 0
     assert capsys.readouterr().out.strip() == "0.1.0"
     assert cli.main(["db", "init", str(tmp_path / "s.db")]) == 0
-    assert "schema version 8" in capsys.readouterr().out
+    assert "schema version 9" in capsys.readouterr().out

@@ -22,9 +22,11 @@ from omnigent_factory.core.effects import (
     RetryClass,
 )
 from omnigent_factory.core.events import Event, Provenance
+from omnigent_factory.core.predicates import settled
 from omnigent_factory.core.types import (
     MICROS_PER_MINUTE,
     AdmissionSnapshot,
+    Hold,
     InboxHoldReason,
     Lifecycle,
     Parcel,
@@ -58,6 +60,7 @@ from omnigent_factory.store.sqlite import (
     ApplyResult,
     DeliveryOutcome,
     DeliveryRecord,
+    PruneBatch,
     SqliteStore,
     StoredEffect,
 )
@@ -78,8 +81,12 @@ RERENDERABLE_KINDS = frozenset(
 
 #: Delivery-loop cadence while a delivery is due now but left pending by its pass.
 DELIVERY_BUSY_POLL_SECONDS = 0.05
-#: How often the clock loop sweeps old processed delivery bodies.
-RETENTION_SWEEP_INTERVAL_SECONDS = 3600.0
+#: How often the clock loop runs the history retention sweep (delivery bodies, old
+#: observation events).
+RETENTION_SWEEP_INTERVAL_SECONDS = 900.0
+#: Observation batches (500 events each) one periodic sweep deletes at most, so the clock
+#: loop is never held for long; a large backlog drains over several sweeps.
+RETENTION_SWEEP_MAX_BATCHES = 20
 
 RETRYABLE_PUBLICATION_KINDS = frozenset(
     {
@@ -617,13 +624,25 @@ class FactoryService:
         )
 
     async def _reconcile_loop(self) -> None:
-        # Startup reconciliation occurs immediately, then on the configured cadence.
+        # Startup reconciliation occurs immediately, then on the configured cadence; a
+        # completed, idle parcel only every completed_reconcile_interval_seconds.
         failures = 0
+        last_at: dict[str, float] = {}
         while not self._stop.is_set():
             try:
                 now = self.clock.now_utc_us()
                 parcel_ids = await self._parcel_ids()
                 for parcel_id in parcel_ids:
+                    loop_now = asyncio.get_running_loop().time()
+                    previous = last_at.get(parcel_id)
+                    if (
+                        previous is not None
+                        and loop_now - previous < self.config.completed_reconcile_interval_seconds
+                    ):
+                        parcel = await self.db.call(partial(_load_parcel, parcel_id=parcel_id))
+                        if parcel is not None and _completed_idle(parcel):
+                            continue
+                    last_at[parcel_id] = loop_now
                     await self.apply_event(
                         self._event(
                             parcel_id,
@@ -650,10 +669,10 @@ class FactoryService:
                 if self._next_retention_at is None or loop_now >= self._next_retention_at:
                     self._next_retention_at = loop_now + RETENTION_SWEEP_INTERVAL_SECONDS
                     try:
-                        await self.prune_delivery_bodies()
+                        await self.prune_history(max_batches=RETENTION_SWEEP_MAX_BATCHES)
                     except Exception:
                         # Housekeeping only: retried next sweep, never a clock-loop failure.
-                        LOG.warning("delivery body retention sweep failed")
+                        LOG.warning("history retention sweep failed")
                 failures = 0
                 await self._wait(self.config.clock_interval_seconds)
             except asyncio.CancelledError:
@@ -663,19 +682,21 @@ class FactoryService:
 
     async def prune_delivery_bodies(self) -> int:
         """Empty bodies of processed deliveries past retention, in short batches."""
-        retention_us = int(self.config.delivery_body_retention_days * 86_400 * 1_000_000)
-        before_us = self.clock.now_utc_us() - retention_us
-        pruned = 0
-        while True:
-            batch = await self.db.call(
-                lambda store: store.prune_delivery_bodies(before_us, limit=100)
-            )
-            pruned += batch
-            if batch < 100:
-                break
-        if pruned:
-            LOG.info("delivery bodies pruned count=%s", pruned)
-        return pruned
+        return await prune_delivery_bodies(
+            self.db.call, self.config, self.clock.now_utc_us(), dry_run=False
+        )
+
+    async def prune_history(
+        self, *, dry_run: bool = False, max_batches: int | None = None
+    ) -> dict[str, int]:
+        """One retention sweep (see :func:`prune_history`)."""
+        return await prune_history(
+            self.db.call,
+            self.config,
+            self.clock.now_utc_us(),
+            dry_run=dry_run,
+            max_batches=max_batches,
+        )
 
     async def _sample_clock(self, parcel: Parcel) -> None:
         await self._expire_drains(parcel)
@@ -796,6 +817,8 @@ class FactoryService:
             return await self._explain(parcel_id)
         if command == "recovery":
             return await self._recovery()
+        if command == "prune":
+            return await self.prune_history(dry_run=bool(args.get("dry_run", False)))
         if command == "resume":
             parcel_id = str(args.get("parcel", ""))
             text = str(args.get("message", ""))
@@ -1082,6 +1105,98 @@ def _has_own_pr(parcel: Parcel | None, admission: AdmissionSnapshot) -> bool:
         r.parcel_id == parcel.parcel_id and r.kind == ReservationKind.OPEN_PR and r.live
         for r in admission.reservations
     )
+
+
+def _completed_idle(parcel: Parcel) -> bool:
+    """Completed, with no live session or open decision: nothing a reconcile can advance."""
+    session = parcel.current_session
+    return (
+        Hold.COMPLETED in parcel.holds
+        and (session is None or settled(session))
+        and not parcel.open_decisions
+    )
+
+
+StoreCall = Callable[[Callable[[SqliteStore], Any]], Awaitable[Any]]
+
+
+async def prune_delivery_bodies(
+    call: StoreCall, config: ServiceConfig, now_us: int, *, dry_run: bool = False
+) -> int:
+    """Empty bodies of processed deliveries past retention (``dry_run``: count them)."""
+    before_us = now_us - int(config.delivery_body_retention_days * 86_400 * 1_000_000)
+    if dry_run:
+        return int(await call(lambda store: store.prune_delivery_bodies(before_us, dry_run=True)))
+    pruned = 0
+    while True:
+        batch = int(await call(lambda store: store.prune_delivery_bodies(before_us, limit=100)))
+        pruned += batch
+        if batch < 100:
+            break
+    if pruned:
+        LOG.info("delivery bodies pruned count=%s", pruned)
+    return pruned
+
+
+async def prune_history(
+    call: StoreCall,
+    config: ServiceConfig,
+    now_us: int,
+    *,
+    dry_run: bool = False,
+    max_batches: int | None = None,
+) -> dict[str, int]:
+    """One retention sweep: delivery bodies, then old observation events.
+
+    Each batch is its own short transaction, so live work interleaves on the DB worker.
+    ``max_batches`` bounds the observation batches (a large backlog then drains over
+    several sweeps). Freed pages go back to the filesystem when the file uses incremental
+    auto_vacuum.
+    """
+    bodies = await prune_delivery_bodies(call, config, now_us, dry_run=dry_run)
+    before_us = now_us - int(config.observation_retention_hours * 3600 * 1_000_000)
+    totals = await prune_observations(call, before_us, dry_run=dry_run, max_batches=max_batches)
+    if not dry_run:
+        free_pages = -1
+        while True:
+            left = int(await call(lambda store: store.incremental_vacuum(1000)))
+            if left in (0, free_pages):
+                break
+            free_pages = left
+    result = {"delivery_bodies": bodies, **totals}
+    if not dry_run and any(result.values()):
+        LOG.info("history pruned %s", " ".join(f"{k}={v}" for k, v in result.items()))
+    return result
+
+
+async def prune_observations(
+    call: StoreCall,
+    before_us: int,
+    *,
+    dry_run: bool = False,
+    limit: int = 500,
+    max_batches: int | None = None,
+) -> dict[str, int]:
+    """Run :meth:`SqliteStore.prune_observations` batches to the end (or ``max_batches``)."""
+    totals = {"events": 0, "effects": 0, "audit": 0}
+    after = 0
+    batches = 0
+    while True:
+        step = partial(
+            SqliteStore.prune_observations,
+            before_us=before_us,
+            after_sequence=after,
+            limit=limit,
+            dry_run=dry_run,
+        )
+        batch: PruneBatch = await call(step)
+        totals["events"] += batch.events
+        totals["effects"] += batch.effects
+        totals["audit"] += batch.audit
+        batches += 1
+        if batch.done or (max_batches is not None and batches >= max_batches):
+            return totals
+        after = batch.last_sequence
 
 
 def _admission_signature(
