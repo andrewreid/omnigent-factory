@@ -33,6 +33,8 @@ HOT_RELOAD_KEYS = frozenset(
         "drain_timeout_minutes",
         "cost_backstop_usd_per_hour",
         "review_bot_grace_minutes",
+        "review_bot_ack_minutes",
+        "review_bot_max_wait_minutes",
         "review_bot_login",
         "review_bot_mention",
         "independent_reviewer_ids",
@@ -142,6 +144,13 @@ class ServiceConfig(BaseModel):
     #: applies only while it can still respond (it has not answered the head, or was
     #: re-pinged since its last answer).
     review_bot_grace_minutes: int = Field(default=10, ge=0, le=120)
+    #: With ``review_bot_login`` set, the bot's 👀 ("reviewing") reaction decides the wait
+    #: instead: minutes after a trigger (push, PR open, re-ping) it gets to show 👀 or
+    #: answer; with neither, the wait ends.
+    review_bot_ack_minutes: int = Field(default=5, ge=0, le=120)
+    #: Minutes after a trigger a bot showing 👀 (or whose state cannot be read) is waited
+    #: for at most; its answer ends the wait at once.
+    review_bot_max_wait_minutes: int = Field(default=45, ge=0, le=720)
     #: The review bot's GitHub login ("" = unknown: the grace always applies).
     review_bot_login: str = "chatgpt-codex-connector[bot]"
     #: The mention that asks the review bot for a (re-)review.
@@ -286,6 +295,8 @@ class ServiceConfig(BaseModel):
             grace_us=self.checkpoint_grace_minutes * MICROS_PER_MINUTE,
             cost_usd_per_hour_micros=self.cost_backstop_usd_per_hour * 1_000_000,
             review_grace_us=self.review_bot_grace_minutes * MICROS_PER_MINUTE,
+            review_ack_us=self.review_bot_ack_minutes * MICROS_PER_MINUTE,
+            review_cap_us=self.review_bot_max_wait_minutes * MICROS_PER_MINUTE,
         )
 
     def prepare_private_directories(self) -> None:

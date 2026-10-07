@@ -142,3 +142,98 @@ async def test_unanswered_ping_after_the_push_is_the_trigger():
     pinged = OPENED_US + 300 * S
     handler = server(comments=[comment("@codex review", pinged)])
     assert await pending(handler) == pinged
+
+
+# ------------------------------------------------------- 👀 while reviewing (#799)
+
+
+def eyes_server(comment_reactions: Any = None, **kw: Any):
+    """``server`` plus the reactions of issue comment 42 (a list, or an HTTP status)."""
+    base = server(**kw)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/issues/comments/42/reactions"):
+            if isinstance(comment_reactions, int):
+                return httpx.Response(comment_reactions, json={"message": "Not Found"})
+            return httpx.Response(200, json=comment_reactions or [])
+        return base(request)
+
+    return handler
+
+
+async def eyes_of(handler: Any) -> tuple[int | None, str]:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        gh: GitHubAPIAdapter = adapter(http, review_bot_login=CODEX, review_bot_mention="@codex")
+        since = await gh._review_bot_pending_since(PR, 686, HEAD)
+        return since, gh._last_bot_eyes
+
+
+def eyes(when: int, login: str = CODEX) -> dict[str, Any]:
+    return {"user": {"login": login}, "content": "eyes", "created_at": at(when)}
+
+
+@pytest.mark.asyncio
+async def test_eyes_on_the_pr_after_the_push_are_seen():
+    since, state = await eyes_of(eyes_server(reactions=[eyes(OPENED_US + 20 * S)]))
+    assert (since, state) == (OPENED_US, "seen")
+
+
+@pytest.mark.asyncio
+async def test_eyes_before_the_trigger_or_by_someone_else_are_absent():
+    old = eyes(OPENED_US - 60 * S)
+    person = eyes(OPENED_US + 20 * S, login="andrewreid")
+    since, state = await eyes_of(eyes_server(reactions=[old, person]))
+    assert (since, state) == (OPENED_US, "absent")
+
+
+@pytest.mark.asyncio
+async def test_eyes_on_the_re_ping_comment_are_seen():
+    """#799: Rosie's `@codex review` after the push got Codex's 👀, then nothing for 14
+    minutes: it was still reviewing."""
+    pinged = OPENED_US + 900 * S
+    ping = {**comment("@codex review", pinged, login="molly-omnigent-factory[bot]"), "id": 42}
+    handler = eyes_server(
+        comment_reactions=[eyes(pinged + 5 * S)],
+        reviews=[review(HEAD, OPENED_US + 149 * S)],
+        comments=[ping],
+        reactions=[eyes(OPENED_US + 10 * S)],  # the PR-open review's 👀: before the ping
+    )
+    assert await eyes_of(handler) == (pinged, "seen")
+
+
+@pytest.mark.asyncio
+async def test_unreadable_ping_reactions_are_unknown_and_answers_need_no_eyes():
+    pinged = OPENED_US + 900 * S
+    ping = {**comment("@codex review", pinged), "id": 42}
+    handler = eyes_server(comment_reactions=404, comments=[ping])
+    assert await eyes_of(handler) == (pinged, "unknown")
+    answered = eyes_server(reviews=[review(HEAD, OPENED_US + 149 * S)])
+    assert await eyes_of(answered) == (0, "")
+    assert await eyes_of(eyes_server(commit_status=404)) == (None, "unknown")
+
+
+def test_codex_finding_threads_carry_path_severity_title_and_link():
+    from omnigent_factory.github.adapter import _finding_ref
+
+    body = (
+        "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub>"
+        "</sub>  Keep the delivery row when the retry fails**\n\nThe retry deletes ..."
+    )
+    thread = {
+        "path": "api/src/export.ts",
+        "comments": {"nodes": [{"body": body, "url": "https://github.com/o/r/pull/1#r1"}]},
+    }
+    ref = _finding_ref(thread)
+    assert (ref.path, ref.severity, ref.title, ref.url) == (
+        "api/src/export.ts",
+        "P1",
+        "Keep the delivery row when the retry fails",
+        "https://github.com/o/r/pull/1#r1",
+    )
+    plain = _finding_ref({"comments": {"nodes": [{"body": "Consider a guard here", "url": ""}]}})
+    assert (plain.path, plain.severity, plain.title, plain.url) == (
+        "",
+        "",
+        "Consider a guard here",
+        "",
+    )

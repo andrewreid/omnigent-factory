@@ -148,3 +148,47 @@ async def test_thread_read_records_the_review_bots_finding_commits():
         gh: GitHubAPIAdapter = adapter(http, review_bot_login=CODEX)
         assert await gh._bot_threads_settled(686) is True
         assert gh._last_bot_thread_commits == (HEAD, HEAD)
+
+
+@pytest.mark.asyncio
+async def test_thread_read_lists_every_open_bot_thread_and_earlier_rounds():
+    """#799: the owner's Needs you comment names each open thread (the read no longer
+    stops at the first one)."""
+    old = "11d5cfae" + "0" * 32
+    badge = "**<sub><sub>![P{n} Badge](https://img.shields.io/badge/P{n}-red)</sub></sub> {t}**"
+
+    def thread(n: int, title: str, oid: str, replied: bool) -> dict[str, Any]:
+        first = {
+            "author": {"__typename": "Bot", "login": "chatgpt-codex-connector"},
+            "originalCommit": {"oid": oid},
+            "body": badge.format(n=n, t=title) + "\n\nWhy ...",
+            "url": f"https://github.com/o/r/pull/799#discussion_r{n}",
+        }
+        reply = {"author": {"__typename": "Bot", "databaseId": BOT_ID}}
+        nodes = [first, reply] if replied else [first]
+        return {
+            "isResolved": False,
+            "resolvedBy": None,
+            "path": f"api/f{n}.ts",
+            "comments": {"nodes": nodes},
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nodes = [
+            thread(2, "Earlier, answered", old, True),
+            thread(1, "First open", HEAD, False),
+            thread(0, "Second open", HEAD, False),
+        ]
+        page = {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}
+        return httpx.Response(
+            200, json={"data": {"repository": {"pullRequest": {"reviewThreads": page}}}}
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        gh: GitHubAPIAdapter = adapter(http, review_bot_login=CODEX)
+        assert await gh._bot_threads_settled(799) is False
+        assert [(f.path, f.severity, f.title) for f in gh._last_open_findings] == [
+            ("api/f1.ts", "P1", "First open"),
+            ("api/f0.ts", "P0", "Second open"),
+        ]
+        assert gh._last_bot_thread_commits == (old, HEAD, HEAD)

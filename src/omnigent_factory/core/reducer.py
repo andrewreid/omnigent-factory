@@ -2006,6 +2006,10 @@ def _h_column_observed(ctx: _Ctx, body: ev.ColumnObserved) -> None:
         if body.stage != move.to_stage:
             raise Rejected("ack-target-mismatch")
         _retire_move(ctx, move, landed=True)
+        if _late_findings_wake_due(ctx):
+            r = ctx.p.readiness
+            assert r is not None  # noqa: S101 - checked by _late_findings_wake_due
+            _fetch_evidence(ctx, r)  # the read that wakes the re-opened run
         return
     if body.stage is None:
         raise Rejected("column-observation-without-stage")
@@ -2179,6 +2183,10 @@ def _h_review_changed(ctx: _Ctx, body: ev.ReviewChanged) -> None:
         _invalidate_ready(ctx, "review-changed")  # the owner asks for rework
     elif body.head_sha and body.head_sha != r.head_sha:
         _fetch_evidence(ctx, r)  # e.g. an approval of a newer head: re-read, never rework
+    elif _awaiting_evidence(ctx):
+        # E.g. the review bot's answer while it is waited for, or late findings on a Ready
+        # card (#799): judged from a fresh read now, not at the next reconcile.
+        _fetch_evidence(ctx, r)
     # Otherwise an observation only: a review never authorizes a new work episode.
 
 
@@ -2209,7 +2217,9 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
     if body.read_started_us > r.read_started_us:
         r = replace(r, read_started_us=body.read_started_us)
         ctx.update(readiness=r)
-    r = _review_bot_window(ctx, r, body.review_bot_pending_since_us, body.review_bot_verdict)
+    r = _review_bot_window(
+        ctx, r, body.review_bot_pending_since_us, body.review_bot_verdict, body.review_bot_eyes
+    )
     if body.remediation_exhausted:
         ctx.hold(Hold.REMEDIATION_EXHAUSTED)
     r = _restore_withdrawn(ctx, r, body)
@@ -2243,17 +2253,23 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
                 _mark_red(ctx, r, body)
                 _refresh_ready_report(ctx, body.checks_summary)
                 return
-            ctx.hold(Hold.READINESS_FAILED)
+            if _reopen_for_late_findings(ctx, r, body):
+                return
             reason = (
                 "readiness-unverified"
                 if body.checks is None
                 else _failure_reason(r, body, ctx.p.issue_number)
             )
+            if Hold.READINESS_FAILED not in ctx.p.holds and body.checks is not None:
+                _needs_you_comment(ctx, r, body, reason)
+            ctx.hold(Hold.READINESS_FAILED)
             _invalidate_ready(ctx, reason)
             return
         if body.checks is None or not body.pr_open:
             ctx.hold(Hold.READINESS_FAILED)  # legacy read or closed PR: owner decides
             return
+        if _reopen_for_late_findings(ctx, r, body):
+            r = ctx.p.readiness or r  # the withdrawn card's run waits again: wake it below
         _not_ready(ctx, r, body)
         return
     if in_ready and body.remediation_exhausted:
@@ -2547,29 +2563,169 @@ def _settle_at(ctx: _Ctx, head: str) -> int:
     return ctx.now + ctx.config.review_grace_us
 
 
-def _review_bot_window(ctx: _Ctx, r: Readiness, since: int | None, verdict: str = "") -> Readiness:
+def _reopen_for_late_findings(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> bool:
+    """Review-bot findings without an outcome arrived on the current head after the card
+    reached Ready (#799: Codex answered 2 minutes after the grace), and this round's
+    findings wake is unused: the build run retired for Ready is re-opened once, under its
+    own authorization and approval (no new authority), and gets the findings wake.
+
+    The card goes back to Building; the run waits on checks again with its building slot
+    re-reserved, and the read after the move lands wakes it (``_not_ready``). A card the
+    earlier rule already withdrew to Building for those findings (``readiness_failed`` +
+    ``rework_control_required``) is re-opened in place and woken by this read. Anything
+    else (the wake spent, the run re-opened before, no free building slot, a closed gate)
+    stays with the owner as before. Returns whether the run was re-opened.
+    """
+    s = ctx.p.session(r.session_id)
+    in_ready = ctx.p.stage == Stage.READY and (r.ready or _refreshing(ctx))
+    # Only a failed read withdraws Ready with both holds (an owner review or a refused
+    # rework sets ``rework_control_required`` alone); this read decides that findings are
+    # the gap (the withdrawal note may be cut short or already cleared).
+    withdrawn = (
+        ctx.p.stage == Stage.BUILDING
+        and not r.ready
+        and {Hold.READINESS_FAILED, Hold.REWORK_CONTROL_REQUIRED} <= ctx.p.holds
+    )
+    if not (
+        (in_ready or withdrawn)
+        and body.findings_open
+        and body.pr_open
+        and body.checks not in (None, ev.ChecksState.PENDING)
+        and body.closes_issue
+        and body.review_accepted
+        and not body.base_sync  # an owner sync head keeps its existing rule
+        and not body.remediation_exhausted
+        and ctx.p.findings_wakes < 1
+        and s is not None
+        and s.kind == SessionKind.BUILD
+        and s.session_id == ctx.p.current_session_id
+        and s.lifecycle == Lifecycle.RETIRED
+        and s.execution_closed
+        and not s.reopened
+        and not s.fences
+        and s.root_id is not None
+        and not s.external_active
+        and not s.restart_pending
+        and s.policy_ready
+        and s.grant.remaining_us > 0
+        and not ctx.p.holds & (_NOT_CHECKS_WITHDRAWN | BLOCKING_HOLDS)
+        and not ctx.p.open_decisions
+        and not _rework_queued(ctx)
+        and approval_ok(ctx.p)
+        and authority_ok(ctx.p, s)
+        and not uncertain(ctx.p)
+        and building_capacity_available(ctx.admission, ctx.config)
+    ):
+        return False
+    a = ctx.p.current_approval
+    assert a is not None  # noqa: S101 - approval_ok checked above
+    ctx.unhold(*_READY_CLEARED_HOLDS)
+    ctx.put_session(
+        replace(
+            s,
+            lifecycle=Lifecycle.WAITING,
+            wait_reason=WaitReason.CHECKS,
+            quiescent=True,
+            execution_closed=False,
+            reopened=True,
+        )
+    )
+    building = Reservation(
+        ctx.new_id("rs"), ctx.p.parcel_id, ReservationKind.BUILDING, a.approval_id
+    )
+    ctx.admission = replace(ctx.admission, reservations=(*ctx.admission.reservations, building))
+    ctx.update(
+        readiness=replace(
+            r,
+            ready=False,
+            verified=False,
+            sync_red=False,
+            red_checks="",
+            report_effect_id="",  # a later Ready posts a new report
+            report_key="",
+        ),
+        pr_number=r.pr_number,
+    )
+    _move(ctx, Stage.BUILDING)
+    ctx.note(f"Back to the build run: review-bot findings arrived on {r.head_sha[:7]} after Ready")
+    return True
+
+
+def _late_findings_wake_due(ctx: _Ctx) -> bool:
+    """A run re-opened for late findings waits for its wake (see ``_not_ready``)."""
+    r = ctx.p.readiness
+    s = ctx.p.session(r.session_id) if r is not None else None
+    return (
+        r is not None
+        and s is not None
+        and s.reopened
+        and not r.verified
+        and ctx.p.stage == Stage.BUILDING
+        and s.session_id == ctx.p.current_session_id
+        and s.lifecycle == Lifecycle.WAITING
+        and s.quiescent
+        and ctx.p.findings_wakes < 1
+        and not board_pending(ctx.p)
+    )
+
+
+def _review_bot_window(
+    ctx: _Ctx,
+    r: Readiness,
+    since: int | None,
+    verdict: str = "",
+    eyes: ev.BotEyes | None = None,
+) -> Readiness:
     """Wait for the review bot only while it can still respond to this head.
 
     ``since`` 0: it already answered this head and nothing re-pinged it, so readiness is
-    judged on current evidence at once. A trigger time (push, PR open or re-ping) runs
-    the grace from the later of that trigger and the build result. None (unknown) keeps
-    the wait: an unreadable bot state is never taken as answered.
+    judged on current evidence at once. A trigger time (push, PR open or re-ping) opens a
+    wait from that trigger; None (unknown) keeps the wait: an unreadable bot state is
+    never taken as answered.
+
+    With the bot's 👀 readable (``eyes``), it decides the wait (#799: Ready was declared
+    while Codex was visibly reviewing): 👀 at or after the trigger waits up to the cap,
+    sticky for that trigger; no 👀 ends the wait ``review_ack_us`` after the trigger; an
+    unreadable state waits up to the cap, from the trigger or (no trigger known) from the
+    first such read. Without it (older reads, no bot configured) the grace runs from the
+    later of the trigger and the build result.
 
     ``review_bot`` keeps the Ready report's review-bot line: the verdict as read, or no
-    response (Ready is then only reached once the grace has passed).
+    response (Ready is then only reached once the wait has passed).
     """
+    cfg = ctx.config
     if since == 0:
         line = verdict[:200] or f"responded on `{r.head_sha[:7]}`"
-        window = replace(r, review_bot_done=True, review_bot=line)
+        window = replace(r, review_bot_done=True, review_bot=line, unknown_since_us=0)
     elif since is None:
         window = replace(r, review_bot_done=False, review_bot="")
+        if eyes == ev.BotEyes.UNKNOWN:
+            start = r.unknown_since_us or ctx.now
+            settle_at = start + cfg.review_cap_us
+            window = replace(
+                window,
+                unknown_since_us=start,
+                settle_at_us=settle_at,
+                review_bot=_NO_BOT_RESPONSE if ctx.now >= settle_at else _BOT_ASKED,
+            )
     else:
-        trigger_end = min(since, ctx.now) + ctx.config.review_grace_us
-        settle_at = max(r.settle_at_us, trigger_end)
+        trigger = min(since, ctx.now)
+        eyes_trigger = r.eyes_trigger_us
+        if eyes == ev.BotEyes.SEEN:
+            eyes_trigger = since
+        if eyes is None:
+            settle_at = max(r.settle_at_us, trigger + cfg.review_grace_us)
+        elif eyes_trigger == since or eyes == ev.BotEyes.UNKNOWN:
+            settle_at = trigger + cfg.review_cap_us  # from the running config (reload)
+        else:
+            # No 👀 for this trigger: the ack window from the trigger replaces the grace.
+            settle_at = trigger + cfg.review_ack_us
         window = replace(
             r,
             review_bot_done=False,
             settle_at_us=settle_at,
+            eyes_trigger_us=eyes_trigger,
+            unknown_since_us=0,
             review_bot=_NO_BOT_RESPONSE if ctx.now >= settle_at else _BOT_ASKED,
         )
     if window != r:
@@ -2613,6 +2769,8 @@ def _head_changed(ctx: _Ctx, r: Readiness, head: str) -> None:
         report_effect_id="",  # the posted report is for the old head: never edited now
         report_key="",
         read_started_us=0,  # no read of the new head applied yet
+        eyes_trigger_us=0,
+        unknown_since_us=0,
     )
     ctx.update(readiness=r)
     ctx.unhold(Hold.CHECKS_FAILED, Hold.READINESS_FAILED)
@@ -2664,7 +2822,7 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
         reason += f"; {_NO_NEW_RESULT}"
     check_wake = _check_gap(body) and ctx.p.readiness_wakes < 1
     findings_wake = body.findings_open and ctx.p.findings_wakes < 1
-    if (
+    waiting = (
         (check_wake or findings_wake)
         and s is not None
         and s.session_id == ctx.p.current_session_id
@@ -2674,8 +2832,10 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
         and not ctx.p.open_decisions
         and approval_ok(ctx.p)
         and dispatchable(ctx.p)
-        and work_allowed(ctx.p, s)
-    ):
+    )
+    if waiting and board_pending(ctx.p):
+        return  # e.g. back to Building for late findings: woken once the move lands
+    if waiting and s is not None and work_allowed(ctx.p, s):
         # One wake names every current gap; it spends the budget of each kind it covers.
         ctx.update(
             readiness_wakes=ctx.p.readiness_wakes + int(check_wake),
@@ -2704,8 +2864,27 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
         return
     if Hold.READINESS_FAILED not in ctx.p.holds:
         ctx.hold(Hold.READINESS_FAILED)
-        ctx.comment("ready-blocked", pr_number=r.pr_number, head_sha=r.head_sha, reason=reason)
+        _needs_you_comment(ctx, r, body, reason)
         ctx.note(f"Needs you: PR #{r.pr_number} not ready on {r.head_sha[:7]}: {reason}")
+
+
+def _needs_you_comment(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence, reason: str) -> None:
+    """The one comment when readiness puts the card at Needs you: the reason and, for
+    review-bot findings, each open thread (path, severity, title, link). Posted only on
+    entering the hold (callers check), so a restart or an unchanged re-read never posts
+    it again; a retry adopts the comment by its effect marker."""
+    args: dict[str, JsonValue] = {
+        "pr_number": r.pr_number,
+        "head_sha": r.head_sha,
+        "reason": reason,
+    }
+    if body.findings_open and body.open_findings:
+        args["findings"] = [
+            {"path": f.path, "severity": f.severity, "title": f.title, "url": f.url}
+            for f in body.open_findings
+        ]
+        args["further_round"] = body.findings_earlier_rounds
+    ctx.comment("ready-blocked", **args)
 
 
 def _check_gap(body: ev.ReadinessEvidence) -> bool:

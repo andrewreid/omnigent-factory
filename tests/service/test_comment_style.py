@@ -236,3 +236,38 @@ async def test_publication_is_capped_at_8000_characters(service_config: ServiceC
     )
     assert len(text) <= 8000 and text.endswith("[truncated]")
     assert "word\n\nword" in text  # line breaks survive
+
+
+async def test_findings_needs_you_lists_each_open_thread_plainly(service_config: ServiceConfig):
+    """#799: Needs you for review-bot findings names every open thread; no ids, links to
+    Omnigent or instruction lines."""
+    findings = [
+        {
+            "path": "api/src/export_delivery.ts",
+            "severity": "P1",
+            "title": "Keep the row when the retry fails",
+            "url": "https://github.com/o/r/pull/799#discussion_r1",
+        },
+        {"path": "", "severity": "", "title": "Bound the `retry` loop", "url": ""},
+    ]
+    text = await _render(
+        service_config,
+        EffectKind.POST_COMMENT,
+        {},
+        template="ready-blocked",
+        pr_number=799,
+        head_sha="9bb7f7f" + "0" * 33,
+        reason="review-bot findings have no outcome (fixed, follow-up or advisory)",
+        findings=findings,
+        further_round=True,
+    )
+    for bad in FORBIDDEN:
+        assert bad not in text, (bad, text)
+    assert "PR #799 isn't ready at `9bb7f7f`" in text
+    assert "2 open findings on `9bb7f7f`, a further review round after a fix commit" in text
+    assert (
+        "- **P1** `api/src/export_delivery.ts`: Keep the row when the retry fails "
+        "([thread](https://github.com/o/r/pull/799#discussion_r1))"
+    ) in text
+    assert "- (no file): Bound the 'retry' loop" in text
+    assert "parcel" not in text and "ss_" not in text

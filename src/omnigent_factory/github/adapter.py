@@ -23,7 +23,7 @@ from omnigent_factory.core.effects import (
     JsonValue,
     RetryableReadFailure,
 )
-from omnigent_factory.core.events import ChecksState
+from omnigent_factory.core.events import BotEyes, ChecksState, FindingRef
 from omnigent_factory.core.types import IssueSnapshot, Stage
 from omnigent_factory.github.client import (
     AmbiguousRequest,
@@ -130,6 +130,10 @@ class GitHubAPIAdapter:
         self._last_bot_answer = ""
         #: Commit of each review thread the review bot opened, from the last thread read.
         self._last_bot_thread_commits: tuple[str, ...] = ()
+        #: The bot threads without an outcome, from the last thread read.
+        self._last_open_findings: tuple[FindingRef, ...] = ()
+        #: The review bot's 👀 for its latest unanswered trigger, from the last read.
+        self._last_bot_eyes = ""
         if independent_reviewer_ids & (owner_ids | {bot_user_id}):
             raise ValueError("independent reviewers cannot include owners or the factory bot")
         self.independent_reviewer_ids = independent_reviewer_ids
@@ -326,6 +330,11 @@ class GitHubAPIAdapter:
                 base_sync=base_sync,
                 failing_checks=self._last_failing_checks,
                 review_bot_verdict=verdict,
+                review_bot_eyes=self._last_bot_eyes,
+                open_findings=() if findings_dispositioned else self._last_open_findings,
+                findings_earlier_rounds=any(
+                    oid != head_sha for oid in self._last_bot_thread_commits
+                ),
             )
         except RateLimited as exc:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
@@ -342,11 +351,17 @@ class GitHubAPIAdapter:
         reviewed commit, or a +1 on the PR taken after the head was pushed (committer date
         and PR creation, whichever is later). An explicit mention by anyone else after its
         last answer re-pings it. None whenever this cannot be told.
+
+        While a trigger is unanswered, ``_last_bot_eyes`` records whether the bot shows it
+        is reviewing: its 👀 on the PR, or on the re-ping comment, taken at or after the
+        trigger (reactions send no webhook: each read looks again).
         """
         self._last_bot_answer = ""
+        self._last_bot_eyes = ""
         login = self.review_bot_login
         if not login:
             return None
+        self._last_bot_eyes = BotEyes.UNKNOWN.value  # until the state is read
         try:
             commit: Any = await self.client.get_json(f"/repos/{self.repository}/commits/{head_sha}")
         except GitHubRejected:
@@ -360,6 +375,8 @@ class GitHubAPIAdapter:
         pushed = max(committed, opened)
         answers: list[tuple[int, str]] = []
         pings: list[int] = []
+        #: Issue comments that re-ping the bot: (time, comment id) - the bot puts its 👀 there.
+        ping_comments: list[tuple[int, int]] = []
         reviews = await self.client.paginate(
             f"/repos/{self.repository}/pulls/{pr_number}/reviews?per_page=100"
         )
@@ -386,18 +403,55 @@ class GitHubAPIAdapter:
                 if not at:
                     return None  # an undatable re-ping could be the latest one
                 pings.append(at)
+                if kind == "comment" and isinstance(item.get("id"), int):
+                    ping_comments.append((at, item["id"]))
+        eyes: list[int] = []
         for reaction in reactions:
-            if not isinstance(reaction, dict) or reaction.get("content") != "+1":
+            if not isinstance(reaction, dict):
                 continue
             user = reaction.get("user")
+            if not isinstance(user, dict) or user.get("login") != login:
+                continue
             at = self._parse_time_us(reaction.get("created_at"))
-            if isinstance(user, dict) and user.get("login") == login and at > pushed:
+            if reaction.get("content") == "+1" and at > pushed:
                 answers.append((at, "reaction"))
+            elif reaction.get("content") == "eyes" and at:
+                eyes.append(at)
         if not answers:
-            return max([pushed, *pings])
-        answered, self._last_bot_answer = max(answers)
-        later = [at for at in pings if at > answered]
-        return max(later) if later else 0
+            trigger = max([pushed, *pings])
+        else:
+            answered, self._last_bot_answer = max(answers)
+            later = [at for at in pings if at > answered]
+            trigger = max(later) if later else 0
+        self._last_bot_eyes = await self._bot_eyes(trigger, eyes, ping_comments) if trigger else ""
+        return trigger
+
+    async def _bot_eyes(
+        self, trigger: int, pr_eyes: list[int], ping_comments: list[tuple[int, int]]
+    ) -> str:
+        """ "seen" when the bot's 👀 on the PR, or on the comment that is the trigger, was
+        taken at or after ``trigger``; "absent" when not; "unknown" when that comment's
+        reactions cannot be read."""
+        if any(at >= trigger for at in pr_eyes):
+            return BotEyes.SEEN.value
+        for at, comment_id in ping_comments:
+            if at != trigger:
+                continue
+            try:
+                reactions = await self.client.paginate(
+                    f"/repos/{self.repository}/issues/comments/{comment_id}/reactions?per_page=100"
+                )
+            except GitHubRejected:
+                return BotEyes.UNKNOWN.value
+            for reaction in reactions:
+                user = reaction.get("user") if isinstance(reaction, dict) else None
+                if (
+                    isinstance(user, dict)
+                    and user.get("login") == self.review_bot_login
+                    and reaction.get("content") == "eyes"
+                ):
+                    return BotEyes.SEEN.value
+        return BotEyes.ABSENT.value
 
     def _review_bot_verdict(self, head_sha: str, since: int | None, settled: bool) -> str:
         """The review bot's answer to ``head_sha`` for the Ready report ("" = none yet).
@@ -708,7 +762,8 @@ class GitHubAPIAdapter:
         (``resolvedBy`` is a user, so a bot resolver reads as null) is still open.
 
         A complete read also records the commit of each thread the review bot opened
-        (its findings count in the Ready report)."""
+        (its findings count in the Ready report) and the threads without an outcome (for
+        the owner's Needs you comment)."""
         owner, _, name = self.repository.partition("/")
         query = """
         query($owner: String!, $name: String!, $number: Int!, $after: String) {
@@ -718,10 +773,13 @@ class GitHubAPIAdapter:
                 nodes {
                   isResolved
                   resolvedBy { login }
+                  path
                   comments(first: 50) {
                     nodes {
                       author { __typename login ... on Bot { databaseId } }
                       originalCommit { oid }
+                      body
+                      url
                     }
                   }
                 }
@@ -733,8 +791,10 @@ class GitHubAPIAdapter:
         """
         after: str | None = None
         self._last_bot_thread_commits = ()
+        self._last_open_findings = ()
         bot_login = self.review_bot_login.removesuffix("[bot]")  # GraphQL omits "[bot]"
         bot_commits: list[str] = []
+        open_findings: list[FindingRef] = []
         while True:
             data = await self.client.graphql(
                 query, {"owner": owner, "name": name, "number": pr_number, "after": after}
@@ -766,11 +826,12 @@ class GitHubAPIAdapter:
                     for a in authors[1:]
                 )
                 if not answered:
-                    return False
+                    open_findings.append(_finding_ref(thread))
             page = threads.get("pageInfo") if isinstance(threads, dict) else None
             if not isinstance(page, dict) or not page.get("hasNextPage"):
                 self._last_bot_thread_commits = tuple(bot_commits)
-                return True
+                self._last_open_findings = tuple(open_findings[:_MAX_FINDINGS])
+                return not open_findings
             cursor = page.get("endCursor")
             if not isinstance(cursor, str):
                 raise GitHubAPIError("review threads pagination cursor was missing")
@@ -1475,6 +1536,38 @@ class GitHubAPIAdapter:
 
 #: Where a Ready report's factory lines begin (see ``service.directory._ready_text``).
 _REPORT_FACTORY_LINES = "\n**PR:** "
+
+
+#: Open bot threads carried to the owner's Needs you comment.
+_MAX_FINDINGS = 20
+_BADGE = re.compile(r"!\[\s*(P[0-3])\b[^\]]*\]\([^)]*\)", re.IGNORECASE)
+_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_SEVERITY = re.compile(r"\b(P[0-3])\b")
+_TAG = re.compile(r"<[^>]{0,200}>")
+
+
+def _finding_ref(thread: dict[str, Any]) -> FindingRef:
+    """Path, severity badge (P0-P3, when parseable), one-line title and link of a thread,
+    from its first comment (a Codex finding starts "**![P1 Badge](...) Title**")."""
+    comments = thread.get("comments")
+    nodes = comments.get("nodes") if isinstance(comments, dict) else None
+    first = nodes[0] if isinstance(nodes, list) and nodes else None
+    body = str(first.get("body") or "") if isinstance(first, dict) else ""
+    url = str(first.get("url") or "") if isinstance(first, dict) else ""
+    lines = [line for line in body.splitlines() if line.strip()]
+    head = lines[0] if lines else ""
+    badge = _BADGE.search(head) or _SEVERITY.search(_IMAGE.sub("", head)[:40])
+    title = _TAG.sub("", _IMAGE.sub("", head)).replace("**", "").replace("__", "")
+    title = " ".join(title.split())
+    if not title and len(lines) > 1:
+        title = " ".join(_TAG.sub("", lines[1]).replace("**", "").split())
+    path = thread.get("path")
+    return FindingRef(
+        path=path[:200] if isinstance(path, str) else "",
+        severity=badge.group(1).upper() if badge else "",
+        title=title[:120],
+        url=url[:300] if url.startswith("https://") else "",
+    )
 
 
 def _bot_thread_commit(comments: object, bot_login: str) -> str | None:

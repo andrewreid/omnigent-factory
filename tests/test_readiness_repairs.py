@@ -697,8 +697,12 @@ def test_catch_up_read_returns_a_ready_card_to_ready_without_a_completion_webhoo
 def test_catch_up_read_covers_needs_you_without_a_live_build_session():
     h = Harness()
     _ready(h)
-    # Ready -> Needs you (a red check alone would stay in Ready, Bot Blocked: #461)
-    h.send(P, evidence(h, OLD, checks=ev.ChecksState.FAILED, findings_open=True))
+    # Ready -> Needs you (a red check alone would stay in Ready, Bot Blocked: #461; late
+    # findings alone get the findings wake: test_late_review_findings)
+    h.send(
+        P,
+        evidence(h, OLD, checks=ev.ChecksState.FAILED, findings_open=True, review_accepted=False),
+    )
     p = h.p()
     assert p.stage == Stage.BUILDING and p.bot == BotState.NEEDS_YOU
     assert p.session(p.readiness.session_id).lifecycle == Lifecycle.RETIRED

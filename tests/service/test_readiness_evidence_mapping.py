@@ -195,3 +195,42 @@ def test_the_verdict_reaches_the_reducer(service_config):
     event = executor._ack_event(fetch, Ack("686", detail))
     assert event is not None and isinstance(event.body, ev.ReadinessEvidence)
     assert event.body.review_bot_verdict == "👍 on `fb2159a`"
+
+
+def test_executor_carries_the_bots_eyes_and_the_open_threads(service_config: ServiceConfig):
+    """#799: the 👀 state and the open review-bot threads reach the reducer (bounded)."""
+    executor = EffectExecutor(
+        None,  # type: ignore[arg-type]
+        service_config.trusted,
+        FakeClock(),
+        (),
+        ParcelSerializers(),
+        poll_seconds=1,
+    )
+    fetch = EffectIntent(
+        effect_id="ef_fetch",
+        kind=EffectKind.FETCH_PR_EVIDENCE,
+        parcel_id="I_1",
+        target="I_1",
+        preconditions=Preconditions(1, 0),
+        args={"pr_number": 799, "head_sha": HEAD, "session_id": "ss_b"},
+    )
+    thread = {"path": "api/a.ts", "severity": "P1", "title": "T" * 500, "url": "https://x/1"}
+    detail = {
+        "head_sha": HEAD,
+        "checks": "green",
+        "findings_dispositioned": False,
+        "verified": False,
+        "review_bot_eyes": "seen",
+        "open_findings": [thread] * 25,
+        "findings_earlier_rounds": True,
+    }
+    event = executor._ack_event(fetch, Ack("799", detail))
+    assert event is not None and isinstance(event.body, ev.ReadinessEvidence)
+    body = event.body
+    assert body.review_bot_eyes == ev.BotEyes.SEEN and body.findings_earlier_rounds
+    assert len(body.open_findings) == 20
+    assert body.open_findings[0] == ev.FindingRef("api/a.ts", "P1", "T" * 120, "https://x/1")
+    older = executor._ack_event(fetch, Ack("799", {"head_sha": HEAD, "verified": False}))
+    assert older is not None and isinstance(older.body, ev.ReadinessEvidence)
+    assert older.body.review_bot_eyes is None and older.body.open_findings == ()

@@ -157,7 +157,7 @@ waits up to 90 s for it instead of failing.
 | `pause` / `unpause` | Stop / resume admitting new work repository-wide; in-flight parcels and safety events carry on. |
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, the reconcile intervals and the retention windows; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, the reconcile intervals and the retention windows; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.
@@ -208,7 +208,15 @@ syncs the base branch, the card goes to Ready, `Blocked`. A run woken by an owne
 that ends its turn without re-submitting is `Needs you`, never left `Working`. Review-bot
 findings without an outcome get a wake of their own (once per build or rework, separate
 from the check wake, so findings that arrive after the check wake still reach the run);
-findings still without an outcome after it are `Needs you`. A blocked report for a defect in the change stays with the owner. An owner drag
+findings still without an outcome after it are `Needs you`. Findings that arrive on the
+head after the card reached Ready (the bot answered after its wait ended) still get that
+wake when it is unused: the card goes back to Building, its closed build run is re-opened
+once (same authorization and approval, a free build slot needed) and woken; with the
+wake spent, no slot free or on an owner sync head, they are `Needs you` as before (a
+withdrawn card is re-checked on each read, so a slot freed later still gets the wake). Whenever readiness puts the
+card at `Needs you`, one comment says why and lists each open review-bot thread (path,
+`P0`-`P3` badge, title, link), noting a further review round after a fix commit; it is
+not posted again while that state stands. A blocked report for a defect in the change stays with the owner. An owner drag
 from Building to Ready is accepted on the same terms (Bot by the checks, the run is
 closed); otherwise the card returns to Building with the reason in the note
 (`Kept in Building: ...`).
@@ -284,13 +292,32 @@ stays open. The agent's shell policy allows `gh issue create`, thread replies an
 `resolveReviewThread`, and denies closing, deleting, transferring or locking issues and PRs
 (CLI, REST and GraphQL), merging and administration. While the review bot
 (`review_bot_login`, default `chatgpt-codex-connector[bot]`) can still respond to the PR
-head, the head is Ready only from a green read taken `review_bot_grace_minutes` (default
-10) after the later of the build report and the trigger (the head push or PR opening, or a
-`review_bot_mention` re-ping after its last answer), so late bot comments are handled by
-the build's findings wake instead of pulling a Ready card back. The bot can still
-respond until it has answered that head (a review of the commit, a verdict naming it, or a
-+1 on the PR after the push); once it has and nothing re-pinged it, readiness is judged on
-current evidence at once. When the bot's state cannot be read, the grace applies.
+head, the card is not Ready, so late bot comments are handled by the build's findings
+wake instead of pulling a Ready card back. The bot can still respond until it has
+answered that head (a review of the commit, a verdict naming it, or a +1 on the PR after
+the push); once it has and nothing re-pinged it, readiness is judged on current evidence
+at once. Its trigger is the head push or PR opening, or a `review_bot_mention` re-ping
+after its last answer. Codex shows it is reviewing with a 👀 reaction (on the PR, or on
+the re-ping comment), which sends no webhook, so each read (every reconcile, about every
+2 minutes, while it is waited for) looks again:
+
+| Bot state on its latest trigger | Wait |
+|---|---|
+| Answered (review, `Reviewed commit` comment, +1 after the push) | none: judged at once (a review webhook triggers the read) |
+| 👀 taken at or after the trigger | until it answers, at most `review_bot_max_wait_minutes` (default 45) after the trigger; kept even if the 👀 is later removed |
+| No 👀 | `review_bot_ack_minutes` (default 5) after the trigger |
+| Unreadable | as for 👀: at most `review_bot_max_wait_minutes` after the trigger (or, with none known, after the first unreadable read) |
+| No bot configured (`review_bot_login = ""`) | `review_bot_grace_minutes` (default 10) after the later of the build report and the trigger |
+
+All three are hot-reloadable. For example:
+
+```toml
+review_bot_login = "chatgpt-codex-connector[bot]"
+review_bot_mention = "@codex"
+review_bot_ack_minutes = 5        # no 👀 by then: stop waiting
+review_bot_max_wait_minutes = 45  # 👀 or unreadable: wait at most this long
+review_bot_grace_minutes = 10     # used when the bot's 👀 cannot be told (no login set)
+```
 
 The Ready report is the agent's summary (what changed, decisions, follow-ups; no CI or
 review-bot status) followed by the factory's lines from the read that decided Ready: PR,
@@ -300,7 +327,7 @@ Ready on that head, a later read that changes those lines (a late verdict, the c
 summary, a red check) edits the report in place (found by its marker; edits do not
 notify), never posting a second one. GitHub sends no webhook for a +1 reaction, so a
 Ready card whose report still shows no bot response is re-read on each reconcile, for up
-to 24 hours after the grace. A new head, withdrawal or rework never edits it.
+to 24 hours after the wait. A new head, withdrawal or rework never edits it.
 
 ### Finished parcels
 

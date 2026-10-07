@@ -94,6 +94,11 @@ max_open_bot_prs = 3
 checkpoint_grace_minutes = 15
 cost_backstop_usd_per_hour = 35
 independent_reviewer_ids = []
+review_bot_login = "chatgpt-codex-connector[bot]"
+review_bot_mention = "@codex"
+review_bot_ack_minutes = 5        # no 👀 from the review bot by then: stop waiting
+review_bot_max_wait_minutes = 45  # 👀 (reviewing) or unreadable: wait at most this long
+review_bot_grace_minutes = 10     # the wait when the bot's 👀 cannot be told
 # triage_guidance = "Classify work with the repo's area:* labels."
 # engineering_guidance = "Engineering conventions live in AGENTS.md."
 

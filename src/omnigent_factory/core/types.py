@@ -445,6 +445,9 @@ class StageSession:
     #: When the current drain began (0: not draining, or a drain recorded before this
     #: field existed). The scheduler ends a drain still waiting after the drain timeout.
     drain_started_us: int = 0
+    #: A build run retired for Ready was re-opened once for review-bot findings that
+    #: arrived after Ready (#799). Never again: a later late finding is the owner's.
+    reopened: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -539,6 +542,12 @@ class Readiness:
     #: When the newest applied evidence read of ``head_sha`` began (0 = none or older
     #: records): a check webhook received before then is already reflected in it.
     read_started_us: int = 0
+    #: Source time of the latest review-bot trigger on which its 👀 was seen: the bot is
+    #: reviewing it, so its wait runs to the cap even if the reaction is later gone.
+    eyes_trigger_us: int = 0
+    #: When the wait for a review bot whose state cannot be read began (0 = none): such
+    #: a wait still ends at the cap.
+    unknown_since_us: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -769,6 +778,12 @@ class TrustedConfig:
     cost_usd_per_hour_micros: int = 35_000_000
     #: How long review bots get to comment on a new PR head before it can be Ready.
     review_grace_us: int = 0
+    #: With the review bot's 👀 readable: how long after a trigger it gets to show 👀 (or
+    #: answer) before the wait ends.
+    review_ack_us: int = 0
+    #: How long after a trigger a review bot showing 👀 (or whose state cannot be read)
+    #: is waited for at most.
+    review_cap_us: int = 0
 
     def block_us(self, size: Size) -> int:
         return self.block_hours[size] * MICROS_PER_HOUR

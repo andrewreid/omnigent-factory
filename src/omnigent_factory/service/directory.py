@@ -622,12 +622,49 @@ class PublicationRenderer:
             text = _public_result(body, agent_display_name(self.config))
         elif effect.kind == EffectKind.POST_COMMENT and effect.args.get("template") == "decision":
             text = _decision_text(effect.args)
+        elif (
+            effect.kind == EffectKind.POST_COMMENT
+            and effect.args.get("template") == "ready-blocked"
+            and isinstance(effect.args.get("findings"), list)
+        ):
+            text = _findings_blocked_text(effect.args, review_bot_name(self.config))
         elif effect.kind == EffectKind.POST_COMMENT:
             template = str(effect.args.get("template") or "status")
             text = _status_text(template, effect.args, agent_display_name(self.config))
         else:
             return None
         return _safe_publication(text, self.config)
+
+
+def _findings_blocked_text(args: Mapping[str, Any], bot_name: str = "Review bot") -> str:
+    """Needs you for review-bot findings: the reason, then each open thread (severity,
+    path, title, link), so the owner sees what is left without opening the PR."""
+    findings = [f for f in args.get("findings") or [] if isinstance(f, dict)]
+    head = str(args.get("head_sha") or "")[:7]
+    count = len(findings)
+    noun = "finding" if count == 1 else "findings"
+    lines = [
+        f"PR #{args.get('pr_number')} isn't ready at `{head}`: {args.get('reason')}. "
+        "I have no automatic fix attempt left, so I need your call.",
+        "",
+    ]
+    if args.get("further_round"):
+        lines.append(
+            f"{bot_name} has {count} open {noun} on `{head}`, a further review round "
+            "after a fix commit:"
+        )
+    else:
+        lines.append(f"{bot_name} has {count} open {noun} on `{head}`:")
+    lines.append("")
+    for f in findings:
+        badge = f"**{f.get('severity')}** " if f.get("severity") else ""
+        path = str(f.get("path") or "").replace("`", "'")
+        path = f"`{path}`" if path else "(no file)"
+        title = " ".join(str(f.get("title") or "").replace("`", "'").split())
+        url = str(f.get("url") or "")
+        line = f"- {badge}{path}: {title or 'untitled'}"
+        lines.append(f"{line} ([thread]({url}))" if url else line)
+    return "\n".join(lines)
 
 
 def _decision_text(args: Mapping[str, Any]) -> str:

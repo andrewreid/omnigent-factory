@@ -544,6 +544,9 @@ class EffectExecutor:
                 failing_checks=str(detail.get("failing_checks") or "")[:200],
                 review_bot_verdict=str(detail.get("review_bot_verdict") or "")[:200],
                 read_started_us=_json_int(detail.get("read_started_us"), 0),
+                review_bot_eyes=_bot_eyes(detail.get("review_bot_eyes")),
+                open_findings=_finding_refs(detail.get("open_findings")),
+                findings_earlier_rounds=detail.get("findings_earlier_rounds") is True,
             )
         elif effect.kind == EffectKind.RESOLVE_ELICITATION:
             body = ev.ElicitationResolved(
@@ -605,6 +608,29 @@ def _checks_state(value: object) -> ev.ChecksState | None:
         return ev.ChecksState(str(value)) if value is not None else None
     except ValueError:
         return None
+
+
+def _bot_eyes(value: object) -> ev.BotEyes | None:
+    try:
+        return ev.BotEyes(str(value)) if value else None
+    except ValueError:
+        return None
+
+
+def _finding_refs(value: object) -> tuple[ev.FindingRef, ...]:
+    """The open bot threads of a read, bounded (they are only shown to the owner)."""
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        ev.FindingRef(
+            path=str(item.get("path") or "")[:200],
+            severity=str(item.get("severity") or "")[:2],
+            title=str(item.get("title") or "")[:120],
+            url=str(item.get("url") or "")[:300],
+        )
+        for item in value[:20]
+        if isinstance(item, dict)
+    )
 
 
 def _json_int(value: object, default: int) -> int:

@@ -124,3 +124,22 @@ def test_review_bot_grace_defaults_to_ten_minutes_and_is_hot():
         == 0
     )
     assert "review_bot_grace_minutes" in HOT_RELOAD_KEYS
+
+
+def test_review_bot_eyes_windows_default_and_are_hot():
+    """#799: no 👀 within 5 minutes ends the wait; 👀 (or an unreadable state) waits up
+    to 45 minutes; both apply on `reload`."""
+    from omnigent_factory.core.types import MICROS_PER_MINUTE
+    from omnigent_factory.service.config import HOT_RELOAD_KEYS
+
+    trusted = ServiceConfig(repo_id="R", owners=frozenset({1})).trusted
+    assert trusted.review_ack_us == 5 * MICROS_PER_MINUTE
+    assert trusted.review_cap_us == 45 * MICROS_PER_MINUTE
+    custom = ServiceConfig(
+        repo_id="R",
+        owners=frozenset({1}),
+        review_bot_ack_minutes=3,
+        review_bot_max_wait_minutes=60,
+    ).trusted
+    assert (custom.review_ack_us, custom.review_cap_us) == (3 * MICROS_PER_MINUTE, 3600_000_000)
+    assert {"review_bot_ack_minutes", "review_bot_max_wait_minutes"} <= HOT_RELOAD_KEYS

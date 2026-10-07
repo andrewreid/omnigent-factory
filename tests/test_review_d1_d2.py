@@ -87,13 +87,15 @@ def ready(h: Harness):
             verified=True,
             remediation_exhausted=True,
         ),
-        # A red check alone keeps Ready (Bot Blocked, #461); with open findings it does not.
+        # A red check alone keeps Ready (Bot Blocked, #461); with open findings it does not
+        # (on a reviewed head, late findings re-open the run instead: #799).
         lambda b: ev.ReadinessEvidence(
             session_id=b.session_id,
             pr_number=7,
             head_sha=HEAD,
             checks=ev.ChecksState.FAILED,
             findings_open=True,
+            review_accepted=False,
         ),
         lambda b: ev.PRObserved(
             pr_number=7,

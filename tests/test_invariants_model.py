@@ -893,10 +893,12 @@ class FactoryModel(RuleBasedStateMachine):
             if removed:
                 assert removed == {FenceKind.CHECKPOINT}
                 assert event.kind == EventKind.POLICY_READY and not s2.fences
-            # retired/closed gates never reopen
-            if s.lifecycle == Lifecycle.RETIRED:
+            # retired/closed gates never reopen, except once: a build run retired for
+            # Ready re-opened by an evidence read for late review-bot findings (#799)
+            reopened = event.kind == EventKind.READINESS_EVIDENCE and s2.reopened and not s.reopened
+            if s.lifecycle == Lifecycle.RETIRED and not reopened:
                 assert s2.lifecycle == Lifecycle.RETIRED
-            if s.execution_closed:
+            if s.execution_closed and not reopened:
                 assert s2.execution_closed
         # (6) revision_pending clears only on publication of that exact revision.
         if before.revision_pending and not after.revision_pending:

@@ -135,6 +135,28 @@ class ChecksState(enum.StrEnum):
     FAILED = "failed"
 
 
+class BotEyes(enum.StrEnum):
+    """The review bot's 👀 ("reviewing") reaction for its latest unanswered trigger."""
+
+    #: 👀 on the PR or the re-ping comment, taken at or after the trigger.
+    SEEN = "seen"
+    #: None taken since the trigger.
+    ABSENT = "absent"
+    #: The bot is configured but its state could not be read: waited on, up to the cap.
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class FindingRef:
+    """One review-bot thread without an outcome, for the owner's Needs you comment."""
+
+    path: str = ""
+    #: "P0".."P3" when the bot's badge names one ("" = none parsed).
+    severity: str = ""
+    title: str = ""
+    url: str = ""
+
+
 class _Body:
     KIND: ClassVar[EventKind]
     CLASS: ClassVar[EventClass]
@@ -433,6 +455,14 @@ class ReadinessEvidence(_Body):
     #: When the read began (daemon clock; 0 = unknown, older reads): it reflects every
     #: check webhook received before then.
     read_started_us: int = 0
+    #: The review bot's 👀 for its latest unanswered trigger (None = not told: no bot
+    #: configured, nothing pending or an older read).
+    review_bot_eyes: BotEyes | None = None
+    #: The bot threads without an outcome (at most 20), when ``findings_open``.
+    open_findings: tuple[FindingRef, ...] = ()
+    #: The review bot also opened threads on earlier commits of the PR: open findings are
+    #: a further review round after a fix.
+    findings_earlier_rounds: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -954,6 +984,7 @@ __all__ = [
     "ApprovalInvalidated",
     "ApprovePlan",
     "AssignedHuman",
+    "BotEyes",
     "CapacityAvailable",
     "ChecksChanged",
     "ChecksState",
@@ -977,6 +1008,7 @@ __all__ = [
     "EventBody",
     "EventClass",
     "EventKind",
+    "FindingRef",
     "GitHubSnapshot",
     "GraceExpired",
     "InboxHoldReleased",

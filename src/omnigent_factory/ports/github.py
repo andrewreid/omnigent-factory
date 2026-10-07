@@ -45,7 +45,7 @@ from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
 from omnigent_factory.core.effects import EffectKind, RetryableReadFailure
-from omnigent_factory.core.events import ChecksState
+from omnigent_factory.core.events import ChecksState, FindingRef
 from omnigent_factory.core.types import IssueSnapshot, Stage
 from omnigent_factory.ports.adapter import EffectAdapter
 
@@ -132,6 +132,13 @@ class PullRequestEvidence:
     failing_checks: str = ""
     #: How the review bot answered ``head_sha`` (only when it did), for the Ready report.
     review_bot_verdict: str = ""
+    #: The bot's 👀 for its latest unanswered trigger: "seen", "absent", "unknown" (its
+    #: state could not be read), "" = not told (no bot configured or nothing pending).
+    review_bot_eyes: str = ""
+    #: The bot threads without an outcome (at most 20), for the owner's Needs you comment.
+    open_findings: tuple[FindingRef, ...] = ()
+    #: The review bot also opened threads on earlier commits of the PR.
+    findings_earlier_rounds: bool = False
 
     @property
     def verified(self) -> bool:
