@@ -12,6 +12,104 @@ plan and build. A human always merges and closes.
 
 Status: under construction.
 
+## Using the factory on GitHub
+
+GitHub is the control plane: the factory acts only on card drags, `factory:` labels,
+slash commands and plain comments on GitHub, and only from an owner (a numeric GitHub user
+ID in `owners`; logins are never matched). Anyone else's comments, labels and reviews are
+ignored, the factory bot's own actions never count, and a control older than the latest
+stop or safety barrier is refused. Columns below use the board's display names (Inbox,
+Triage, Planning, Building, Ready, from `[service.status_names]`).
+
+Typing in the parcel's Omnigent session is not a control: it grants no approval, time or
+stage and does not answer the agent's questions. A native Omnigent prompt answered there
+only closes that prompt; no approval or time is inferred. Activity in a stopped run's
+session holds the next run until the session is idle (see [Card status vs. comments](#card-status-vs-comments)).
+
+### Slash commands
+
+Write the command as the whole comment, on the issue (a command on a PR is ignored).
+Accepted commands get a 👍 reaction, refused ones 😕; most refusals also put
+`Command refused: <reason>` in the card's `Factory note`. `<N>h` is a whole number of
+hours, 1–12. Without one, a grant is the time block for the parcel's size:
+`checkpoint_block_hours` S/M/L = 2/4/6 h by default (size from triage, else the plan;
+otherwise S for triage and M for the rest).
+
+| Command | Where | What it does |
+|---|---|---|
+| `/triage` | Inbox; any column but Ready after a stop | Moves the card to Triage and starts a triage run. In Triage, re-run triage with a plain comment instead; a repeat while the same triage is still starting or running is ignored (😕, no note). |
+| `/plan`, `/replan` | Inbox, Triage, Planning, Building; not Ready | Starts a plan run; in Planning, `/plan` while the same plan is still unpublished is ignored (😕, no note). In Building, or with a build approved, it revokes the build and replans. |
+| `/approve [hash] [for <N>h]` | Planning or Building | Approves the latest published plan and queues the build. `hash` is a prefix (≥ 12 lowercase hex) that must identify the latest plan; without it, the plan must have been posted before the command. Refused while a question is open, a revision is pending or another build holds the parcel. Re-approving a running approval only notes `Approved: build starts when capacity allows`. |
+| `/continue [for <N>h]` | A card at `Bot: Checkpoint` | Grants another time block to the paused run. Refused when the run is not at a checkpoint, is stopped or revoked, or a question is still open. |
+| `/stop` | Any column | Stops all work: drains every run, drops any queued build and pending start. Note `Stopped: /stop`. Resume with a new control (`/triage`, `/plan`, a drag, or a plain comment in Triage or Planning); a comment never starts a rework on a stopped card. |
+| `/decide <id> <answer>` | A card with an open question | Answers the open question `<id>` with `<answer>`. On a build, `/decide` revokes the build and replans (a plain reply is taken within the approval). The id is not shown in the question comment, so a plain reply is the normal answer. |
+
+### Labels
+
+Adding a label is a control like the matching command. Only the owner's labelling counts,
+including labels applied when the issue is opened (GitHub sends a `labeled` event for each).
+
+| Label | Acts like |
+|---|---|
+| `factory:triage` | `/triage` |
+| `factory:plan` | `/plan` |
+| `factory:build` | Build without a plan: approves the issue's current title and body as written (default block M), from any column. Refused while a question is open, a revision is pending or a build is live. Editing the title or body later voids that approval. |
+
+### Card drags
+
+A rightward owner drag is a control; any leftward drag (by anyone, including a move to
+Inbox or off the board) is a stop first. A refused drag into Building moves the card back
+with the reason in the note.
+
+| Drag | Effect |
+|---|---|
+| Inbox → Triage | Starts triage. |
+| Inbox or Triage → Planning | Starts a plan. |
+| Planning → Building | Approves the latest plan (as `/approve`, default block). |
+| Inbox or Triage → Building | Builds without a plan (as `factory:build`). |
+| Building → Ready | Accepted only if the run is closed and the PR is Ready; otherwise moved back (`Kept in Building: ...`). |
+| Building → Planning | Stops and revokes the build and voids the approval; an owner drag also starts a replan. |
+| Ready → Building | Stops, then reworks the build under the same approval (see [Rework](#steering-by-comment)); if rework is refused the card stays in Building, stopped, with `Rework refused: <reason>`. |
+| Any other leftward move | Stop only; nothing starts. |
+
+Assigning the issue to a person (not a bot) takes the parcel out of the factory: work
+stops and controls are refused until the person is unassigned and a new control is
+given. Closing, deleting or transferring the issue also stops it.
+
+### Plain comments
+
+A plain (non-`/`) owner comment is recorded for every later run. While the agent has an
+open question, the next plain comment on the issue or its PR is the answer. Otherwise,
+by column:
+
+| Column | A plain comment |
+|---|---|
+| Inbox, Done | Recorded only. |
+| Triage | Re-runs triage (or is read by the triage run in progress). |
+| Planning | Revises the plan; voids any approval of the previous version. |
+| Building | Guidance to the build within its approval: relayed to an idle run or one waiting on checks, read by a busy run before it can submit. On a finished build, or at `Needs you` with no fix attempt left, it starts a rework. |
+| Ready | Starts a rework (back to Building, `Rework: owner feedback`). |
+| Any, at `Bot: Checkpoint` | Recorded only; the run needs `/continue` before it reads it. |
+
+On the parcel's PR, an owner conversation comment, or a review that requests changes,
+comments, or approves with text, counts as the same plain comment (so on a Ready card it
+starts a rework). Not after `/stop` or once merged. See
+[Steering by comment](#steering-by-comment) for details.
+
+### Bot and Factory note
+
+| `Bot` | Meaning |
+|---|---|
+| `Working` | A run is doing work. |
+| `Queued` | Approved build waiting for a slot; note `Queued: 2nd in line`. |
+| `Needs you` | An open question, or a hold only the owner can clear. |
+| `Checkpoint` | The run used its time block; comment `/continue`. |
+| `Blocked` | Something failed, or a required check is red on Ready; the note says what. |
+| `Idle` | Nothing to do; the next move is the owner's. |
+
+`Factory note` is one line with the latest reason (refusals, stops, queue position,
+rework), cleared when the card moves on.
+
 ## Development
 
 Requires [uv](https://docs.astral.sh/uv/) and Python 3.13 (pinned in `.python-version`).
@@ -119,8 +217,8 @@ closed); otherwise the card returns to Building with the reason in the note
 on the issue or its PR is the answer: the question is resolved with that comment, the
 answer is sent to the run that asked, and the card returns to Working. On a Building card
 at Needs you with no fix attempt left the reply instead starts a rework (below), which
-reads the answer with the comment. `/decide <id> <answer>` and answering in Omnigent still
-work.
+reads the answer with the comment. `/decide <id> <answer>` also works, but the id is not
+shown on GitHub; replying in the Omnigent session does not answer the question.
 
 ### Issue sessions and the factory MCP endpoint
 
