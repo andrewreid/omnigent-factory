@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import importlib.metadata
+import io
 import ipaddress
 import os
 import socket
 import stat
 import subprocess
+import tarfile
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
+import yaml
 
 from omnigent_factory.github.auth import AppAuthenticator, InstallationTokenService
 from omnigent_factory.github.client import GitHubAPIError, GitHubClient
@@ -26,6 +30,7 @@ from omnigent_factory.omnigent.rest import (
 from omnigent_factory.ports.credentials import TokenRefusal
 from omnigent_factory.service.composition import _private_file
 from omnigent_factory.service.config import ServiceConfig
+from omnigent_factory.service.mcp import TOOL_NAMES
 from omnigent_factory.service.omnigent_auth import expiry, expiry_message, omnigent_auth
 
 
@@ -109,8 +114,8 @@ async def run_doctor(
             client = GitHubClient(github_http, daemon.token, api_url=config.github_api_url)
             await _check_github(config, client, jwt, report)
         await _check_omnigent(config, omnigent, report)
-        if live:
-            await _check_live_session(config, omnigent, report)
+        probe = await _check_live_session(config, omnigent, report) if live else None
+        await _check_agent_factory_tools(config, omnigent, report, session_id=probe)
     except (httpx.HTTPError, ValueError, RuntimeError) as exc:
         report.fail("live_checks", f"{type(exc).__name__}: {exc}")
     finally:
@@ -441,14 +446,14 @@ async def _check_omnigent(config: ServiceConfig, rest: OmnigentRest, report: Doc
 
 async def _check_live_session(
     config: ServiceConfig, rest: OmnigentRest, report: DoctorReport
-) -> None:
+) -> str | None:
     """Create a session exactly as a stage run would (no message, no git branch) and
-    archive it again."""
+    archive it again; returns the session (its agent bundle stays readable)."""
     agent = report.resolved.get("omnigent_agent_id")
     host = report.resolved.get("omnigent_host_id")
     if not agent or not host:
         report.fail("live_session", "agent or host is not resolved")
-        return
+        return None
     body: dict[str, Any] = {
         "agent_id": agent,
         "host_type": "external",
@@ -466,15 +471,146 @@ async def _check_live_session(
     if classify_write(created) != WriteClass.OK or not isinstance(root, str) or not root:
         detail = created.error_code or _error_message(created.body) or created.error or ""
         report.fail("live_session", f"session create failed: HTTP {created.status} {detail}")
-        return
+        return None
     archived = await rest.patch_json(f"/v1/sessions/{root}", {"archived": True})
     if classify_write(archived) != WriteClass.OK:
         report.fail(
             "live_session",
             f"created {root} but could not archive it: HTTP {archived.status}",
         )
-        return
+        return root
     report.pass_check("live_session", f"created and archived {root}")
+    return root
+
+
+#: Prefixes an agent allowlist may put before a factory tool's name.
+_TOOL_PREFIXES = ("mcp__factory__", "factory__")
+
+
+def _bare_tool(tool: str) -> str:
+    for prefix in _TOOL_PREFIXES:
+        tool = tool.removeprefix(prefix)
+    return tool
+
+
+def missing_factory_tools(
+    servers: Iterable[tuple[str, str | None, Sequence[str] | None]],
+    mcp_port: int,
+    served: Sequence[str] = TOOL_NAMES,
+) -> list[str] | None:
+    """The served factory tools the agent cannot call, from its MCP servers as
+    (name, url, tool allowlist or None for every tool); None when it declares no factory
+    server. The factory server is the one named ``factory``, or whose URL is the factory
+    listener (``FACTORY_MCP_URL`` or the loopback ``mcp_port``)."""
+    listener = (f"127.0.0.1:{mcp_port}", f"localhost:{mcp_port}", "FACTORY_MCP_URL")
+    allowed: set[str] = set()
+    found = False
+    for name, url, tools in servers:
+        if name != "factory" and not any(mark in (url or "") for mark in listener):
+            continue
+        found = True
+        if tools is None:
+            return []
+        allowed.update(_bare_tool(tool) for tool in tools)
+    if not found:
+        return None
+    return [tool for tool in served if tool not in allowed]
+
+
+def _bundle_mcp_servers(bundle: bytes) -> list[tuple[str, str | None, list[str] | None]]:
+    """The MCP servers an agent bundle (``.tar.gz``) declares, read without extracting
+    or validating the rest of the spec: inline ``type: mcp`` entries under
+    ``config.yaml``'s ``tools:`` and ``tools/mcp/*.yaml`` sidecars, as (name, url as
+    written, ``tools`` allowlist; an absent or empty list allows every tool)."""
+    servers: list[tuple[str, str | None, list[str] | None]] = []
+    config: Any = None
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:*") as tar:
+        for member in tar.getmembers():
+            path = member.name.removeprefix("./")
+            sidecar = path.startswith("tools/mcp/") and path.endswith(".yaml")
+            if not member.isfile() or (path != "config.yaml" and not sidecar):
+                continue
+            handle = tar.extractfile(member)
+            raw = yaml.safe_load(handle.read()) if handle is not None else None
+            if path == "config.yaml":
+                config = raw
+            elif isinstance(raw, dict) and raw.get("name") is not None:
+                servers.append((str(raw["name"]), _text(raw.get("url")), _allowlist(raw)))
+    if not isinstance(config, dict):
+        raise ValueError("the bundle has no config.yaml mapping")
+    tools = config.get("tools")
+    for key, value in tools.items() if isinstance(tools, dict) else ():
+        if isinstance(value, dict) and str(value.get("type", "")) == "mcp":
+            servers.append((str(key), _text(value.get("url")), _allowlist(value)))
+    return servers
+
+
+def _text(value: object) -> str | None:
+    return None if value is None else str(value)
+
+
+def _allowlist(raw: dict[str, Any]) -> list[str] | None:
+    """Omnigent's per-server ``tools:`` rule: a non-empty list restricts, else all."""
+    tools = raw.get("tools")
+    return [str(t) for t in tools] if isinstance(tools, list) and tools else None
+
+
+async def _agent_session(rest: OmnigentRest, agent_id: str) -> str | None:
+    """The newest session of the configured agent (the agent bundle is read through a
+    session), archived ones included."""
+    rows = await rest.paginate(
+        "/v1/sessions",
+        {"kind": "default", "include_archived": "true", "visibility": "all", "order": "desc"},
+        until=lambda row: row.get("agent_id") == agent_id,
+    )
+    for row in rows:
+        if row.get("agent_id") == agent_id and isinstance(row.get("id"), str):
+            return str(row["id"])
+    return None
+
+
+async def _check_agent_factory_tools(
+    config: ServiceConfig,
+    rest: OmnigentRest,
+    report: DoctorReport,
+    *,
+    session_id: str | None = None,
+) -> None:
+    """Every tool the factory MCP server serves is one the configured agent may call (an
+    agent allowlist without e.g. ``factory_submit_ranking`` fails ranking silently)."""
+    name = "agent_factory_tools"
+    agent = report.resolved.get("omnigent_agent_id")
+    if not agent:
+        return  # the agent check already failed
+    try:
+        root = session_id or await _agent_session(rest, str(agent))
+        if root is None:
+            report.warn(
+                name,
+                "agent bundle unreadable: no session of the configured agent to read it "
+                "through (run `doctor --live`)",
+            )
+            return
+        bundle = await rest.get_bytes(f"/v1/sessions/{root}/agent/contents")
+        servers = await asyncio.to_thread(_bundle_mcp_servers, bundle)
+    except OmnigentReadError as exc:
+        report.warn(name, f"agent bundle unreadable: {exc.reason}")
+        return
+    except Exception as exc:  # a bundle this client cannot parse
+        report.warn(name, f"agent bundle unreadable: {type(exc).__name__}: {exc}"[:300])
+        return
+    missing = missing_factory_tools(servers, config.mcp_port)
+    if missing is None:
+        report.fail(name, "the agent declares no factory MCP server; it can call no factory tool")
+    elif missing:
+        report.fail(
+            name,
+            "the agent's factory MCP allowlist lacks "
+            + ", ".join(missing)
+            + " (add them to the agent's `tools:` list for the factory server)",
+        )
+    else:
+        report.pass_check(name, f"the agent can call all {len(TOOL_NAMES)} factory tools")
 
 
 def _error_message(body: object) -> str:

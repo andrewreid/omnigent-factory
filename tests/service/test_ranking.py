@@ -4,6 +4,7 @@ triggering and mutual exclusion with auto-triage, restart/duplicate safety, arch
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
@@ -258,19 +259,13 @@ class Rig:
     board: FakeBoard
     sessions: FakeSessions
     ranker: Ranker
-    triaged: dict[str, frozenset[str]]
 
     def new_ranker(self) -> Ranker:
         """A fresh instance over the same store and fakes (a daemon restart)."""
-
-        async def priorities(nodes: list[str]) -> Mapping[str, frozenset[str]]:
-            return {n: self.triaged.get(n, frozenset()) for n in nodes}
-
         return Ranker(
             self.service,
             board=self.board,  # type: ignore[arg-type]
             sessions=self.sessions,  # type: ignore[arg-type]
-            triage_priorities=priorities,
             policy_barrier_us=0,
         )
 
@@ -322,7 +317,7 @@ async def rig(config: ServiceConfig, clock: FakeClock | None = None) -> AsyncIte
     await service.start()
     try:
         await service.operator_command("unpause", {})
-        r = Rig(service, clock, FakeBoard(), FakeSessions(), None, {})  # type: ignore[arg-type]
+        r = Rig(service, clock, FakeBoard(), FakeSessions(), None)  # type: ignore[arg-type]
         r.ranker = r.new_ranker()
         service.ranker = r.ranker
         yield r
@@ -508,7 +503,6 @@ async def test_a_completed_run_writes_ranks_comment_and_status_once_and_archives
     service_config: ServiceConfig,
 ):
     async with rig(ranking_config(service_config)) as r:
-        r.triaged = {"I_1": frozenset({"P2"}), "I_2": frozenset({"P3"})}
         run = await started(
             r, card(1, priority="P2"), card(2, priority="P3"), card(7, stage=Stage.BUILDING)
         )
@@ -572,11 +566,71 @@ async def test_rank_writes_only_when_the_value_changes(service_config: ServiceCo
         assert not (await r.field("I_1", "rank")).owner_set  # type: ignore[union-attr]
 
 
+def owner_edit(
+    config: ServiceConfig, node: str, field_value: dict[str, Any] | None, sender: int = OWNER_ID
+) -> bytes:
+    """A ``projects_v2_item`` edited delivery body (no ``changes`` when ``field_value``
+    is None)."""
+    payload: dict[str, Any] = {
+        "action": "edited",
+        "sender": {"id": sender},
+        "projects_v2_item": {"project_node_id": config.project_node_id, "content_node_id": node},
+    }
+    if field_value is not None:
+        payload["changes"] = {"field_value": field_value}
+    return json.dumps(payload).encode()
+
+
 @pytest.mark.asyncio
-async def test_a_rank_the_factory_did_not_write_is_an_owner_pin(service_config: ServiceConfig):
+async def test_a_value_nobody_recorded_is_a_baseline_not_an_owner_choice(
+    service_config: ServiceConfig, caplog: pytest.LogCaptureFixture
+):
+    """The #735 case: an earlier triage (or pre-ranking tooling) left P2 and a Rank on the
+    board, unrecorded, and the owner never touched them."""
+    caplog.set_level(logging.INFO, "omnigent_factory.service.ranking")
+    async with rig(ranking_config(service_config)) as r:
+        await started(r, card(735, priority="P2"), card(341, rank=1.0, priority="P1"), card(31))
+        for node, name in (
+            ("I_735", "priority"),
+            ("I_341", "rank"),
+            ("I_341", "priority"),
+            ("I_735", "rank"),
+        ):
+            row = await r.field(node, name) or rs.BoardField(node, name)
+            assert not row.owner_set, (node, name)
+        assert "owner choice detected" not in caplog.text
+        # Ranking may change both under the normal rules (with the priority comment).
+        await r.submit(
+            {
+                "ranking": [item(31), item(735), item(341)],
+                "summary": "s",
+                "priority_changes": [{"issue": 735, "new_priority": "P1", "reason": "blocks"}],
+            }
+        )
+        assert await r.ranker.run_once() == "completed"
+        assert r.board.priorities == [("PVTI_735", "P1")]
+        assert sorted(r.board.ranks) == [("PVTI_31", 1), ("PVTI_341", 3), ("PVTI_735", 2)]
+        assert r.board.comment_posts == 1
+        assert "P2 -> P1" in next(iter(r.board.comments.values()))
+
+
+@pytest.mark.asyncio
+async def test_an_owner_rank_webhook_pins_until_the_owner_clears_it(
+    service_config: ServiceConfig,
+):
     async with rig(ranking_config(service_config, ranking_status_update=False)) as r:
-        await started(r, card(1), card(2), card(3, rank=1.0))
-        assert (await r.field("I_3", "rank")).owner_set  # type: ignore[union-attr]
+        r.board.cards_ = [card(1), card(2), card(3, rank=1.0)]
+        # The owner sets #3's Rank (the bot's own edit of the same field is ignored).
+        await r.ranker.note_owner_field(
+            owner_edit(service_config, "I_3", {"field_node_id": RANK_FIELD, "to": 1}, BOT_ID)
+        )
+        assert await r.field("I_3", "rank") is None
+        await r.ranker.note_owner_field(
+            owner_edit(service_config, "I_3", {"field_node_id": RANK_FIELD, "to": 1})
+        )
+        await started(r, *r.board.cards_)
+        row = await r.field("I_3", "rank")
+        assert row is not None and row.owner_choice and row.owner_value == "1"
         with pytest.raises(RankingToolError, match="#3 is owner-pinned at rank 1"):
             await r.submit({"ranking": [item(1), item(3), item(2)], "summary": "s"})
         await r.submit({"ranking": [item(2), item(1)], "summary": "s"})
@@ -586,7 +640,7 @@ async def test_a_rank_the_factory_did_not_write_is_an_owner_pin(service_config: 
         r.board._set("PVTI_3", rank=None)
         await r.ranker.command({"action": "now"})
         assert await r.ranker.run_once() == "started"
-        assert not (await r.field("I_3", "rank")).owner_set  # type: ignore[union-attr]
+        assert not (await r.field("I_3", "rank")).owner_choice  # type: ignore[union-attr]
         with pytest.raises(RankingToolError, match="missing Triage issues: #3"):
             await r.submit({"ranking": [item(2), item(1)], "summary": "s"})
 
@@ -625,56 +679,133 @@ async def test_an_owner_webhook_pin_mid_run_is_never_overwritten(service_config:
 
 
 @pytest.mark.asyncio
-async def test_owner_priority_is_sticky_by_webhook_and_by_a_foreign_value(
-    service_config: ServiceConfig,
-):
+async def test_owner_priority_is_sticky_only_by_an_owner_webhook(service_config: ServiceConfig):
     async with rig(ranking_config(service_config, ranking_status_update=False)) as r:
-        # #1: triage set P2 (not the owner's); #2: P1 nobody recorded writing (owner's).
-        r.triaged = {"I_1": frozenset({"P2"}), "I_2": frozenset({"P3"})}
+        # #1 and #2 carry priorities nobody recorded writing: baselines, not the owner's.
         await started(r, card(1, priority="P2"), card(2, priority="P1"), card(3, priority="P3"))
-        assert not (await r.field("I_1", "priority") or rs.BoardField("", "")).owner_set
-        assert (await r.field("I_2", "priority")).owner_set  # type: ignore[union-attr]
+        for node in ("I_1", "I_2"):
+            assert not (await r.field(node, "priority")).owner_choice  # type: ignore[union-attr]
         # #3: the owner changes Priority by hand (webhook).
         await r.ranker.note_owner_field(
-            json.dumps(
-                {
-                    "action": "edited",
-                    "sender": {"id": OWNER_ID},
-                    "projects_v2_item": {
-                        "project_node_id": service_config.project_node_id,
-                        "content_node_id": "I_3",
-                    },
-                    "changes": {
-                        "field_value": {
-                            "field_node_id": PRIORITY_FIELD,
-                            "to": {"id": "opt_P3", "name": "P3"},
-                        }
-                    },
-                }
-            ).encode()
+            owner_edit(
+                service_config,
+                "I_3",
+                {"field_node_id": PRIORITY_FIELD, "to": {"id": "opt_P3", "name": "P3"}},
+            )
         )
-        for issue in (2, 3):
-            with pytest.raises(RankingToolError, match=f"the owner set the Priority of #{issue}"):
-                await r.submit(
-                    {
-                        "ranking": [item(1), item(2), item(3)],
-                        "summary": "s",
-                        "priority_changes": [
-                            {"issue": issue, "new_priority": "P0", "reason": "new info"}
-                        ],
-                    }
-                )
+        with pytest.raises(RankingToolError, match="the owner set the Priority of #3"):
+            await r.submit(
+                {
+                    "ranking": [item(1), item(2), item(3)],
+                    "summary": "s",
+                    "priority_changes": [{"issue": 3, "new_priority": "P0", "reason": "new"}],
+                }
+            )
         await r.submit(
             {
                 "ranking": [item(1), item(2), item(3)],
                 "summary": "s",
-                "priority_changes": [{"issue": 1, "new_priority": "P0", "reason": "outage"}],
+                "priority_changes": [
+                    {"issue": 1, "new_priority": "P0", "reason": "outage"},
+                    {"issue": 2, "new_priority": "P3", "reason": "workaround"},
+                ],
             }
         )
         assert await r.ranker.run_once() == "completed"
-        assert r.board.priorities == [("PVTI_1", "P0")]
+        assert r.board.priorities == [("PVTI_1", "P0"), ("PVTI_2", "P3")]
         # The factory's own change is not the owner's: a later run may change it again.
-        assert not (await r.field("I_1", "priority")).owner_set  # type: ignore[union-attr]
+        assert not (await r.field("I_1", "priority")).owner_choice  # type: ignore[union-attr]
+        row = await r.field("I_3", "priority")
+        assert row is not None and row.owner_choice and row.owner_value == "P3"
+
+
+@pytest.mark.asyncio
+async def test_an_owner_edit_without_a_field_id_is_attributed_only_when_unambiguous(
+    service_config: ServiceConfig,
+):
+    async with rig(ranking_config(service_config, ranking_status_update=False)) as r:
+        await started(r, card(1, priority="P2"), card(2, priority="P2"), card(3, priority="P2"))
+        # #1: only Priority changed after the owner's edit -> the owner's.
+        # #2: Priority and Rank changed -> ambiguous, nobody's.
+        # #3: nothing it could be attributed to changed -> nobody's.
+        r.board._set("PVTI_1", priority="P0")
+        r.board._set("PVTI_2", priority="P0", rank=4.0)
+        for node in ("I_1", "I_2", "I_3"):
+            await r.ranker.note_owner_field(owner_edit(service_config, node, None))
+        cards = await r.ranker.cards()
+        _pinned, sticky = await r.ranker.owner_choices(cards)
+        assert sticky == frozenset({"I_1"})
+        row = await r.field("I_1", "priority")
+        assert row is not None and row.owner_choice and row.owner_value == "P0"
+        for node in ("I_2", "I_3"):
+            for name in ("rank", "priority"):
+                other = await r.field(node, name)
+                assert other is not None and not other.owner_choice and not other.owner_probe
+
+
+@pytest.mark.asyncio
+async def test_repair_clears_inferred_owner_choices_and_keeps_webhook_backed_ones(
+    service_config: ServiceConfig, caplog: pytest.LogCaptureFixture
+):
+    """Rows the removed inference wrote (owner_set, no owner_webhook) are cleared unless a
+    stored owner delivery backs them; the repair runs once, on the first pass."""
+    caplog.set_level(logging.INFO, "omnigent_factory.service.ranking")
+    async with rig(ranking_config(service_config, ranking=False)) as r:
+        now = r.clock.now_utc_us()
+        legacy = [
+            ("I_735", "priority", "P2"),
+            ("I_341", "rank", "2"),
+            ("I_9", "rank", "1"),
+            ("I_10", "priority", "P0"),
+        ]
+        deliveries = [
+            owner_edit(service_config, "I_9", {"field_node_id": RANK_FIELD, "to": 1}),
+            owner_edit(
+                service_config, "I_10", {"field_node_id": PRIORITY_FIELD, "to": {"name": "P0"}}
+            ),
+            # Not evidence: the bot's own write, and an owner Status move.
+            owner_edit(service_config, "I_341", {"field_node_id": RANK_FIELD, "to": 2}, BOT_ID),
+            owner_edit(
+                service_config,
+                "I_735",
+                {"field_node_id": "PVTSSF_status", "to": {"name": "Triage"}},
+            ),
+        ]
+
+        def seed(store: Any) -> None:
+            with store._txn() as conn:
+                for node, name, value in legacy:
+                    conn.execute(
+                        "INSERT INTO board_fields (issue_node_id, field, owner_value, owner_set, "
+                        "updated_at_us) VALUES (?, ?, ?, 1, ?)",
+                        (node, name, value, now),
+                    )
+                for index, body in enumerate(deliveries):
+                    conn.execute(
+                        "INSERT INTO deliveries (delivery_guid, event_name, action, "
+                        "headers_json, body, body_sha256, received_at_us, provenance, status) "
+                        "VALUES (?, 'projects_v2_item', 'edited', '{}', ?, 'x', ?, 'webhook', "
+                        "'processed')",
+                        (f"g{index}", body, now),
+                    )
+
+        await r.service.db.call(seed)
+        await r.ranker.run_once()
+        for node, name, _value in legacy[:2]:
+            row = await r.field(node, name)
+            assert row is not None and not row.owner_set and row.owner_value is None
+        for node, name, value in legacy[2:]:
+            row = await r.field(node, name)
+            assert row is not None and row.owner_choice and row.owner_value == value
+        assert "cleared (no owner webhook backs it) node=I_735 field=priority value=P2" in (
+            caplog.text
+        )
+        assert "node=I_341 field=rank value=2" in caplog.text
+        assert "ranking owner choice repair cleared=2 kept=2" in caplog.text
+        # Once per process: a second pass does not repeat it.
+        caplog.clear()
+        await r.ranker.run_once()
+        assert "repair" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -682,7 +813,6 @@ async def test_restart_mid_run_adopts_the_session_and_never_duplicates_writes(
     service_config: ServiceConfig,
 ):
     async with rig(ranking_config(service_config)) as r:
-        r.triaged = {"I_1": frozenset({"P2"})}
         r.sessions.fail_create = RankingSessionError("create outcome unknown", retry=True)
         r.board.cards_ = [card(1, priority="P2"), card(2)]
         await r.ranker.command({"action": "now"})
@@ -718,7 +848,6 @@ async def test_a_definitive_failure_is_recorded_and_the_status_update_degrades(
     service_config: ServiceConfig,
 ):
     async with rig(ranking_config(service_config)) as r:
-        r.triaged = {"I_1": frozenset({"P2"})}
         await started(r, card(1, priority="P2"))
         await r.submit(
             {

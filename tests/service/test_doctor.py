@@ -1,17 +1,28 @@
 from __future__ import annotations
 
+import io
 import os
 import subprocess
+import tarfile
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
+import yaml
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from omnigent_factory.omnigent.rest import OmnigentRest
 from omnigent_factory.service.config import ServiceConfig
-from omnigent_factory.service.doctor import run_doctor
+from omnigent_factory.service.doctor import (
+    DoctorReport,
+    _bundle_mcp_servers,
+    _check_agent_factory_tools,
+    missing_factory_tools,
+    run_doctor,
+)
+from omnigent_factory.service.mcp import TOOL_NAMES
 
 
 def _secret(path: Path, value: bytes) -> None:
@@ -136,7 +147,17 @@ async def test_doctor_resolves_live_ids_and_does_not_create_local_state(tmp_path
             },
             "/v1/projects": {"object": "list", "data": [{"id": "project-1", "name": "Timesheets"}]},
             "/api/version": {"version": "0.0.0-other"},  # drift is a warning, never a failure
+            "/v1/sessions": {
+                "object": "list",
+                "data": [
+                    {"id": "conv_other", "agent_id": "agent-2"},
+                    {"id": "conv_rosie", "agent_id": "agent-1"},
+                ],
+                "has_more": False,
+            },
         }
+        if request.url.path == "/v1/sessions/conv_rosie/agent/contents":
+            return httpx.Response(200, content=bundle(inline={"factory": {"type": "mcp"}}))
         return httpx.Response(200, json=values[request.url.path])
 
     before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
@@ -160,6 +181,7 @@ async def test_doctor_resolves_live_ids_and_does_not_create_local_state(tmp_path
     assert report.checks["mcp_listener"].endswith("requires the bearer token")
     assert report.checks["mcp_token"].endswith("is private (mode 0600)")
     assert report.checks["caller_policy"].startswith("compiles")
+    assert report.checks["agent_factory_tools"] == "the agent can call all 8 factory tools"
     assert report.resolved["omnigent_agent_id"] == "agent-1"
     assert any(
         w.startswith("omnigent_version: server 0.0.0-other differs") for w in report.warnings
@@ -209,8 +231,6 @@ def _live_rest(handler) -> OmnigentRest:
 
 
 def _resolved_report():
-    from omnigent_factory.service.doctor import DoctorReport
-
     report = DoctorReport()
     report.resolved.update(
         omnigent_agent_id="agent-1", omnigent_host_id="host-1", omnigent_project_id="project-1"
@@ -271,3 +291,130 @@ async def test_doctor_is_not_live_by_default():
     from omnigent_factory.service.doctor import run_doctor as doctor
 
     assert inspect.signature(doctor).parameters["live"].default is False
+
+
+# ------------------------------------------------------------------ agent factory tools
+
+
+def bundle(
+    *, inline: dict[str, Any] | None = None, sidecars: dict[str, dict[str, Any]] | None = None
+) -> bytes:
+    """An agent bundle ``.tar.gz``: ``config.yaml`` (inline ``tools:``) and sidecars."""
+    files = {
+        "./config.yaml": {"spec_version": 1, "name": "rosie", "tools": inline or {}},
+        **{f"tools/mcp/{name}.yaml": body for name, body in (sidecars or {}).items()},
+    }
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w:gz") as tar:
+        for name, body in files.items():
+            data = yaml.safe_dump(body).encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return out.getvalue()
+
+
+ROSIE_ALLOWLIST = [
+    "factory_get_issue",
+    "factory_get_plan",
+    "factory_get_feedback",
+    "factory_get_status",
+    "factory_ask_owner",
+    "factory_submit_result",
+]
+
+
+def test_missing_factory_tools_compares_the_allowlist_with_the_served_tools():
+    url = "${FACTORY_MCP_URL}"
+    # Rosie's allowlist before the fix: ranking and related-issue reads were invisible.
+    assert missing_factory_tools([("factory", url, ROSIE_ALLOWLIST)], 8787) == [
+        "factory_list_issues",
+        "factory_submit_ranking",
+    ]
+    assert missing_factory_tools([("factory", url, None)], 8787) == []  # no allowlist: all
+    assert missing_factory_tools([("factory", url, list(TOOL_NAMES))], 8787) == []
+    # Prefixed names count; the server is found by its loopback URL under another name.
+    prefixed = [f"mcp__factory__{t}" for t in TOOL_NAMES[:-1]]
+    assert missing_factory_tools([("fac", "http://127.0.0.1:9999/mcp/", prefixed)], 9999) == [
+        "factory_submit_ranking"
+    ]
+    # Other servers' allowlists never count; no factory server at all is None.
+    others = [("github", "https://api.example/mcp", list(TOOL_NAMES))]
+    assert missing_factory_tools(others, 8787) is None
+    assert missing_factory_tools([], 8787) is None
+
+
+def test_bundle_mcp_servers_reads_inline_and_sidecar_declarations():
+    data = bundle(
+        inline={
+            "factory": {"type": "mcp", "url": "${FACTORY_MCP_URL}", "tools": ROSIE_ALLOWLIST},
+            "web": {"type": "builtin"},
+        },
+        sidecars={"gh": {"name": "github", "transport": "http", "url": "https://x", "tools": []}},
+    )
+    assert sorted(_bundle_mcp_servers(data)) == [
+        ("factory", "${FACTORY_MCP_URL}", ROSIE_ALLOWLIST),
+        ("github", "https://x", None),
+    ]
+
+
+def _agent_rest(contents: httpx.Response | None, sessions: list[dict[str, Any]]) -> OmnigentRest:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(200, json={"data": sessions, "has_more": False})
+        assert request.url.path == "/v1/sessions/conv_1/agent/contents"
+        assert contents is not None
+        return contents
+
+    return _live_rest(handler)
+
+
+@pytest.mark.asyncio
+async def test_doctor_names_factory_tools_the_agent_cannot_call():
+    config = ServiceConfig(repo_id="R", owners=frozenset({1}))
+    inline = {"factory": {"type": "mcp", "url": "${FACTORY_MCP_URL}", "tools": ROSIE_ALLOWLIST}}
+    rest = _agent_rest(
+        httpx.Response(200, content=bundle(inline=inline)),
+        [{"id": "conv_1", "agent_id": "agent-1"}],
+    )
+    report = _resolved_report()
+    await _check_agent_factory_tools(config, rest, report)
+    await rest.aclose()
+    assert not report.ok
+    assert report.errors == [
+        "agent_factory_tools: the agent's factory MCP allowlist lacks factory_list_issues, "
+        "factory_submit_ranking (add them to the agent's `tools:` list for the factory server)"
+    ]
+    # No factory server declared at all: also an error.
+    rest = _agent_rest(httpx.Response(200, content=bundle()), [])
+    report = _resolved_report()
+    await _check_agent_factory_tools(config, rest, report, session_id="conv_1")
+    await rest.aclose()
+    assert not report.ok and "declares no factory MCP server" in report.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_doctor_warns_when_the_agent_bundle_cannot_be_read():
+    config = ServiceConfig(repo_id="R", owners=frozenset({1}))
+    for rest, expected in (
+        (_agent_rest(None, [{"id": "conv_x", "agent_id": "agent-2"}]), "no session"),
+        (
+            _agent_rest(httpx.Response(404), [{"id": "conv_1", "agent_id": "agent-1"}]),
+            "HTTP 404",
+        ),
+        (
+            _agent_rest(
+                httpx.Response(200, content=b"not a tarball"),
+                [{"id": "conv_1", "agent_id": "agent-1"}],
+            ),
+            "ReadError",
+        ),
+    ):
+        report = _resolved_report()
+        await _check_agent_factory_tools(config, rest, report)
+        await rest.aclose()
+        assert report.ok, report.errors
+        [warning] = report.warnings
+        assert warning.startswith("agent_factory_tools: agent bundle unreadable") and (
+            expected in warning
+        ), warning

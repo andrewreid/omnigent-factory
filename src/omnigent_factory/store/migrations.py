@@ -636,6 +636,23 @@ CREATE TABLE session_deletions (
 );
 """
 
+# Owner choices only from positive evidence (an owner's projects_v2_item webhook).
+#
+# * owner_webhook: the owner choice (owner_set) is backed by an owner webhook. Rows set by
+#   the removed "a value the factory did not write is the owner's" inference have 0 and
+#   are cleared by the ranking's startup repair unless a stored owner delivery backs them.
+# * seen_value/seen_at_us: the field's value at the last board read (a baseline).
+# * owner_probe: an owner webhook without a usable field id touched the item; the next
+#   read attributes the change only when exactly one candidate field changed.
+V12_SQL = """
+ALTER TABLE board_fields ADD COLUMN owner_webhook INTEGER NOT NULL DEFAULT 0
+    CHECK (owner_webhook IN (0, 1));
+ALTER TABLE board_fields ADD COLUMN seen_value TEXT;
+ALTER TABLE board_fields ADD COLUMN seen_at_us INTEGER;
+ALTER TABLE board_fields ADD COLUMN owner_probe INTEGER NOT NULL DEFAULT 0
+    CHECK (owner_probe IN (0, 1));
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -648,4 +665,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(9, "history-retention", V9_SQL),
     Migration(10, "auto-triage", V10_SQL),
     Migration(11, "triage-ranking-and-session-retention", V11_SQL),
+    Migration(12, "owner-choice-evidence", V12_SQL),
 )

@@ -15,9 +15,12 @@ changes (each with one comment on the issue) and one project status update. Each
 idempotent or adopted by its marker, so a restart never duplicates one. The session is
 archived when the run completes, fails or is abandoned; a failure backs off.
 
-Owner choices win: a Rank the owner sets (owner webhook, or a value the factory did not
-write) pins the card at that rank until the owner clears it; a Priority the owner sets is
-never changed by the factory again. Triage-set priorities are not owner-set.
+Owner choices win: a Rank the owner sets pins the card at that rank until the owner clears
+it; a Priority the owner sets is never changed by the factory again. The only evidence of
+an owner choice is the owner's own ``projects_v2_item`` webhook (or, when its payload names
+no field, the next read showing exactly one of the fields changed). Any other value the
+factory did not write (triage results, earlier tooling) is a baseline: not owner-set, and
+ranking may change it under the normal rules.
 """
 
 from __future__ import annotations
@@ -33,18 +36,14 @@ from datetime import datetime
 from functools import partial
 from typing import Any
 
-from omnigent_factory.core.codec import parcel_from_json
 from omnigent_factory.core.effects import RetryableReadFailure
-from omnigent_factory.core.types import MICROS_PER_HOUR, MICROS_PER_MINUTE, SessionKind, Stage
+from omnigent_factory.core.types import MICROS_PER_HOUR, MICROS_PER_MINUTE, Stage
 from omnigent_factory.github.ranking import PRIORITIES, RankingBoard, RankingWriteError
 from omnigent_factory.omnigent.ranking import RankingSessionError, RankingSessions
 from omnigent_factory.ports.github import RankingCard
 from omnigent_factory.service.auto_triage import stage_busy
-from omnigent_factory.service.directory import (
-    ServiceDispatchDirectory,
-    _safe_publication,
-    _template,
-)
+from omnigent_factory.service.config import ServiceConfig
+from omnigent_factory.service.directory import _safe_publication, _template
 from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.store import ranking as rs
 
@@ -227,7 +226,38 @@ def _backoff(failures: int) -> int:
     return int(min(MAX_BACKOFF_US, BASE_BACKOFF_US * 2 ** max(0, failures)))
 
 
-TriagePriorities = Callable[[list[str]], Awaitable[Mapping[str, frozenset[str]]]]
+def _priority_name(to: object) -> str | None:
+    name = to.get("name") if isinstance(to, Mapping) else None
+    return str(name) if name in PRIORITIES else None
+
+
+def owner_edit(
+    payload: object, config: ServiceConfig
+) -> tuple[str, str | None, Mapping[str, Any]] | None:
+    """(issue node, changed field id or None, the change) of a ``projects_v2_item``
+    ``edited`` delivery the configured owner sent on the configured project; else None."""
+    if not isinstance(payload, Mapping) or payload.get("action") != "edited":
+        return None
+    sender = payload.get("sender")
+    item = payload.get("projects_v2_item")
+    changes = payload.get("changes")
+    change = changes.get("field_value") if isinstance(changes, Mapping) else None
+    if (
+        not isinstance(sender, Mapping)
+        or sender.get("id") not in config.owners
+        or not isinstance(item, Mapping)
+        or item.get("project_node_id") != config.project_node_id
+        or not isinstance(item.get("content_node_id"), str)
+    ):
+        return None
+    if not isinstance(change, Mapping):
+        change = {}
+    field_id = change.get("field_node_id")
+    return (
+        str(item["content_node_id"]),
+        field_id if isinstance(field_id, str) and field_id else None,
+        change,
+    )
 
 
 class Ranker:
@@ -239,15 +269,15 @@ class Ranker:
         *,
         board: RankingBoard | None,
         sessions: RankingSessions | None,
-        triage_priorities: TriagePriorities,
         policy_barrier_us: int = 35_000_000,
     ) -> None:
         self.service = service
         self.board = board
         self.sessions = sessions
-        self.triage_priorities = triage_priorities
         self.policy_barrier_us = policy_barrier_us
         self._lock = asyncio.Lock()
+        #: Inferred owner choices were repaired (once per process).
+        self._repaired = False
         #: The Priority field's node ID (resolved from the first board read).
         self.priority_field_id: str | None = None
 
@@ -307,112 +337,182 @@ class Ranker:
         self, cards: list[RankingCard]
     ) -> tuple[dict[str, float], frozenset[str]]:
         """Reconcile owner choices from a fresh read: (pinned rank per node, nodes whose
-        Priority the owner chose). A value the factory did not write is the owner's."""
-        triage = [c for c in cards if c.stage == Stage.TRIAGED]
-        nodes = [c.node_id for c in cards]
-        fields = await self._db(rs.board_fields, node_ids=nodes)
-        priorities = await self.triage_priorities([c.node_id for c in triage])
+        Priority the owner chose). Only an owner's webhook is evidence of an owner choice;
+        any other value the factory did not write is a baseline the ranking may change."""
+        await self.repair_owner_choices()
+        fields = await self._db(rs.board_fields, node_ids=[c.node_id for c in cards])
         now = self._now()
         pinned: dict[str, float] = {}
         sticky: set[str] = set()
+        changed: list[rs.BoardField] = []
         for card in cards:
-            rank = self._reconcile_rank(card, fields.get((card.node_id, "rank")))
-            prio = self._reconcile_priority(
-                card,
-                fields.get((card.node_id, "priority")),
-                priorities.get(card.node_id, frozenset()),
-            )
-            for before, after in (
-                (fields.get((card.node_id, "rank")), rank),
-                (fields.get((card.node_id, "priority")), prio),
-            ):
-                if after is not None and after != before:
-                    await self._db(rs.save_board_field, field=after, now_us=now)
-                    if after.owner_set and (before is None or not before.owner_set):
-                        LOG.info(
-                            "ranking owner choice detected issue=#%s field=%s value=%s",
-                            card.number,
-                            after.field,
-                            after.owner_value,
-                        )
-            if rank is not None and rank.owner_set and card.rank is not None:
+            before = (fields.get((card.node_id, "rank")), fields.get((card.node_id, "priority")))
+            after = self._reconcile(card, *before, now=now)
+            for old, new in zip(before, after, strict=True):
+                if new == old:
+                    continue
+                changed.append(new)
+                if new.owner_choice and (old is None or not old.owner_choice):
+                    LOG.info(
+                        "ranking owner choice detected issue=#%s field=%s value=%s",
+                        card.number,
+                        new.field,
+                        new.owner_value,
+                    )
+            rank, prio = after
+            if rank.owner_choice and card.rank is not None:
                 pinned[card.node_id] = card.rank
-            if prio is not None and prio.owner_set:
+            if prio.owner_choice:
                 sticky.add(card.node_id)
+        await self._db(rs.save_board_fields, fields=changed, now_us=now)
         return pinned, frozenset(sticky)
 
     @staticmethod
-    def _reconcile_rank(card: RankingCard, row: rs.BoardField | None) -> rs.BoardField | None:
-        current = rank_text(card.rank)
-        base = row or rs.BoardField(card.node_id, "rank")
-        if row is not None and row.owner_refresh:
-            return replace(
-                row, owner_set=current is not None, owner_value=current, owner_refresh=False
-            )
-        if current is None:
-            # Cleared on the board: an owner's pin ends (the factory never clears a Rank).
-            return replace(base, owner_set=False, owner_value=None) if row is not None else None
-        if row is not None and row.owner_set:
-            return replace(row, owner_value=current)
-        if current != base.factory_value:
-            return replace(base, owner_set=True, owner_value=current)
-        return row
+    def _reconcile(
+        card: RankingCard,
+        rank_row: rs.BoardField | None,
+        prio_row: rs.BoardField | None,
+        *,
+        now: int,
+    ) -> tuple[rs.BoardField, rs.BoardField]:
+        """One card's Rank and Priority rows after a read: an owner webhook's pending value
+        is recorded, a probe is attributed only when unambiguous, and the read value
+        becomes the baseline (``seen_value``)."""
+        rows = {
+            "rank": rank_row or rs.BoardField(card.node_id, "rank"),
+            "priority": prio_row or rs.BoardField(card.node_id, "priority"),
+        }
+        current = {"rank": rank_text(card.rank), "priority": card.priority}
+        probed = [name for name, row in rows.items() if row.owner_probe]
+        if probed:
+            known = all(rows[name].seen_at_us is not None for name in probed)
+            moved = [
+                name
+                for name in probed
+                if current[name] != rows[name].seen_value
+                and (rows[name].factory_value is None or current[name] != rows[name].factory_value)
+            ]
+            for name in probed:
+                rows[name] = replace(rows[name], owner_probe=False)
+            if known and len(moved) == 1:
+                rows[moved[0]] = replace(rows[moved[0]], owner_refresh=True)
+            else:
+                LOG.info(
+                    "ranking owner edit not attributed issue=#%s candidates=%s changed=%s",
+                    card.number,
+                    ",".join(probed),
+                    ",".join(moved) if known else "unknown (no earlier read)",
+                )
+        for name in ("rank", "priority"):
+            row, value = rows[name], current[name]
+            if row.owner_refresh:
+                # An owner set the field: Rank pins at the value read (none: no pin);
+                # Priority is the owner's from now on.
+                owner = value is not None or name == "priority"
+                row = replace(
+                    row,
+                    owner_set=owner,
+                    owner_webhook=owner,
+                    owner_value=value,
+                    owner_refresh=False,
+                )
+            elif row.owner_choice and name == "rank" and value is None:
+                # Cleared on the board: an owner's pin ends (the factory never clears a Rank).
+                row = replace(row, owner_set=False, owner_webhook=False, owner_value=None)
+            elif row.owner_choice:
+                row = replace(row, owner_value=value)
+            if row.seen_at_us is None or row.seen_value != value:
+                row = replace(row, seen_value=value, seen_at_us=now)
+            rows[name] = row
+        return rows["rank"], rows["priority"]
 
-    @staticmethod
-    def _reconcile_priority(
-        card: RankingCard, row: rs.BoardField | None, triaged: frozenset[str]
-    ) -> rs.BoardField | None:
-        current = card.priority
-        if row is not None and (row.owner_refresh or row.owner_set):
-            return replace(row, owner_set=True, owner_value=current, owner_refresh=False)
-        if current is None:
-            return row
-        factory = row.factory_value if row is not None else None
-        if current != factory and current not in triaged:
-            base = row or rs.BoardField(card.node_id, "priority")
-            return replace(base, owner_set=True, owner_value=current)
-        return row
+    async def repair_owner_choices(self) -> None:
+        """Once per process: clear owner choices no owner webhook backs (set by the removed
+        "a value the factory did not write is the owner's" inference); keep those a stored
+        owner ``projects_v2_item`` delivery backs."""
+        if self._repaired:
+            return
+        config = self.service.config
+        priority_id = self.priority_field_id
+
+        def backed(node: str, field: str, payloads: Iterable[Mapping[str, Any]]) -> bool:
+            for payload in payloads:
+                edit = owner_edit(payload, config)
+                if edit is None or edit[0] != node:
+                    continue
+                field_id, change = edit[1], edit[2]
+                rank_id = config.rank_field_node_id
+                if field == "rank" and rank_id and field_id == rank_id:
+                    return True
+                if field == "priority" and field_id is not None and field_id != rank_id:
+                    if priority_id is not None:
+                        if field_id == priority_id:
+                            return True
+                    elif _priority_name(change.get("to")) is not None:
+                        return True
+            return False
+
+        kept, cleared = await self._db(rs.repair_owner_choices, backed=backed, now_us=self._now())
+        self._repaired = True
+        for row in cleared:
+            LOG.warning(
+                "ranking owner choice cleared (no owner webhook backs it) node=%s field=%s "
+                "value=%s",
+                row.issue_node_id,
+                row.field,
+                row.owner_value,
+            )
+        for row in kept:
+            LOG.info(
+                "ranking owner choice kept (owner webhook) node=%s field=%s value=%s",
+                row.issue_node_id,
+                row.field,
+                row.owner_value,
+            )
+        if kept or cleared:
+            LOG.info("ranking owner choice repair cleared=%s kept=%s", len(cleared), len(kept))
 
     async def note_owner_field(self, body: bytes) -> None:
         """A ``projects_v2_item`` delivery: record an owner's Rank or Priority change.
 
         Only the owner's own edits count (the factory bot's writes are ignored), on the
         configured project. A cleared Rank unpins; a value whose payload omits it is read
-        on the next board read.
+        on the next board read. A payload without a usable field id probes: the next read
+        attributes the change only if exactly one candidate field changed.
         """
         try:
             payload: Any = json.loads(body)
         except ValueError:
             return
-        if not isinstance(payload, dict) or payload.get("action") != "edited":
-            return
         config = self.service.config
-        sender = payload.get("sender")
-        item = payload.get("projects_v2_item")
-        changes = payload.get("changes")
-        change = changes.get("field_value") if isinstance(changes, dict) else None
-        if (
-            not isinstance(sender, dict)
-            or sender.get("id") not in config.owners
-            or not isinstance(item, dict)
-            or item.get("project_node_id") != config.project_node_id
-            or not isinstance(item.get("content_node_id"), str)
-            or not isinstance(change, dict)
-        ):
+        edit = owner_edit(payload, config)
+        if edit is None:
             return
-        field_id = change.get("field_node_id")
-        node_id = str(item["content_node_id"])
+        node_id, field_id, change = edit
         now = self._now()
         if config.rank_field_node_id and field_id == config.rank_field_node_id:
             await self._owner_rank(node_id, change, now)
-        elif field_id is not None and field_id == await self._priority_field():
-            to = change.get("to")
-            name = to.get("name") if isinstance(to, dict) else None
-            value = str(name) if name in PRIORITIES else None
-            await self._db(
-                rs.mark_owner_change, node_id=node_id, field="priority", value=value, now_us=now
+            return
+        candidates: tuple[str, ...] = ()
+        if field_id is None:
+            candidates = ("rank", "priority")
+        else:
+            priority_id = await self._priority_field()
+            if priority_id is None:
+                candidates = ("priority",)
+            elif field_id == priority_id:
+                value = _priority_name(change.get("to"))
+                await self._db(
+                    rs.mark_owner_change, node_id=node_id, field="priority", value=value, now_us=now
+                )
+                LOG.info("ranking owner priority recorded node=%s value=%s", node_id, value or "?")
+        if candidates:
+            await self._db(rs.mark_owner_probe, node_id=node_id, fields=candidates, now_us=now)
+            LOG.info(
+                "ranking owner edit without a known field node=%s candidates=%s",
+                node_id,
+                ",".join(candidates),
             )
-            LOG.info("ranking owner priority recorded node=%s value=%s", node_id, value or "?")
 
     async def _owner_rank(self, node_id: str, change: Mapping[str, Any], now: int) -> None:
         if "to" not in change:
@@ -432,7 +532,14 @@ class Ranker:
             row = fields.get((node_id, "rank")) or rs.BoardField(node_id, "rank")
             await self._db(
                 rs.save_board_field,
-                field=replace(row, owner_set=False, owner_value=None, owner_refresh=False),
+                field=replace(
+                    row,
+                    owner_set=False,
+                    owner_webhook=False,
+                    owner_value=None,
+                    owner_refresh=False,
+                    owner_probe=False,
+                ),
                 now_us=now,
             )
             LOG.info("ranking owner pin cleared node=%s", node_id)
@@ -459,6 +566,7 @@ class Ranker:
     async def run_once(self) -> str:
         """One pass: archive finished sessions, advance the open run or maybe start one."""
         async with self._lock:
+            await self.repair_owner_choices()
             await self._archive_finished()
             run = await self._db(rs.open_run, repo_id=self.repo_id)
             if run is not None:
@@ -907,7 +1015,7 @@ class Ranker:
         node = write.issue_node_id or ""
         fields = await self._db(rs.board_fields, node_ids=[node])
         row = fields.get((node, field)) or rs.BoardField(node, field)
-        if row.owner_set:
+        if row.owner_choice:
             return "done", f"skipped: owner-{'pinned' if field == 'rank' else 'set'}"
         await self._db(
             rs.save_board_field, field=replace(row, factory_value=value), now_us=self._now()
@@ -992,38 +1100,6 @@ class Ranker:
         }
 
 
-def directory_triage_priorities(
-    service: FactoryService, directory: ServiceDispatchDirectory
-) -> TriagePriorities:
-    """Every priority the parcels' accepted triage results set (a revised triage that
-    found the field already filled leaves the earlier triage's value on the board)."""
-
-    async def read(node_ids: list[str]) -> Mapping[str, frozenset[str]]:
-        rows = await service.db.call(
-            lambda store: store.query(
-                "SELECT parcel_id, aggregate_json FROM parcels "
-                "WHERE parcel_id IN (SELECT value FROM json_each(?))",
-                (json.dumps(node_ids),),
-            )
-        )
-        found: dict[str, frozenset[str]] = {}
-        for row in rows:
-            parcel = parcel_from_json(str(row[1]))
-            values: set[str] = set()
-            for session in parcel.sessions:
-                if session.kind != SessionKind.TRIAGE:
-                    continue
-                stored = directory.latest_result(session.session_id)
-                record = stored.get("factory_result") if stored is not None else None
-                body = record.get("result") if isinstance(record, dict) else None
-                if isinstance(body, dict) and body.get("priority") in PRIORITIES:
-                    values.add(str(body["priority"]))
-            found[str(row[0])] = frozenset(values)
-        return found
-
-    return read
-
-
 def _priority_comment(change: PriorityChange) -> str:
     old = change.old or "unset"
     return (
@@ -1058,7 +1134,6 @@ __all__ = [
     "RankingToolError",
     "Submission",
     "assign_ranks",
-    "directory_triage_priorities",
     "rank_text",
     "triage_digest",
     "validate_submission",

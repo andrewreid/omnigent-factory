@@ -60,7 +60,7 @@ from omnigent_factory.service.locking import ProcessLock
 from omnigent_factory.service.mcp import McpEndpoint, build_endpoint
 from omnigent_factory.service.observer import OmnigentObserver
 from omnigent_factory.service.omnigent_auth import log_expiry, omnigent_auth
-from omnigent_factory.service.ranking import Ranker, directory_triage_priorities
+from omnigent_factory.service.ranking import Ranker
 from omnigent_factory.service.related import RelatedMarker
 from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.service.session_retention import SessionRetention
@@ -381,7 +381,6 @@ async def build_production(
         board=RankingBoard(github),
         # Read-only: no git worktree or credential capability, only the factory tools.
         sessions=RankingSessions(omnigent_adapter, str(config.source_clone)),
-        triage_priorities=directory_triage_priorities(service, directory),
         policy_barrier_us=omnigent_adapter.config.policy_barrier_us,
     )
     service.ranker = ranker

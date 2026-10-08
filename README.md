@@ -184,6 +184,7 @@ the other cards around it and never overwrite it, until you clear the field. Set
 Priority yourself and the factory never changes that issue's Priority again (the value
 triage filled in is not yours). The session is archived when the run completes, fails or
 is abandoned; a failed run backs off (1 h, doubling, at most 24 h).
+Only your own board edit (its `projects_v2_item` webhook) marks a Rank or Priority as yours; any other value the factory did not write is a baseline ranking may change, and owner choices recorded without such a webhook (before this rule) are cleared at startup and logged.
 
 ## Development
 
@@ -221,7 +222,7 @@ waits up to 90 s for it instead of failing.
 | Command | What it does |
 |---|---|
 | `status` | Readiness, pause state, building count/cap, queue, pending/unknown effects, parked deliveries. |
-| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. |
+| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. It also reads the configured agent's bundle (through its newest session, or the `--live` probe) and fails naming any factory MCP tool the agent's `tools:` allowlist for the factory server leaves out (a warning when the bundle cannot be read). |
 | `explain <parcel>` | The parcel's persisted state: stage, bot, sessions, holds, effects. |
 | `recovery` | Failed/unknown effects and parked webhook deliveries. |
 | `retry-effect <effect_id>` | Requeue a failed/unknown `publish_triage`/`publish_report`/`post_comment`; it adopts an existing comment by its marker, so it never duplicates. |

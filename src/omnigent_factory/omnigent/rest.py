@@ -136,6 +136,16 @@ class OmnigentRest:
             raise OmnigentReadError(f"GET {path}: non-object body")
         return body
 
+    async def get_bytes(self, path: str) -> bytes:
+        """A raw (non-JSON) body, e.g. an agent bundle ``.tar.gz``."""
+        try:
+            resp = await self._client.get(path)
+        except httpx.HTTPError as exc:
+            raise OmnigentReadError(f"GET {path}: {type(exc).__name__}") from exc
+        if resp.status_code != 200:
+            raise OmnigentReadError(f"GET {path}: HTTP {resp.status_code}", resp.status_code)
+        return resp.content
+
     async def paginate(
         self,
         path: str,

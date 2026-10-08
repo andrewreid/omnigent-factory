@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -90,6 +90,18 @@ class BoardField:
     owner_set: bool = False
     #: An owner webhook changed the field: the next board read records its value.
     owner_refresh: bool = False
+    #: ``owner_set`` is backed by an owner webhook (the only evidence of an owner choice).
+    owner_webhook: bool = False
+    #: The field's value at the last board read (``seen_at_us`` None: never read).
+    seen_value: str | None = None
+    seen_at_us: int | None = None
+    #: An owner webhook without a usable field id touched the item: the next read
+    #: attributes the change only when exactly one candidate field changed.
+    owner_probe: bool = False
+
+    @property
+    def owner_choice(self) -> bool:
+        return self.owner_set and self.owner_webhook
 
 
 # ---------------------------------------------------------------------- state
@@ -436,37 +448,61 @@ def board_fields(store: SqliteStore, node_ids: Iterable[str]) -> dict[tuple[str,
         "SELECT * FROM board_fields WHERE issue_node_id IN (SELECT value FROM json_each(?))",
         (json.dumps(sorted(set(node_ids))),),
     )
-    return {
-        (r["issue_node_id"], r["field"]): BoardField(
+    return {(f.issue_node_id, f.field): f for f in _board_fields(rows)}
+
+
+def _board_fields(rows: Iterable[sqlite3.Row]) -> list[BoardField]:
+    return [
+        BoardField(
             issue_node_id=r["issue_node_id"],
             field=r["field"],
             factory_value=r["factory_value"],
             owner_value=r["owner_value"],
             owner_set=bool(r["owner_set"]),
             owner_refresh=bool(r["owner_refresh"]),
+            owner_webhook=bool(r["owner_webhook"]),
+            seen_value=r["seen_value"],
+            seen_at_us=r["seen_at_us"],
+            owner_probe=bool(r["owner_probe"]),
         )
         for r in rows
-    }
+    ]
 
 
 def save_board_field(store: SqliteStore, field: BoardField, now_us: int) -> None:
+    save_board_fields(store, [field], now_us)
+
+
+def save_board_fields(store: SqliteStore, fields: Sequence[BoardField], now_us: int) -> None:
+    if not fields:
+        return
     with store._txn() as conn:
-        conn.execute(
+        conn.executemany(
             "INSERT INTO board_fields (issue_node_id, field, factory_value, owner_value, "
-            "owner_set, owner_refresh, updated_at_us) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "owner_set, owner_refresh, owner_webhook, seen_value, seen_at_us, owner_probe, "
+            "updated_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(issue_node_id, field) DO UPDATE SET "
             "factory_value = excluded.factory_value, owner_value = excluded.owner_value, "
             "owner_set = excluded.owner_set, owner_refresh = excluded.owner_refresh, "
+            "owner_webhook = excluded.owner_webhook, seen_value = excluded.seen_value, "
+            "seen_at_us = excluded.seen_at_us, owner_probe = excluded.owner_probe, "
             "updated_at_us = excluded.updated_at_us",
-            (
-                field.issue_node_id,
-                field.field,
-                field.factory_value,
-                field.owner_value,
-                int(field.owner_set),
-                int(field.owner_refresh),
-                now_us,
-            ),
+            [
+                (
+                    field.issue_node_id,
+                    field.field,
+                    field.factory_value,
+                    field.owner_value,
+                    int(field.owner_set),
+                    int(field.owner_refresh),
+                    int(field.owner_webhook),
+                    field.seen_value,
+                    field.seen_at_us,
+                    int(field.owner_probe),
+                    now_us,
+                )
+                for field in fields
+            ],
         )
 
 
@@ -483,10 +519,79 @@ def mark_owner_change(
             (node_id, field, now_us),
         )
         conn.execute(
-            "UPDATE board_fields SET owner_set = 1, owner_value = ?, owner_refresh = ?, "
-            "updated_at_us = ? WHERE issue_node_id = ? AND field = ?",
+            "UPDATE board_fields SET owner_set = 1, owner_webhook = 1, owner_value = ?, "
+            "owner_refresh = ?, owner_probe = 0, updated_at_us = ? "
+            "WHERE issue_node_id = ? AND field = ?",
             (value, int(value is None), now_us, node_id, field),
         )
+
+
+def mark_owner_probe(store: SqliteStore, node_id: str, fields: Sequence[str], now_us: int) -> None:
+    """An owner webhook touched the item without naming the field: the next board read
+    attributes a change of exactly one of ``fields`` (never more) to the owner."""
+    with store._txn() as conn:
+        for field in fields:
+            conn.execute(
+                "INSERT INTO board_fields (issue_node_id, field, updated_at_us) "
+                "VALUES (?, ?, ?) ON CONFLICT(issue_node_id, field) DO NOTHING",
+                (node_id, field, now_us),
+            )
+            conn.execute(
+                "UPDATE board_fields SET owner_probe = 1, updated_at_us = ? "
+                "WHERE issue_node_id = ? AND field = ?",
+                (now_us, node_id, field),
+            )
+
+
+def repair_owner_choices(
+    store: SqliteStore,
+    backed: Callable[[str, str, Sequence[Mapping[str, Any]]], bool],
+    now_us: int,
+) -> tuple[list[BoardField], list[BoardField]]:
+    """Owner choices without webhook evidence (set by the removed "a value the factory
+    did not write is the owner's" inference): kept, marked webhook-backed, when
+    ``backed(node, field, payloads)`` finds the owner's edit among the node's stored
+    ``projects_v2_item`` deliveries; cleared otherwise. Returns (kept, cleared).
+    """
+    rows = _board_fields(
+        store.query("SELECT * FROM board_fields WHERE owner_set = 1 AND owner_webhook = 0")
+    )
+    if not rows:
+        return [], []
+    nodes = {r.issue_node_id for r in rows}
+    payloads: dict[str, list[Mapping[str, Any]]] = {}
+    deliveries = store.query(
+        "SELECT body FROM deliveries WHERE event_name = 'projects_v2_item' "
+        "AND action = 'edited' AND length(body) > 0"
+    )
+    for (body,) in deliveries:
+        try:
+            payload = json.loads(bytes(body))
+        except (ValueError, TypeError):
+            continue
+        item = payload.get("projects_v2_item") if isinstance(payload, dict) else None
+        node = item.get("content_node_id") if isinstance(item, dict) else None
+        if isinstance(node, str) and node in nodes:
+            payloads.setdefault(node, []).append(payload)
+    kept: list[BoardField] = []
+    cleared: list[BoardField] = []
+    with store._txn() as conn:
+        for row in rows:
+            if backed(row.issue_node_id, row.field, payloads.get(row.issue_node_id, [])):
+                conn.execute(
+                    "UPDATE board_fields SET owner_webhook = 1, updated_at_us = ? "
+                    "WHERE issue_node_id = ? AND field = ?",
+                    (now_us, row.issue_node_id, row.field),
+                )
+                kept.append(row)
+            else:
+                conn.execute(
+                    "UPDATE board_fields SET owner_set = 0, owner_value = NULL, "
+                    "owner_refresh = 0, updated_at_us = ? WHERE issue_node_id = ? AND field = ?",
+                    (now_us, row.issue_node_id, row.field),
+                )
+                cleared.append(row)
+    return kept, cleared
 
 
 # ---------------------------------------------------------------------- retention
