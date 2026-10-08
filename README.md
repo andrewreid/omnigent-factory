@@ -142,7 +142,7 @@ split.
 
 Off by default. When on, and the factory is otherwise idle (no plan, build or rework run
 working or draining, no queued build that could start now, no stage request waiting, a
-triage slot free, not paused), the factory triages the oldest eligible Inbox issue, one at
+triage slot free, no triage ranking running, not paused), the factory triages the oldest eligible Inbox issue, one at
 a time, exactly as if you had dragged it to Triage: the bot moves the card, posts the
 normal triage comment and leaves it `Idle`. It never goes past Triage. A card in Building
 or Ready whose `Bot` is `Blocked`, `Idle`, `Needs you` or `Checkpoint` (once the run's
@@ -158,6 +158,30 @@ hold, no parked delivery). It is checked about every `reconcile_interval_seconds
 `auto_triage_daily_limit` per local day (`auto-triage grant <n>` adds more for today). The
 audit records each start as an `AutoTriage` event from the trusted clock (the operator's
 standing authorisation), never as an owner control.
+
+### Triage ranking
+
+Off by default (`ranking = true` or `ranking on`). When the factory is idle by the
+auto-triage rule and no triage is running, and either `ranking_min_new_triages` (5)
+triage results are new or changed since the last ranking or 24 hours have passed with a
+change in the Triage column, one read-only Omnigent session (`Factory ranking · <date>`)
+orders the Triage column. It weighs priority, size, dependencies and blockers from each
+triage's related list, overlaps, clashes with Building or Ready work, stale or likely-done
+findings and age; it reads with `factory_list_issues` and `factory_get_issue` and submits
+once with `factory_submit_ranking`. It never moves cards, starts stages or closes issues,
+and a ranking and auto-triage never run at the same time.
+
+What it writes: the project's `Rank` number field (1 = next), only where the value
+changes; a `Priority` change only when the run found the triage priority wrong, each with
+one short comment on the issue (reason, old -> new); and one short project status update
+(top 5 and any priority changes; `ranking_status_update = false` turns it off; without
+access the run posts none and logs it).
+
+Your choices win. Set a card's Rank yourself and it is pinned there: later rankings order
+the other cards around it and never overwrite it, until you clear the field. Set a
+Priority yourself and the factory never changes that issue's Priority again (the value
+triage filled in is not yours). The session is archived when the run completes, fails or
+is abandoned; a failed run backs off (1 h, doubling, at most 24 h).
 
 ## Development
 
@@ -207,9 +231,13 @@ waits up to 90 s for it instead of failing.
 | `auto-triage status` | Idle-time auto-triage: enabled (and whether config or the CLI decides), today's used/limit/granted, idle or what keeps it busy, triage slots, the next candidate. |
 | `auto-triage on` / `off` | Turn auto-triage on/off at runtime. Stored in the state database, so it survives restarts, until `auto_triage` in the config file changes: then the config value applies again (the newer intent wins). |
 | `auto-triage grant <n>` | Add `<n>` (1-1000) auto-triages to today's budget (local day; it does not carry over). |
+| `ranking status` | Triage ranking: enabled (and whether config or the CLI decides), idle or what keeps it busy, new triage results since the last ranking, failures/backoff, recent runs. |
+| `ranking on` / `off` | Turn triage ranking on/off at runtime; stored like `auto-triage on`/`off` (the newer intent wins). |
+| `ranking now` | Run one ranking as soon as the factory is idle, whatever changed (also when ranking is off, or backing off). |
+| `sessions prune [--dry-run]` | Delete (or list) the factory sessions session retention would remove now (through the daemon). |
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours` and `triage_concurrency`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id` and `session_retention_days`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.
@@ -220,7 +248,15 @@ auto_triage = false              # idle-time auto-triage of Inbox issues
 auto_triage_daily_limit = 20     # auto-started triages per local day
 auto_triage_min_age_hours = 24   # grace before a new issue is taken
 triage_concurrency = 1           # triage runs at once, however started
+ranking = false                  # idle-time ranking of the Triage column
+ranking_min_new_triages = 5      # new/changed triage results that start a ranking
+ranking_status_update = true     # short project status update per ranking
+rank_field_node_id = ""          # the project's "Rank" NUMBER field (doctor checks it)
+session_retention_days = 30      # delete factory sessions archived this long; 0 = never
 ```
+
+Create the `Rank` field with the board migration (`setup render` lists it) and record its
+node ID as `rank_field_node_id`; ranking does not start without it.
 
 A triage/report/status publication that failed definitively leaves the card at
 `Bot: Blocked`. Fix the cause, then run `recovery` and `retry-effect <effect_id>`.
@@ -299,11 +335,13 @@ summary in its start message). When the parcel is terminal (merged or closed) an
 tree is quiescent, the session is archived; a session replaced by a fresh one is archived
 too. When the issue title changes, the live session is renamed.
 
-Stage messages are short pointers; the agent works through seven MCP tools served by the
+Stage messages are short pointers; the agent works through eight MCP tools served by the
 daemon at `http://127.0.0.1:<mcp_port>/mcp/` (loopback only, bearer token):
 `factory_get_issue`, `factory_get_plan`, `factory_get_feedback`, `factory_get_status`,
 `factory_list_issues` (a compact index of the other open board issues, read from GitHub
-through a one-minute cache), `factory_ask_owner` and `factory_submit_result`. Each takes the caller's own Omnigent
+through a one-minute cache), `factory_ask_owner`, `factory_submit_result` and
+`factory_submit_ranking` (triage ranking sessions only, which may also read any issue with
+`factory_get_issue`). Each takes the caller's own Omnigent
 `session_id`; a per-session CEL policy (`factory-caller@…`) denies factory tool calls
 carrying any other id, and the daemon resolves issue, run and stage from its own store.
 Create the token once with `omnigent-factory setup mcp-token` (written to
@@ -417,6 +455,17 @@ dispatch intent, own item or own send, and every control, comment, safety and
 session-lifecycle event. Deleted events have IDs that never recur (clock-stamped,
 one-shot effect acks, or webhook delivery GUIDs the inbox still dedupes), so a restart
 cannot re-apply one.
+
+**Omnigent sessions.** Factory-created sessions archived longer than
+`session_retention_days` (default 30, hot-reloadable, `0` = never) are deleted, a few per
+sweep: only sessions the factory recorded (issue sessions and replaced ones of issues that
+are merged, closed or Done with every run settled, and finished ranking sessions), still
+carrying the factory's `factory.dispatch` label, archived, and with nothing running or
+waiting anywhere in their tree. Deleting a session removes its child and worker sessions
+too (Omnigent's `DELETE /v1/sessions/{id}`); worktrees and branches are left alone. Each
+deletion is recorded and never retried. `omnigent-factory sessions prune --dry-run` lists
+what would go now. Triage ranking keeps its newest 10 finished runs; older ones are
+removed once their session is deleted (or archived, with retention off).
 
 Freed pages return to the filesystem only once the file uses incremental auto_vacuum
 (new files do). For an existing file, run once with the daemon stopped:

@@ -62,8 +62,16 @@ def create_app(
             return Response(status_code=413)
         try:
             delivery = await verifier.verify(body, dict(request.headers))
-        except WebhookRejected:
-            LOG.warning("webhook rejected: signature or identity check failed")
+        except WebhookRejected as exc:
+            # Fixed reason text and IDs only: never the body, headers or secret.
+            LOG.warning(
+                "webhook rejected: %s check failed delivery=%s event=%s action=%s reason=%s",
+                exc.check,
+                exc.delivery or "-",
+                exc.event or "-",
+                exc.action or "-",
+                exc.reason,
+            )
             return Response(status_code=401)
         except Exception:
             # Verifier/SDK exceptions can contain signature or credential material.

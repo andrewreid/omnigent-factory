@@ -27,9 +27,11 @@ from omnigent_factory.credentials.worktree import BotIdentity, Workspaces
 from omnigent_factory.github.adapter import BoardSchema, GitHubAPIAdapter
 from omnigent_factory.github.auth import AppAuthenticator, InstallationTokenService
 from omnigent_factory.github.client import GitHubClient
+from omnigent_factory.github.ranking import RankingBoard
 from omnigent_factory.github.webhook import DeliveryIdentity, DeliveryNormalizer
 from omnigent_factory.omnigent.adapter import OmnigentConfig, OmnigentExecutionAdapter
 from omnigent_factory.omnigent.policies import PolicyError
+from omnigent_factory.omnigent.ranking import RankingSessions
 from omnigent_factory.omnigent.rest import OmnigentReadError, OmnigentRest
 from omnigent_factory.ports.clock import SystemClock
 from omnigent_factory.ports.github import IssueRef
@@ -58,8 +60,10 @@ from omnigent_factory.service.locking import ProcessLock
 from omnigent_factory.service.mcp import McpEndpoint, build_endpoint
 from omnigent_factory.service.observer import OmnigentObserver
 from omnigent_factory.service.omnigent_auth import log_expiry, omnigent_auth
+from omnigent_factory.service.ranking import Ranker, directory_triage_priorities
 from omnigent_factory.service.related import RelatedMarker
 from omnigent_factory.service.runtime import FactoryService
+from omnigent_factory.service.session_retention import SessionRetention
 from omnigent_factory.service.tokens import DaemonTokenProvider
 
 LOG = logging.getLogger(__name__)
@@ -372,6 +376,16 @@ async def build_production(
     board = BoardIndex(github.board_issues, clock)
     github.related_marker = RelatedMarker(service, board, directory).schedule
     service.auto_triager = AutoTriager(service, board, github.issue_snapshot)
+    ranker = Ranker(
+        service,
+        board=RankingBoard(github),
+        # Read-only: no git worktree or credential capability, only the factory tools.
+        sessions=RankingSessions(omnigent_adapter, str(config.source_clone)),
+        triage_priorities=directory_triage_priorities(service, directory),
+        policy_barrier_us=omnigent_adapter.config.policy_barrier_us,
+    )
+    service.ranker = ranker
+    service.session_retention = SessionRetention(service, omnigent_adapter)
     service.comment_rerenderer = github.rerender_comment
     service.busy_nodes = omnigent_adapter.busy_nodes
 
@@ -386,15 +400,17 @@ async def build_production(
     service.config_listeners.append(adopt_reloaded)
     cleaner = WorkspaceCleaner(directory, workspaces, config.worktree_root)
     service.workspace_cleaner = cleaner
+    processor = GitHubDeliveryProcessor(service, normalizer, github, clock)
+    processor.field_observer = ranker.note_owner_field
     service.bind_integrations(
         adapters=(github, recording_omnigent, broker, CleanupAdapter(cleaner)),
-        delivery_processor=GitHubDeliveryProcessor(service, normalizer, github, clock),
+        delivery_processor=processor,
         managed=(runtime,),
     )
     return ProductionComposition(
         service,
         GitHubWebhookVerifier(config.resolved_webhook_secret_file, normalizer, clock),
-        build_endpoint(service, directory, config, board=board),
+        build_endpoint(service, directory, config, board=board, ranker=ranker),
     )
 
 

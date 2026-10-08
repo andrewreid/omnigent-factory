@@ -126,6 +126,24 @@ class BoardIssue:
 
 
 @dataclass(frozen=True, slots=True)
+class RankingCard:
+    """One open repository issue on the board with its Rank and Priority (a fresh read).
+
+    ``rank`` is the "Rank" NUMBER field value (None: empty); ``priority`` the "Priority"
+    option name (None: empty or not a P0-P3 option). Title is untrusted issue data.
+    """
+
+    node_id: str
+    item_id: str
+    number: int
+    title: str
+    stage: Stage | None
+    created_at_us: int
+    rank: float | None
+    priority: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class PullRequestEvidence:
     """Fresh PR facts used to verify a build-ready attestation (§8, §7.2)."""
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,6 +16,8 @@ from omnigent_factory.github.client import GitHubAPIError, RateLimited
 from omnigent_factory.github.webhook import (
     NO_PROJECT_TRANSITION,
     DeliveryNormalizer,
+    IdentityError,
+    SignatureError,
     WebhookError,
     resolve_project_delivery,
 )
@@ -41,11 +43,28 @@ class GitHubWebhookVerifier:
         guid = lowered.get("x-github-delivery")
         event_name = lowered.get("x-github-event")
         if not guid or not event_name:
-            raise WebhookRejected("missing GitHub delivery headers")
+            raise WebhookRejected(
+                "missing GitHub delivery headers",
+                delivery=_header_token(guid),
+                event=_header_token(event_name),
+            )
+
+        def rejected(check: str, reason: str) -> WebhookRejected:
+            return WebhookRejected(
+                reason,
+                check=check,
+                delivery=_header_token(guid),
+                event=_header_token(event_name),
+                action=_body_action(body),
+            )
+
         try:
             secret = self.secret_file.read_bytes().strip()
-            if not secret:
-                raise WebhookError("empty webhook secret")
+        except OSError:
+            raise rejected("signature", "webhook secret file unreadable") from None
+        if not secret:
+            raise rejected("signature", "webhook secret file empty")
+        try:
             normalized = self.normalizer.authenticate_and_normalize(
                 secret=secret,
                 signature=lowered.get("x-hub-signature-256"),
@@ -55,8 +74,15 @@ class GitHubWebhookVerifier:
                 delivery_time_us=self.clock.now_utc_us(),
             )
             payload = json.loads(body)
-        except (OSError, ValueError, WebhookError) as exc:
-            raise WebhookRejected("GitHub delivery authentication failed") from exc
+        except SignatureError as exc:
+            raise rejected("signature", str(exc)) from exc
+        except IdentityError as exc:
+            # The signature verified: the IDs below are GitHub's, not an attacker's.
+            raise rejected("identity", f"{exc} ({_routing_ids(body)})") from exc
+        except WebhookError as exc:
+            raise rejected("identity", str(exc)) from exc
+        except ValueError as exc:
+            raise rejected("identity", f"payload unreadable: {type(exc).__name__}") from exc
         action = payload.get("action") if isinstance(payload, dict) else None
         return DeliveryRecord(
             delivery_guid=guid,
@@ -75,6 +101,52 @@ class GitHubWebhookVerifier:
         )
 
 
+_TOKEN = re.compile(r"[A-Za-z0-9_.:/-]{1,100}")
+
+
+def _header_token(value: str | None) -> str | None:
+    """A delivery GUID or event name fit for a log line (anything else is redacted)."""
+    if value is None:
+        return None
+    return value if _TOKEN.fullmatch(value) else "<malformed>"
+
+
+def _body_action(body: bytes) -> str | None:
+    """The payload's ``action`` (a short identifier), never any other body text."""
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return None
+    action = payload.get("action") if isinstance(payload, dict) else None
+    return _header_token(action) if isinstance(action, str) else None
+
+
+def _routing_ids(body: bytes) -> str:
+    """The routing identifiers a signed delivery carried (IDs and names only)."""
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return "unreadable"
+    if not isinstance(payload, dict):
+        return "unreadable"
+
+    def field(key: str, *path: str) -> object:
+        value: object = payload.get(key)
+        for part in path:
+            value = value.get(part) if isinstance(value, dict) else None
+        if isinstance(value, bool) or not isinstance(value, int | str):
+            return "-"
+        return value if isinstance(value, int) else _header_token(value)
+
+    return (
+        f"installation={field('installation', 'id')} "
+        f"organization={field('organization', 'id')} "
+        f"repository={field('repository', 'full_name')} "
+        f"project={field('projects_v2_item', 'project_node_id')} "
+        f"sender={field('sender', 'id')}"
+    )
+
+
 class GitHubDeliveryProcessor:
     """Turn one committed inbox row into at most one normalized reducer event."""
 
@@ -89,6 +161,9 @@ class GitHubDeliveryProcessor:
         self.normalizer = normalizer
         self.github = github
         self.clock = clock
+        #: Told about every authenticated ``projects_v2_item`` delivery (the ranking's
+        #: owner Rank/Priority edits, ``service.ranking.Ranker.note_owner_field``).
+        self.field_observer: Callable[[bytes], Awaitable[None]] | None = None
 
     async def process(self, delivery: DeliveryRecord) -> None:
         try:
@@ -107,6 +182,15 @@ class GitHubDeliveryProcessor:
                 await self._ignore(delivery, f"unreadable {delivery.event_name}: {exc}")
                 return
             raise NonRetryableDelivery(f"unreadable {delivery.event_name}: {exc}") from exc
+
+        if self.field_observer is not None and delivery.event_name == "projects_v2_item":
+            try:
+                # Idempotent bookkeeping: a re-processed delivery records the same choice.
+                await self.field_observer(delivery.body)
+            except Exception:
+                LOG.warning(
+                    "owner field observation failed delivery_guid=%s", delivery.delivery_guid
+                )
 
         content_id = normalized.unresolved_content_node_id
         if content_id is not None:

@@ -11,7 +11,29 @@ from omnigent_factory.store.sqlite import ApplyResult, DeliveryRecord
 
 
 class WebhookRejected(ValueError):
-    """A request failed signature, identity, or routing validation."""
+    """A request failed signature, identity, or routing validation.
+
+    ``check`` is ``signature``, ``identity`` or ``request`` and ``reason`` a fixed,
+    secret-free description (which identity check failed and the IDs it saw); the
+    delivery GUID, event and action come from the headers and the body's ``action``
+    only, never from body text.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        check: str = "request",
+        delivery: str | None = None,
+        event: str | None = None,
+        action: str | None = None,
+    ) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.check = check
+        self.delivery = delivery
+        self.event = event
+        self.action = action
 
 
 class NonRetryableDelivery(RuntimeError):

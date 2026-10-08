@@ -3,7 +3,8 @@
 The standing authorisation is the operator's (host config ``auto_triage``, or the
 ``auto-triage on|off`` CLI override, with a per-day budget). When it is on and the
 factory is idle (no plan, build or rework run working or draining, no queued build that
-could start now, no stage request waiting, a triage slot free, not paused), the oldest
+could start now, no stage request waiting, a triage slot free, no triage ranking running,
+not paused), the oldest
 eligible Inbox issue gets an
 ``AutoTriage`` event from the trusted clock. The reducer starts triage exactly as an
 owner Inbox -> Triage drag would; nothing past triage is ever started automatically.
@@ -27,6 +28,7 @@ from omnigent_factory.core.events import Event, EventKind, Provenance
 from omnigent_factory.core.projection import project_bot, startable_build
 from omnigent_factory.core.types import (
     MICROS_PER_HOUR,
+    AdmissionSnapshot,
     BotState,
     IssueSnapshot,
     Lifecycle,
@@ -38,6 +40,7 @@ from omnigent_factory.core.types import (
 from omnigent_factory.ports.github import BoardIssue, IssueRef
 from omnigent_factory.service.board_index import BoardIndex, BoardUnavailable
 from omnigent_factory.service.runtime import FactoryService
+from omnigent_factory.store import ranking as ranking_store
 from omnigent_factory.store.sqlite import AutoTriageState, SqliteStore
 
 LOG = logging.getLogger(__name__)
@@ -215,19 +218,9 @@ class AutoTriager:
             return "paused"
         if len(admission.triage_runs) >= config.triage_concurrency:
             return "every triage slot is taken"
-        if await self.service.db.call(lambda store: store.has_pending_delivery()):
-            return "webhook deliveries are pending"
-        reason = busy_reason(
-            await self.service.db.call(partial(_active_parcels, repo_id=config.repo_id))
-        )
-        if reason is not None:
-            return reason
-        head = startable_build(admission, config.trusted)
-        if head is None:
-            return None
-        parcel = await self.service.db.call(lambda store: store.load_parcel(head.parcel_id))
-        number = f" on #{parcel.issue_number}" if parcel is not None else ""
-        return f"a queued build{number} can start"
+        if await self.service.db.call(partial(ranking_store.open_run, repo_id=config.repo_id)):
+            return "a triage ranking is running"
+        return await stage_busy(self.service, admission)
 
     async def candidates(self) -> list[BoardIssue]:
         """Eligible Inbox issues, oldest first (raises ``BoardUnavailable``)."""
@@ -378,6 +371,26 @@ class AutoTriager:
         return out
 
 
+async def stage_busy(service: FactoryService, admission: AdmissionSnapshot) -> str | None:
+    """Why stage work keeps the factory from idle (shared by auto-triage and ranking).
+
+    Pending webhook deliveries, a plan/build/rework run working or draining, an owner
+    stage request not yet started, or a queued build that could start now.
+    """
+    config = service.config
+    if await service.db.call(lambda store: store.has_pending_delivery()):
+        return "webhook deliveries are pending"
+    reason = busy_reason(await service.db.call(partial(_active_parcels, repo_id=config.repo_id)))
+    if reason is not None:
+        return reason
+    head = startable_build(admission, config.trusted)
+    if head is None:
+        return None
+    parcel = await service.db.call(lambda store: store.load_parcel(head.parcel_id))
+    number = f" on #{parcel.issue_number}" if parcel is not None else ""
+    return f"a queued build{number} can start"
+
+
 def _parcels_by_id(store: SqliteStore, *, parcel_ids: list[str]) -> dict[str, Parcel]:
     found: dict[str, Parcel] = {}
     for parcel_id in parcel_ids:
@@ -406,4 +419,5 @@ __all__ = [
     "eligible_candidates",
     "known_to_factory",
     "local_day",
+    "stage_busy",
 ]

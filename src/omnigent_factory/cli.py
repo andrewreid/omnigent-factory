@@ -113,6 +113,25 @@ def build_parser() -> argparse.ArgumentParser:
     grant = auto_sub.add_parser("grant", help="add <n> auto-triages to today's budget")
     grant.add_argument("count", type=int)
     _config_arg(grant)
+    ranking = sub.add_parser(
+        "ranking",
+        help="triage ranking: status, on/off (overrides the config until it changes), "
+        "now (one run as soon as the factory is idle)",
+    )
+    ranking_sub = ranking.add_subparsers(dest="ranking_command", required=True)
+    for name in ("status", "on", "off", "now"):
+        _config_arg(ranking_sub.add_parser(name))
+    sessions = sub.add_parser("sessions", help="factory-created Omnigent sessions")
+    sessions_sub = sessions.add_subparsers(dest="sessions_command", required=True)
+    sessions_prune = sessions_sub.add_parser(
+        "prune",
+        help="delete factory sessions archived longer than session_retention_days "
+        "(through the running daemon)",
+    )
+    sessions_prune.add_argument(
+        "--dry-run", action="store_true", help="list what would be deleted; delete nothing"
+    )
+    _config_arg(sessions_prune)
     vacuum = sub.add_parser(
         "vacuum",
         help="compact the state database and enable incremental auto_vacuum (daemon stopped)",
@@ -156,6 +175,8 @@ def _operator(
         "cleanup": 60.0,
         "prune": 900.0,
         "auto-triage": 60.0,  # status reads the board
+        "ranking": 60.0,
+        "sessions-prune": 600.0,  # snapshot, tree scan and delete per session
     }.get(command, 5.0)
     deadline = time.monotonic() + startup_wait_seconds
     waiting = False
@@ -223,6 +244,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.auto_command == "grant":
             request["count"] = args.count
         return _operator(config, "auto-triage", request)
+    if args.command == "ranking":
+        return _operator(config, "ranking", {"action": args.ranking_command})
+    if args.command == "sessions" and args.sessions_command == "prune":
+        return _operator(config, "sessions-prune", {"dry_run": args.dry_run})
     if args.command == "prune":
         return _prune(config, dry_run=args.dry_run)
     if args.command == "vacuum":

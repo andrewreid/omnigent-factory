@@ -1,0 +1,16 @@
+Factory ranking run {run_id} for {repository}.
+Your Omnigent session id is {session_id}: pass it as session_id to every factory tool.
+Order the {triage_column} column so the owner can see what to work on next: it holds
+{count} open issues. This run is read-only: do not edit, push, comment, label, move cards
+or open issues or pull requests.
+Start with factory_list_issues (every open issue with its column and triage); read an
+issue in detail with factory_get_issue and its issue number when you need more.
+Weigh priority, size, dependencies and blockers (each triage's related list), overlaps,
+clashes with Building or Ready work, triages that found an issue stale or likely done,
+and age. Owner-pinned issues keep their rank ({pinned}): leave them out or keep
+them at that place.
+Change a Priority only when you found that its triage priority is wrong.
+Finish with factory_submit_ranking: every unpinned {triage_column} issue in order with a
+one-line reason, any priority_changes, and a brief summary (at most 600 characters).
+Errors list exactly what to fix; resend. What you submit is shown to a human: plain
+GitHub Markdown, no internal labels or IDs.

@@ -132,6 +132,8 @@ def render_project_migration(
                 _option("L", "RED", "Molly HIGH-RISK"),
             ],
         },
+        # Triage ranking order (1 = next); record its node ID as rank_field_node_id.
+        {"name": "Rank", "dataType": "NUMBER"},
     ]
     create_fields = [{"input": {"projectId": PROJECT_NODE_ID, **field}} for field in fields]
     views: list[dict[str, Any]] = []
@@ -187,7 +189,7 @@ def render_project_migration(
         "create_fields": create_fields,
         "create_views": views,
         "post_apply_verification": [
-            "persist every returned node and database id",
+            "persist every returned node and database id (Rank: rank_field_node_id)",
             "verify every preserved option id and existing item value",
             f"keep item-added to {status_names[Stage.INBOX]} and disable PR-driven moves",
             "retire Agent/Audit and old views only after new views verify",

@@ -16,7 +16,7 @@ from typing import Any
 import httpx
 
 from omnigent_factory.github.auth import AppAuthenticator, InstallationTokenService
-from omnigent_factory.github.client import GitHubClient
+from omnigent_factory.github.client import GitHubAPIError, GitHubClient
 from omnigent_factory.omnigent.rest import (
     OmnigentReadError,
     OmnigentRest,
@@ -292,6 +292,51 @@ async def _check_project(config: ServiceConfig, client: GitHubClient, report: Do
         report.fail("github_project", "Factory note text field ID does not match")
         return
     report.pass_check("github_project", "project and live field/option IDs match")
+    ranking_set_up = config.ranking or bool(config.rank_field_node_id)
+    if ranking_set_up:
+        _check_rank_field(config, by_id, report)
+    if ranking_set_up and config.ranking_status_update:
+        await _check_status_updates(config, client, report)
+
+
+def _check_rank_field(config: ServiceConfig, by_id: dict[Any, Any], report: DoctorReport) -> None:
+    """The triage ranking's "Rank" NUMBER field (``rank_field_node_id``)."""
+    if not config.rank_field_node_id:
+        report.warn(
+            "github_rank_field",
+            "rank_field_node_id is not set: triage ranking cannot run (create the Rank "
+            "NUMBER field, see `setup render`, and record its node ID)",
+        )
+        return
+    rank = by_id.get(config.rank_field_node_id)
+    if not isinstance(rank, dict) or rank.get("name") != "Rank" or rank.get("dataType") != "NUMBER":
+        report.fail("github_rank_field", "Rank number field ID does not match")
+        return
+    report.pass_check("github_rank_field", "Rank number field ID matches")
+
+
+async def _check_status_updates(
+    config: ServiceConfig, client: GitHubClient, report: DoctorReport
+) -> None:
+    """Advisory: the App can read project status updates (the ranking posts one; without
+    access it posts no summary and logs it)."""
+    query = """
+    query($id: ID!) { node(id: $id) { ... on ProjectV2 {
+      statusUpdates(first: 1) { nodes { id } }
+    } } }
+    """
+    try:
+        data = await client.graphql(query, {"id": config.project_node_id})
+    except GitHubAPIError as exc:
+        report.warn("github_status_updates", f"project status updates unavailable: {exc}")
+        return
+    node = data.get("node")
+    if not isinstance(node, dict) or not isinstance(node.get("statusUpdates"), dict):
+        report.warn("github_status_updates", "project status updates unavailable to the App")
+        return
+    report.pass_check(
+        "github_status_updates", "status updates readable (creation is checked on first use)"
+    )
 
 
 def _check_status_names(

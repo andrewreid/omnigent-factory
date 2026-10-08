@@ -558,6 +558,84 @@ CREATE TABLE auto_triage (
 CREATE INDEX ix_events_kind_time ON events (kind, source_time_us);
 """
 
+# Triage ranking and session retention (service-level, outside the parcel reducer).
+#
+# * ranking: the operator's ``ranking on|off`` override (same rule as auto_triage), a
+#   pending ``ranking now``, the last completed run (time and the Triage column digest it
+#   ranked) and the failure backoff.
+# * ranking_runs: one row per ranking run and its read-only Omnigent session (nonce label
+#   for adoption after a crash); finished rows beyond the newest few are pruned once their
+#   session is archived.
+# * ranking_writes: the run's outbox, written with the accepted submission in one
+#   transaction (Rank/Priority values, priority comments, the project status update),
+#   applied in ``seq`` order, each idempotent or adopted by its marker. Pruned with the run.
+# * board_fields: per issue, the Rank/Priority the factory last wrote and the owner's pin
+#   (Rank) or sticky choice (Priority). One row per issue and field.
+# * session_deletions: factory sessions retention deleted (never retried).
+V11_SQL = """
+CREATE TABLE ranking (
+    repo_id TEXT PRIMARY KEY REFERENCES repositories (repo_id),
+    enabled_override INTEGER CHECK (enabled_override IN (0, 1)),
+    override_config INTEGER CHECK (override_config IN (0, 1)),
+    now_requested_at_us INTEGER,
+    last_completed_at_us INTEGER,
+    last_triage_digest TEXT,
+    failures INTEGER NOT NULL DEFAULT 0 CHECK (failures >= 0),
+    retry_after_us INTEGER,
+    updated_at_us INTEGER NOT NULL
+);
+CREATE TABLE ranking_runs (
+    run_id TEXT PRIMARY KEY,
+    repo_id TEXT NOT NULL,
+    nonce TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN
+        ('creating', 'preparing', 'sending', 'running', 'applying', 'done', 'failed')),
+    forced INTEGER NOT NULL DEFAULT 0 CHECK (forced IN (0, 1)),
+    root_id TEXT,
+    policy_ready_at_us INTEGER,
+    triage_digest TEXT NOT NULL,
+    submission_json TEXT,
+    outcome TEXT NOT NULL DEFAULT '',
+    created_at_us INTEGER NOT NULL,
+    started_at_us INTEGER,
+    finished_at_us INTEGER,
+    archived_at_us INTEGER,
+    updated_at_us INTEGER NOT NULL
+);
+CREATE INDEX ix_ranking_runs_state ON ranking_runs (repo_id, state);
+CREATE TABLE ranking_writes (
+    write_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES ranking_runs (run_id),
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('rank', 'priority', 'comment', 'status_update')),
+    issue_node_id TEXT,
+    issue_number INTEGER,
+    payload_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'done', 'failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    detail TEXT NOT NULL DEFAULT '',
+    updated_at_us INTEGER NOT NULL
+);
+CREATE INDEX ix_ranking_writes_run ON ranking_writes (run_id, seq);
+CREATE TABLE board_fields (
+    issue_node_id TEXT NOT NULL,
+    field TEXT NOT NULL CHECK (field IN ('rank', 'priority')),
+    factory_value TEXT,
+    owner_value TEXT,
+    owner_set INTEGER NOT NULL DEFAULT 0 CHECK (owner_set IN (0, 1)),
+    owner_refresh INTEGER NOT NULL DEFAULT 0 CHECK (owner_refresh IN (0, 1)),
+    updated_at_us INTEGER NOT NULL,
+    PRIMARY KEY (issue_node_id, field)
+);
+CREATE TABLE session_deletions (
+    root_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    deleted_at_us INTEGER NOT NULL
+);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -569,4 +647,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(8, "inbox-index-and-body-retention", V8_SQL),
     Migration(9, "history-retention", V9_SQL),
     Migration(10, "auto-triage", V10_SQL),
+    Migration(11, "triage-ranking-and-session-retention", V11_SQL),
 )

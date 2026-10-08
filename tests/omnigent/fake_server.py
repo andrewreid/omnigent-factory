@@ -251,6 +251,21 @@ class FakeOmnigentServer:
                 if key in (body or {}):
                     setattr(session, key, body[key])
             return httpx.Response(200, json=session.response())
+        if len(parts) == 3 and method == "DELETE":
+            # delete_conversation (sqlalchemy_store.py @1c0153aa): the whole subtree.
+            doomed = {sid}
+            while True:
+                more = {
+                    s.id
+                    for s in self.sessions.values()
+                    if s.parent_session_id in doomed and s.id not in doomed
+                }
+                if not more:
+                    break
+                doomed |= more
+            for gone in doomed:
+                self.sessions.pop(gone, None)
+            return httpx.Response(200, json={"id": sid, "object": "session", "deleted": True})
         if len(parts) == 3 and method == "GET":
             body = session.response()
             body["pending_elicitations"] = self._snapshot_elicitations(session)

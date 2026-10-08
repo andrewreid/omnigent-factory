@@ -49,6 +49,11 @@ HOT_RELOAD_KEYS = frozenset(
         "auto_triage_daily_limit",
         "auto_triage_min_age_hours",
         "triage_concurrency",
+        "ranking",
+        "ranking_min_new_triages",
+        "ranking_status_update",
+        "rank_field_node_id",
+        "session_retention_days",
     }
 )
 
@@ -170,6 +175,20 @@ class ServiceConfig(BaseModel):
     #: Triage runs at once, repository-wide (owner drags, labels, commands and comments
     #: included); further triage requests wait for a free slot.
     triage_concurrency: int = Field(default=1, ge=1, le=20)
+    #: Triage ranking: while the factory is idle, one read-only session orders the Triage
+    #: column (the ``Rank`` field). ``omnigent-factory ranking on|off`` overrides it until
+    #: it changes here.
+    ranking: bool = False
+    #: New or changed triage results since the last ranking that start a new one (else a
+    #: change in the Triage column and 24 hours).
+    ranking_min_new_triages: int = Field(default=5, ge=1, le=1000)
+    #: Post a short project status update after each ranking.
+    ranking_status_update: bool = True
+    #: Projects v2 NUMBER field "Rank" ("" = not set up: ranking runs do not start).
+    rank_field_node_id: str = ""
+    #: Days a factory-created Omnigent session stays archived before retention deletes it
+    #: (only sessions of finished issues and ranking runs; 0 = never delete).
+    session_retention_days: float = Field(default=30.0, ge=0)
     github_config: Path | None = None
     secrets_dir: Path = Field(
         default_factory=lambda: Path.home() / ".config/omnigent-factory/secrets"

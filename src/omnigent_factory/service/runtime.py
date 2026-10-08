@@ -56,6 +56,7 @@ from omnigent_factory.service.parked import (
     inbox_release_event,
 )
 from omnigent_factory.service.redaction import install_redaction_filter, redact_text
+from omnigent_factory.store import ranking as ranking_store
 from omnigent_factory.store.sqlite import (
     ApplyResult,
     DeliveryOutcome,
@@ -124,6 +125,12 @@ class FactoryService:
         #: Idle-time auto-triage and its ``auto-triage`` operator command (composition;
         #: ``service.auto_triage.AutoTriager``). None: not wired.
         self.auto_triager: Any = None
+        #: Idle-time triage ranking and its ``ranking`` operator command (composition;
+        #: ``service.ranking.Ranker``). None: not wired.
+        self.ranker: Any = None
+        #: Deletion of long-archived factory sessions (composition;
+        #: ``service.session_retention.SessionRetention``). None: not wired.
+        self.session_retention: Any = None
         self._fatal_exit = fatal_exit
         self._fatal_reason: str | None = None
         self._delivery_failures: dict[str, int] = {}
@@ -212,6 +219,8 @@ class FactoryService:
                 self._tasks.append(
                     asyncio.create_task(self._auto_triage_loop(), name="auto-triage")
                 )
+            if self.ranker is not None:
+                self._tasks.append(asyncio.create_task(self._ranking_loop(), name="ranking"))
             for task in self._tasks:
                 task.add_done_callback(self._background_done)
             self.ready = True
@@ -682,6 +691,27 @@ class FactoryService:
             except Exception:
                 LOG.warning("auto-triage pass failed")
 
+    async def _ranking_loop(self) -> None:
+        """Triage ranking passes: every few seconds while a run is open, else every
+        reconcile interval. Housekeeping: a failed pass is logged and retried."""
+        wait = self.config.reconcile_interval_seconds
+        while not self._stop.is_set():
+            await self._wait(wait)
+            if self._stop.is_set():
+                continue
+            try:
+                outcome = await self.ranker.run_once()
+                LOG.debug("ranking pass outcome=%s", outcome)
+                running = await self.db.call(
+                    partial(ranking_store.open_run, repo_id=self.config.repo_id)
+                )
+                wait = self.ranker.next_wait(running is not None)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.warning("ranking pass failed")
+                wait = self.config.reconcile_interval_seconds
+
     async def _clock_loop(self) -> None:
         failures = 0
         while not self._stop.is_set():
@@ -698,12 +728,28 @@ class FactoryService:
                     except Exception:
                         # Housekeeping only: retried next sweep, never a clock-loop failure.
                         LOG.warning("history retention sweep failed")
+                    await self._session_housekeeping()
                 failures = 0
                 await self._wait(self.config.clock_interval_seconds)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 failures = await self._background_error("clock", failures)
+
+    async def _session_housekeeping(self) -> None:
+        """Session retention and old ranking runs, a small batch per sweep."""
+        try:
+            if self.session_retention is not None:
+                await self.session_retention.sweep()
+            repo_id = self.config.repo_id
+            require_deleted = self.config.session_retention_days > 0
+            await self.db.call(
+                lambda store: ranking_store.prune_runs(
+                    store, repo_id, require_deleted=require_deleted
+                )
+            )
+        except Exception:
+            LOG.warning("session retention sweep failed")
 
     async def prune_delivery_bodies(self) -> int:
         """Empty bodies of processed deliveries past retention, in short batches."""
@@ -840,6 +886,18 @@ class FactoryService:
                 raise ValueError("auto-triage is not wired")
             report: dict[str, object] = await self.auto_triager.command(args)
             return report
+        if command == "ranking":
+            if self.ranker is None:
+                raise ValueError("ranking is not wired")
+            ranking: dict[str, object] = await self.ranker.command(args)
+            return ranking
+        if command == "sessions-prune":
+            if self.session_retention is None:
+                raise ValueError("session retention is not wired")
+            pruned: dict[str, object] = await self.session_retention.sweep(
+                dry_run=bool(args.get("dry_run", False)), limit=100
+            )
+            return pruned
         if command == "explain":
             parcel_id = str(args.get("parcel", ""))
             if not parcel_id:

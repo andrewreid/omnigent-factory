@@ -65,6 +65,7 @@ owners = [114979]
 project_node_id = "PVT_kwDOEanNes4BkJhb"
 status_field_node_id = "PVTSSF_lADOEanNes4BkJhbzhi7I9w"
 note_field_node_id = "PVTF_lADOEanNes4BkJhbzhjww0c"
+# rank_field_node_id = ""      # the "Rank" NUMBER field (setup render creates it)
 github_app_id = 5085812
 github_installation_id = 165144097
 github_bot_login = "molly-omnigent-factory[bot]"
@@ -99,6 +100,10 @@ review_bot_mention = "@codex"
 review_bot_ack_minutes = 5        # no 👀 from the review bot by then: stop waiting
 review_bot_max_wait_minutes = 45  # 👀 (reviewing) or unreadable: wait at most this long
 review_bot_grace_minutes = 10     # the wait when the bot's 👀 cannot be told
+ranking = false                # idle-time ranking of the Triage column
+ranking_min_new_triages = 5    # new/changed triages that start a ranking
+ranking_status_update = true   # short project status update per ranking
+session_retention_days = 30    # delete factory sessions archived this long (0 = never)
 # triage_guidance = "Classify work with the repo's area:* labels."
 # engineering_guidance = "Engineering conventions live in AGENTS.md."
 
