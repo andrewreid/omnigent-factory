@@ -477,6 +477,7 @@ class EffectExecutor:
                 reason=(
                     str(detail.get("reason") or "")[:200] if detail.get("unusable") is True else ""
                 ),
+                note=str(detail.get("note") or "")[:200],
                 policy_ready_at_us=_json_int(detail.get("policy_ready_at_us"), 0),
             )
         elif effect.kind == EffectKind.VERIFY_POLICIES:

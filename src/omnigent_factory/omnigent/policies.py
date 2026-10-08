@@ -242,11 +242,63 @@ def _shell_pattern(default_branch: str) -> str:
     return "(" + "|".join(rules) + ")"
 
 
+READ_ONLY_REASON = (
+    "Denied by factory policy: this stage (triage, plan or ranking) is read-only. Git "
+    "commands that move HEAD or change the working tree or index (checkout, switch, "
+    "reset, restore, merge, rebase, cherry-pick, revert, pull, stash, commit, worktree "
+    "add/remove/move) are not allowed here: the issue worktree must stay on its recorded "
+    "branch for the build. Inspect other refs without moving HEAD: git show "
+    "<ref>:<path>, git diff <ref> [-- <path>], git log <ref>, git ls-tree <ref> (git "
+    "fetch is fine). If this matched text inside a message or file content, write that "
+    "text to a file and pass it by path (e.g. --body-file / -F)."
+)
+
+#: Whitespace between shell words, including a backslash line continuation.
+_GAP = r"([ \t]|\\\n)+"
+#: A Git global option before the subcommand (``-C <dir>``, ``-c k=v``, ``--no-pager``).
+_GIT_OPTION = (
+    r"(-[Cc]|--git-dir|--work-tree|--namespace|--exec-path|--config-env|--super-prefix)"
+    r"(=|" + _GAP + r")(\"[^\"]*\"|'[^']*'|[^\s;&|)]+)"
+    r"|--?[A-Za-z][-A-Za-z0-9]*(=[^\s;&|)]*)?"
+)
+#: Where a shell word ends.
+_END = r"($|[\s;&|)`'\"])"
+
+
+def _read_only_pattern() -> str:
+    """Git subcommands that move HEAD or change the working tree or index (#761).
+
+    The subcommand is the first word after ``git`` and its global options, so reads that
+    merely mention one (``git show origin/main:src/reset.ts``, ``git merge-base``,
+    ``git log --grep checkout``, ``git stash list``) stay allowed.
+    """
+    mutating = (
+        r"(checkout|switch|reset|restore|merge|rebase|cherry-pick|revert|pull|commit"
+        r"|worktree" + _GAP + r"(add|remove|move)"
+        r"|stash" + _GAP + r"(push|pop|apply|drop|clear|save|create|store|branch))" + _END
+    )
+    # Bare ``git stash`` (or ``git stash -u ...``) is ``stash push``.
+    bare_stash = r"stash([ \t]*($|[\n;&|)`'\"])|" + _GAP + r"-)"
+    return (
+        r"(^|[\s;&|(`'\"/])git("
+        + _GAP
+        + r"("
+        + _GIT_OPTION
+        + r"))*"
+        + _GAP
+        + r"("
+        + mutating
+        + r"|"
+        + bare_stash
+        + r")"
+    )
+
+
 def _cel_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def factory_cel_expression(default_branch: str = "main") -> str:
+def factory_cel_expression(default_branch: str = "main", *, read_only: bool = False) -> str:
     """Fixed deny rule over the pinned ``PolicyEvent`` shape (policies/schema.py @1c0153aa).
 
     ``tool_call`` events carry ``data = {"name": <tool>, "arguments": {...}}``. The rule
@@ -254,6 +306,11 @@ def factory_cel_expression(default_branch: str = "main") -> str:
     command argument (shell text) matching the deny list. It only ever returns DENY
     or ALLOW. Every access is type-guarded: the pinned ``cel_policy`` *abstains* (allows)
     on an evaluation error, so an unguarded field access would fail open.
+
+    ``read_only`` (triage, plan and ranking sessions): additionally deny Git commands that
+    move HEAD or change the working tree or index (#761: a plan-stage ``git checkout
+    origin/main`` left the issue worktree detached and blocked the build). Sub-agents
+    (Rosie's workers) inherit their root's session policies, so this covers them too.
     """
     if not default_branch or any(c.isspace() for c in default_branch):
         raise ValueError("default branch name is required")
@@ -267,7 +324,28 @@ def factory_cel_expression(default_branch: str = "main") -> str:
         f"({named} && {data}.name.matches({_cel_string(_FILE_TOOLS)}) && {has_args}"
         f" && has({args}.branch) && {args}.branch == {_cel_string(default_branch)})"
     )
-    pattern = _cel_string(_shell_pattern(default_branch))
+    shell = _command_matches(_shell_pattern(default_branch))
+    rule = (
+        f"({is_call}) && ({admin_tool} || {file_to_default} || {shell})"
+        f' ? {{"result": "DENY", "reason": {_cel_string(CEL_REASON)}}}'
+        ' : {"result": "ALLOW"}'
+    )
+    if not read_only:
+        return rule
+    # Checked first so the denial names the read-only cause and how to read other refs.
+    read_only_git = _command_matches(_read_only_pattern())
+    return (
+        f"({is_call}) && {read_only_git}"
+        f' ? {{"result": "DENY", "reason": {_cel_string(READ_ONLY_REASON)}}}'
+        f" : ({rule})"
+    )
+
+
+def _command_matches(regex: str) -> str:
+    """CEL: some command argument (shell text, string or list form) matches ``regex``."""
+    args = "event.data.arguments"
+    has_args = f"has({args}) && type({args}) == map"
+    pattern = _cel_string(regex)
     command_key = " || ".join(f'k == "{key}"' for key in _COMMAND_KEYS)
     # celpy evaluates a nested ``exists`` target eagerly even behind ``&&``: a list
     # comprehension over a non-list argument raises, the pinned cel_policy then abstains
@@ -282,12 +360,7 @@ def factory_cel_expression(default_branch: str = "main") -> str:
         f" && {args}.{key}.exists(x, type(x) == string && x.matches({pattern})))"
         for key in _COMMAND_KEYS
     ]
-    shell = "(" + " || ".join([string_form, *list_forms]) + ")"
-    return (
-        f"({is_call}) && ({admin_tool} || {file_to_default} || {shell})"
-        f' ? {{"result": "DENY", "reason": {_cel_string(CEL_REASON)}}}'
-        ' : {"result": "ALLOW"}'
-    )
+    return "(" + " || ".join([string_form, *list_forms]) + ")"
 
 
 def _compiled(name: str, expression: str, reason: str) -> PolicySpec:
@@ -348,9 +421,14 @@ def caller_policy(session_id: str) -> PolicySpec:
     return _compiled(CALLER_NAME, caller_cel_expression(session_id), CALLER_REASON)
 
 
-def factory_cel_policy(default_branch: str = "main") -> PolicySpec:
-    """The required fixed safety rule, always attached as ``factory-cel``. Not replaceable."""
-    return _compiled(CEL_NAME, factory_cel_expression(default_branch), CEL_REASON)
+def factory_cel_policy(default_branch: str = "main", *, read_only: bool = False) -> PolicySpec:
+    """The required fixed safety rule, always attached as ``factory-cel``. Not replaceable.
+
+    The read-only variant is another version of the same family, so a stage switch on a
+    reused root (plan -> build) adds the new rule before removing the old one.
+    """
+    expression = factory_cel_expression(default_branch, read_only=read_only)
+    return _compiled(CEL_NAME, expression, CEL_REASON)
 
 
 def operator_cel_policy(expression: str, reason: str = CEL_REASON) -> PolicySpec:

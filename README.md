@@ -337,6 +337,12 @@ context-full session is replaced before the next run (the new one gets a short s
 summary in its start message). When the parcel is terminal (merged or closed) and its
 tree is quiescent, the session is archived; a session replaced by a fresh one is archived
 too. When the issue title changes, the live session is renamed.
+Triage, plan and ranking runs (and their sub-agents) may not run Git commands that move
+HEAD or change the working tree (`checkout`, `switch`, `reset`, `stash`, `commit`, …); they
+read other refs with `git show <ref>:<path>`, `git diff <ref>` or `git log <ref>`.
+Preparing a run switches a worktree found off its recorded branch back to it when the tree
+is clean and nothing is in progress; otherwise the card's note says why, e.g.
+`Blocked: worktree off branch factory/issue-761 (detached at 469e2af, uncommitted changes)`.
 
 Stage messages are short pointers; the agent works through eight MCP tools served by the
 daemon at `http://127.0.0.1:<mcp_port>/mcp/` (loopback only, bearer token):

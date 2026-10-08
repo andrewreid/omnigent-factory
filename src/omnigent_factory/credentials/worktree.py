@@ -64,6 +64,13 @@ class WorktreeError(RuntimeError):
     """A workspace failed verification or could not be wired. Fail closed."""
 
 
+class OffBranchError(WorktreeError):
+    """A worktree is off its recorded branch and could not be switched back safely.
+
+    The message is owner-facing (the card's "Factory note") and names what to fix.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class BotIdentity:
     """Commit identity of the GitHub App bot user (``<id>+<slug>[bot]@users.noreply...``)."""
@@ -276,6 +283,14 @@ class Workspaces:
 
     def verify_worktree(self, workspace: str | Path, branch: str) -> VerifiedWorktree:
         """Verify ``workspace`` is our clone's worktree on ``branch`` inside owned roots."""
+        resolved = self._owned_worktree(workspace)
+        if self._head_branch(resolved) != branch:
+            raise WorktreeError("workspace is not on the recorded branch")
+        oid = self._git(["rev-parse", "HEAD"], resolved)
+        return VerifiedWorktree(resolved, branch, oid)
+
+    def _owned_worktree(self, workspace: str | Path) -> Path:
+        """``workspace`` resolved, if it is a worktree root of our clone inside owned roots."""
         raw = Path(workspace)
         if not raw.is_absolute():
             raise WorktreeError("workspace path is not absolute")
@@ -291,17 +306,82 @@ class Workspaces:
             raise WorktreeError("workspace is not a worktree root")
         if self.common_dir(resolved) != self.common_dir(self.source_clone):
             raise WorktreeError("workspace does not belong to the dedicated source clone")
+        return resolved
+
+    def _head_branch(self, path: Path) -> str | None:
+        """The branch HEAD points at, None when detached."""
         head = _run(
             ["symbolic-ref", "--short", "-q", "HEAD"],
-            resolved,
+            path,
             check=False,
             git=self.git,
             env=self.inspection_env,
         )
-        if head.returncode != 0 or head.stdout.strip() != branch:
-            raise WorktreeError("workspace is not on the recorded branch")
-        oid = self._git(["rev-parse", "HEAD"], resolved)
-        return VerifiedWorktree(resolved, branch, oid)
+        if head.returncode != 0:
+            return None
+        return head.stdout.strip() or None
+
+    def restore_branch(self, workspace: str | Path, branch: str) -> str | None:
+        """Put a worktree that left its recorded branch back on it (#761).
+
+        A read-only stage once ran ``git checkout origin/main`` in the issue worktree, so
+        the next preparation was refused. Switches back only when nothing can be lost:
+        tracked and untracked (non-ignored) files clean, no merge/rebase/cherry-pick/
+        revert/bisect in progress, the recorded branch exists locally and a detached HEAD
+        is contained in some branch or remote-tracking ref. Then ``git switch <branch>``
+        (no fetch, no force, nothing else moved). Returns the OID HEAD was at when it
+        switched, None when already on ``branch``. Otherwise raises
+        :class:`OffBranchError` naming where HEAD is and why it stays there.
+        """
+        path = self._owned_worktree(workspace)
+        current = self._head_branch(path)
+        if current == branch:
+            return None
+        oid = self._git(["rev-parse", "HEAD"], path)
+        where = f"detached at {oid[:7]}" if current is None else f"on {current}"
+        problems: list[str] = []
+        if not self.branch_exists(branch):
+            problems.append("branch missing")
+        if not self.is_clean(path):
+            problems.append("uncommitted changes")
+        problems += self._operations_in_progress(path)
+        if current is None and not self._git(
+            ["for-each-ref", "--count=1", "--contains", oid, "refs/heads", "refs/remotes"], path
+        ):
+            problems.append("commits on no branch")
+        if problems:
+            raise OffBranchError(f"worktree off branch {branch} ({where}, {', '.join(problems)})")
+        proc = _run(
+            ["switch", "--no-guess", branch],
+            path,
+            check=False,
+            git=self.git,
+            env=self.inspection_env,
+        )
+        if proc.returncode != 0 or self._head_branch(path) != branch:
+            raise OffBranchError(f"worktree off branch {branch} ({where}, switch failed)")
+        return oid
+
+    _OPERATIONS = (
+        ("MERGE_HEAD", "merge"),
+        ("rebase-merge", "rebase"),
+        ("rebase-apply", "rebase"),
+        ("CHERRY_PICK_HEAD", "cherry-pick"),
+        ("REVERT_HEAD", "revert"),
+        ("BISECT_LOG", "bisect"),
+    )
+
+    def _operations_in_progress(self, path: Path) -> list[str]:
+        args = ["rev-parse", "--path-format=absolute"]
+        for name, _ in self._OPERATIONS:
+            args += ["--git-path", name]
+        found = self._git(args, path).splitlines()
+        names = [
+            f"{op} in progress"
+            for (_, op), marker in zip(self._OPERATIONS, found, strict=True)
+            if Path(marker).exists()
+        ]
+        return list(dict.fromkeys(names))
 
     def _config_entries(self, path: Path, pattern: str) -> list[tuple[str, str]]:
         proc = _run(

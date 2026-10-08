@@ -25,15 +25,18 @@ Outcome contract per effect kind (``Ack.detail`` keys are stable):
     Incomplete reads are ``RetryableReadFailure``.
 ``PREPARE_SESSION``
     Verifies the root (nonce label, agent, project, workspace = our clone's worktree on the
-    recorded branch inside owned roots), checks no unexpected turn ran, provisions/rotates
-    the run's capability, wires the worktree, attaches github/CEL/caller/cost policies
-    (added and verified before anything they supersede is removed) and verifies the final
-    set. ``args.reuse``: the root is the parcel's existing issue session, so earlier turns
-    are expected; a missing, archived, failed, foreign-agent or context-full root is
+    recorded branch inside owned roots; a worktree left off that branch is switched back
+    when nothing can be lost, else ``note`` says why not), checks no unexpected turn ran,
+    provisions/rotates the run's capability, wires the worktree, attaches
+    github/CEL/caller/cost policies (CEL in its read-only form for triage and plan; added
+    and verified before anything they supersede is removed) and verifies the final set.
+    ``args.reuse``: the root is the parcel's existing issue session, so earlier turns are
+    expected; a missing, archived, failed, foreign-agent or context-full root is
     ``unusable`` (the reducer re-creates the run in a fresh issue session). ``detail``:
-    ``ok``, ``unexpected_turn``, ``unusable``, ``reason``, ``policy_ready_at_us``
-    (cross-replica propagation barrier). Transient/ambiguous steps are
-    ``RetryableReadFailure``: re-running adopts by exact policy name and parameters.
+    ``ok``, ``unexpected_turn``, ``unusable``, ``reason``, ``note`` (owner-facing refusal
+    cause), ``policy_ready_at_us`` (cross-replica propagation barrier). Transient or
+    ambiguous steps are ``RetryableReadFailure``: re-running adopts by exact policy name
+    and parameters.
 ``SEND_MESSAGE``
     Records the own-send intent (effect ID, node, text digest) *before* one events POST;
     the text carries a unique effect marker. ``Ack(remote_id=item_id)``; ``denied`` input
@@ -76,6 +79,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,8 +98,10 @@ from omnigent_factory.core.effects import (
     JsonValue,
     RetryableReadFailure,
 )
+from omnigent_factory.core.types import SessionKind
 from omnigent_factory.credentials.worktree import (
     BotIdentity,
+    OffBranchError,
     StageWiring,
     VerifiedWorktree,
     Workspaces,
@@ -122,6 +128,8 @@ from omnigent_factory.omnigent.rest import (
 from omnigent_factory.omnigent.tree import DEFAULT_MAX_NODES, TreeObservation, scan_tree
 from omnigent_factory.ports.clock import Clock
 from omnigent_factory.ports.omnigent import OMNIGENT_EFFECT_KINDS, SessionMatch, TreeScan
+
+LOG = logging.getLogger(__name__)
 
 ELICITATION_NOT_PENDING = "elicitation-not-pending"
 NONCE_LABEL = "factory.dispatch"
@@ -232,9 +240,15 @@ class OmnigentExecutionAdapter:
         #: Busy node IDs of each root's latest scan (named by the drain-timeout warning).
         self._busy_nodes: dict[str, tuple[str, ...]] = {}
         # Required safety policy, compiled now so a bad deployment input fails at wiring.
-        self._cel: tuple[pol.PolicySpec, ...] = (pol.factory_cel_policy(config.default_branch),)
+        operator: tuple[pol.PolicySpec, ...] = ()
         if config.cel_expression is not None:
-            self._cel += (pol.operator_cel_policy(config.cel_expression, config.cel_reason),)
+            operator = (pol.operator_cel_policy(config.cel_expression, config.cel_reason),)
+        self._cel = (pol.factory_cel_policy(config.default_branch), *operator)
+        #: Triage, plan and ranking: also no Git command that moves HEAD (#761).
+        self._cel_read_only = (
+            pol.factory_cel_policy(config.default_branch, read_only=True),
+            *operator,
+        )
 
     @property
     def handled_kinds(self) -> frozenset[EffectKind]:
@@ -524,14 +538,33 @@ class OmnigentExecutionAdapter:
         turn = self._unexpected_turn(snap, reuse=reuse)
         if turn is not None:
             return self._prepared(root, ok=True, unexpected=True, reason=turn)
+        workspace = str(snap.get("workspace") or "")
         try:
+            # A stage may have left the worktree off its branch (#761): switch back when
+            # nothing can be lost, else refuse with an owner-facing note.
+            if (
+                spec.bind_worktree is None
+                or Path(workspace).resolve() == spec.bind_worktree.resolve()
+            ):
+                moved_from = await asyncio.to_thread(
+                    self.workspaces.restore_branch, workspace, spec.branch
+                )
+                if moved_from is not None:
+                    LOG.warning(
+                        "worktree %s was off its branch: switched from %s to %s",
+                        workspace,
+                        moved_from,
+                        spec.branch,
+                    )
             verified = await asyncio.to_thread(
-                self.workspaces.verify_worktree, str(snap.get("workspace") or ""), spec.branch
+                self.workspaces.verify_worktree, workspace, spec.branch
             )
             if spec.bind_worktree is not None and verified.path != spec.bind_worktree.resolve():
                 return self._prepared(root, ok=False, reason="bound workspace differs")
             capability = await self.provisioner.provision(spec.session_id)
             await asyncio.to_thread(self._wire, verified, spec, capability.path)
+        except OffBranchError as exc:
+            return self._prepared(root, ok=False, reason=f"workspace: {exc}", note=str(exc))
         except WorktreeError as exc:
             return self._prepared(root, ok=False, reason=f"workspace: {exc}")
         cost = pol.cost_policy(
@@ -589,7 +622,7 @@ class OmnigentExecutionAdapter:
     def _static_policies(self, spec: StageSpec, root: str) -> tuple[pol.PolicySpec, ...]:
         return (
             pol.github_policy(spec.kind, self.config.repository, spec.branch),
-            *self._cel,
+            *(self._cel if spec.kind == SessionKind.BUILD else self._cel_read_only),
             pol.caller_policy(root),
         )
 

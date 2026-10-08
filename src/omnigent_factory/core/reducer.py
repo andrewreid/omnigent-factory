@@ -3317,6 +3317,8 @@ def _h_prepared(ctx: _Ctx, body: ev.Prepared) -> None:
         return
     if not body.ok:
         ctx.hold(Hold.PREPARE_FAILED)
+        if body.note:
+            ctx.note(f"Blocked: {body.note}")
         _begin_drain(ctx, s)
         return
     # Prepared is not open: the policy set must propagate (barrier) and be re-verified

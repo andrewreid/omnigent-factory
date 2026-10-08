@@ -6,7 +6,8 @@ Each step is safe to repeat after a crash or a lost response:
   included) before it POSTs, and an unclear POST is never retried blindly (the next pass
   adopts by nonce);
 * policies are reconciled by exact name and parameters (add and verify before removing)
-  and verified as the exact set: the read-only GitHub policy, the fixed CEL rule, the
+  and verified as the exact set: the read-only GitHub policy, the fixed CEL rule in its
+  read-only form (no Git command that moves HEAD in the source clone), the
   per-session ``factory-caller`` identity guard and one cost generation;
 * the start message carries a unique marker and is sent only when the session's history
   does not already hold it;
@@ -66,7 +67,7 @@ class RankingSessions:
     def policies(self, root_id: str) -> tuple[pol.PolicySpec, ...]:
         return (
             pol.github_policy(SessionKind.TRIAGE, self.config.repository, ""),
-            *self.adapter._cel,
+            *self.adapter._cel_read_only,
             pol.caller_policy(root_id),
             pol.cost_policy(1, pol.cost_threshold_usd(None, RANKING_COST_GRANT_US)),
         )

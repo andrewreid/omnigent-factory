@@ -584,6 +584,9 @@ class Prepared(_Body):
     unexpected_turn: bool = False
     unusable: bool = False
     reason: str = ""
+    #: Owner-facing reason a preparation was refused (the card's "Factory note"), e.g.
+    #: the worktree is off its recorded branch and cannot be switched back safely.
+    note: str = ""
     #: Cross-replica policy propagation barrier of the policy set just attached.
     policy_ready_at_us: int = 0
 

@@ -50,6 +50,7 @@ def observations(effect: EffectIntent, outcome: AdapterOutcome) -> tuple[ev.Even
                 unexpected_turn=bool(d.get("unexpected_turn")),
                 unusable=bool(d.get("unusable")),
                 reason=str(d.get("reason") or "")[:200] if d.get("unusable") else "",
+                note=str(d.get("note") or "")[:200],
                 policy_ready_at_us=_int(d.get("policy_ready_at_us")),
             ),
         )
