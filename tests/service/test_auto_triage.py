@@ -14,10 +14,13 @@ from omnigent_factory import cli
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.effects import EffectKind, RetryableReadFailure
 from omnigent_factory.core.events import EventKind
+from omnigent_factory.core.projection import project_bot
 from omnigent_factory.core.types import (
     MICROS_PER_HOUR,
+    BotState,
     Lifecycle,
     Parcel,
+    ReservationKind,
     SessionKind,
     Stage,
     Via,
@@ -172,6 +175,70 @@ def test_busy_reason_names_running_plans_and_waiting_requests():
     assert busy_reason([h.p("T")]) is None
 
 
+def test_busy_reason_names_working_and_draining_builds_and_reworks():
+    from omnigent_factory.testing.harness import Harness
+
+    h = Harness()
+    h.to_building("B")
+    assert busy_reason([h.p("B")]) == "build running on #1"
+    h.send("B", ev.Stop())  # draining: the tree still runs until observed quiet
+    assert h.cur("B").lifecycle == Lifecycle.DRAINING
+    assert busy_reason([h.p("B")]) == "build draining on #1"
+    h.quiesce("B", h.cur("B").session_id)
+    assert busy_reason([h.p("B")]) is None
+    h2 = Harness()
+    h2.to_building("R")
+    h2.build_ready("R")
+    h2.send("R", ev.RequestRework())
+    h2.send("R", ev.CapacityAvailable())
+    assert busy_reason([h2.p("R")]) == "rework running on #1"
+
+
+def _blocked(h: Any, pid: str) -> None:
+    s = h.cur(pid)
+    h.send(pid, result_candidate(s.session_id, s.root_id, s.revision, ev.ResultKind.BLOCKED))
+
+
+def _asks_owner(h: Any, pid: str) -> None:
+    s = h.cur(pid)
+    h.send(pid, ev.OwnerQuestion(session_id=s.session_id, question_key="q-1", summary="?"))
+
+
+def _waits_on_checks(h: Any, pid: str) -> None:
+    s = h.cur(pid)
+    h.send(
+        pid,
+        result_candidate(
+            s.session_id,
+            s.root_id,
+            s.revision,
+            ev.ResultKind.BUILD_READY,
+            pr_number=7,
+            head_sha="a" * 40,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("settle", "bot"),
+    [(_blocked, BotState.BLOCKED), (_asks_owner, BotState.NEEDS_YOU), (_waits_on_checks, None)],
+)
+def test_a_build_holding_its_slot_without_working_is_not_busy(settle: Any, bot: Any):
+    """Blocked, Needs you or waiting on CI: the run holds its build slot but does no work."""
+    from omnigent_factory.testing.harness import Harness
+
+    h = Harness()
+    h.to_building("B")
+    settle(h, "B")
+    p = h.p("B")
+    assert p.stage == Stage.BUILDING and h.admission.building_count == 1
+    if bot is not None:
+        assert project_bot(p) == bot
+    else:
+        assert h.cur("B").wait_reason is not None
+    assert busy_reason([p]) is None
+
+
 # ------------------------------------------------------------------ service rig
 
 
@@ -323,28 +390,88 @@ async def test_an_active_build_blocks_auto_triage(service_config: ServiceConfig)
             return admission.building_count == 1
 
         await eventually(admitted)
-        assert await r.triager.run_once() == "not idle: a build is active"
+        assert await r.triager.run_once() == "not idle: build running on #91"
 
 
 @pytest.mark.asyncio
-async def test_a_queued_build_blocks_auto_triage(service_config: ServiceConfig):
+async def test_a_queued_build_that_can_start_blocks_auto_triage(service_config: ServiceConfig):
     async with rig(auto_config(service_config)) as r:
         r.inbox(3)
-        await r.service.operator_command("pause", {})
+        r.service.accepting_admission = False  # hold the queue: nothing is admitted yet
         for number in (91, 92):
             factory = EventFactory(f"I_q{number}", issue_number=number)
             await r.service.apply_event(
                 factory.make(ev.GitHubSnapshot(), evidence=snapshot(read_at_us=factory.now))
             )
             await r.service.apply_event(factory.make(ev.WaivePlan(via=Via.DRAG)))
-        assert await r.triager.run_once() == "not idle: a build is queued"
+        assert await r.triager.run_once() == "not idle: a queued build on #91 can start"
+        status = await r.triager.status()
+        assert status["idle"] is False
+        assert status["busy"] == "a queued build on #91 can start"
+        await r.service.operator_command("pause", {})  # paused: no queued build can start
+        assert await r.triager.run_once() == "not idle: paused"
         await r.service.operator_command("unpause", {})
+        r.service.accepting_admission = True
 
         async def admitted() -> bool:
-            return await r.triager.run_once() == "not idle: a build is active"
+            # #91 runs; #92 stays queued with no free build slot, which alone is no work.
+            return await r.triager.run_once() == "not idle: build running on #91"
 
         await eventually(admitted)
         assert await r.parcel("I_auto_3") is None
+
+
+@pytest.mark.asyncio
+async def test_a_card_holding_a_build_slot_with_no_run_working_leaves_the_factory_idle(
+    service_config: ServiceConfig,
+):
+    """#729: a card in Building, Bot Idle, holding a build slot, no session running."""
+    async with rig(auto_config(service_config)) as r:
+        r.inbox(3)
+        pid = "I_729"
+        factory = EventFactory(pid, issue_number=729, start_us=r.clock.now_utc_us())
+        await r.service.apply_event(
+            factory.make(ev.GitHubSnapshot(), evidence=snapshot(read_at_us=factory.now))
+        )
+        await r.service.apply_event(factory.make(ev.WaivePlan(via=Via.DRAG)))
+
+        async def active() -> bool:
+            p = await r.parcel(pid)
+            run = p.current_session if p is not None else None
+            return run is not None and run.lifecycle == Lifecycle.ACTIVE
+
+        await eventually(active)
+        parcel = await r.parcel(pid)
+        assert parcel is not None and parcel.current_session is not None
+        run = parcel.current_session
+        await r.service.apply_event(factory.make(ev.Stop()))
+        await r.service.apply_event(
+            factory.make(ev.TreeQuiescent(session_id=run.session_id, complete=True, busy=False))
+        )
+        parcel = await r.parcel(pid)
+        assert parcel is not None
+        assert parcel.session(run.session_id).lifecycle == Lifecycle.FENCED  # type: ignore[union-attr]
+        # The live #729 state: the card still holds its build slot, with no run behind it.
+
+        def hold_slot(store: Any) -> None:
+            with store._txn() as conn:
+                conn.execute(
+                    "INSERT INTO reservations (reservation_id, repo_id, parcel_id, kind, "
+                    "episode_id, pr_number, live) VALUES (?, ?, ?, ?, ?, NULL, 1)",
+                    ("rs_729", service_config.repo_id, pid, ReservationKind.BUILDING.value, "ep"),
+                )
+
+        await r.service.db.call(hold_slot)
+        admission = await r.service.db.call(
+            lambda store: store.load_admission(service_config.repo_id)
+        )
+        parcel = await r.parcel(pid)
+        assert parcel is not None and admission.building_count == 1
+        assert parcel.stage == Stage.BUILDING and project_bot(parcel) == BotState.IDLE
+        status = await r.triager.status()
+        assert status["idle"] is True and status["busy"] is None
+        assert await r.triager.run_once() == "started #3"
+        await triage_running(r, "I_auto_3")
 
 
 @pytest.mark.asyncio

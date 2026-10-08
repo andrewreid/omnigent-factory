@@ -21,6 +21,7 @@ from omnigent_factory.core.types import (
     Stage,
     Via,
 )
+from omnigent_factory.service.auto_triage import busy_reason
 from omnigent_factory.testing.builders import OWNER_ID, config, result_candidate, snapshot
 from omnigent_factory.testing.harness import Harness
 
@@ -150,17 +151,34 @@ def test_auto_triage_respects_pause_and_holds():
     assert not r.audit.accepted  # a parked/unresolved delivery holds the parcel
 
 
-def test_auto_triage_refused_while_a_build_is_active_or_queued():
+def test_auto_triage_refused_while_a_queued_build_can_start():
     h = Harness()
-    h.to_building("C")
+    h.plan_published("C")
+    h.approve("C")  # approved, queued (not yet admitted), a build slot free
+    assert h.admission.queue and h.admission.building_count == 0
     r = auto(h, "A")
     assert not r.audit.accepted and r.audit.reason == "auto-triage-factory-busy"
-    h2 = Harness()
-    h2.plan_published("C")
-    h2.approve("C")  # approved, queued (not yet admitted)
-    assert h2.admission.queue
-    r = auto(h2, "A")
-    assert not r.audit.accepted and r.audit.reason == "auto-triage-factory-busy"
+
+
+def test_a_queued_build_without_a_free_pr_slot_does_not_refuse_auto_triage():
+    h = Harness(cfg=config(max_open_bot_prs=0))
+    h.plan_published("C")
+    h.approve("C")  # queued, a build slot free, but no open-PR slot: it cannot start now
+    assert h.admission.queue_entry("C") is not None and h.admission.building_count == 0
+    r = auto(h, "A")
+    assert r.audit.accepted, r.audit.reason
+
+
+def test_a_held_build_slot_alone_does_not_refuse_auto_triage():
+    """Whether a run works is the service's idle check; admission only shows the slot."""
+    h = Harness()
+    h.to_building("C")
+    h.plan_published("D")
+    h.approve("D")  # queued behind C: no build slot free, so it cannot start now
+    assert h.admission.building_count == 1 and h.admission.queue_entry("D") is not None
+    r = auto(h, "A")
+    assert r.audit.accepted, r.audit.reason
+    assert h.p("A").stage == Stage.TRIAGED
 
 
 def test_a_running_auto_triage_finishes_when_a_build_arrives():
@@ -175,9 +193,8 @@ def test_a_running_auto_triage_finishes_when_a_build_arrives():
     finish_triage(h, "A")
     assert h.cur("A").lifecycle == Lifecycle.RETIRED
     assert Hold.PUBLICATION_PENDING in h.p("A").holds  # the triage was accepted
-    # ... and no new auto-triage starts while the build runs.
-    r = auto(h, "B")
-    assert not r.audit.accepted and r.audit.reason == "auto-triage-factory-busy"
+    # ... and no new auto-triage starts while the build runs (the service's idle check).
+    assert busy_reason([h.p("C")]) == "build running on #2"
 
 
 # ----------------------------------------------------------------- triage slots

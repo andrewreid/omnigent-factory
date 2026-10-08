@@ -21,6 +21,7 @@ from omnigent_factory.core.types import (
     Parcel,
     QueueEntry,
     QueueStatus,
+    ReservationKind,
     Stage,
     StageSession,
     TrustedConfig,
@@ -264,3 +265,19 @@ def building_capacity_available(admission: AdmissionSnapshot, config: TrustedCon
 
 def pr_capacity_available(admission: AdmissionSnapshot, config: TrustedConfig) -> bool:
     return admission.prospective_pr_count < config.max_open_bot_prs
+
+
+def startable_build(admission: AdmissionSnapshot, config: TrustedConfig) -> QueueEntry | None:
+    """The queued build that capacity would admit right now, if any.
+
+    Not paused, the queue head, a building slot free and an open-PR slot free unless the
+    head already holds one: the repository-wide checks of ``CapacityAvailable`` (its
+    per-parcel preconditions are the parcel's own).
+    """
+    head = queue_head(admission)
+    if head is None or admission.paused or not building_capacity_available(admission, config):
+        return None
+    holds_pr = any(
+        r.parcel_id == head.parcel_id for r in admission.live_reservations(ReservationKind.OPEN_PR)
+    )
+    return head if holds_pr or pr_capacity_available(admission, config) else None

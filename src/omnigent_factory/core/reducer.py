@@ -67,6 +67,7 @@ from omnigent_factory.core.projection import (
     project_note,
     queue_head,
     ready_bot_ok,
+    startable_build,
     sync_red_note,
     triage_queued_note,
     work_live,
@@ -1287,9 +1288,11 @@ def _h_auto_triage(ctx: _Ctx, body: ev.AutoTriage) -> None:
     Starts triage exactly as an owner Inbox -> Triage drag does (the daemon moves the
     card), but only for an Inbox issue the factory never worked on: no authority, run,
     hold or pending write of any kind. The service picks the issue when the factory is
-    idle; this re-checks what the parcel and admission can tell: not paused, no build
-    reserved or queued, a triage slot free. A barrier (stop, leftward move, safety fact)
-    after the read refuses it like a stale owner control.
+    idle; this re-checks what the parcel and admission can tell: not paused, no queued
+    build that could start now (``startable_build``), a triage slot free. A build slot held
+    with no run working does not count: whether a run works is the service's check. A
+    barrier (stop, leftward move, safety fact) after the read refuses it like a stale owner
+    control.
     """
     _ = body
     p = ctx.p
@@ -1313,9 +1316,7 @@ def _h_auto_triage(ctx: _Ctx, body: ev.AutoTriage) -> None:
         or p.pending_authorization_id is not None
     ):
         raise Rejected("auto-triage-issue-known")
-    if ctx.admission.building_count or any(
-        q.status == QueueStatus.QUEUED for q in ctx.admission.queue
-    ):
+    if startable_build(ctx.admission, ctx.config) is not None:
         raise Rejected("auto-triage-factory-busy")
     if not _triage_slot_free(ctx):
         raise Rejected("auto-triage-slot-busy")

@@ -2,8 +2,9 @@
 
 The standing authorisation is the operator's (host config ``auto_triage``, or the
 ``auto-triage on|off`` CLI override, with a per-day budget). When it is on and the
-factory is idle (no build active or queued, no plan or rework run in flight, no triage
-request waiting, a triage slot free), the oldest eligible Inbox issue gets an
+factory is idle (no plan, build or rework run working or draining, no queued build that
+could start now, no stage request waiting, a triage slot free, not paused), the oldest
+eligible Inbox issue gets an
 ``AutoTriage`` event from the trusted clock. The reducer starts triage exactly as an
 owner Inbox -> Triage drag would; nothing past triage is ever started automatically.
 
@@ -23,15 +24,16 @@ from omnigent_factory.core import events as ev
 from omnigent_factory.core.codec import parcel_from_json
 from omnigent_factory.core.effects import RetryableReadFailure
 from omnigent_factory.core.events import Event, EventKind, Provenance
-from omnigent_factory.core.predicates import RUNNING_LIFECYCLES
+from omnigent_factory.core.projection import project_bot, startable_build
 from omnigent_factory.core.types import (
     MICROS_PER_HOUR,
+    BotState,
     IssueSnapshot,
     Lifecycle,
     Parcel,
-    QueueStatus,
     SessionKind,
     Stage,
+    StageSession,
 )
 from omnigent_factory.ports.github import BoardIssue, IssueRef
 from omnigent_factory.service.board_index import BoardIndex, BoardUnavailable
@@ -115,19 +117,40 @@ def eligible_candidates(
     return sorted(chosen, key=lambda issue: (issue.created_at_us, issue.number))
 
 
+#: A plan or build run in one of these lifecycles is starting or working, if its card
+#: shows ``Working``: Blocked, Needs you and Checkpoint mean it waits, whatever the
+#: lifecycle says (an agent that reported blocked stays ``ACTIVE``).
+_WORKING_LIFECYCLES = frozenset(
+    {Lifecycle.INTENT, Lifecycle.CREATING, Lifecycle.PREPARING, Lifecycle.ACTIVE}
+)
+
+
+def _run_name(parcel: Parcel, session: StageSession) -> str:
+    auth = parcel.authorization(session.authorization_id)
+    return "rework" if auth is not None and auth.rework else session.kind.value
+
+
 def busy_reason(parcels: Iterable[Parcel]) -> str | None:
     """Why stage work keeps the factory from idle (None: none does).
 
-    A plan or build run that is running (not waiting on the owner), or any stage request
-    not yet started: owner triage requests waiting for a slot go first.
+    A stage request not yet started (owner triage requests waiting for a slot go first),
+    or a plan, build or rework run that is working or draining. Not stage work: a run
+    waiting on the owner or on checks, a blocked one, and a card that only holds a build
+    slot with no run working (triage runs are governed by the triage slots).
     """
     for parcel in parcels:
         pending = parcel.authorization(parcel.pending_authorization_id)
         if pending is not None and not pending.cancelled:
             return f"{pending.kind.value} requested on #{parcel.issue_number}"
+        working = project_bot(parcel) == BotState.WORKING
         for session in parcel.sessions:
-            if session.kind != SessionKind.TRIAGE and session.lifecycle in RUNNING_LIFECYCLES:
-                return f"{session.kind.value} running on #{parcel.issue_number}"
+            if session.kind == SessionKind.TRIAGE:
+                continue
+            # A stop, revoke or checkpoint drain: the tree still runs, whatever the card shows.
+            if session.lifecycle == Lifecycle.DRAINING:
+                return f"{_run_name(parcel, session)} draining on #{parcel.issue_number}"
+            if working and session.lifecycle in _WORKING_LIFECYCLES:
+                return f"{_run_name(parcel, session)} running on #{parcel.issue_number}"
     return None
 
 
@@ -183,19 +206,23 @@ class AutoTriager:
         """Why the factory is not idle for auto-triage (None: idle)."""
         config = self.service.config
         admission = await self.service.db.call(lambda store: store.load_admission(config.repo_id))
-        if admission.building_count:
-            return "a build is active"
-        if any(q.status == QueueStatus.QUEUED for q in admission.queue):
-            return "a build is queued"
         if admission.paused:
             return "paused"
         if len(admission.triage_runs) >= config.triage_concurrency:
             return "every triage slot is taken"
         if await self.service.db.call(lambda store: store.has_pending_delivery()):
             return "webhook deliveries are pending"
-        return busy_reason(
+        reason = busy_reason(
             await self.service.db.call(partial(_active_parcels, repo_id=config.repo_id))
         )
+        if reason is not None:
+            return reason
+        head = startable_build(admission, config.trusted)
+        if head is None:
+            return None
+        parcel = await self.service.db.call(lambda store: store.load_parcel(head.parcel_id))
+        number = f" on #{parcel.issue_number}" if parcel is not None else ""
+        return f"a queued build{number} can start"
 
     async def candidates(self) -> list[BoardIssue]:
         """Eligible Inbox issues, oldest first (raises ``BoardUnavailable``)."""

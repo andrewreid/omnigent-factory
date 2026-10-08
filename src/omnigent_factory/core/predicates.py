@@ -19,9 +19,10 @@ from omnigent_factory.core.types import (
     StageSession,
 )
 
-#: A stage run in one of these lifecycles is running: a triage run holds a triage slot,
-#: a plan or build run keeps the factory from idle-time auto-triage. A run waiting on
-#: the owner (an open question, a plan approval, a checkpoint) or blocked/closed is not.
+#: A triage run in one of these lifecycles is running and holds a triage slot. A run
+#: waiting on the owner (an open question, a plan approval, a checkpoint) or
+#: blocked/closed is not. (Idle-time auto-triage has its own, narrower rule for plan and
+#: build runs: ``service.auto_triage.busy_reason``.)
 RUNNING_LIFECYCLES = frozenset(
     {
         Lifecycle.INTENT,

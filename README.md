@@ -136,12 +136,15 @@ split.
 
 ### Idle-time auto-triage
 
-Off by default. When on, and the factory is otherwise idle (no build active or queued, no
-plan or rework run in flight, no triage request waiting, a triage slot free, not paused),
-the factory triages the oldest eligible Inbox issue, one at a time, exactly as if you had
-dragged it to Triage: the bot moves the card, posts the normal triage comment and leaves
-it `Idle`. It never goes past Triage. A running triage finishes even if a build arrives;
-no new one starts until the factory is idle again.
+Off by default. When on, and the factory is otherwise idle (no plan, build or rework run
+working or draining, no queued build that could start now, no stage request waiting, a
+triage slot free, not paused), the factory triages the oldest eligible Inbox issue, one at
+a time, exactly as if you had dragged it to Triage: the bot moves the card, posts the
+normal triage comment and leaves it `Idle`. It never goes past Triage. A card in Building
+or Ready whose `Bot` is `Blocked`, `Idle`, `Needs you` or `Checkpoint`, or whose run waits
+on checks, does not keep the factory busy, even while it holds a build slot. A running
+triage finishes even if a build arrives; no new one starts until the factory is idle
+again.
 
 Eligible: an open issue (not a pull request or draft) of the configured repository in the
 Inbox column, assigned to nobody, without the `factory:skip` label, created more than
