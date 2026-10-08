@@ -1,10 +1,11 @@
 """Triage ranking: an idle-time pass that orders the Triage column (the board's Rank field).
 
 The standing authorisation is the operator's (host config ``ranking``, or the
-``ranking on|off`` CLI override; ``ranking now`` asks for one run). A run starts when the
-factory is idle by the auto-triage rule, no triage is running, and enough changed since
-the last completed run (``ranking_min_new_triages`` new triage results, or 24 hours and
-any change in the Triage column). It never moves cards, starts stages or closes issues.
+``ranking on|off`` CLI override; ``ranking now`` asks for one run). An automatic run starts
+when the factory is idle by the auto-triage rule, no triage is running, and enough changed
+since the last completed run (``ranking_min_new_triages`` new triage results, or 24 hours
+and any change in the Triage column). A ``now`` run waits only for a running triage (and
+a pause), not for stage work. It never moves cards, starts stages or closes issues.
 
 One run = one read-only Omnigent session (``RankingSessions``) that reads through
 ``factory_list_issues``/``factory_get_issue`` and submits once with
@@ -271,15 +272,18 @@ class Ranker:
         state = await self.state()
         return state.enabled(configured), state.source(configured)
 
-    async def busy(self) -> str | None:
-        """Why the factory is not idle for a ranking (None: idle). The auto-triage rule,
-        and no triage of any kind running (a ranking shares the triage slot)."""
+    async def busy(self, *, forced: bool = False) -> str | None:
+        """Why a ranking cannot start now (None: it can). No triage of any kind running (a
+        ranking shares the triage slot) and, unless ``forced`` (an operator ``ranking now``),
+        the auto-triage idle rule."""
         config = self.service.config
         admission = await self.service.db.call(lambda store: store.load_admission(config.repo_id))
         if admission.paused:
             return "paused"
         if admission.triage_runs:
             return "a triage is running"
+        if forced:
+            return None
         return await stage_busy(self.service, admission)
 
     def _not_configured(self) -> str | None:
@@ -473,7 +477,7 @@ class Ranker:
         now = self._now()
         if not forced and state.retry_after_us is not None and now < state.retry_after_us:
             return "backing off after a failed run"
-        reason = await self.busy()
+        reason = await self.busy(forced=forced)
         if reason is not None:
             return f"not idle: {reason}"
         try:
@@ -953,7 +957,12 @@ class Ranker:
     async def status(self) -> dict[str, object]:
         state = await self.state()
         enabled, source = await self.enabled()
-        busy = await self.busy()
+        forced = state.now_requested_at_us is not None
+        busy = await self.busy(forced=forced)
+        if busy is None and forced:
+            open_run = await self._db(rs.open_run, repo_id=self.repo_id)
+            if open_run is not None:
+                busy = "a ranking run is in flight"
         runs = await self._db(rs.recent_runs, repo_id=self.repo_id)
         new = await self._db(rs.count_triage_results, since_us=state.last_completed_at_us or 0)
         return {
@@ -961,7 +970,7 @@ class Ranker:
             "enabled_source": source,
             "configured": self._not_configured() is None,
             "not_configured": self._not_configured(),
-            "now_requested": state.now_requested_at_us is not None,
+            "now_requested": forced,
             "idle": busy is None,
             "busy": busy,
             "new_triage_results": new,

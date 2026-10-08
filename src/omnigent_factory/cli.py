@@ -116,7 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
     ranking = sub.add_parser(
         "ranking",
         help="triage ranking: status, on/off (overrides the config until it changes), "
-        "now (one run as soon as the factory is idle)",
+        "now (one run as soon as no triage or ranking is running)",
     )
     ranking_sub = ranking.add_subparsers(dest="ranking_command", required=True)
     for name in ("status", "on", "off", "now"):

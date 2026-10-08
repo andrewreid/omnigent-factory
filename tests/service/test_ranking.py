@@ -426,6 +426,58 @@ async def test_not_idle_while_a_plan_runs_or_a_triage_runs(service_config: Servi
 
         await eventually(triage_running)
         assert await r.ranker.run_once() == "not idle: a triage is running"
+        # ``now`` skips the idle rule, never the triage slot.
+        status = await r.ranker.command({"action": "now"})
+        assert status["busy"] == "a triage is running" and status["idle"] is False
+        assert await r.ranker.run_once() == "not idle: a triage is running"
+        assert await r.run() is None
+
+
+async def build_running(r: Rig) -> None:
+    factory = EventFactory("I_build", issue_number=91, start_us=r.clock.now_utc_us())
+    await r.service.apply_event(
+        factory.make(ev.GitHubSnapshot(), evidence=snapshot(read_at_us=factory.now))
+    )
+    await r.service.apply_event(factory.make(ev.WaivePlan(via=Via.DRAG)))
+
+    async def admitted() -> bool:
+        admission = await r.service.db.call(lambda s: s.load_admission(r.service.config.repo_id))
+        return admission.building_count == 1
+
+    from tests.service.test_pilot_677 import eventually
+
+    await eventually(admitted)
+
+
+@pytest.mark.asyncio
+async def test_now_starts_while_a_build_runs_and_an_automatic_run_waits(
+    service_config: ServiceConfig,
+):
+    async with rig(ranking_config(service_config)) as r:
+        r.board.cards_ = [card(1)]
+        await r.add_triage_results(5)
+        await build_running(r)
+        assert await r.ranker.run_once() == "not idle: build running on #91"
+        status = await r.ranker.status()
+        assert status["busy"] == "build running on #91" and status["idle"] is False
+        status = await r.ranker.command({"action": "now"})
+        assert status["now_requested"] is True
+        assert status["busy"] is None and status["idle"] is True
+        assert await r.ranker.run_once() == "started"
+        # A second ``now`` during the run waits for it, and says so.
+        status = await r.ranker.command({"action": "now"})
+        assert status["busy"] == "a ranking run is in flight" and status["idle"] is False
+        assert await r.ranker.run_once() == "running"
+        assert len(await r.runs()) == 1
+        await r.submit({"ranking": [item(1)], "summary": "s"})
+        assert await r.ranker.run_once() == "completed"
+        assert await r.ranker.run_once() == "started"  # the second request, build still on
+        await r.submit({"ranking": [item(1)], "summary": "s"})
+        assert await r.ranker.run_once() == "completed"
+        # Automatic runs still wait for idle.
+        await r.add_triage_results(5)
+        assert await r.ranker.run_once() == "not idle: build running on #91"
+        assert (await r.ranker.status())["busy"] == "build running on #91"
 
 
 @pytest.mark.asyncio
@@ -709,6 +761,12 @@ async def test_a_run_that_submits_nothing_fails_backs_off_and_is_archived(
         )
         with pytest.raises(RankingToolError, match="closed"):
             await r.ranker.submit(run.root_id, run.run_id, {"ranking": [item(1)], "summary": "s"})
+        # ``now`` overrides the backoff once; automatic runs back off again after.
+        await r.ranker.command({"action": "now"})
+        assert await r.ranker.run_once() == "started"
+        r.clock.advance(3 * MICROS_PER_MINUTE)
+        assert (await r.ranker.run_once()).startswith("failed: ")
+        assert await r.ranker.run_once() == "backing off after a failed run"
 
 
 @pytest.mark.asyncio

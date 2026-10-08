@@ -169,7 +169,9 @@ orders the Triage column. It weighs priority, size, dependencies and blockers fr
 triage's related list, overlaps, clashes with Building or Ready work, stale or likely-done
 findings and age; it reads with `factory_list_issues` and `factory_get_issue` and submits
 once with `factory_submit_ranking`. It never moves cards, starts stages or closes issues,
-and a ranking and auto-triage never run at the same time.
+and a ranking and auto-triage never run at the same time. `ranking now` skips the idle rule: it
+starts as soon as no triage and no other ranking is running, even while builds, plans or
+reworks run.
 
 What it writes: the project's `Rank` number field (1 = next), only where the value
 changes; a `Priority` change only when the run found the triage priority wrong, each with
@@ -233,7 +235,7 @@ waits up to 90 s for it instead of failing.
 | `auto-triage grant <n>` | Add `<n>` (1-1000) auto-triages to today's budget (local day; it does not carry over). |
 | `ranking status` | Triage ranking: enabled (and whether config or the CLI decides), idle or what keeps it busy, new triage results since the last ranking, failures/backoff, recent runs. |
 | `ranking on` / `off` | Turn triage ranking on/off at runtime; stored like `auto-triage on`/`off` (the newer intent wins). |
-| `ranking now` | Run one ranking as soon as the factory is idle, whatever changed (also when ranking is off, or backing off). |
+| `ranking now` | Run one ranking as soon as no triage or other ranking is running (it does not wait for builds, plans, reworks, queued builds or stage requests), whatever changed (also when ranking is off, or backing off; not while paused). `ranking status` then shows only what it still waits on. |
 | `sessions prune [--dry-run]` | Delete (or list) the factory sessions session retention would remove now (through the daemon). |
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
