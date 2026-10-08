@@ -19,6 +19,31 @@ from omnigent_factory.core.types import (
     StageSession,
 )
 
+#: A stage run in one of these lifecycles is running: a triage run holds a triage slot,
+#: a plan or build run keeps the factory from idle-time auto-triage. A run waiting on
+#: the owner (an open question, a plan approval, a checkpoint) or blocked/closed is not.
+RUNNING_LIFECYCLES = frozenset(
+    {
+        Lifecycle.INTENT,
+        Lifecycle.CREATING,
+        Lifecycle.PREPARING,
+        Lifecycle.ACTIVE,
+        Lifecycle.CHECKPOINT_GRACE,
+        Lifecycle.DRAINING,
+        Lifecycle.UNKNOWN,
+    }
+)
+
+
+def holds_triage_slot(p: Parcel) -> bool:
+    """A triage run of ``p`` occupies one of the repository's triage slots.
+
+    The store derives ``AdmissionSnapshot.triage_runs`` with the same rule in SQL.
+    """
+    return any(
+        s.kind == SessionKind.TRIAGE and s.lifecycle in RUNNING_LIFECYCLES for s in p.sessions
+    )
+
 
 def eligible(p: Parcel) -> bool:
     """E for recording authority: open, unassigned, identity-verified issue."""

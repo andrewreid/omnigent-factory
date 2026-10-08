@@ -72,6 +72,10 @@ def contract_text(size: str = "M", goal: str = "Ship the export button") -> str:
     return canonical_contract(contract(size, goal)).decode("utf-8")
 
 
+#: Control provenances that carry no GitHub actor (operator socket, trusted clock).
+_ACTORLESS = frozenset({Provenance.OPERATOR, Provenance.SCHEDULER})
+
+
 class EventFactory:
     """Builds events for one parcel with increasing IDs and source times.
 
@@ -134,14 +138,15 @@ class EventFactory:
                 | ev.GraceExpired
                 | ev.CapacityAvailable
                 | ev.RetryDue
-                | ev.ReconcileDue,
+                | ev.ReconcileDue
+                | ev.AutoTriage,
             ):
                 provenance = Provenance.SCHEDULER
             if isinstance(body, ev.InboxHoldSet | ev.InboxHoldReleased):
                 provenance = Provenance.INBOX
             if isinstance(body, ev.ResultCandidate | ev.OwnerQuestion):
                 provenance = Provenance.MCP
-        if actor is None and cls == EventClass.CONTROL and provenance != Provenance.OPERATOR:
+        if actor is None and cls == EventClass.CONTROL and provenance not in _ACTORLESS:
             actor = OWNER_ID
         if isinstance(evidence, str):
             evidence = snapshot(read_at_us=t) if cls == EventClass.CONTROL else None

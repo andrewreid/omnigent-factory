@@ -68,11 +68,13 @@ from omnigent_factory.core.projection import (
     queue_head,
     ready_bot_ok,
     sync_red_note,
+    triage_queued_note,
     work_live,
 )
 from omnigent_factory.core.types import (
     BLOCKING_HOLDS,
     CONTROL_CLEARED_HOLDS,
+    RELATIONS,
     STAGE_ORDER,
     AdmissionSnapshot,
     Approval,
@@ -97,6 +99,7 @@ from omnigent_factory.core.types import (
     QueueEntry,
     QueueStatus,
     Readiness,
+    RelatedMark,
     Reservation,
     ReservationKind,
     SessionKind,
@@ -943,11 +946,22 @@ def _try_activate_pending(ctx: _Ctx) -> None:
         ):
             _begin_drain(ctx, cur)
         return
+    if auth.kind == SessionKind.TRIAGE and not _triage_slot_free(ctx):
+        # Every triage slot is taken (owner and auto-triage runs alike): the request
+        # waits, recorded, and starts on a later event once a slot is free.
+        ctx.note(triage_queued_note())
+        return
     if not ctx.event.entropy:
         return
     _retire_settled_current(ctx)
     if _create_session(ctx, auth) is not None:
         ctx.update(pending_authorization_id=None)
+
+
+def _triage_slot_free(ctx: _Ctx) -> bool:
+    """A repository triage slot is free for this parcel (``triage_concurrency``)."""
+    others = ctx.admission.triage_runs - {ctx.p.parcel_id}
+    return len(others) < ctx.config.triage_concurrency
 
 
 def _maybe_start_prepared(ctx: _Ctx) -> None:
@@ -1265,6 +1279,67 @@ def _h_request_triage(ctx: _Ctx, body: ev.RequestTriage) -> None:
     _cancel_queue(ctx)
     _move(ctx, Stage.TRIAGED, body.via)
     _start_stage(ctx, SessionKind.TRIAGE, ctx.config.block_us(ctx.p.size or Size.S))
+
+
+def _h_auto_triage(ctx: _Ctx, body: ev.AutoTriage) -> None:
+    """Idle-time auto-triage: the operator's standing authorisation, from the clock.
+
+    Starts triage exactly as an owner Inbox -> Triage drag does (the daemon moves the
+    card), but only for an Inbox issue the factory never worked on: no authority, run,
+    hold or pending write of any kind. The service picks the issue when the factory is
+    idle; this re-checks what the parcel and admission can tell: not paused, no build
+    reserved or queued, a triage slot free. A barrier (stop, leftward move, safety fact)
+    after the read refuses it like a stale owner control.
+    """
+    _ = body
+    p = ctx.p
+    if ctx.event.evidence is None:
+        raise Rejected("auto-triage-without-fresh-read")
+    if ctx.now <= p.barrier_time_us:
+        raise Rejected("auto-triage-not-fresh-after-barrier")
+    if ctx.admission.paused:
+        raise Rejected("paused")
+    if not dispatchable(p):
+        raise Rejected("parcel-not-dispatchable")
+    if ctx.origin_stage not in _TRIAGE_STAGES or p.stage != Stage.INBOX:
+        raise Rejected("auto-triage-not-in-inbox")
+    if (
+        p.authorizations
+        or p.sessions
+        or p.holds
+        or p.decisions
+        or board_pending(p)
+        or p.unknown_effects
+        or p.pending_authorization_id is not None
+    ):
+        raise Rejected("auto-triage-issue-known")
+    if ctx.admission.building_count or any(
+        q.status == QueueStatus.QUEUED for q in ctx.admission.queue
+    ):
+        raise Rejected("auto-triage-factory-busy")
+    if not _triage_slot_free(ctx):
+        raise Rejected("auto-triage-slot-busy")
+    _move(ctx, Stage.TRIAGED)
+    _start_stage(ctx, SessionKind.TRIAGE, ctx.config.block_us(p.size or Size.S))
+
+
+#: Related marks kept per card (newest win); the note shows what fits on one line.
+_MAX_RELATED_MARKS = 5
+
+
+def _h_related_marked(ctx: _Ctx, body: ev.RelatedMarked) -> None:
+    """Another issue's accepted triage named this one: remember it for the card's note."""
+    if (
+        body.relation not in RELATIONS
+        or body.source_issue < 1
+        or body.source_issue == ctx.p.issue_number
+    ):
+        raise Rejected("invalid-related-mark")
+    mark = RelatedMark(body.source_issue, body.relation)
+    if mark in ctx.p.related_marks:
+        raise Rejected("already-marked")
+    rest = tuple(m for m in ctx.p.related_marks if m.issue != body.source_issue)
+    ctx.update(related_marks=(*rest, mark)[-_MAX_RELATED_MARKS:])
 
 
 def _replan(ctx: _Ctx, via: Via | None) -> None:
@@ -3996,6 +4071,8 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.REVIEW_CHANGED: _h_review_changed,
     EventKind.READINESS_EVIDENCE: _h_readiness,
     EventKind.OPERATOR_RESUME: _h_operator_resume,
+    EventKind.AUTO_TRIAGE: _h_auto_triage,
+    EventKind.RELATED_MARKED: _h_related_marked,
     EventKind.CONTRACT_PUBLISHED: _h_contract_published,
     EventKind.PUBLICATION_ACKED: _h_publication_acked,
     EventKind.SESSION_CREATED: _h_session_created,
@@ -4101,6 +4178,10 @@ def _project_board(ctx: _Ctx) -> None:
     drain, Working -> Idle, keeps it: it explains why the card is idle), unless this
     event set it.
     """
+    # The card moved on (a parcel first seen now counts as coming from Inbox): the marks
+    # served their purpose.
+    if ctx.p.related_marks and ctx.p.stage not in (None, ctx.origin_stage or Stage.INBOX):
+        ctx.update(related_marks=())
     old_bot = ctx.p.bot
     bot = project_bot(ctx.p, queued=_queued(ctx))
     if ctx.p.note and not ctx.note_set:

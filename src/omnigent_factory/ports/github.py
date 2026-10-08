@@ -107,6 +107,25 @@ class IssueRef:
 
 
 @dataclass(frozen=True, slots=True)
+class BoardIssue:
+    """One open issue of the configured repository on the project board (a fresh read).
+
+    Title and labels are untrusted issue data. Pull requests, draft items and issues of
+    other repositories are never listed.
+    """
+
+    node_id: str
+    number: int
+    title: str
+    #: Column by Status option ID (None: no or an unknown Status).
+    stage: Stage | None
+    labels: tuple[str, ...]
+    created_at_us: int
+    #: Anyone is assigned (GitHub assignees are people).
+    assigned: bool
+
+
+@dataclass(frozen=True, slots=True)
 class PullRequestEvidence:
     """Fresh PR facts used to verify a build-ready attestation (§8, §7.2)."""
 

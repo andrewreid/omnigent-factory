@@ -539,6 +539,25 @@ UPDATE parcels
     WHERE json_array_length(aggregate_json, '$.parcel.applied_event_ids') > 0;
 """
 
+# Idle-time auto-triage.
+#
+# * auto_triage: the operator's runtime override of host config ``auto_triage`` (with the
+#   config value it was set against: once the config changes, the config wins again) and
+#   today's extra budget from ``auto-triage grant``. Auto-started triages are counted from
+#   their accepted ``AutoTriage`` events, which retention never deletes.
+# * ix_events_kind_time: that count (per local day) without scanning every event.
+V10_SQL = """
+CREATE TABLE auto_triage (
+    repo_id TEXT PRIMARY KEY REFERENCES repositories (repo_id),
+    enabled_override INTEGER CHECK (enabled_override IN (0, 1)),
+    override_config INTEGER CHECK (override_config IN (0, 1)),
+    grant_day TEXT,
+    granted INTEGER NOT NULL DEFAULT 0 CHECK (granted >= 0),
+    updated_at_us INTEGER NOT NULL
+);
+CREATE INDEX ix_events_kind_time ON events (kind, source_time_us);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -549,4 +568,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(7, "pr-review-comments", V7_SQL),
     Migration(8, "inbox-index-and-body-retention", V8_SQL),
     Migration(9, "history-retention", V9_SQL),
+    Migration(10, "auto-triage", V10_SQL),
 )

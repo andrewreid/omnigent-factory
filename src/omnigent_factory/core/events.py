@@ -60,6 +60,7 @@ class EventKind(enum.StrEnum):
     PAUSE = "Pause"
     UNPAUSE = "Unpause"
     OPERATOR_RESUME = "OperatorResume"
+    AUTO_TRIAGE = "AutoTriage"
     # safety
     LEFTWARD_MOVE = "LeftwardMove"
     ASSIGNED_HUMAN = "AssignedHuman"
@@ -100,6 +101,7 @@ class EventKind(enum.StrEnum):
     POLICY_GUARD_FAILED = "PolicyGuardFailed"
     RESULT_CANDIDATE = "ResultCandidate"
     ISSUE_SESSION_CLOSED = "IssueSessionClosed"
+    RELATED_MARKED = "RelatedMarked"
     TREE_QUIESCENT = "TreeQuiescent"
     STOP_TIMEOUT = "StopTimeout"
     SESSION_CRASHED = "SessionCrashed"
@@ -270,6 +272,20 @@ class OperatorResume(_Body):
 @dataclass(frozen=True, slots=True)
 class Unpause(_Body):
     KIND: ClassVar[EventKind] = EventKind.UNPAUSE
+    CLASS: ClassVar[EventClass] = EventClass.CONTROL
+
+
+@dataclass(frozen=True, slots=True)
+class AutoTriage(_Body):
+    """Idle-time auto-triage of one Inbox issue (the trusted clock, never an owner).
+
+    The standing authorisation is the operator's: host config ``auto_triage`` (or the
+    ``auto-triage on`` CLI) and its daily budget. The service picks the issue and attaches
+    a fresh read; the reducer starts triage exactly as an owner Inbox -> Triage drag would,
+    for an issue the factory has never worked on. Nothing past triage is ever started.
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.AUTO_TRIAGE
     CLASS: ClassVar[EventClass] = EventClass.CONTROL
 
 
@@ -691,6 +707,19 @@ class IssueSessionClosed(_Body):
 
 
 @dataclass(frozen=True, slots=True)
+class RelatedMarked(_Body):
+    """Issue ``source_issue``'s accepted triage named this issue (``relation``).
+
+    Display only: it sets the card's lowest-precedence "Factory note", never authority.
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.RELATED_MARKED
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    source_issue: int = 0
+    relation: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class ResultCandidate(_Body):
     """A stage result accepted from ``factory_submit_result``, already validated.
 
@@ -817,6 +846,7 @@ EventBody = (
     | Pause
     | OperatorResume
     | Unpause
+    | AutoTriage
     | LeftwardMove
     | AssignedHuman
     | Closed
@@ -854,6 +884,7 @@ EventBody = (
     | PolicyGuardFailed
     | ResultCandidate
     | IssueSessionClosed
+    | RelatedMarked
     | TreeQuiescent
     | StopTimeout
     | SessionCrashed
@@ -884,6 +915,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         Pause,
         OperatorResume,
         Unpause,
+        AutoTriage,
         LeftwardMove,
         AssignedHuman,
         Closed,
@@ -921,6 +953,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         PolicyGuardFailed,
         ResultCandidate,
         IssueSessionClosed,
+        RelatedMarked,
         TreeQuiescent,
         StopTimeout,
         SessionCrashed,
@@ -984,6 +1017,7 @@ __all__ = [
     "ApprovalInvalidated",
     "ApprovePlan",
     "AssignedHuman",
+    "AutoTriage",
     "BotEyes",
     "CapacityAvailable",
     "ChecksChanged",
@@ -1032,6 +1066,7 @@ __all__ = [
     "PublicationKind",
     "ReadinessEvidence",
     "ReconcileDue",
+    "RelatedMarked",
     "RequestPlan",
     "RequestReplan",
     "RequestRework",

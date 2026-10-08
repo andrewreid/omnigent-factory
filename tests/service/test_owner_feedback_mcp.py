@@ -112,9 +112,9 @@ async def test_A_result_is_refused_until_every_comment_is_read(service_config: S
 async def test_A_stage_templates_point_at_owner_feedback():
     root = files("omnigent_factory.service") / "templates"
     for name in (
-        "triage-v5.txt",
-        "triage-feedback-v3.txt",
-        "plan-v5.txt",
+        "triage-v6.txt",
+        "triage-feedback-v4.txt",
+        "plan-v6.txt",
         "build-v8.txt",
         "feedback-v3.txt",
         "build-feedback-v2.txt",
@@ -126,9 +126,9 @@ async def test_A_stage_templates_point_at_owner_feedback():
         assert "factory_get_feedback" in text, name
         assert len(text) < 1300, name
     for name in (
-        "triage-v5.txt",
-        "triage-feedback-v3.txt",
-        "plan-v5.txt",
+        "triage-v6.txt",
+        "triage-feedback-v4.txt",
+        "plan-v6.txt",
         "build-v8.txt",
         "build-rework-v5.txt",
     ):
@@ -161,6 +161,9 @@ async def test_A_stage_templates_point_at_owner_feedback():
         "build-v7.txt",
         "build-rework-v4.txt",
         "readiness-wake-v6.txt",
+        "triage-v5.txt",
+        "triage-feedback-v3.txt",
+        "plan-v5.txt",
     ):
         assert not (root / gone).is_file()
 

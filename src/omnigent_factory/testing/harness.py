@@ -7,11 +7,12 @@ tests can reach any stage quickly.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.effects import EffectIntent, EffectKind
 from omnigent_factory.core.events import Event, Provenance
+from omnigent_factory.core.predicates import holds_triage_slot
 from omnigent_factory.core.projection import ready_bot_ok
 from omnigent_factory.core.reducer import TransitionResult, transition
 from omnigent_factory.core.types import (
@@ -84,13 +85,16 @@ class Harness:
             parcel = self.parcels.get(event.parcel_id) or Parcel(
                 parcel_id=event.parcel_id, repo_id=event.repo_id, issue_number=event.issue_number
             )
-        result = transition(State(parcel, self.admission, self.cfg), event)
+        # Derived on load as the store does (never carried between transitions).
+        runs = frozenset(pid for pid, p in self.parcels.items() if holds_triage_slot(p))
+        admission = replace(self.admission, triage_runs=runs)
+        result = transition(State(parcel, admission, self.cfg), event)
         if result.state.parcel is not None:
             # Projection invariant on every transition: Ready is never Working/Queued.
             after = result.state.parcel
             assert ready_bot_ok(after, after.bot), (event.kind, after.stage, after.bot)
             self.parcels[result.state.parcel.parcel_id] = result.state.parcel
-        self.admission = result.state.admission
+        self.admission = replace(result.state.admission, triage_runs=frozenset())
         self.log.append((event, result))
         return result
 

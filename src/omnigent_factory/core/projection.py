@@ -12,6 +12,7 @@ from __future__ import annotations
 from omnigent_factory.core.types import (
     BLOCKING_HOLDS,
     NEEDS_YOU_HOLDS,
+    RELATIONS,
     AdmissionSnapshot,
     BotState,
     FenceKind,
@@ -210,8 +211,43 @@ def project_note(p: Parcel, bot: BotState) -> str:
         assert p.readiness is not None  # noqa: S101 - checks_running checks it
         text = f"Checks running on `{p.readiness.head_sha[:7]}`"
     else:
-        text = ""
+        # Lowest precedence: other issues' triage named this one. Any status reason or
+        # derived Blocked/Needs you/Checkpoint/Queued note above outranks it.
+        text = related_note(p)
     return text[:NOTE_MAX]
+
+
+#: How a related mark reads on the marked card (the source issue's relation to it).
+RELATION_NOTE = dict(
+    zip(
+        RELATIONS,
+        (
+            "duplicate",
+            "overlap",
+            "conflict",
+            "depends on this",
+            "blocks this",
+            "supersedes this",
+        ),
+        strict=True,
+    )
+)
+
+
+def related_note(p: Parcel) -> str:
+    """``Related: #12 (overlap), #9 (conflict)``, newest first ("" without marks)."""
+    if not p.related_marks:
+        return ""
+    parts = [
+        f"#{m.issue} ({RELATION_NOTE.get(m.relation, m.relation)})"
+        for m in reversed(p.related_marks)
+    ]
+    return f"Related: {', '.join(parts)}"[:NOTE_MAX]
+
+
+def triage_queued_note() -> str:
+    """A triage request waiting for a free triage slot (``triage_concurrency``)."""
+    return "Queued: triage starts when a triage slot is free"
 
 
 def queue_head(admission: AdmissionSnapshot) -> QueueEntry | None:

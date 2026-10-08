@@ -39,6 +39,7 @@ from pathlib import Path
 from omnigent_factory.core import codec
 from omnigent_factory.core.effects import EffectIntent, EffectKind
 from omnigent_factory.core.events import EffectReconciled, Event, EventKind, MessageAck
+from omnigent_factory.core.predicates import RUNNING_LIFECYCLES
 from omnigent_factory.core.reducer import TransitionResult, transition
 from omnigent_factory.core.types import (
     FENCE_BITS,
@@ -66,6 +67,32 @@ _QUIET_KINDS = frozenset(
 _PARCEL_CACHE_LIMIT = 1024
 
 Reducer = Callable[[State, Event], TransitionResult]
+
+_RUNNING_LIFECYCLES_JSON = json.dumps(sorted(x.value for x in RUNNING_LIFECYCLES))
+
+
+@dataclass(frozen=True, slots=True)
+class AutoTriageState:
+    """Durable operator state of idle-time auto-triage (see ``auto_triage`` table)."""
+
+    #: ``auto-triage on|off`` (None: never set, or cleared).
+    enabled_override: bool | None = None
+    #: The config ``auto_triage`` value when the override was set.
+    override_config: bool | None = None
+    #: Local day (ISO date) of ``granted``.
+    grant_day: str = ""
+    granted: int = 0
+
+    def enabled(self, config_value: bool) -> bool:
+        """The override while the config still says what it said then; else the config."""
+        if self.enabled_override is None or self.override_config != config_value:
+            return config_value
+        return self.enabled_override
+
+    def granted_on(self, day: str) -> int:
+        return self.granted if self.grant_day == day else 0
+
+
 FaultHook = Callable[[str], None]
 
 
@@ -419,6 +446,17 @@ class SqliteStore:
                 (repo_id,),
             )
         )
+        # Derived, never written back: the rule of ``predicates.holds_triage_slot``.
+        triage_runs = frozenset(
+            str(r[0])
+            for r in conn.execute(
+                "SELECT DISTINCT s.parcel_id FROM stage_sessions s "
+                "JOIN parcels p ON p.parcel_id = s.parcel_id "
+                "WHERE p.repo_id = ? AND s.kind = 'triage' "
+                "AND s.lifecycle IN (SELECT value FROM json_each(?))",
+                (repo_id, _RUNNING_LIFECYCLES_JSON),
+            )
+        )
         return AdmissionSnapshot(
             repo_id=repo_id,
             paused=bool(row["paused"]),
@@ -426,7 +464,72 @@ class SqliteStore:
             queue=queue,
             reservations=reservations,
             open_bot_prs=frozenset(int(x) for x in json.loads(row["open_bot_prs_json"])),
+            triage_runs=triage_runs,
         )
+
+    # ---------------------------------------------------------- auto-triage
+
+    def auto_triage_state(self, repo_id: str) -> AutoTriageState:
+        row = self._conn.execute(
+            "SELECT enabled_override, override_config, grant_day, granted FROM auto_triage "
+            "WHERE repo_id = ?",
+            (repo_id,),
+        ).fetchone()
+        if row is None:
+            return AutoTriageState()
+        return AutoTriageState(
+            enabled_override=None if row[0] is None else bool(row[0]),
+            override_config=None if row[1] is None else bool(row[1]),
+            grant_day=str(row[2] or ""),
+            granted=int(row[3]),
+        )
+
+    def set_auto_triage_override(self, repo_id: str, enabled: bool, config_value: bool) -> None:
+        """The operator turned auto-triage on/off, against the current config value."""
+        with self._txn() as conn:
+            conn.execute(
+                "INSERT INTO auto_triage (repo_id, enabled_override, override_config, granted, "
+                "updated_at_us) VALUES (?, ?, ?, 0, ?) ON CONFLICT(repo_id) DO UPDATE SET "
+                "enabled_override = excluded.enabled_override, "
+                "override_config = excluded.override_config, "
+                "updated_at_us = excluded.updated_at_us",
+                (repo_id, int(enabled), int(config_value), self._clock.now_utc_us()),
+            )
+
+    def clear_auto_triage_override(self, repo_id: str) -> None:
+        with self._txn() as conn:
+            conn.execute(
+                "UPDATE auto_triage SET enabled_override = NULL, override_config = NULL, "
+                "updated_at_us = ? WHERE repo_id = ?",
+                (self._clock.now_utc_us(), repo_id),
+            )
+
+    def grant_auto_triage(self, repo_id: str, day: str, count: int) -> int:
+        """Add ``count`` auto-triages to ``day``'s budget; returns that day's total grant."""
+        with self._txn() as conn:
+            conn.execute(
+                "INSERT INTO auto_triage (repo_id, grant_day, granted, updated_at_us) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(repo_id) DO UPDATE SET "
+                "granted = CASE WHEN grant_day IS excluded.grant_day "
+                "THEN granted + excluded.granted ELSE excluded.granted END, "
+                "grant_day = excluded.grant_day, updated_at_us = excluded.updated_at_us",
+                (repo_id, day, count, self._clock.now_utc_us()),
+            )
+            row = conn.execute(
+                "SELECT granted FROM auto_triage WHERE repo_id = ?", (repo_id,)
+            ).fetchone()
+        return int(row[0])
+
+    def count_accepted_events(
+        self, repo_id: str, kind: EventKind, since_us: int, until_us: int
+    ) -> int:
+        """Accepted events of ``kind`` whose source time is in ``[since_us, until_us)``."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM events WHERE kind = ? AND source_time_us >= ? "
+            "AND source_time_us < ? AND repo_id = ? AND accepted = 1",
+            (kind.value, since_us, until_us, repo_id),
+        ).fetchone()
+        return int(row[0])
 
     # --------------------------------------------------------------- inbox
 

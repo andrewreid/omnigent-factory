@@ -29,7 +29,7 @@ def test_stage_templates_are_short_tool_pointers():
         "plan": "factory_get_issue",
         "build": "factory_get_plan",
     }
-    names = {"triage": "triage-v5.txt", "plan": "plan-v5.txt", "build": "build-v8.txt"}
+    names = {"triage": "triage-v6.txt", "plan": "plan-v6.txt", "build": "build-v8.txt"}
     for stage, tool in first_tool.items():
         text = (root / names[stage]).read_text(encoding="utf-8").format(**values)
         assert f"Start with {tool}" in text

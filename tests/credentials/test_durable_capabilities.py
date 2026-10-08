@@ -27,6 +27,7 @@ from omnigent_factory.service.durable import (
     StoreWorkerGrantStore,
     reenable_issuance_after_boot,
 )
+from omnigent_factory.testing.builders import config
 from omnigent_factory.testing.fakes import FakeClock
 from omnigent_factory.testing.harness import Harness
 
@@ -209,7 +210,7 @@ async def test_worker_grant_tuples_persist_and_revoke(tmp_path: Path) -> None:
 
 
 async def test_service_reenables_only_current_unfenced_executing_stages(tmp_path: Path) -> None:
-    h = Harness()
+    h = Harness(cfg=config(triage_concurrency=3))  # three triages run at once
     h.eligible("A")
     h.send("A", ev.RequestTriage(via=Via.DRAG))
     active = h.create_ok("A")

@@ -45,6 +45,10 @@ HOT_RELOAD_KEYS = frozenset(
         "completed_reconcile_interval_seconds",
         "delivery_body_retention_days",
         "observation_retention_hours",
+        "auto_triage",
+        "auto_triage_daily_limit",
+        "auto_triage_min_age_hours",
+        "triage_concurrency",
     }
 )
 
@@ -155,6 +159,17 @@ class ServiceConfig(BaseModel):
     review_bot_login: str = "chatgpt-codex-connector[bot]"
     #: The mention that asks the review bot for a (re-)review.
     review_bot_mention: str = "@codex"
+    #: Idle-time auto-triage: while no build is active or queued and no plan or rework
+    #: runs, triage the oldest eligible Inbox issue (one at a time, up to the daily
+    #: limit). ``omnigent-factory auto-triage on|off`` overrides it until it changes here.
+    auto_triage: bool = False
+    #: Auto-started triages per local day (``auto-triage grant <n>`` adds more today).
+    auto_triage_daily_limit: int = Field(default=20, ge=0, le=1000)
+    #: An issue must be at least this old before auto-triage takes it (owner grace).
+    auto_triage_min_age_hours: float = Field(default=24.0, ge=0)
+    #: Triage runs at once, repository-wide (owner drags, labels, commands and comments
+    #: included); further triage requests wait for a free slot.
+    triage_concurrency: int = Field(default=1, ge=1, le=20)
     github_config: Path | None = None
     secrets_dir: Path = Field(
         default_factory=lambda: Path.home() / ".config/omnigent-factory/secrets"
@@ -297,6 +312,7 @@ class ServiceConfig(BaseModel):
             review_grace_us=self.review_bot_grace_minutes * MICROS_PER_MINUTE,
             review_ack_us=self.review_bot_ack_minutes * MICROS_PER_MINUTE,
             review_cap_us=self.review_bot_max_wait_minutes * MICROS_PER_MINUTE,
+            triage_concurrency=self.triage_concurrency,
         )
 
     def prepare_private_directories(self) -> None:

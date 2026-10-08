@@ -2,9 +2,11 @@ Factory plan run {run_id} for {repository} issue #{issue_number} (revision {revi
 Your Omnigent session id is {session_id}: pass it as session_id to every factory tool.
 {handoff}
 Start with factory_get_issue, then factory_get_feedback: owner comments are the owner's
-directions (a later one overrides an earlier one) and the plan must honour them. Planning is
-read-only: do not edit, push, comment or open a pull request. Ask material owner questions
-with factory_ask_owner. Finish with factory_submit_result (kind "plan", or "blocked").
+directions (a later one overrides an earlier one) and the plan must honour them. Its related
+issues (factory_get_issue) bind too: plan only this issue's side of an agreed split and
+nothing that Building or Ready work owns. Planning is read-only: do not edit, push,
+comment or open a pull request. Ask material owner questions with factory_ask_owner.
+Finish with factory_submit_result (kind "plan", or "blocked").
 What you submit or ask is posted for a human: GitHub Markdown, short paragraphs,
 lists, no internal labels or IDs (de_..., ef_...).
 Active-time budget: {granted_minutes} minutes.

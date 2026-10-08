@@ -121,6 +121,9 @@ class FactoryService:
         #: Busy node IDs of a root's latest tree scan, for the drain-timeout warning
         #: (composition).
         self.busy_nodes: Callable[[str], tuple[str, ...]] | None = None
+        #: Idle-time auto-triage and its ``auto-triage`` operator command (composition;
+        #: ``service.auto_triage.AutoTriager``). None: not wired.
+        self.auto_triager: Any = None
         self._fatal_exit = fatal_exit
         self._fatal_reason: str | None = None
         self._delivery_failures: dict[str, int] = {}
@@ -205,6 +208,10 @@ class FactoryService:
                 asyncio.create_task(self._reconcile_loop(), name="reconcile"),
                 asyncio.create_task(self._clock_loop(), name="clock"),
             ]
+            if self.auto_triager is not None:
+                self._tasks.append(
+                    asyncio.create_task(self._auto_triage_loop(), name="auto-triage")
+                )
             for task in self._tasks:
                 task.add_done_callback(self._background_done)
             self.ready = True
@@ -657,6 +664,24 @@ class FactoryService:
             except Exception:
                 failures = await self._background_error("reconcile", failures)
 
+    async def _auto_triage_loop(self) -> None:
+        """One auto-triage decision per reconcile interval (it starts at most one triage).
+
+        Housekeeping, not a safety loop: a failed pass (GitHub unreachable, ...) is logged
+        and retried next interval, never a daemon failure.
+        """
+        while not self._stop.is_set():
+            await self._wait(self.config.reconcile_interval_seconds)
+            if self._stop.is_set() or not self.accepting_admission:
+                continue
+            try:
+                outcome = await self.auto_triager.run_once()
+                LOG.debug("auto-triage pass outcome=%s", outcome)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.warning("auto-triage pass failed")
+
     async def _clock_loop(self) -> None:
         failures = 0
         while not self._stop.is_set():
@@ -810,6 +835,11 @@ class FactoryService:
             await self.apply_event(self._event(None, body, f"operator:{command}:{uuid.uuid4()}"))
             self._last_admission_attempt = None
             return await self._status()
+        if command == "auto-triage":
+            if self.auto_triager is None:
+                raise ValueError("auto-triage is not wired")
+            report: dict[str, object] = await self.auto_triager.command(args)
+            return report
         if command == "explain":
             parcel_id = str(args.get("parcel", ""))
             if not parcel_id:

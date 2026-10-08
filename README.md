@@ -55,6 +55,10 @@ including labels applied when the issue is opened (GitHub sends a `labeled` even
 | `factory:plan` | `/plan` |
 | `factory:build` | Build without a plan: approves the issue's current title and body as written (default block M), from any column. Refused while a question is open, a revision is pending or a build is live. Editing the title or body later voids that approval. |
 
+`factory:skip` is not a control: it only keeps the issue out of
+[idle-time auto-triage](#idle-time-auto-triage) (anyone may add it; the factory never
+starts anything because of it).
+
 ### Card drags
 
 A rightward owner drag is a control; any leftward drag (by anyone, including a move to
@@ -71,6 +75,12 @@ with the reason in the note.
 | Building → Planning | Stops and revokes the build and voids the approval; an owner drag also starts a replan. |
 | Ready → Building | Stops, then reworks the build under the same approval (see [Rework](#steering-by-comment)); if rework is refused the card stays in Building, stopped, with `Rework refused: <reason>`. |
 | Any other leftward move | Stop only; nothing starts. |
+
+At most `triage_concurrency` triage runs (default 1) run at once, whatever started them
+(drag, label, command, comment or auto-triage). A further triage request is not dropped:
+the card moves to Triage with the note `Queued: triage starts when a triage slot is free`
+and its run starts once a slot frees (within a reconcile interval). A run waiting on an
+owner answer or at a checkpoint does not hold a slot.
 
 Assigning the issue to a person (not a bot) takes the parcel out of the factory: work
 stops and controls are refused until the person is unassigned and a new control is
@@ -108,7 +118,38 @@ starts a rework). Not after `/stop` or once merged. See
 | `Idle` | Nothing to do; the next move is the owner's. |
 
 `Factory note` is one line with the latest reason (refusals, stops, queue position,
-rework), cleared when the card moves on.
+rework), cleared when the card moves on. When nothing else is to be said, it shows the
+issues whose triage named this one, e.g. `Related: #12 (overlap), #9 (conflict)` (also
+cleared when the card moves on); any status reason or Blocked, Needs you, Checkpoint or
+Queued note takes precedence.
+
+### Related issues
+
+Triage checks the other open issues on the board (`factory_list_issues`) for duplicates,
+overlaps and contradictions. The triage comment then ends with a short **Related** list
+(`- Overlaps #12: <how the scope is split>`); a duplicate gets a keep/close recommendation
+(you close it), an overlap a proposed scope split, a genuine contradiction a question to
+you (`Needs you`), and a clash with Building or Ready work is flagged. Each related issue
+open on the board gets the `Related: ...` note above, without a comment. Plan and build
+runs read the list and its agreed outcome, so later stages keep to this issue's side of a
+split.
+
+### Idle-time auto-triage
+
+Off by default. When on, and the factory is otherwise idle (no build active or queued, no
+plan or rework run in flight, no triage request waiting, a triage slot free, not paused),
+the factory triages the oldest eligible Inbox issue, one at a time, exactly as if you had
+dragged it to Triage: the bot moves the card, posts the normal triage comment and leaves
+it `Idle`. It never goes past Triage. A running triage finishes even if a build arrives;
+no new one starts until the factory is idle again.
+
+Eligible: an open issue (not a pull request or draft) of the configured repository in the
+Inbox column, assigned to nobody, without the `factory:skip` label, created more than
+`auto_triage_min_age_hours` ago, that the factory has never worked on (no run, request or
+hold, no parked delivery). It is checked about every `reconcile_interval_seconds`, at most
+`auto_triage_daily_limit` per local day (`auto-triage grant <n>` adds more for today). The
+audit records each start as an `AutoTriage` event from the trusted clock (the operator's
+standing authorisation), never as an owner control.
 
 ## Development
 
@@ -155,12 +196,23 @@ waits up to 90 s for it instead of failing.
 | `cleanup <parcel> [--merged]` | Remove a finished parcel's factory worktree(s) and local `factory/` branch from the factory clone. |
 | `release-delivery <guid>` | Release one parked webhook delivery for processing. |
 | `pause` / `unpause` | Stop / resume admitting new work repository-wide; in-flight parcels and safety events carry on. |
+| `auto-triage status` | Idle-time auto-triage: enabled (and whether config or the CLI decides), today's used/limit/granted, idle or what keeps it busy, triage slots, the next candidate. |
+| `auto-triage on` / `off` | Turn auto-triage on/off at runtime. Stored in the state database, so it survives restarts, until `auto_triage` in the config file changes: then the config value applies again (the newer intent wins). |
+| `auto-triage grant <n>` | Add `<n>` (1-1000) auto-triages to today's budget (local day; it does not carry over). |
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, the reconcile intervals and the retention windows; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours` and `triage_concurrency`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.
+Auto-triage keys (under `[service]`, all hot-reloadable):
+
+```toml
+auto_triage = false              # idle-time auto-triage of Inbox issues
+auto_triage_daily_limit = 20     # auto-started triages per local day
+auto_triage_min_age_hours = 24   # grace before a new issue is taken
+triage_concurrency = 1           # triage runs at once, however started
+```
 
 A triage/report/status publication that failed definitively leaves the card at
 `Bot: Blocked`. Fix the cause, then run `recovery` and `retry-effect <effect_id>`.
@@ -239,10 +291,11 @@ summary in its start message). When the parcel is terminal (merged or closed) an
 tree is quiescent, the session is archived; a session replaced by a fresh one is archived
 too. When the issue title changes, the live session is renamed.
 
-Stage messages are short pointers; the agent works through six MCP tools served by the
+Stage messages are short pointers; the agent works through seven MCP tools served by the
 daemon at `http://127.0.0.1:<mcp_port>/mcp/` (loopback only, bearer token):
 `factory_get_issue`, `factory_get_plan`, `factory_get_feedback`, `factory_get_status`,
-`factory_ask_owner` and `factory_submit_result`. Each takes the caller's own Omnigent
+`factory_list_issues` (a compact index of the other open board issues, read from GitHub
+through a one-minute cache), `factory_ask_owner` and `factory_submit_result`. Each takes the caller's own Omnigent
 `session_id`; a per-session CEL policy (`factory-caller@…`) denies factory tool calls
 carrying any other id, and the daemon resolves issue, run and stage from its own store.
 Create the token once with `omnigent-factory setup mcp-token` (written to

@@ -102,6 +102,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="report what would be removed; change nothing"
     )
     _config_arg(prune)
+    auto = sub.add_parser(
+        "auto-triage",
+        help="idle-time auto-triage: status, on/off (overrides the config until it changes), "
+        "grant <n> more for today",
+    )
+    auto_sub = auto.add_subparsers(dest="auto_command", required=True)
+    for name in ("status", "on", "off"):
+        _config_arg(auto_sub.add_parser(name))
+    grant = auto_sub.add_parser("grant", help="add <n> auto-triages to today's budget")
+    grant.add_argument("count", type=int)
+    _config_arg(grant)
     vacuum = sub.add_parser(
         "vacuum",
         help="compact the state database and enable incremental auto_vacuum (daemon stopped)",
@@ -140,7 +151,12 @@ def _operator(
 ) -> int:
     # Re-rendering reads, edits and re-verifies a GitHub comment: allow more time; a
     # first prune of a large history runs many batches.
-    timeout = {"rerender-comment": 60.0, "cleanup": 60.0, "prune": 900.0}.get(command, 5.0)
+    timeout = {
+        "rerender-comment": 60.0,
+        "cleanup": 60.0,
+        "prune": 900.0,
+        "auto-triage": 60.0,  # status reads the board
+    }.get(command, 5.0)
     deadline = time.monotonic() + startup_wait_seconds
     waiting = False
     while True:
@@ -202,6 +218,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _operator(config, "rerender-comment", {"effect": args.effect})
     if args.command == "retry-effect":
         return _operator(config, "retry-effect", {"effect": args.effect})
+    if args.command == "auto-triage":
+        request: dict[str, object] = {"action": args.auto_command}
+        if args.auto_command == "grant":
+            request["count"] = args.count
+        return _operator(config, "auto-triage", request)
     if args.command == "prune":
         return _prune(config, dry_run=args.dry_run)
     if args.command == "vacuum":

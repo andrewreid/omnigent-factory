@@ -68,9 +68,9 @@ def test_stage_prompts_keep_internal_ids_out_of_github_prose():
     """Decision/effect IDs (de_..., ef_...) are factory internals, not owner-facing text."""
     root = files("omnigent_factory.service") / "templates"
     for name in (
-        "triage-v5.txt",
-        "triage-feedback-v3.txt",
-        "plan-v5.txt",
+        "triage-v6.txt",
+        "triage-feedback-v4.txt",
+        "plan-v6.txt",
         "build-v8.txt",
         "build-rework-v5.txt",
     ):

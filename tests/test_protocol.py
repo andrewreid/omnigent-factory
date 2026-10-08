@@ -209,3 +209,65 @@ def test_checkpoint_only_inside_checkpoint():
         validate_result(cp, Correlation("P1", "S1", "N1", 3, "build"))
     corr = Correlation("P1", "S1", "N1", 3, "build", in_checkpoint=True)
     assert validate_result(cp, corr).contract_canonical is None
+
+
+# ---------------------------------------------------------------- related (cross-issue)
+
+
+def triage_corr() -> Correlation:
+    return Correlation("P1", "S1", "N1", 3, "triage", issue_number=40)
+
+
+def test_triage_related_is_optional_and_validated():
+    assert validate_result(triage_result(), triage_corr()).result.result.related == []  # type: ignore[union-attr]
+    related = [
+        {"issue": 12, "relation": "overlaps", "note": "split: #12 keeps the API, this the UI"},
+        {"issue": 9, "relation": "conflicts", "note": "#9 (Building) removes the endpoint"},
+    ]
+    parsed = validate_result(triage_result(related=related), triage_corr())
+    body = parsed.result.result
+    assert [(r.issue, r.relation) for r in body.related] == [(12, "overlaps"), (9, "conflicts")]  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("related", "message"),
+    [
+        ([{"issue": 12, "relation": "similar", "note": "x"}], "relation"),
+        ([{"issue": 0, "relation": "overlaps", "note": "x"}], "issue"),
+        ([{"issue": 12, "relation": "overlaps", "note": ""}], "note"),
+        ([{"issue": 12, "relation": "overlaps", "note": "x" * 301}], "note"),
+        ([{"issue": 12, "relation": "overlaps"}], "note"),
+        ([{"issue": 12, "relation": "overlaps", "note": "x", "id": 1}], "id"),
+        (
+            [
+                {"issue": 12, "relation": "overlaps", "note": "x"},
+                {"issue": 12, "relation": "blocks", "note": "y"},
+            ],
+            "each issue at most once",
+        ),
+        ([{"issue": 40, "relation": "duplicate", "note": "x"}], "itself"),
+        ([{"issue": n, "relation": "overlaps", "note": "x"} for n in range(1, 23)], "related"),
+    ],
+)
+def test_invalid_related_is_refused_at_submit(related, message):
+    valid = [{"issue": 12, "relation": "overlaps", "note": "x"}]
+    validate_result(triage_result(related=valid), triage_corr())  # the field itself is fine
+    with pytest.raises(ResultError) as error:
+        validate_result(triage_result(related=related), triage_corr())
+    assert message in " ".join(error.value.details)
+
+
+def test_schema_file_declares_related():
+    schema = json.loads(
+        (Path(core_pkg.__file__).parent / "result_schema_v1.json").read_text("utf-8")
+    )
+    triage = schema["$defs"]["triage"]
+    assert "related" in triage["properties"] and "related" not in triage["required"]
+    assert schema["$defs"]["related"]["properties"]["relation"]["enum"] == [
+        "duplicate",
+        "overlaps",
+        "conflicts",
+        "depends_on",
+        "blocks",
+        "supersedes",
+    ]

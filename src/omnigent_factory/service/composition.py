@@ -33,6 +33,8 @@ from omnigent_factory.omnigent.policies import PolicyError
 from omnigent_factory.omnigent.rest import OmnigentReadError, OmnigentRest
 from omnigent_factory.ports.clock import SystemClock
 from omnigent_factory.ports.github import IssueRef
+from omnigent_factory.service.auto_triage import AutoTriager
+from omnigent_factory.service.board_index import BoardIndex
 from omnigent_factory.service.cleanup import CleanupAdapter, WorkspaceCleaner
 from omnigent_factory.service.config import ConfigError, ServiceConfig
 from omnigent_factory.service.credentials import AppInstallationTokenMinter, StoreExecutionGate
@@ -56,6 +58,7 @@ from omnigent_factory.service.locking import ProcessLock
 from omnigent_factory.service.mcp import McpEndpoint, build_endpoint
 from omnigent_factory.service.observer import OmnigentObserver
 from omnigent_factory.service.omnigent_auth import log_expiry, omnigent_auth
+from omnigent_factory.service.related import RelatedMarker
 from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.service.tokens import DaemonTokenProvider
 
@@ -366,6 +369,9 @@ async def build_production(
         omnigent=omnigent,
         omnigent_adapter=omnigent_adapter,
     )
+    board = BoardIndex(github.board_issues, clock)
+    github.related_marker = RelatedMarker(service, board, directory).schedule
+    service.auto_triager = AutoTriager(service, board, github.issue_snapshot)
     service.comment_rerenderer = github.rerender_comment
     service.busy_nodes = omnigent_adapter.busy_nodes
 
@@ -388,7 +394,7 @@ async def build_production(
     return ProductionComposition(
         service,
         GitHubWebhookVerifier(config.resolved_webhook_secret_file, normalizer, clock),
-        build_endpoint(service, directory, config),
+        build_endpoint(service, directory, config, board=board),
     )
 
 

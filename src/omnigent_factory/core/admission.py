@@ -11,7 +11,10 @@ Trust classes:
   ambiguous effect, acknowledge a daemon board write, or stand in for a daemon outcome.
 * ``ADAPTER`` is the daemon's executor/observer: effect outcomes, session/stream
   observations, read-after-write board acknowledgements.
-* ``SCHEDULER`` is the trusted clock; ``OPERATOR`` the local protected CLI socket.
+* ``SCHEDULER`` is the trusted clock; ``OPERATOR`` the local protected CLI socket. The
+  clock alone carries ``AutoTriage``: the operator's standing authorisation (host config
+  or the ``auto-triage`` CLI, with a daily budget) acted on when the factory is idle. It
+  only ever starts triage of an Inbox issue the factory never worked on.
 * ``MCP`` is a factory tool call over the loopback MCP endpoint, already resolved by the
   service to the calling issue session's current run. It can only report that run's own
   result or ask the owner a question; it never carries authority.
@@ -66,6 +69,8 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.PAUSE: Admission(_OPERATOR),
     EventKind.UNPAUSE: Admission(_OPERATOR),
     EventKind.OPERATOR_RESUME: Admission(_OPERATOR),
+    # standing operator authorisation, acted on by the trusted clock (no actor)
+    EventKind.AUTO_TRIAGE: Admission(_SCHEDULER),
     # safety facts: any actor, GitHub input or a daemon read (they only restrict)
     EventKind.LEFTWARD_MOVE: Admission(_GITHUB_OR_READ),
     EventKind.ASSIGNED_HUMAN: Admission(_GITHUB_OR_READ),
@@ -106,6 +111,8 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.RESULT_CANDIDATE: Admission(_MCP),
     EventKind.OWNER_QUESTION: Admission(_MCP),
     EventKind.ISSUE_SESSION_CLOSED: Admission(_ADAPTER),
+    # display only: another issue's accepted triage named this one
+    EventKind.RELATED_MARKED: Admission(_ADAPTER),
     EventKind.POLICIES_VERIFIED: Admission(_ADAPTER),
     EventKind.POLICY_GUARD_FAILED: Admission(_ADAPTER),
     EventKind.TREE_QUIESCENT: Admission(_ADAPTER),

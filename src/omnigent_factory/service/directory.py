@@ -886,6 +886,9 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
         missing = _bullets(result.get("missing_information"))
         if missing:
             lines += ["", "**Missing information:**", missing]
+        related = _related_lines(result.get("related"))
+        if related:
+            lines += ["", "**Related:**", *related]
         return "\n".join(lines)
     if kind == "plan":
         contract = result.get("contract")
@@ -926,6 +929,29 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
             f"release readiness: {result.get('release_readiness')}."
         )
     return "Report recorded."
+
+
+#: How each related issue reads in the triage comment: "- Overlaps #12: note".
+_RELATION_TEXT = {
+    "duplicate": "Duplicate of",
+    "overlaps": "Overlaps",
+    "conflicts": "Conflicts with",
+    "depends_on": "Depends on",
+    "blocks": "Blocks",
+    "supersedes": "Supersedes",
+}
+
+
+def _related_lines(items: object) -> list[str]:
+    """One plain list item per related issue (``#N`` links it; no internal ids)."""
+    lines: list[str] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("issue"), int):
+            continue
+        verb = _RELATION_TEXT.get(str(item.get("relation")), "Related to")
+        note = " ".join(str(item.get("note") or "").split())
+        lines.append(f"- {verb} #{item['issue']}" + (f": {note}" if note else ""))
+    return lines
 
 
 def _safe_publication(text: str, config: ServiceConfig) -> str:
@@ -1051,11 +1077,11 @@ def _new_boundary() -> str:
 
 #: First-message template of each stage run (the dispatch snapshot pins name and bytes).
 _FIRST_TEMPLATES = {
-    SessionKind.TRIAGE: "triage-v5.txt",
-    SessionKind.PLAN: "plan-v5.txt",
+    SessionKind.TRIAGE: "triage-v6.txt",
+    SessionKind.PLAN: "plan-v6.txt",
     SessionKind.BUILD: "build-v8.txt",
 }
-_RETRIAGE_TEMPLATE = "triage-feedback-v3.txt"
+_RETRIAGE_TEMPLATE = "triage-feedback-v4.txt"
 _REWORK_TEMPLATE = "build-rework-v5.txt"
 
 

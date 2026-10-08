@@ -64,6 +64,18 @@ class ContractModel(_Strict):
     resolved_decisions: Annotated[list[ResolvedDecision], Field(max_length=100)]
 
 
+Relation = Literal["duplicate", "overlaps", "conflicts", "depends_on", "blocks", "supersedes"]
+RelatedNote = Annotated[str, StringConstraints(min_length=1, max_length=300)]
+
+
+class Related(_Strict):
+    """This issue <relation> ``issue`` (another open issue found during triage)."""
+
+    issue: Annotated[int, Field(ge=1)]
+    relation: Relation
+    note: RelatedNote
+
+
 class TriageResult(_Strict):
     kind: Literal["triage"]
     summary: Text
@@ -73,6 +85,7 @@ class TriageResult(_Strict):
     duplicate_issue: Annotated[int, Field(ge=1)] | None
     labels: Annotated[list[Label], Field(max_length=20)]
     missing_information: Texts
+    related: Annotated[list[Related], Field(max_length=20)] = []
 
 
 class PlanResult(_Strict):
@@ -181,7 +194,8 @@ _RESULT_KINDS = frozenset({"triage", "plan", "build_ready", "checkpoint", "block
 RESULT_SHAPES: dict[str, str] = {
     "triage": '{"kind":"triage","summary":str,"priority":"P0|P1|P2|P3","size":"S|M|L",'
     '"recommendation":"fix|wont_fix|duplicate|needs_info","duplicate_issue":int|null,'
-    '"labels":[str],"missing_information":[str]}',
+    '"labels":[str],"missing_information":[str],"related"?:[{"issue":int,'
+    '"relation":"duplicate|overlaps|conflicts|depends_on|blocks|supersedes","note":str}]}',
     "plan": '{"kind":"plan","publication_kind":"contract|info","approach":str,"risks":[str],'
     '"contract":{"goal":str,"acceptance_criteria":[{"id":str,"criterion":str,'
     '"verification":str}],"non_goals":[str],"size":"S|M|L","resolved_decisions":'
@@ -225,6 +239,8 @@ class Correlation:
     stage: Literal["triage", "plan", "build"]
     waiver_build: bool = False
     in_checkpoint: bool = False
+    #: The parcel's own issue number (a triage may not relate the issue to itself).
+    issue_number: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +298,11 @@ def validate_result(result: Mapping[str, object], expected: Correlation) -> Pars
             raise ResultError("labels must be unique")
         if any(label.lower().startswith("factory:") for label in r.labels):
             raise ResultError("factory:* labels are control labels")
+        related = [item.issue for item in r.related]
+        if len(set(related)) != len(related):
+            raise ResultError("related: each issue at most once")
+        if expected.issue_number is not None and expected.issue_number in related:
+            raise ResultError("related: an issue cannot relate to itself")
     elif isinstance(r, PlanResult):
         if expected.stage == "plan" and r.publication_kind != "contract":
             raise ResultError("plan stage must publish a contract")

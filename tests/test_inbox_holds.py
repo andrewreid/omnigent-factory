@@ -23,6 +23,7 @@ from omnigent_factory.core.types import (
     QueueStatus,
     Via,
 )
+from omnigent_factory.testing.builders import config
 from omnigent_factory.testing.harness import Harness
 
 P = "I_parcel_1"
@@ -186,7 +187,7 @@ def test_pending_authority_recorded_during_hold_wakes_on_release():
 
 
 def test_hold_is_parcel_scoped():
-    h = Harness()
+    h = Harness(cfg=config(triage_concurrency=2))  # both triages run at once
     active_triage(h)
     h.eligible(Q)
     h.send(Q, ev.RequestTriage(via=Via.DRAG))

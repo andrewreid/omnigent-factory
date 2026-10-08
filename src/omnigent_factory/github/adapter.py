@@ -35,6 +35,7 @@ from omnigent_factory.github.client import (
 from omnigent_factory.ports.github import (
     GITHUB_EFFECT_KINDS,
     STATUS_OPTION_IDS,
+    BoardIssue,
     ContractPublication,
     IssueRef,
     PullRequestEvidence,
@@ -45,6 +46,8 @@ LOG = logging.getLogger(__name__)
 
 #: Project fields a triage result may fill (design §B: only while the owner left them unset).
 TRIAGE_FIELDS = ("Priority", "Size")
+#: Board pages (100 items each) one ``board_issues`` read takes at most.
+_BOARD_MAX_PAGES = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +146,9 @@ class GitHubAPIAdapter:
         self.review_bot_login = review_bot_login
         #: The mention that asks it for a review (e.g. "@codex"); "" = none recognised.
         self.review_bot_mention = review_bot_mention
+        #: Told (without waiting) once a triage comment exists, to mark the issues the
+        #: triage names as related (``service.related.RelatedMarker.schedule``).
+        self.related_marker: Callable[[EffectIntent], None] | None = None
 
     @property
     def handled_kinds(self) -> frozenset[EffectKind]:
@@ -177,6 +183,90 @@ class GitHubAPIAdapter:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
         except GitHubAPIError as exc:
             return RetryableReadFailure(str(exc))
+
+    async def board_issues(self) -> list[BoardIssue] | RetryableReadFailure:
+        """Open issues of the repository on the project board, by Status option ID."""
+        query = """
+        query($id: ID!, $after: String) { node(id: $id) { ... on ProjectV2 {
+          items(first: 100, after: $after) {
+            nodes {
+              status: fieldValueByName(name: "Status") {
+                ... on ProjectV2ItemFieldSingleSelectValue { optionId }
+              }
+              content { __typename ... on Issue {
+                id number title state createdAt repository { id }
+                assignees(first: 1) { totalCount }
+                labels(first: 20) { nodes { name } }
+              } }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        } } }
+        """
+        issues: list[BoardIssue] = []
+        after: str | None = None
+        try:
+            for _ in range(_BOARD_MAX_PAGES):
+                data = await self.client.graphql(
+                    query, {"id": self.project_node_id, "after": after}
+                )
+                node = data.get("node")
+                items = node.get("items") if isinstance(node, dict) else None
+                nodes = items.get("nodes") if isinstance(items, dict) else None
+                if not isinstance(items, dict) or not isinstance(nodes, list):
+                    return RetryableReadFailure("project items were unavailable")
+                for item in nodes:
+                    issue = self._board_issue(item)
+                    if issue is not None:
+                        issues.append(issue)
+                page = items.get("pageInfo")
+                if not isinstance(page, dict) or not page.get("hasNextPage"):
+                    break
+                cursor = page.get("endCursor")
+                if not isinstance(cursor, str):
+                    return RetryableReadFailure("project items pagination cursor was missing")
+                after = cursor
+        except RateLimited as exc:
+            return RetryableReadFailure(str(exc), exc.retry_after_us)
+        except GitHubAPIError as exc:
+            return RetryableReadFailure(str(exc))
+        return issues
+
+    def _board_issue(self, item: object) -> BoardIssue | None:
+        if not isinstance(item, dict):
+            return None
+        content = item.get("content")
+        if not isinstance(content, dict) or content.get("__typename") != "Issue":
+            return None  # pull requests and draft items are never parcels
+        repository = content.get("repository")
+        if not isinstance(repository, dict) or repository.get("id") != self.repository_node_id:
+            return None
+        node_id, number = content.get("id"), content.get("number")
+        if content.get("state") != "OPEN" or not isinstance(node_id, str):
+            return None
+        if not isinstance(number, int) or isinstance(number, bool):
+            return None
+        status = item.get("status")
+        stage = stage_for_option(
+            status.get("optionId") if isinstance(status, dict) else None, self.status_options
+        )
+        labels = content.get("labels")
+        names = labels.get("nodes") if isinstance(labels, dict) else None
+        assignees = content.get("assignees")
+        assigned = not isinstance(assignees, dict) or assignees.get("totalCount") != 0
+        return BoardIssue(
+            node_id=node_id,
+            number=number,
+            title=str(content.get("title") or ""),
+            stage=stage,
+            labels=tuple(
+                str(label["name"])
+                for label in (names if isinstance(names, list) else [])
+                if isinstance(label, dict) and isinstance(label.get("name"), str)
+            ),
+            created_at_us=self._parse_time_us(content.get("createdAt")),
+            assigned=assigned,
+        )
 
     async def _project_stage(
         self, parcel_id: str
@@ -1059,7 +1149,11 @@ class GitHubAPIAdapter:
         duplicates the comment; every step below is idempotent. Transient failures retry
         the whole effect; a GitHub refusal is logged and does not undo the publication.
         """
-        if effect.kind != EffectKind.PUBLISH_TRIAGE or self.triage_fields is None:
+        if effect.kind != EffectKind.PUBLISH_TRIAGE:
+            return Ack(comment_id, detail)
+        if self.related_marker is not None:
+            self.related_marker(effect)  # background, idempotent: a retry marks once
+        if self.triage_fields is None:
             return Ack(comment_id, detail)
         fields = await self.triage_fields(effect)
         if fields is None:

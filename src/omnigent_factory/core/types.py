@@ -595,6 +595,18 @@ class Reservation:
     live: bool = True
 
 
+#: How a triage relates another issue to the one it triaged (``related`` in a triage result).
+RELATIONS = ("duplicate", "overlaps", "conflicts", "depends_on", "blocks", "supersedes")
+
+
+@dataclass(frozen=True, slots=True)
+class RelatedMark:
+    """Another issue's triage named this one: ``issue`` <relation> this issue."""
+
+    issue: int
+    relation: str
+
+
 @dataclass(frozen=True, slots=True)
 class Parcel:
     """Per-issue aggregate. ``parcel_id`` is the stable issue node ID."""
@@ -657,6 +669,9 @@ class Parcel:
     #: The Omnigent conversation reused by every stage run of this issue (None before the
     #: first create is adopted).
     issue_session: IssueSession | None = None
+    #: Other issues whose accepted triage named this one (newest last). Shown as the
+    #: lowest-precedence "Factory note"; cleared when the card changes column.
+    related_marks: tuple[RelatedMark, ...] = ()
     applied_event_ids: frozenset[str] = frozenset()
 
     def session(self, session_id: str | None) -> StageSession | None:
@@ -739,6 +754,9 @@ class AdmissionSnapshot:
     queue: tuple[QueueEntry, ...] = ()
     reservations: tuple[Reservation, ...] = ()
     open_bot_prs: frozenset[int] = frozenset()
+    #: Derived on load, never persisted: parcels whose triage run holds a triage slot
+    #: (``predicates.holds_triage_slot``), shared by every triage start in the repository.
+    triage_runs: frozenset[str] = frozenset()
 
     def queue_entry(self, parcel_id: str) -> QueueEntry | None:
         for q in self.queue:
@@ -784,6 +802,9 @@ class TrustedConfig:
     #: How long after a trigger a review bot showing 👀 (or whose state cannot be read)
     #: is waited for at most.
     review_cap_us: int = 0
+    #: Triage runs that may hold a slot at once, repository-wide (owner and auto-triage
+    #: starts alike); a triage request beyond it waits for a slot.
+    triage_concurrency: int = 1
 
     def block_us(self, size: Size) -> int:
         return self.block_hours[size] * MICROS_PER_HOUR

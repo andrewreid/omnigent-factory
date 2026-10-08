@@ -3,7 +3,8 @@ on the triage. Your Omnigent session id is {session_id}: pass it as session_id t
 factory tool.
 {handoff}
 Read factory_get_feedback (factory_get_issue has the issue and the last triage) and submit
-a revised triage with factory_submit_result (kind "triage"). A later comment overrides an
+a revised triage with factory_submit_result (kind "triage", related issues and their
+agreed outcome kept current). A later comment overrides an
 earlier one. If a comment only directs later stages (for example what to fix and what to
 leave out), still resubmit the triage adjusted to reflect it. Triage stays read-only.
 What you submit or ask is posted for a human: GitHub Markdown, short paragraphs,

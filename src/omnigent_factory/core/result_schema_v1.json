@@ -149,6 +149,36 @@
         }
       }
     },
+    "related": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issue",
+        "relation",
+        "note"
+      ],
+      "properties": {
+        "issue": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "relation": {
+          "enum": [
+            "duplicate",
+            "overlaps",
+            "conflicts",
+            "depends_on",
+            "blocks",
+            "supersedes"
+          ]
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        }
+      }
+    },
     "triage": {
       "type": "object",
       "additionalProperties": false,
@@ -207,6 +237,13 @@
         },
         "missing_information": {
           "$ref": "#/$defs/texts"
+        },
+        "related": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "$ref": "#/$defs/related"
+          }
         }
       }
     },
