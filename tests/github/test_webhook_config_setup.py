@@ -252,6 +252,23 @@ async def test_any_actor_leftward_drag_is_safety_but_automation_rightward_is_obs
     assert isinstance(right.body, ev.ColumnObserved)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("old", "new", "body_type"),
+    [
+        ("Inbox", "Triaged", ev.RequestTriage),
+        ("Inbox", "Scoped", ev.RequestPlan),
+        ("Triaged", "Building", ev.WaivePlan),
+        ("Scoped", "Building", ev.ApprovePlan),
+    ],
+)
+async def test_owner_drag_carries_its_own_source_column(old, new, body_type):
+    """#729: the reducer judges a drag by its own columns, not by a read that got there."""
+    (event,) = (await resolve_drag(project_drag(old=old, new=new))).events
+    assert isinstance(event.body, body_type)
+    assert event.body.board_from == Stage(old)
+
+
 def test_setup_payloads_preserve_ids_and_render_native_review_rule():
     bundle = render_setup(created_field_database_ids={"Bot": 1, "Priority": 2, "Size": 3})
     options = bundle.project_migration["update_status"]["input"]["singleSelectOptions"]

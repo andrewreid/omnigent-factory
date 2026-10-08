@@ -63,7 +63,11 @@ starts anything because of it).
 
 A rightward owner drag is a control; any leftward drag (by anyone, including a move to
 Inbox or off the board) is a stop first. A refused drag into Building moves the card back
-with the reason in the note.
+with the reason in the note. A drag is judged by its own from and to columns: a periodic
+read that sees the new column before the drag's webhook arrives changes nothing about
+it. A card moved right with no owner drag behind it (a non-owner, or a drag whose webhook
+never came) gets no authority and the note `Moved to <column> without an owner command
+seen: drag it again or add a factory: label`.
 
 | Drag | Effect |
 |---|---|
@@ -141,8 +145,9 @@ working or draining, no queued build that could start now, no stage request wait
 triage slot free, not paused), the factory triages the oldest eligible Inbox issue, one at
 a time, exactly as if you had dragged it to Triage: the bot moves the card, posts the
 normal triage comment and leaves it `Idle`. It never goes past Triage. A card in Building
-or Ready whose `Bot` is `Blocked`, `Idle`, `Needs you` or `Checkpoint`, or whose run waits
-on checks, does not keep the factory busy, even while it holds a build slot. A running
+or Ready whose `Bot` is `Blocked`, `Idle`, `Needs you` or `Checkpoint` (once the run's
+checkpoint grace is over), or whose run waits on checks, does not keep the factory busy,
+even while it holds a build slot. A running
 triage finishes even if a build arrives; no new one starts until the factory is idle
 again.
 

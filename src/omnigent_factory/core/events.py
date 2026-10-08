@@ -172,6 +172,8 @@ class RequestTriage(_Body):
     KIND: ClassVar[EventKind] = EventKind.REQUEST_TRIAGE
     CLASS: ClassVar[EventClass] = EventClass.CONTROL
     via: Via = Via.COMMAND
+    #: The column an owner drag left (from the webhook); None for a command or label.
+    board_from: Stage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +181,8 @@ class RequestPlan(_Body):
     KIND: ClassVar[EventKind] = EventKind.REQUEST_PLAN
     CLASS: ClassVar[EventClass] = EventClass.CONTROL
     via: Via = Via.COMMAND
+    #: The column an owner drag left (from the webhook); None for a command or label.
+    board_from: Stage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +190,8 @@ class RequestReplan(_Body):
     KIND: ClassVar[EventKind] = EventKind.REQUEST_REPLAN
     CLASS: ClassVar[EventClass] = EventClass.CONTROL
     via: Via = Via.COMMAND
+    #: The column an owner drag left (from the webhook); None for a command or label.
+    board_from: Stage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +214,8 @@ class ApprovePlan(_Body):
     via: Via = Via.DRAG
     hash_text: str | None = None
     duration_us: int | None = None
+    #: The column an owner drag left (from the webhook); None for a command or label.
+    board_from: Stage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +226,8 @@ class WaivePlan(_Body):
     CLASS: ClassVar[EventClass] = EventClass.CONTROL
     via: Via = Via.DRAG
     duration_us: int | None = None
+    #: The column an owner drag left (from the webhook); None for a command or label.
+    board_from: Stage | None = None
 
 
 @dataclass(frozen=True, slots=True)

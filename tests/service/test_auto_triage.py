@@ -186,6 +186,14 @@ def test_busy_reason_names_working_and_draining_builds_and_reworks():
     assert busy_reason([h.p("B")]) == "build draining on #1"
     h.quiesce("B", h.cur("B").session_id)
     assert busy_reason([h.p("B")]) is None
+    h3 = Harness()
+    h3.to_building("G")
+    s = h3.cur("G")
+    h3.send("G", ev.ActiveLimitReached(session_id=s.session_id, grant_id=s.grant.grant_id))
+    g = h3.p("G")  # checkpoint grace: the card shows Checkpoint, the agent still winds down
+    assert h3.cur("G").lifecycle == Lifecycle.CHECKPOINT_GRACE
+    assert project_bot(g) == BotState.CHECKPOINT
+    assert busy_reason([g]) == "build winding down on #1"
     h2 = Harness()
     h2.to_building("R")
     h2.build_ready("R")

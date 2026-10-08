@@ -431,21 +431,23 @@ class DeliveryNormalizer:
             return (ev.LeftwardMove(from_stage=from_stage, to_stage=to_stage),)
         if actor_id not in self.identity.owner_ids or actor_id in self.identity.automation_user_ids:
             return (ev.ColumnObserved(stage=to_stage),)
+        # Each drag carries its own source column: a read that recorded the move first
+        # cannot make it look like a no-op (the reducer's ``_drag_origin``).
         if to_stage == Stage.TRIAGED:
-            return (ev.RequestTriage(via=Via.DRAG),)
+            return (ev.RequestTriage(via=Via.DRAG, board_from=from_stage),)
         if to_stage == Stage.SCOPED:
             body: ev.EventBody = (
-                ev.RequestReplan(via=Via.DRAG)
+                ev.RequestReplan(via=Via.DRAG, board_from=from_stage)
                 if from_stage == Stage.BUILDING
-                else ev.RequestPlan(via=Via.DRAG)
+                else ev.RequestPlan(via=Via.DRAG, board_from=from_stage)
             )
             return (body,)
         if to_stage == Stage.BUILDING:
             if from_stage in {Stage.INBOX, Stage.TRIAGED}:
-                return (ev.WaivePlan(via=Via.DRAG),)
+                return (ev.WaivePlan(via=Via.DRAG, board_from=from_stage),)
             if from_stage == Stage.READY:
                 return (ev.RequestRework(),)
-            return (ev.ApprovePlan(via=Via.DRAG),)
+            return (ev.ApprovePlan(via=Via.DRAG, board_from=from_stage),)
         return (ev.ColumnObserved(stage=to_stage),)
 
     def _pull_request(self, payload: dict[str, Any]) -> tuple[ev.EventBody, ...]:

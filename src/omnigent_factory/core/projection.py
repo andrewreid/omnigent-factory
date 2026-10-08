@@ -26,6 +26,7 @@ from omnigent_factory.core.types import (
     StageSession,
     TrustedConfig,
     WaitReason,
+    is_leftward,
 )
 
 _SETTLED = frozenset({Lifecycle.RETIRED, Lifecycle.FENCED})
@@ -123,6 +124,20 @@ def checks_running(p: Parcel) -> bool:
     )
 
 
+def unexplained_move(p: Parcel) -> bool:
+    """The card was moved right on the board (seen by a read or a non-owner) and no owner
+    control explains it yet: it sits there with no authority."""
+    m = p.observed_move
+    return m is not None and m.to_stage == p.stage and not is_leftward(m.from_stage, m.to_stage)
+
+
+def unexplained_move_note(stage: Stage) -> str:
+    return (
+        f"Moved to {stage.value} without an owner command seen: "
+        "drag it again or add a factory: label"
+    )[:NOTE_MAX]
+
+
 def sync_red(p: Parcel) -> bool:
     """In Ready, the bot's work done, a required check red (see ``Readiness.sync_red``)."""
     r = p.readiness
@@ -211,6 +226,9 @@ def project_note(p: Parcel, bot: BotState) -> str:
     elif bot == BotState.IDLE and checks_running(p):
         assert p.readiness is not None  # noqa: S101 - checks_running checks it
         text = f"Checks running on `{p.readiness.head_sha[:7]}`"
+    elif bot == BotState.IDLE and unexplained_move(p):
+        assert p.stage is not None  # noqa: S101 - unexplained_move checks it
+        text = unexplained_move_note(p.stage)
     else:
         # Lowest precedence: other issues' triage named this one. Any status reason or
         # derived Blocked/Needs you/Checkpoint/Queued note above outranks it.

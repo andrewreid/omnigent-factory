@@ -95,6 +95,7 @@ from omnigent_factory.core.types import (
     IssueSessionStatus,
     IssueSnapshot,
     Lifecycle,
+    ObservedMove,
     Parcel,
     PendingMove,
     QueueEntry,
@@ -837,7 +838,9 @@ def _observe_stage(ctx: _Ctx, observed: Stage) -> None:
         ctx.update(stage=observed)
         return
     if is_leftward(current, observed):
+        prior = ctx.p.barrier_time_us
         _leftward_negative(ctx, current, observed)
+        _record_observed_move(ctx, current, observed, prior)
         return
     if board_pending(ctx.p):
         # A daemon write is in flight/queued: its target is the single desired column
@@ -854,6 +857,8 @@ def _observe_stage(ctx: _Ctx, observed: Stage) -> None:
         _emit_move(ctx, current, source=observed)
         ctx.note(f"Kept in {current.value}: the bot is still working")
         return
+    if observed in _DRAG_TARGETS.values():
+        _record_observed_move(ctx, current, observed, ctx.p.barrier_time_us)
     r = ctx.p.readiness
     if (
         current == Stage.BUILDING
@@ -865,6 +870,62 @@ def _observe_stage(ctx: _Ctx, observed: Stage) -> None:
         # E.g. the owner drags a finished build to Ready: a fresh read accepts it (Bot
         # by the checks) or moves it back with the reason (see ``_h_readiness``).
         _fetch_evidence(ctx, r)
+
+
+#: Owner drag controls and the column each one moves the card to.
+_DRAG_TARGETS: dict[EventKind, Stage] = {
+    EventKind.REQUEST_TRIAGE: Stage.TRIAGED,
+    EventKind.REQUEST_PLAN: Stage.SCOPED,
+    EventKind.REQUEST_REPLAN: Stage.SCOPED,
+    EventKind.APPROVE_PLAN: Stage.BUILDING,
+    EventKind.WAIVE_PLAN: Stage.BUILDING,
+}
+
+
+def _record_observed_move(
+    ctx: _Ctx, from_stage: Stage, to_stage: Stage, prior_barrier_us: int
+) -> None:
+    """Remember a column change seen without an owner control (never authority)."""
+    ctx.update(
+        observed_move=ObservedMove(from_stage, to_stage, ctx.p.barrier_time_us, prior_barrier_us)
+    )
+
+
+def _owner_control(ctx: _Ctx) -> bool:
+    e = ctx.event
+    return (
+        e.provenance in ev.CONTROL_PROVENANCES
+        and e.actor_id is not None
+        and e.actor_id in ctx.config.owners
+    )
+
+
+def _drag_origin(ctx: _Ctx) -> None:
+    """Judge an owner drag by its own columns, not by a read that got there first.
+
+    A reconcile read can land between the owner's drag and its webhook: it records the
+    new column as a plain observation, and the drag would then look like a move from
+    the column it went to (#729). When the parcel's last observed move is exactly the
+    drag's from -> to and the card is still there, the drag's own source column is the
+    origin its stage rules see. Authority still comes only from the drag (``_control``).
+    """
+    p = ctx.maybe_parcel
+    body = ctx.event.body
+    target = _DRAG_TARGETS.get(ctx.event.kind)
+    if p is None or target is None or not _owner_control(ctx):
+        return
+    assert isinstance(  # noqa: S101 - _DRAG_TARGETS lists only these kinds
+        body, ev.RequestTriage | ev.RequestPlan | ev.RequestReplan | ev.ApprovePlan | ev.WaivePlan
+    )
+    move = p.observed_move
+    if (
+        body.via == Via.DRAG
+        and body.board_from is not None
+        and move is not None
+        and (move.from_stage, move.to_stage) == (body.board_from, target)
+        and p.stage == target
+    ):
+        ctx.origin_stage = body.board_from
 
 
 def _leftward_negative(
@@ -1898,12 +1959,17 @@ def _h_pause(ctx: _Ctx, body: ev.Pause | ev.Unpause) -> None:
 
 def _h_leftward(ctx: _Ctx, body: ev.LeftwardMove) -> None:
     e = ctx.event
-    owner_fresh = (
-        e.provenance in ev.CONTROL_PROVENANCES
-        and e.actor_id is not None
-        and e.actor_id in ctx.config.owners
-        and e.source_time_us > ctx.p.barrier_time_us
+    move = ctx.p.observed_move
+    # A read that showed this very move first raised the barrier: the owner's drag is
+    # judged against the barrier before it, unless anything newer raised it since.
+    seen_first = (
+        move is not None
+        and (move.from_stage, move.to_stage) == (body.from_stage, body.to_stage)
+        and ctx.p.stage == body.to_stage
+        and ctx.p.barrier_time_us == move.barrier_us
     )
+    barrier = move.prior_barrier_us if seen_first and move is not None else ctx.p.barrier_time_us
+    owner_fresh = _owner_control(ctx) and e.source_time_us > barrier
     # A GitHub-origin move can never acknowledge a daemon write (daemon_effect_id is
     # ignored here). Only a non-owner/untrusted move to exactly the in-flight or queued
     # daemon target is consistent with it; a fresh owner control is always evaluated
@@ -4172,6 +4238,16 @@ def _queued(ctx: _Ctx) -> bool:
     return entry is not None and entry.status == QueueStatus.QUEUED
 
 
+def _settle_observed_move(ctx: _Ctx, accepted: bool) -> None:
+    """An accepted owner drag explains the observed move; a card that moved on drops it."""
+    move = ctx.p.observed_move
+    if move is None:
+        return
+    drag = ctx.event.kind in _DRAG_TARGETS or ctx.event.kind == EventKind.LEFTWARD_MOVE
+    if ctx.p.stage != move.to_stage or (accepted and drag and _owner_control(ctx)):
+        ctx.update(observed_move=None)
+
+
 def _project_board(ctx: _Ctx) -> None:
     """Derived Bot and "Factory note" values; each is written only when it changes.
 
@@ -4259,6 +4335,7 @@ def transition(state: State, event: Event) -> TransitionResult:
         return _reject(state, event, inadmissible)
 
     ctx = _Ctx(state, event)
+    _drag_origin(ctx)
     # ---- family 2: current safety facts (fresh-read evidence)
     _apply_evidence(ctx)
     checkpoint_parcel = ctx.maybe_parcel
@@ -4288,6 +4365,7 @@ def transition(state: State, event: Event) -> TransitionResult:
     dropped = 0
     new_parcel = ctx.maybe_parcel
     if new_parcel is not None:
+        _settle_observed_move(ctx, accepted)
         _project_board(ctx)
         new_parcel = ctx.p
         kept: list[EffectIntent] = []

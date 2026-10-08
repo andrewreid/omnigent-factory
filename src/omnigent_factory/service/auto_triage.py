@@ -124,6 +124,9 @@ _WORKING_LIFECYCLES = frozenset(
     {Lifecycle.INTENT, Lifecycle.CREATING, Lifecycle.PREPARING, Lifecycle.ACTIVE}
 )
 
+#: A plan or build run in one of these lifecycles is winding down: its tree still runs.
+_WINDING_DOWN = frozenset({Lifecycle.CHECKPOINT_GRACE, Lifecycle.DRAINING})
+
 
 def _run_name(parcel: Parcel, session: StageSession) -> str:
     auth = parcel.authorization(session.authorization_id)
@@ -146,9 +149,11 @@ def busy_reason(parcels: Iterable[Parcel]) -> str | None:
         for session in parcel.sessions:
             if session.kind == SessionKind.TRIAGE:
                 continue
-            # A stop, revoke or checkpoint drain: the tree still runs, whatever the card shows.
-            if session.lifecycle == Lifecycle.DRAINING:
-                return f"{_run_name(parcel, session)} draining on #{parcel.issue_number}"
+            # Checkpoint grace or a stop, revoke or checkpoint drain: the agent is still
+            # winding down, whatever the card shows.
+            if session.lifecycle in _WINDING_DOWN:
+                state = "draining" if session.lifecycle == Lifecycle.DRAINING else "winding down"
+                return f"{_run_name(parcel, session)} {state} on #{parcel.issue_number}"
             if working and session.lifecycle in _WORKING_LIFECYCLES:
                 return f"{_run_name(parcel, session)} running on #{parcel.issue_number}"
     return None

@@ -608,6 +608,23 @@ class RelatedMark:
 
 
 @dataclass(frozen=True, slots=True)
+class ObservedMove:
+    """A column change a read (or a non-owner webhook) showed, with no owner control yet.
+
+    Never authority. An owner drag of exactly these columns that arrives after the read
+    is judged by its own columns, as if it had come first (see the reducer's
+    ``_drag_origin`` and ``_h_leftward``).
+    """
+
+    from_stage: Stage | None
+    to_stage: Stage
+    #: The parcel's barrier after the observation (a leftward one raises it).
+    barrier_us: int
+    #: The barrier before it: the drag must be fresh against this one.
+    prior_barrier_us: int
+
+
+@dataclass(frozen=True, slots=True)
 class Parcel:
     """Per-issue aggregate. ``parcel_id`` is the stable issue node ID."""
 
@@ -672,6 +689,9 @@ class Parcel:
     #: Other issues whose accepted triage named this one (newest last). Shown as the
     #: lowest-precedence "Factory note"; cleared when the card changes column.
     related_marks: tuple[RelatedMark, ...] = ()
+    #: The latest column change observed without an owner control (None once a control
+    #: explains it or the card moves on).
+    observed_move: ObservedMove | None = None
     applied_event_ids: frozenset[str] = frozenset()
 
     def session(self, session_id: str | None) -> StageSession | None:
