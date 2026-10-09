@@ -213,6 +213,7 @@ class FactoryService:
             error_backoff_seconds=config.background_error_backoff_seconds,
             failure_limit=config.background_failure_limit,
             parked_blocks=self.parked.blocks,
+            fallback_seconds=config.idle_fallback_seconds,
         )
         self.operator = OperatorServer(
             config.operator_socket,
@@ -296,6 +297,7 @@ class FactoryService:
         self.accepting_admission = False
         self._stop.set()
         self._delivery_wake.set()
+        self.db.poke()
         if self.config_path is not None:
             asyncio.get_running_loop().remove_signal_handler(signal.SIGHUP)
         await self.executor.stop()
@@ -645,13 +647,17 @@ class FactoryService:
         return released
 
     async def _admission_loop(self) -> None:
+        """Admission decisions read only stored state: re-evaluated when it changes."""
         failures = 0
+        wake = self.db.subscribe()
         while not self._stop.is_set():
             try:
+                # Cleared before reading: a change committed meanwhile wakes the next wait.
+                wake.clear()
                 if self.accepting_admission:
                     await self._admit_once()
                 failures = 0
-                await self._wait(self.config.clock_interval_seconds)
+                await self._wait_for_change(wake)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -906,13 +912,21 @@ class FactoryService:
                 wait = self.config.reconcile_interval_seconds
 
     async def _clock_loop(self) -> None:
+        """Time limits of clocked runs: re-checked when stored state changes and at the
+        earliest deadline (grace, drain timeout), never by polling every parcel."""
         failures = 0
+        wake = self.db.subscribe()
         while not self._stop.is_set():
             try:
+                wake.clear()
+                deadline_us: int | None = None
                 for parcel_id in await self._clocked_parcel_ids():
                     parcel = await self.db.call(partial(_load_parcel, parcel_id=parcel_id))
                     if parcel is not None:
                         await self._sample_clock(parcel)
+                        due = self._clock_deadline_us(parcel)
+                        if due is not None and (deadline_us is None or due < deadline_us):
+                            deadline_us = due
                 loop_now = asyncio.get_running_loop().time()
                 if self._next_retention_at is None or loop_now >= self._next_retention_at:
                     self._next_retention_at = loop_now + RETENTION_SWEEP_INTERVAL_SECONDS
@@ -923,7 +937,11 @@ class FactoryService:
                         LOG.warning("history retention sweep failed")
                     await self._session_housekeeping()
                 failures = 0
-                await self._wait(self.config.clock_interval_seconds)
+                next_sweep = self._next_retention_at or loop_now
+                timeout = next_sweep - asyncio.get_running_loop().time()
+                if deadline_us is not None:
+                    timeout = min(timeout, (deadline_us - self.clock.now_utc_us()) / 1e6)
+                await self._wait_for_change(wake, timeout)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -993,6 +1011,25 @@ class FactoryService:
                     f"grace:{grant.grant_id}",
                 )
             )
+
+    def _clock_deadline_us(self, parcel: Parcel) -> int | None:
+        """The earliest wall-clock time :meth:`_sample_clock` acts on ``parcel`` without
+        any stored change (a grace deadline or a drain timeout); None: none pending."""
+        due: list[int] = []
+        session = parcel.current_session
+        if (
+            session is not None
+            and session.lifecycle in (Lifecycle.CHECKPOINT_GRACE, Lifecycle.CHECKPOINT_WAIT)
+            and session.grant.grace_deadline_us is not None
+        ):
+            due.append(session.grant.grace_deadline_us)
+        timeout_us = self.config.drain_timeout_minutes * MICROS_PER_MINUTE
+        due.extend(
+            int(s.drain_started_us + timeout_us)
+            for s in parcel.sessions
+            if s.lifecycle == Lifecycle.DRAINING and s.drain_started_us
+        )
+        return min(due) if due else None
 
     async def _expire_drains(self, parcel: Parcel) -> None:
         """End a drain still waiting for quiescence after ``drain_timeout_minutes``."""
@@ -1101,6 +1138,7 @@ class FactoryService:
             body: ev.EventBody = ev.Pause() if command == "pause" else ev.Unpause()
             await self.apply_event(self._event(None, body, f"operator:{command}:{uuid.uuid4()}"))
             self._last_admission_attempt = None
+            self.db.poke()
             return await self._status()
         if command == "auto-triage":
             if self.auto_triager is None:
@@ -1209,6 +1247,7 @@ class FactoryService:
                 self._delivery_failures.pop(delivery_guid, None)
                 self._delivery_retry_at.pop(delivery_guid, None)
                 self._delivery_wake.set()
+                self.db.poke()
                 return {"released": delivery_guid, **await self._status()}
         raise ValueError("unknown command")
 
@@ -1235,11 +1274,13 @@ class FactoryService:
             await self.db.call(lambda store: store.ensure_repository(new.trusted))
             self.config = new
             self.executor.update_config(new.trusted)
+            self.executor.fallback_seconds = new.idle_fallback_seconds
             self.parked.update_config(new.trusted)
             for listener in self.config_listeners:
                 listener(new)
             # Re-evaluate admission on the next tick even if the snapshot is unchanged.
             self._last_admission_attempt = None
+            self.db.poke()
             LOG.info("config reloaded changed=%s", ",".join(changed))
             return {"reloaded": True, "changed": changed}
 
@@ -1339,6 +1380,21 @@ class FactoryService:
     async def _wait(self, seconds: float) -> None:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._stop.wait(), seconds)
+
+    async def _wait_for_change(self, wake: asyncio.Event, timeout: float | None = None) -> None:
+        """Sleep until ``wake`` (a stored change), ``timeout`` seconds or the idle fallback.
+
+        Never returns sooner than ``clock_interval_seconds`` after the previous pass (the
+        busy cadence), so a burst of writes is one pass, not one per write.
+        """
+        await self._wait(self.config.clock_interval_seconds)
+        if self._stop.is_set() or wake.is_set():
+            return
+        seconds = self.config.idle_fallback_seconds
+        if timeout is not None:
+            seconds = min(seconds, max(timeout - self.config.clock_interval_seconds, 0.0))
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(wake.wait(), seconds)
 
     async def _background_error(self, task: str, failures: int) -> int:
         failures += 1

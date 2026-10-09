@@ -379,6 +379,7 @@ async def build_production(
         clock,
         interval_seconds=config.observation_interval_seconds,
         settled_interval_seconds=config.settled_observation_interval_seconds,
+        parked_interval_seconds=config.parked_observation_interval_seconds,
     )
     runtime = ProductionRuntime(
         service=service,
@@ -432,6 +433,7 @@ async def build_production(
         github.review_bot_login = new.review_bot_login
         github.review_bot_mention = new.review_bot_mention
         omnigent_adapter.set_inventory_resync(new.session_inventory_resync_hours * 3600)
+        observer.parked_interval_seconds = new.parked_observation_interval_seconds
 
     service.config_listeners.append(adopt_reloaded)
     cleaner = WorkspaceCleaner(directory, workspaces, config.worktree_root)
@@ -463,7 +465,7 @@ async def build_production(
 #: GitHub keeps idle connections far longer. A bounded pool also stops a burst of
 #: per-parcel effects from opening one connection each (they queue for a free one).
 GITHUB_HTTP_LIMITS = httpx.Limits(
-    max_connections=16, max_keepalive_connections=16, keepalive_expiry=120.0
+    max_connections=4, max_keepalive_connections=4, keepalive_expiry=120.0
 )
 #: Waiting for a pooled connection is not a GitHub timeout: allow a queue behind a burst.
 GITHUB_HTTP_TIMEOUT = httpx.Timeout(15.0, pool=60.0)

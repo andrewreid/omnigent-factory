@@ -60,6 +60,8 @@ HOT_RELOAD_KEYS = frozenset(
         "board_diff_interval_minutes",
         "session_inventory_resync_hours",
         "delivery_row_retention_days",
+        "idle_fallback_seconds",
+        "parked_observation_interval_seconds",
     }
 )
 
@@ -225,14 +227,20 @@ class ServiceConfig(BaseModel):
     #: live work are read every ``reconcile_interval_seconds`` instead. A missed webhook
     #: (close, reopen, move, edit, label, assignment) is applied within one interval.
     board_diff_interval_minutes: float = Field(default=5.0, gt=0)
+    #: Shortest spacing of admission and clock passes (the busy cadence). Both loops
+    #: otherwise sleep until stored state changes or their next deadline.
     clock_interval_seconds: float = Field(default=1.0, gt=0)
+    #: Longest the admission, clock and outbox loops sleep with no change seen: a safety
+    #: net only (every committed change and each due timer wakes them at once).
+    idle_fallback_seconds: float = Field(default=30.0, gt=0)
     effect_poll_seconds: float = Field(default=0.05, gt=0)
     #: Longest the delivery loop sleeps with nothing due. A committed webhook delivery or
     #: an operator release wakes it at once; this only bounds a missed wake-up.
     delivery_idle_poll_seconds: float = Field(default=5.0, gt=0)
     #: Days a processed delivery keeps its body/headers when nothing reads it back (no
     #: event, or only check, pull-request and review observations, references it).
-    delivery_body_retention_days: float = Field(default=1.0, gt=0)
+    #: Default 2 hours: a diagnostics window only (CI webhooks alone were ~50 MB a day).
+    delivery_body_retention_days: float = Field(default=2 / 24, gt=0)
     #: Days a processed delivery whose body was pruned keeps its row (GUID + sha256 for
     #: duplicate and recovery matching; GitHub redelivers for days, not weeks), and its
     #: delivery attempts. Rows an event, a parked delivery or a parcel hold references,
@@ -255,6 +263,11 @@ class ServiceConfig(BaseModel):
     #: Observation cadence of a settled stage session (tree observed quiescent, nothing of
     #: ours running): it is only watched for external activity.
     settled_observation_interval_seconds: float = Field(default=60.0, gt=0)
+    #: Observation cadence of a parked run, or one waiting on the owner, CI or the
+    #: review bot with its tree last seen idle (Needs you, Blocked, a settled checkpoint,
+    #: plan approval): only watched for external activity. The factory relaying an
+    #: owner's move changes its state, which puts it back on the active cadence.
+    parked_observation_interval_seconds: float = Field(default=300.0, gt=0)
     #: Hours between full reads of the archive-inclusive Omnigent session inventory (tree
     #: scans otherwise read only sessions created since the last read).
     session_inventory_resync_hours: float = Field(default=6.0, gt=0)

@@ -333,15 +333,15 @@ def _observer(adapter: CountingOmnigent, clock: FakeClock, parcels: list[Parcel]
 
 
 @pytest.mark.asyncio
-async def test_a_waiting_tree_parked_on_the_owner_is_read_on_the_settled_cadence() -> None:
+async def test_a_waiting_tree_parked_on_the_owner_is_read_on_the_parked_cadence() -> None:
     parked = _waiting_on_owner()
     clock = FakeClock()
     adapter = CountingOmnigent()
     observer = _observer(adapter, clock, [parked])
-    for _ in range(12):  # 60 s of 5 s passes
+    for _ in range(60):  # 300 s of 5 s passes
         await observer.observe_once()
         clock.advance(5_000_000)
-    assert sum(adapter.scans.values()) == 2  # first read, then once a minute
+    assert sum(adapter.scans.values()) == 2  # first read, then once every five minutes
     # Not parked any more (working): every pass again.
     working = replace(
         parked,
@@ -617,7 +617,9 @@ async def test_github_client_keeps_idle_connections_and_bounds_the_pool() -> Non
         pool: Any = client._transport._pool  # type: ignore[attr-defined]
         # httpx's default (5 s) dropped every connection between spaced-out reads.
         assert pool._keepalive_expiry == 120.0
-        assert pool._max_connections == 16 == GITHUB_HTTP_LIMITS.max_keepalive_connections
+        # Four is plenty for one repository (idle GitHub usage is a few reads an hour).
+        assert pool._max_connections == 4 == GITHUB_HTTP_LIMITS.max_keepalive_connections
+        assert pool._max_keepalive_connections == 4
         assert client.timeout.pool == 60.0
     finally:
         await client.aclose()

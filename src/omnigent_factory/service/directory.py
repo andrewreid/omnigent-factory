@@ -39,7 +39,7 @@ from omnigent_factory.core.types import (
     issue_session_title,
 )
 from omnigent_factory.github.adapter import ParcelBinding, TriageFields
-from omnigent_factory.omnigent.directory import FormValue, StageSpec
+from omnigent_factory.omnigent.directory import FormValue, StageSpec, stale_branch_note
 from omnigent_factory.ports.adapter import EffectAdapter
 from omnigent_factory.service.config import ServiceConfig
 from omnigent_factory.service.db import StoreWorker
@@ -95,6 +95,7 @@ class ServiceDispatchDirectory:
             granted_us=session.grant.remaining_us,
             policy_generation=session.grant.policy_generation,
             root_nonce=_root_nonce(parcel, session),
+            default_branch=str(existing.get("base_branch") or self.config.default_branch),
         )
 
     async def _make_snapshot(self, parcel: Parcel, session: StageSession) -> dict[str, object]:
@@ -147,6 +148,31 @@ class ServiceDispatchDirectory:
     def dispatch_snapshot(self, session_id: str) -> dict[str, Any] | None:
         """The persisted dispatch snapshot (branch, workspace, template) of a session."""
         return self._read(self.root / f"{_safe(session_id)}.json")
+
+    async def base_sync(self, session_id: str) -> dict[str, Any] | None:
+        """How this run's start synced the issue worktree with the base (None: not yet)."""
+        data = self._read(self.root / f"{_safe(session_id)}.json")
+        record = data.get("base_sync") if data is not None else None
+        return record if isinstance(record, dict) else None
+
+    async def record_base_sync(self, session_id: str, record: Mapping[str, Any]) -> None:
+        """Persist the run's base sync once: a restart never syncs the same run again."""
+        path = self.root / f"{_safe(session_id)}.json"
+        data = self._read(path)
+        if data is None or isinstance(data.get("base_sync"), dict):
+            return
+        data["base_sync"] = dict(record)
+        _atomic_json(path, data)
+
+    async def stage_workspace(self, session_id: str) -> str | None:
+        """The run's issue worktree as recorded at create or bound from an earlier run."""
+        data = self._read(self.root / f"{_safe(session_id)}.json")
+        if data is None:
+            return None
+        for key in ("workspace", "bind_worktree"):
+            if isinstance(data.get(key), str) and data[key]:
+                return str(data[key])
+        return None
 
     async def record_create(self, session_id: str, ack: Ack) -> None:
         path = self.root / f"{_safe(session_id)}.json"
@@ -238,6 +264,8 @@ class ServiceDispatchDirectory:
             "revision": parcel.revision,
             "granted_minutes": max(1, spec.granted_us // MICROS_PER_MINUTE),
             "handoff": self._handoff(parcel, sid),
+            # Templates before the base sync have no {base_note}: format ignores it.
+            "base_note": base_note(snapshot.get("base_sync"), spec.kind),
         }
         if spec.kind == SessionKind.BUILD:
             _authority_text, authority_hash = _authority(parcel)
@@ -1130,17 +1158,48 @@ def _new_boundary() -> str:
 
 #: First-message template of each stage run (the dispatch snapshot pins name and bytes).
 _FIRST_TEMPLATES = {
-    SessionKind.TRIAGE: "triage-v7.txt",
-    SessionKind.PLAN: "plan-v7.txt",
-    SessionKind.BUILD: "build-v9.txt",
+    SessionKind.TRIAGE: "triage-v8.txt",
+    SessionKind.PLAN: "plan-v8.txt",
+    SessionKind.BUILD: "build-v10.txt",
 }
-_RETRIAGE_TEMPLATE = "triage-feedback-v4.txt"
+_RETRIAGE_TEMPLATE = "triage-feedback-v5.txt"
 #: The triage of an epic (an issue with sub-issues), first run and re-runs alike.
-_EPIC_TRIAGE_TEMPLATE = "epic-triage-v1.txt"
-_REWORK_TEMPLATE = "build-rework-v6.txt"
+_EPIC_TRIAGE_TEMPLATE = "epic-triage-v2.txt"
+_REWORK_TEMPLATE = "build-rework-v7.txt"
 #: A rework run, or a wake of the waiting build run, for a merge conflict with the base.
-_CONFLICT_TEMPLATE = "build-conflict-v1.txt"
+_CONFLICT_TEMPLATE = "build-conflict-v2.txt"
 _CONFLICT_WAKE_TEMPLATE = "readiness-conflict-wake-v1.txt"
+
+
+def base_note(record: object, kind: SessionKind) -> str:
+    """The first message's line on how the run's start synced the worktree (or "")."""
+    if not isinstance(record, dict):
+        return ""
+    status = record.get("status")
+    base = str(record.get("base") or "main")
+    behind = int(record.get("behind") or 0)
+    if status == "fast_forwarded":
+        old, new = str(record.get("old_oid") or ""), str(record.get("new_oid") or "")
+        return (
+            f"The factory fast-forwarded this issue worktree to origin/{base} "
+            f"({old[:12]} -> {new[:12]}, {behind} new commits): what you knew of the code "
+            "may have changed."
+        )
+    if status == "fetch_failed":
+        return f"The factory could not fetch origin/{base}: the worktree's base may be stale."
+    if not behind:
+        return ""
+    if status == "own_commits":
+        if kind == SessionKind.BUILD:
+            return stale_branch_note(base, behind)
+        return f"{base} has moved {behind} commits since this branch's base."
+    if status == "not_synced":
+        reason = str(record.get("reason") or "")[:200]
+        return (
+            f"The factory left this worktree as it was ({reason}): origin/{base} has "
+            f"{behind} commits it lacks, so the code may be stale."
+        )
+    return ""
 
 
 def _template(name: str) -> str:

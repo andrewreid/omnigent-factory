@@ -22,7 +22,6 @@ from omnigent_factory.core.types import (
     Lifecycle,
     Parcel,
     StageSession,
-    WaitReason,
 )
 from omnigent_factory.omnigent.activity import ActivityTracker
 from omnigent_factory.omnigent.adapter import OmnigentExecutionAdapter
@@ -34,6 +33,9 @@ from omnigent_factory.service.directory import ServiceDispatchDirectory
 from omnigent_factory.service.runtime import FactoryService
 
 LOG = logging.getLogger(__name__)
+
+#: Lifecycles a run may be parked in (:meth:`OmnigentObserver._parked`).
+_PARKABLE_LIFECYCLES = frozenset({Lifecycle.ACTIVE, Lifecycle.WAITING, Lifecycle.FENCED})
 
 
 class OmnigentObserver:
@@ -48,6 +50,7 @@ class OmnigentObserver:
         *,
         interval_seconds: float,
         settled_interval_seconds: float | None = None,
+        parked_interval_seconds: float = 300.0,
     ) -> None:
         self.service = service
         self.adapter = adapter
@@ -57,6 +60,9 @@ class OmnigentObserver:
         #: A settled tree (observed quiescent, nothing of ours running) is only watched for
         #: external activity, so it is read at this slower cadence; any other is every pass.
         self.settled_interval_seconds = settled_interval_seconds or interval_seconds
+        #: A parked run, or one waiting on the owner, CI or the review bot with its tree
+        #: last seen idle (:meth:`_parked`), is read at this cadence (hot-reloadable).
+        self.parked_interval_seconds = parked_interval_seconds
         self._settled_read_at: dict[str, int] = {}
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -127,8 +133,15 @@ class OmnigentObserver:
             session = parcel.current_session
             if session is None or session.root_id is None or run_closed(parcel, session):
                 continue
-            slow = settled(session) or self._parked_on_owner(parcel, session)
-            if self._due(session.session_id, settled_now=slow):
+            if self._parked(parcel, session):
+                interval: float | None = max(
+                    self.parked_interval_seconds, self.settled_interval_seconds
+                )
+            elif settled(session):
+                interval = self.settled_interval_seconds
+            else:
+                interval = None
+            if self._due(session.session_id, interval):
                 due.append((parcel, session, session.root_id))
         if not due:
             return frozenset()
@@ -219,29 +232,38 @@ class OmnigentObserver:
             )
             self._crashed.add(session.session_id)
 
-    def _parked_on_owner(self, parcel: Parcel, session: StageSession) -> bool:
-        """A WAITING run last observed idle, waiting on the owner (an open decision, a
-        plan approval, a Needs-you card): only watched for external activity, like a
-        settled tree, until the factory relays the owner's move (which wakes it)."""
-        if session.lifecycle != Lifecycle.WAITING:
+    def _parked(self, parcel: Parcel, session: StageSession) -> bool:
+        """The run holds no turn and waits on someone else: only watched for external
+        activity until the factory relays a move (a state change, which ends this).
+
+        A build the reducer parked (``slot_parked``: Blocked, Needs you, idle on checks
+        or the review bot, a settled checkpoint), or an ACTIVE/WAITING/FENCED run whose
+        tree this process last saw complete and idle that is WAITING (decision, plan
+        approval, checks) or whose card is not Working (Needs you, Blocked, Checkpoint,
+        or Idle with its stage done, e.g. triage). Starting, running, grace and draining
+        runs keep the active cadence; a run never seen idle is never parked here.
+        """
+        if session.lifecycle not in _PARKABLE_LIFECYCLES:
             return False
+        if parcel.slot_parked:
+            return True
         tree = self._last_tree.get(session.session_id)
         if tree is None or not tree[0] or tree[1]:
             return False  # not yet observed complete and idle
         return (
-            bool(parcel.open_decisions)
-            or session.wait_reason in (WaitReason.DECISION, WaitReason.PLAN_APPROVAL)
-            or parcel.bot == BotState.NEEDS_YOU
+            session.lifecycle == Lifecycle.WAITING
+            or bool(parcel.open_decisions)
             or Hold.AWAITING_OWNER in parcel.holds
+            or parcel.bot not in (BotState.WORKING, BotState.QUEUED)
         )
 
-    def _due(self, session_id: str, *, settled_now: bool) -> bool:
-        if not settled_now:
+    def _due(self, session_id: str, interval_seconds: float | None) -> bool:
+        if interval_seconds is None:
             self._settled_read_at.pop(session_id, None)
             return True
         now = self.clock.monotonic_us()
         last = self._settled_read_at.get(session_id)
-        if last is not None and now - last < self.settled_interval_seconds * 1e6:
+        if last is not None and now - last < interval_seconds * 1e6:
             return False
         self._settled_read_at[session_id] = now
         return True

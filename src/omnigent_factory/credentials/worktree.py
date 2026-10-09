@@ -96,6 +96,35 @@ class VerifiedWorktree:
     head_oid: str
 
 
+@dataclass(frozen=True, slots=True)
+class BaseSync:
+    """How a stage run's start brought the issue worktree up to ``origin/<base>``.
+
+    ``status``: ``fast_forwarded`` (no commits of its own, clean: moved ``old_oid`` ->
+    ``new_oid``, ``behind`` commits), ``up_to_date``, ``own_commits`` (never merged or
+    rebased by the factory; ``behind`` commits on the base since), ``not_synced`` (dirty,
+    detached, off its branch or mid-operation: untouched, ``reason`` says why) or
+    ``fetch_failed`` (the base could not be fetched: the worktree may be stale).
+    """
+
+    status: str
+    base: str
+    old_oid: str = ""
+    new_oid: str = ""
+    behind: int = 0
+    reason: str = ""
+
+    def to_json(self) -> dict[str, str | int]:
+        return {
+            "status": self.status,
+            "base": self.base,
+            "old_oid": self.old_oid,
+            "new_oid": self.new_oid,
+            "behind": self.behind,
+            "reason": self.reason,
+        }
+
+
 def default_helper_command() -> str:
     """Absolute helper command (git appends the operation name)."""
     return f"!{shlex.quote(sys.executable)} -m omnigent_factory.credentials.git_helper"
@@ -257,6 +286,61 @@ class Workspaces:
         ref = f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}"
         self._git(["fetch", "--no-tags", "origin", ref], self.source_clone)
         return self._git(["rev-parse", f"refs/remotes/origin/{base_branch}"], self.source_clone)
+
+    def commits_behind(self, workspace: str | Path, base_branch: str = "main") -> int:
+        """Commits on the last fetched ``origin/<base>`` that HEAD lacks (no fetch)."""
+        path = self._owned_worktree(workspace)
+        out = self._git(["rev-list", "--count", f"HEAD..refs/remotes/origin/{base_branch}"], path)
+        return int(out or 0)
+
+    def sync_with_base(
+        self, workspace: str | Path, branch: str, base_branch: str = "main"
+    ) -> BaseSync:
+        """Fetch ``origin/<base>`` and fast-forward an issue worktree with no commits of
+        its own to it (at a stage run's start only, never mid-stage).
+
+        Only ``git merge --ff-only`` on a clean worktree on ``branch`` whose HEAD is an
+        ancestor of the base; a branch with its own commits is never merged or rebased,
+        and a dirty, detached, off-branch or mid-operation worktree is left untouched.
+        Never raises: a failure is reported in the result (the stage starts anyway).
+        """
+        try:
+            target = self.fetch_base(base_branch)
+        except WorktreeError as exc:
+            return BaseSync("fetch_failed", base_branch, reason=str(exc)[:300])
+        try:
+            path = self._owned_worktree(workspace)
+            head = self._git(["rev-parse", "HEAD"], path)
+            behind = self.commits_behind(path, base_branch)
+            ahead = int(self._git(["rev-list", "--count", f"{target}..HEAD"], path) or 0)
+            problems: list[str] = []
+            current = self._head_branch(path)
+            if current != branch:
+                problems.append("detached HEAD" if current is None else f"on {current}")
+            problems += self._operations_in_progress(path)
+            if not self.is_clean(path):
+                problems.append("uncommitted changes")
+            if problems:
+                return BaseSync("not_synced", base_branch, head, head, behind, ", ".join(problems))
+            if ahead:
+                return BaseSync("own_commits", base_branch, head, head, behind)
+            if not behind:
+                return BaseSync("up_to_date", base_branch, head, head)
+            proc = _run(
+                ["merge", "--ff-only", "--no-edit", target],
+                path,
+                check=False,
+                git=self.git,
+                env=self.inspection_env,
+            )
+            moved = self._git(["rev-parse", "HEAD"], path)
+            if proc.returncode != 0 or moved != target:
+                return BaseSync(
+                    "not_synced", base_branch, head, moved, behind, "fast-forward failed"
+                )
+            return BaseSync("fast_forwarded", base_branch, head, moved, behind)
+        except WorktreeError as exc:
+            return BaseSync("not_synced", base_branch, reason=str(exc)[:300])
 
     def find_branch_worktree(self, branch: str) -> Path | None:
         """The worktree that has ``branch`` checked out, if any (orphan inspection)."""

@@ -51,6 +51,16 @@ class StageSpec:
     #: The ``factory.dispatch`` label of the issue session this run executes in (the
     #: creating run's nonce); ``None`` means the run's own ``nonce``.
     root_nonce: str | None = None
+    #: The repository's default branch: a run's start syncs the issue worktree with it.
+    default_branch: str = "main"
+
+
+def stale_branch_note(base: str, behind: int) -> str:
+    """A branch with commits of its own is never merged by the factory: say so."""
+    return (
+        f"{base} has moved {behind} commits since your branch base; merge origin/{base} "
+        "first if relevant."
+    )
 
 
 @runtime_checkable

@@ -115,6 +115,7 @@ from omnigent_factory.omnigent.directory import (
     OwnItemLedger,
     OwnSend,
     StageSpec,
+    stale_branch_note,
 )
 from omnigent_factory.omnigent.inventory import SessionIndex
 from omnigent_factory.omnigent.rest import (
@@ -141,6 +142,8 @@ LOG = logging.getLogger(__name__)
 
 ELICITATION_NOT_PENDING = "elicitation-not-pending"
 NONCE_LABEL = "factory.dispatch"
+#: Message purposes sent within a running stage: they never sync the worktree.
+_MID_STAGE = frozenset({"feedback", "readiness_wake"})
 _TURN_ITEM_TYPES = frozenset(
     {"message", "function_call", "function_call_output", "reasoning", "custom_tool_call"}
 )
@@ -611,6 +614,7 @@ class OmnigentExecutionAdapter:
                         moved_from,
                         spec.branch,
                     )
+                await self._sync_base(spec, workspace)
             verified = await asyncio.to_thread(
                 self.workspaces.verify_worktree, workspace, spec.branch
             )
@@ -649,6 +653,58 @@ class OmnigentExecutionAdapter:
             head_oid=verified.head_oid,
             capability_id=capability.capability_id,
         )
+
+    async def _sync_base(self, spec: StageSpec, workspace: str) -> None:
+        """Bring the issue worktree up to the base at this run's start, once per run.
+
+        Before the run's first message (and only then: never mid-stage). The outcome is
+        recorded with the run's dispatch snapshot, so a retried or restarted preparation
+        never syncs again, and the first message tells the agent what happened.
+        """
+        read = getattr(self.directory, "base_sync", None)
+        record = getattr(self.directory, "record_base_sync", None)
+        if read is None or record is None or await read(spec.session_id) is not None:
+            return
+        result = await asyncio.to_thread(
+            self.workspaces.sync_with_base, workspace, spec.branch, spec.default_branch
+        )
+        if result.status == "fast_forwarded":
+            LOG.info(
+                "issue worktree fast-forwarded session=%s branch=%s %s->%s commits=%s",
+                spec.session_id,
+                spec.branch,
+                result.old_oid,
+                result.new_oid,
+                result.behind,
+            )
+        elif result.status in ("fetch_failed", "not_synced"):
+            LOG.warning(
+                "issue worktree not synced session=%s branch=%s status=%s reason=%s",
+                spec.session_id,
+                spec.branch,
+                result.status,
+                result.reason,
+            )
+        await record(spec.session_id, result.to_json())
+
+    async def _mid_stage_note(self, effect: EffectIntent, spec: StageSpec) -> str:
+        """A build run's mid-stage message (owner feedback, a findings/checks wake) only
+        says how far the base moved: the worktree is never synced mid-stage."""
+        if spec.kind != SessionKind.BUILD or effect.args.get("purpose") not in _MID_STAGE:
+            return ""
+        if effect.args.get("wake") == "conflict":
+            return ""  # the conflict wake itself says to merge the base
+        locate = getattr(self.directory, "stage_workspace", None)
+        workspace = await locate(spec.session_id) if locate is not None else None
+        if not workspace:
+            return ""
+        try:
+            behind = await asyncio.to_thread(
+                self.workspaces.commits_behind, workspace, spec.default_branch
+            )
+        except (WorktreeError, ValueError):
+            return ""
+        return stale_branch_note(spec.default_branch, behind) if behind else ""
 
     def _wire(self, verified: VerifiedWorktree, spec: StageSpec, cap_path: Path) -> None:
         wiring = StageWiring(spec.session_id, cap_path, self.broker_socket, self.config.repository)
@@ -711,6 +767,9 @@ class OmnigentExecutionAdapter:
         text = await self.directory.message_text(effect)
         if not text:
             return DefinitiveFailure("no rendered message text")
+        note = await self._mid_stage_note(effect, spec)
+        if note:
+            text = f"{text}\n\n{note}"
         full = f"{text}\n\n{effect_marker(effect.effect_id)}"
         await self.ledger.record_intent(
             OwnSend(effect.effect_id, spec.session_id, spec.root_id, "message", text_digest(full))

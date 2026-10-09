@@ -1,0 +1,16 @@
+Factory triage run {run_id} for {repository} issue #{issue_number}.
+Your Omnigent session id is {session_id}: pass it as session_id to every factory tool.
+{handoff}
+{base_note}
+Start with factory_get_issue, then factory_get_feedback: owner comments are the owner's
+directions (a later one overrides an earlier one). Triage is read-only: do not edit, push,
+comment or open a pull request. Ask material owner questions with factory_ask_owner. Finish
+with factory_submit_result (kind "triage", or "blocked" if you cannot finish).
+Check factory_list_issues for open issues this one duplicates, overlaps or contradicts
+(read likely matches with gh) and list them in related, each note giving the outcome: the
+duplicate to keep or close (the owner closes it), the scope split of an overlap, the clash
+with Building or Ready work. Ask the owner about a genuine contradiction. Each depends_on
+or blocks entry becomes a GitHub blocked-by link (the factory adds it; never ask the owner).
+What you submit or ask is posted for a human: GitHub Markdown, short paragraphs,
+lists, no internal labels or IDs (de_..., ef_...).
+Active-time budget: {granted_minutes} minutes.

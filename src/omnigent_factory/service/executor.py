@@ -32,7 +32,7 @@ from omnigent_factory.ports.adapter import EffectAdapter
 from omnigent_factory.ports.clock import Clock
 from omnigent_factory.ports.scheduler import SCHEDULER_EFFECT_KINDS
 from omnigent_factory.service.db import StoreWorker
-from omnigent_factory.store.sqlite import Lease, LeaseHeld, StoredEffect
+from omnigent_factory.store.sqlite import Lease, LeaseHeld, SqliteStore, StoredEffect
 
 LOG = logging.getLogger(__name__)
 
@@ -74,6 +74,7 @@ class EffectExecutor:
         error_backoff_seconds: float = 0.05,
         failure_limit: int = 10,
         parked_blocks: Callable[[str | None], bool] | None = None,
+        fallback_seconds: float = 30.0,
     ) -> None:
         self._db = db
         self._config = config
@@ -91,6 +92,10 @@ class EffectExecutor:
         self._scheduled: set[str] = set()
         self._leases: dict[str, Lease] = {}
         self._stopping = asyncio.Event()
+        #: Longest the outbox sleeps with nothing due and no change seen: a safety net
+        #: only (every committed change, and the earliest retry time, wake it).
+        self.fallback_seconds = fallback_seconds
+        self._wake: asyncio.Event | None = None
         for adapter in adapters:
             self.install(adapter)
 
@@ -110,10 +115,14 @@ class EffectExecutor:
 
     async def run(self) -> None:
         failures = 0
+        wake = self._wake = self._db.subscribe()
         try:
             while not self._stopping.is_set():
                 try:
-                    pending = await self._db.call(lambda store: store.pending_effects(limit=200))
+                    # Cleared before the outbox is read: a change committed from here on
+                    # sets it again, so the wait below cannot miss it.
+                    wake.clear()
+                    pending, next_due_us = await self._db.call(_due_effects)
                     if self._stopping.is_set():
                         break
                     for stored in pending:
@@ -132,7 +141,7 @@ class EffectExecutor:
                                 self._parcel_worker(key, queue), name=f"effect:{key}"
                             )
                     failures = 0
-                    await self._wait(self._poll_seconds)
+                    await self._idle(wake, next_due_us)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -158,6 +167,23 @@ class EffectExecutor:
 
     async def stop(self) -> None:
         self._stopping.set()
+        if self._wake is not None:
+            self._wake.set()
+
+    async def _idle(self, wake: asyncio.Event, next_due_us: int | None) -> None:
+        """Sleep until the database changes, the earliest retry is due, or the fallback.
+
+        Never re-polls sooner than ``poll_seconds`` (the busy cadence): a burst of
+        writes is batched into one outbox read.
+        """
+        await self._wait(self._poll_seconds)
+        timeout = self.fallback_seconds
+        if next_due_us is not None:
+            timeout = min(timeout, max(next_due_us - self._clock.now_utc_us(), 0) / 1e6)
+        if self._stopping.is_set() or wake.is_set():
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(wake.wait(), timeout)
 
     async def _parcel_worker(self, key: str, queue: asyncio.Queue[str | None]) -> None:
         failures = 0
@@ -171,7 +197,12 @@ class EffectExecutor:
                     continue
                 async with self._serializers.lock(key):
                     if not self._stopping.is_set():
+                        generation = self._db.generation
                         await self._execute(effect_id)
+                        if self._db.generation != generation and self._wake is not None:
+                            # The outbox read may have skipped this (still scheduled)
+                            # effect after a change it acted on stale: read it again.
+                            self._wake.set()
                 failures = 0
             except Exception:
                 # Identifiers only: exception text/tracebacks can contain credentials.
@@ -704,6 +735,11 @@ def _log_ack(effect: EffectIntent, ack: Ack) -> None:
         effect.parcel_id,
         ack.remote_id,
     )
+
+
+def _due_effects(store: SqliteStore) -> tuple[list[StoredEffect], int | None]:
+    """Pending effects due now, and when the next deferred one becomes due."""
+    return store.pending_effects(limit=200), store.next_effect_due_us()
 
 
 def _inbox_gated(effect: EffectIntent) -> bool:

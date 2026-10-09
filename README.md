@@ -599,8 +599,22 @@ a changed card (or one never compared) gets a per-issue read. A missed webhook (
 reopen, move, edit, label, assignment) is thus applied within one diff interval. Boot reads
 only live parcels.
 
-The Omnigent observer scans only open runs; a WAITING run parked on the owner (open
-decision, plan approval, Needs you) is read on the settled cadence. All trees due in one
+The outbox, admission and clock loops do not poll: each sleeps until a change is
+committed to the state database (a webhook delivery, an effect enqueued or finished, a
+parcel transition, an operator command), a config reload, or its own next deadline (a
+deferred effect retry, a checkpoint grace or drain timeout), never re-running sooner than
+`effect_poll_seconds` / `clock_interval_seconds` (the busy cadence) and never sleeping
+longer than `idle_fallback_seconds` (default `30`, hot-reloadable). An idle factory makes
+almost no database calls. GitHub calls share one pool of at most 4 connections, kept
+alive for 120 s.
+
+The Omnigent observer scans only open runs. A parked run, or one waiting on the owner, CI
+or the review bot with its tree last seen complete and idle (Needs you, Blocked, a settled
+checkpoint, plan approval, idle on checks, triage done), is read every
+`parked_observation_interval_seconds` (default `300`, hot-reloadable); starting, running,
+grace and draining runs keep `observation_interval_seconds` (`5`). The factory relaying
+an owner's move changes the run's state, which puts it back on the active cadence; a
+parked tree a scan sees busy counts as running again. All trees due in one
 pass share one archive-inclusive inventory read (taken after every tree's child walk); its
 full resync runs every `session_inventory_resync_hours` (default `6`, hot-reloadable). A
 failed read still makes every scan of the pass incomplete, never idle.
@@ -613,7 +627,7 @@ reducer never replays. Retention runs every 15 minutes in the daemon, in short b
 | `[service]` key | Default | Removes |
 |---|---|---|
 | `observation_retention_hours` | `2` | Periodic observation events (`ReconcileDue`, `GitHubSnapshot`, delivery-keyed `ChecksChanged`, `ReadinessEvidence`, `TreeQuiescent`, cost/runtime samples, `CapacityAvailable`), their audit rows and the settled read/board-drift effects they spawned. |
-| `delivery_body_retention_days` | `1` | Body and headers of processed deliveries that no event, or only check/PR/review observations, references. The row and its GUID stay for duplicate detection. |
+| `delivery_body_retention_days` | `0.083` (2 h) | Body and headers of processed deliveries that no event, or only check/PR/review observations, references. The row and its GUID stay for duplicate detection. |
 | `delivery_row_retention_days` | `14` | Rows (and delivery attempts) of processed deliveries whose body was pruned, unless an event, a parked delivery, a parcel hold or stored review comments reference them; quarantined attempts are kept. A delivery that produced no event (ignored, no transition) loses its body and headers as soon as it is processed (GUID and sha256 stay). |
 | `completed_reconcile_interval_seconds` | `3600` | Not a deletion: only when no board diff is wired, a parcel with no live work is reconciled at this cadence instead of every `reconcile_interval_seconds`. |
 
@@ -641,6 +655,10 @@ too (Omnigent's `DELETE /v1/sessions/{id}`); worktrees and branches are left alo
 deletion is recorded and never retried. `omnigent-factory sessions prune --dry-run` lists
 what would go now. Triage ranking keeps its newest 10 finished runs; older ones are
 removed once their session is deleted (or archived, with retention off).
+
+A pruned delivery row is rewritten rather than emptied in place, so its page space is
+reused (an emptied row left its page nearly empty until the row itself was deleted); the
+WAL file is truncated back to 4 MiB after each checkpoint.
 
 Freed pages return to the filesystem only once the file uses incremental auto_vacuum
 (new files do). For an existing file, run once with the daemon stopped:

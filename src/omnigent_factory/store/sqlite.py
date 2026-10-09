@@ -123,6 +123,8 @@ PRUNABLE_OBSERVATIONS: dict[str, tuple[str, ...]] = {
     EventKind.CAPACITY_AVAILABLE.value: ("capacity:",),
 }
 _PRUNABLE_KINDS_JSON = json.dumps(sorted(PRUNABLE_OBSERVATIONS))
+#: Size the WAL file is truncated to after a checkpoint (``journal_size_limit``).
+WAL_SIZE_LIMIT_BYTES = 4 * 1024 * 1024
 #: Events whose delivery body nothing reads back (the directory reads owner comments,
 #: decision answers and issue labels; check-run and pull-request payloads carry none).
 _BODY_UNREAD_KINDS_JSON = json.dumps(
@@ -391,6 +393,9 @@ class SqliteStore:
             # Only takes effect on a new, empty file; an existing one switches in vacuum().
             conn.execute(f"PRAGMA auto_vacuum={_AUTO_VACUUM_INCREMENTAL}")
             conn.execute("PRAGMA journal_mode=WAL")
+            # A checkpoint leaves the WAL file at its high-water mark (a large prune or
+            # boot burst kept ~8 MB on disk for good); truncate it back to this size.
+            conn.execute(f"PRAGMA journal_size_limit={WAL_SIZE_LIMIT_BYTES}")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA synchronous=FULL")
             conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
@@ -403,6 +408,14 @@ class SqliteStore:
 
     def close(self) -> None:
         self._conn.close()
+
+    @property
+    def total_changes(self) -> int:
+        """Rows written through this connection so far (-1 once it is closed)."""
+        try:
+            return self._conn.total_changes
+        except sqlite3.ProgrammingError:
+            return -1
 
     def _hook(self, point: str) -> None:
         if self._fault is not None:
@@ -765,11 +778,33 @@ class SqliteStore:
             ).fetchone()
             return int(row[0])
         with self._txn() as conn:
-            cur = conn.execute(
-                "UPDATE deliveries SET body = X'', headers_json = '{}', body_pruned_at_us = ? "
-                f"WHERE delivery_guid IN ({eligible} LIMIT ?)",
-                (self._clock.now_utc_us(), before_us, checks, limit),
+            # Emptied in place, a big row leaves its leaf page nearly empty and SQLite
+            # never merges pages on an update: the file kept ~2/3 of every delivery leaf
+            # page as dead space for the 14-day row retention. Rewritten instead (deleted,
+            # then re-inserted pruned, unchanged otherwise, in this transaction), the
+            # delete rebalances the sparse pages and the small rows pack densely.
+            conn.execute("PRAGMA defer_foreign_keys = ON")  # events reference the GUID
+            conn.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS pruned_deliveries AS "
+                "SELECT * FROM deliveries WHERE 0"
             )
+            conn.execute("DELETE FROM temp.pruned_deliveries")
+            conn.execute(
+                "INSERT INTO temp.pruned_deliveries SELECT * FROM deliveries "
+                f"WHERE delivery_guid IN ({eligible} LIMIT ?)",
+                (before_us, checks, limit),
+            )
+            conn.execute(
+                "UPDATE temp.pruned_deliveries "
+                "SET body = X'', headers_json = '{}', body_pruned_at_us = ?",
+                (self._clock.now_utc_us(),),
+            )
+            conn.execute(
+                "DELETE FROM deliveries WHERE delivery_guid IN "
+                "(SELECT delivery_guid FROM temp.pruned_deliveries)"
+            )
+            cur = conn.execute("INSERT INTO deliveries SELECT * FROM temp.pruned_deliveries")
+            conn.execute("DELETE FROM temp.pruned_deliveries")
         return cur.rowcount
 
     def retire_delivery(self, delivery_guid: str) -> None:
@@ -1675,6 +1710,15 @@ class SqliteStore:
             (now, limit),
         ).fetchall()
         return [self._stored(r) for r in rows]
+
+    def next_effect_due_us(self, *, now_us: int | None = None) -> int | None:
+        """When the earliest deferred (retry-gated) pending effect becomes due."""
+        now = self._clock.now_utc_us() if now_us is None else now_us
+        row = self._conn.execute(
+            "SELECT MIN(next_at_us) FROM effects WHERE state = 'pending' AND next_at_us > ?",
+            (now,),
+        ).fetchone()
+        return None if row is None or row[0] is None else int(row[0])
 
     def effects_in_state(self, state: str) -> list[StoredEffect]:
         rows = self._conn.execute(
