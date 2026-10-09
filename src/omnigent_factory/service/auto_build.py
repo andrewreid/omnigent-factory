@@ -31,6 +31,7 @@ from omnigent_factory.core.projection import (
     building_capacity_available,
     pr_capacity_available,
     queue_head,
+    running_text,
 )
 from omnigent_factory.core.types import (
     AdmissionSnapshot,
@@ -39,6 +40,7 @@ from omnigent_factory.core.types import (
     Parcel,
     QueueStatus,
     Stage,
+    blockers_text,
 )
 from omnigent_factory.ports.github import IssueRef, RankingCard
 from omnigent_factory.service.auto_triage import MAX_GRANT, local_day
@@ -123,6 +125,13 @@ def mark_blocker(parcel: Parcel, *, parked: bool = False) -> str | None:
         return "a card move is in flight"
     if parcel.unknown_effects:
         return "an unconfirmed write is outstanding"
+    links = parcel.links
+    if links is not None and links.epic:
+        return "an epic: build its sub-issues"
+    if links is not None and links.open_blockers:
+        # Becomes eligible by itself once a read shows every blocker closed. Links never
+        # read are not a blocker here: the start's fresh read decides (fails closed).
+        return f"waiting on {blockers_text(links.open_blockers)}"
     return None
 
 
@@ -131,17 +140,25 @@ def admission_blocker(admission: AdmissionSnapshot, service: FactoryService) -> 
     trusted = service.config.trusted
     if admission.paused:
         return "paused"
-    if queue_head(admission) is not None:
+    head = queue_head(admission)
+    if head is not None and (head.resume or not head.auto):
         return "a queued build goes first"
     if not building_capacity_available(admission, trusted):
-        return f"every build slot is taken ({admission.building_count}/{trusted.max_building})"
-    if not auto_build_capacity_available(admission, trusted):
+        running = admission.running()
         return (
-            f"every auto-build slot is taken "
-            f"({admission.auto_build_count}/{trusted.auto_build_concurrency})"
+            f"waiting for a build slot ({admission.building_count}/{trusted.max_building} "
+            f"running: {running_text(running) or '-'})"
+        )
+    if not auto_build_capacity_available(admission, trusted):
+        running = admission.running(auto=True)
+        return (
+            f"waiting for an auto-build slot ({admission.auto_build_count}/"
+            f"{trusted.auto_build_concurrency} in use: {running_text(running)})"
         )
     if not pr_capacity_available(admission, trusted):
         return "every open-PR slot is taken"
+    if head is not None:
+        return "a queued build goes first"
     return None
 
 
@@ -349,6 +366,8 @@ class AutoBuilder:
             "remaining_today": budget.remaining,
             "auto_build_concurrency": config.auto_build_concurrency,
             "auto_builds_running": admission.auto_build_count,
+            "auto_builds_running_issues": [q.issue_number for q in admission.running(auto=True)],
+            "auto_builds_parked": [q.issue_number for q in admission.parked() if q.auto],
             "auto_builds_waiting_for_slot": sum(
                 1 for q in admission.queue if q.auto and q.status == QueueStatus.QUEUED
             ),

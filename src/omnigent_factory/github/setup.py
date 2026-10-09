@@ -14,6 +14,17 @@ PROJECT_NODE_ID = "PVT_kwDOEanNes4BkJhb"
 STATUS_FIELD_NODE_ID = "PVTSSF_lADOEanNes4BkJhbzhi7I9w"
 STATUS_FIELD_DATABASE_ID = 414917596
 
+#: Project field node IDs the "Epics" view shows (read from the live project 2026-10-09).
+EPICS_VIEW_FIELD_NODE_IDS = (
+    "PVTF_lADOEanNes4BkJhbzhi7I9o",  # Title
+    STATUS_FIELD_NODE_ID,
+    "PVTF_lADOEanNes4BkJhbzhi7I-Q",  # Sub-issues progress (built in)
+    "PVTSSF_lADOEanNes4BkJhbzhjgMaM",  # Bot
+    "PVTF_lADOEanNes4BkJhbzhjww0c",  # Factory note
+)
+#: Only issues with sub-issues (GitHub's ``has:<field>`` filter on the built-in field).
+EPICS_VIEW_FILTER = "is:issue is:open has:sub-issues-progress"
+
 #: Status option color and description per stage (the name comes from ``status_names``).
 _STATUS_STYLE: Mapping[Stage, tuple[str, str]] = {
     Stage.INBOX: ("GRAY", "Not started"),
@@ -72,6 +83,9 @@ def render_app_manifest(
             "workflow_run",
             "projects_v2_item",
             "push",
+            # Native link changes (Issues read permission): re-read the issues they name.
+            "sub_issues",
+            "issue_dependencies",
         ],
     }
 
@@ -199,12 +213,40 @@ def render_project_migration(
         },
         "create_fields": create_fields,
         "create_views": views,
+        "create_epics_view": render_epics_view(),
         "post_apply_verification": [
             "persist every returned node and database id (Rank: rank_field_node_id; "
             "Auto-build: auto_build_field_node_id and auto_build_options Queued/Started)",
             "verify every preserved option id and existing item value",
             f"keep item-added to {status_names[Stage.INBOX]} and disable PR-driven moves",
             "retire Agent/Audit and old views only after new views verify",
+        ],
+    }
+
+
+def render_epics_view() -> dict[str, Any]:
+    """The "Epics" table view: create it, then set its filter (``createProjectV2View``
+    takes no filter; ``updateProjectV2View`` does). Rendered only, never applied here."""
+    return {
+        "create": {
+            "mutation": "createProjectV2View",
+            "input": {
+                "projectId": PROJECT_NODE_ID,
+                "name": "Epics",
+                "layout": "TABLE_LAYOUT",
+                "configuration": {"visibleFieldIds": list(EPICS_VIEW_FIELD_NODE_IDS)},
+            },
+        },
+        "update": {
+            "mutation": "updateProjectV2View",
+            "input": {
+                "viewId": "<id returned by createProjectV2View>",
+                "filter": EPICS_VIEW_FILTER,
+            },
+        },
+        "verify": [
+            "the view lists only open issues with sub-issues and shows Sub-issues progress",
+            "if has:sub-issues-progress filters nothing, use type:Epic once epics are typed",
         ],
     }
 

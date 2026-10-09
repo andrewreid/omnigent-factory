@@ -714,7 +714,8 @@ def test_merged_pr_read_is_terminal_with_the_issue_open_and_frees_the_slots():
     h = Harness()
     h.to_building()
     _idle_build_ready(h)
-    assert h.admission.building_count == 1 and h.admission.prospective_pr_count == 1
+    # Idle waiting on checks the run is parked (no build slot); the PR still counts.
+    assert h.admission.building_count == 0 and h.admission.prospective_pr_count == 1
     r = h.send(P, evidence(h, OLD, pr_open=False, merged=True, checks=ev.ChecksState.GREEN))
     p = h.p()
     assert Hold.COMPLETED in p.holds and p.eligible  # the issue is still open

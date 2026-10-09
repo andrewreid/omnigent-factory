@@ -393,3 +393,49 @@ def test_setup_render_creates_the_field_and_doctor_reports_it_missing_or_wrong(
         service_config.model_validate(
             {**service_config.model_dump(), "auto_build_field_node_id": AUTO_FIELD}
         )
+
+
+# ------------------------------------------------------------------ native links
+
+
+@pytest.mark.asyncio
+async def test_a_mark_waits_on_an_open_blocker_and_an_epic_is_never_started(
+    service_config: ServiceConfig,
+):
+    from omnigent_factory.core.types import IssueLinks, LinkedIssue
+
+    blocked = IssueLinks(blocked_by=(LinkedIssue(823, True), LinkedIssue(822, False)))
+    epic = IssueLinks(sub_issues=(LinkedIssue(9, True),), sub_total=1)
+    h = history("I_a", "I_b", "I_c")
+    for pid, links in (("I_a", blocked), ("I_b", epic)):
+        f = h.f(pid)
+        h.apply(
+            f.make(
+                ev.GitHubSnapshot(),
+                evidence=snapshot(read_at_us=f.now, stage=Stage.SCOPED, links=links),
+            )
+        )
+    async with rig(on(service_config), h, ranks={"I_a": 1.0, "I_b": 2.0, "I_c": 3.0}) as r:
+        assert r.builder is not None
+        status = await r.builder.status()
+        assert [(e["issue"], e["eligible"], e["blocker"]) for e in status["queue"]] == [  # type: ignore[union-attr]
+            (1, False, "waiting on #823"),
+            (2, False, "an epic: build its sub-issues"),
+            (3, True, None),
+        ]
+        assert await r.builder.run_once() == "started #3"
+        a = await r.parcel("I_a")
+        assert a.auto_build is not None and a.auto_build.status == AutoBuildStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_status_reports_running_and_parked_builds_separately(service_config: ServiceConfig):
+    h = history("I_a")
+    async with rig(on(service_config), h) as r:
+        assert r.builder is not None
+        assert await r.builder.run_once() == "started #1"
+        status = await r.builder.status()
+        assert status["auto_builds_running_issues"] == []  # queued, not yet admitted
+        assert status["auto_builds_parked"] == []
+        overall = await r.service.operator_command("status", {})
+        assert overall["building_running"] == [] and overall["building_parked"] == []

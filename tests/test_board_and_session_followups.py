@@ -240,9 +240,10 @@ def test_queue_position_note_moves_up_when_a_build_ahead_is_admitted():
     assert h.p(P).note == "Queued: 2nd in line"
     h.admit(Q)
     r = h.send(P, ev.ReconcileDue())
-    assert h.p(P).note == "Queued: 1st in line" and h.p(P).bot == BotState.QUEUED
+    assert h.p(P).note == "Queued: 1st in line (1/1 running: #2)"
+    assert h.p(P).bot == BotState.QUEUED
     [note] = Harness.of(r, EffectKind.SET_NOTE)
-    assert note.args["note"] == "Queued: 1st in line"
+    assert note.args["note"] == "Queued: 1st in line (1/1 running: #2)"
     r = h.send(P, ev.ReconcileDue())
     assert not Harness.of(r, EffectKind.SET_NOTE)  # written only on change
 

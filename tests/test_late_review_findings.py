@@ -177,7 +177,8 @@ def test_799_replay_late_findings_after_ready_get_the_unused_findings_wake_once(
     assert s is not None
     assert p.current_session_id == run and s.reopened and not s.execution_closed
     assert (s.lifecycle, s.wait_reason) == (Lifecycle.WAITING, WaitReason.CHECKS)
-    assert h.admission.building_count == 1  # the slot is held again
+    # Idle waiting on checks, the re-opened run is parked: no slot until it is woken.
+    assert h.admission.building_count == 0
     # The move landed (auto-ack): the read that wakes the run is issued.
     later = all_effects(h, mark)
     assert EffectKind.FETCH_PR_EVIDENCE in [e.kind for e in later]
@@ -189,6 +190,7 @@ def test_799_replay_late_findings_after_ready_get_the_unused_findings_wake_once(
     assert EffectKind.ENABLE_ISSUANCE in [e.kind for e in r.effects]
     p = h.p()
     assert p.findings_wakes == 1 and p.bot == BotState.WORKING
+    assert h.admission.building_count == 1  # the wake took the free slot first
     assert h.cur(P).lifecycle == Lifecycle.ACTIVE
     # Re-reads while the woken run works: no second wake, no comment.
     r = h.send(P, late_findings(h))

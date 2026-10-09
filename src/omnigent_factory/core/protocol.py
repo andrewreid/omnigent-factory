@@ -88,6 +88,40 @@ class TriageResult(_Strict):
     related: Annotated[list[Related], Field(max_length=20)] = []
 
 
+class EpicOrder(_Strict):
+    """One sub-issue in the proposed build order, with why it goes there."""
+
+    issue: Annotated[int, Field(ge=1)]
+    reason: RelatedNote
+
+
+class EpicLink(_Strict):
+    """Suggested native link: sub-issue ``issue`` is blocked by sub-issue ``blocked_by``."""
+
+    issue: Annotated[int, Field(ge=1)]
+    blocked_by: Annotated[int, Field(ge=1)]
+    reason: RelatedNote
+
+
+class EpicCoverage(_Strict):
+    """What the epic body asks for that no sub-issue covers, and sub-issues that overlap."""
+
+    gaps: Texts
+    overlaps: Texts
+
+
+class EpicTriageResult(_Strict):
+    """The triage of an epic (an issue with sub-issues): no priority or size."""
+
+    kind: Literal["epic_triage"]
+    summary: Text
+    coverage: EpicCoverage
+    build_order: Annotated[list[EpicOrder], Field(max_length=100)]
+    links: Annotated[list[EpicLink], Field(max_length=100)] = []
+    missing_information: Texts = []
+    related: Annotated[list[Related], Field(max_length=20)] = []
+
+
 class PlanResult(_Strict):
     kind: Literal["plan"]
     publication_kind: Literal["contract", "info"]
@@ -95,6 +129,7 @@ class PlanResult(_Strict):
     risks: Texts
     contract: ContractModel
     open_decision_ids: Texts
+    related: Annotated[list[Related], Field(max_length=20)] = []
 
 
 class Verification(_Strict):
@@ -133,6 +168,7 @@ class BuildResult(_Strict):
     remediation_batches_used: Annotated[int, Field(ge=0, le=1)]
     targeted_rechecks_used: Annotated[int, Field(ge=0, le=1)]
     release_readiness: Literal["ready", "needs_owner"]
+    related: Annotated[list[Related], Field(max_length=20)] = []
 
 
 class CheckpointResult(_Strict):
@@ -155,10 +191,11 @@ class BlockedResult(_Strict):
     kind: Literal["blocked"]
     reason: Text
     done: Texts
+    related: Annotated[list[Related], Field(max_length=20)] = []
 
 
 StageResult = Annotated[
-    TriageResult | PlanResult | BuildResult | CheckpointResult | BlockedResult,
+    TriageResult | EpicTriageResult | PlanResult | BuildResult | CheckpointResult | BlockedResult,
     Field(discriminator="kind"),
 ]
 
@@ -187,7 +224,7 @@ class ResultError(ValueError):
 #: Bounds for error details relayed to the agent or published in a status comment.
 MAX_ERROR_DETAILS = 10
 MAX_ERROR_DETAIL_CHARS = 200
-_RESULT_KINDS = frozenset({"triage", "plan", "build_ready", "checkpoint", "blocked"})
+_RESULT_KINDS = frozenset({"triage", "epic_triage", "plan", "build_ready", "checkpoint", "blocked"})
 
 
 #: Compact field types per result kind, quoted in tool errors and descriptions.
@@ -196,20 +233,25 @@ RESULT_SHAPES: dict[str, str] = {
     '"recommendation":"fix|wont_fix|duplicate|needs_info","duplicate_issue":int|null,'
     '"labels":[str],"missing_information":[str],"related"?:[{"issue":int,'
     '"relation":"duplicate|overlaps|conflicts|depends_on|blocks|supersedes","note":str}]}',
+    "epic_triage": '{"kind":"epic_triage","summary":str,"coverage":{"gaps":[str],'
+    '"overlaps":[str]},"build_order":[{"issue":int,"reason":str}],"links"?:[{"issue":int,'
+    '"blocked_by":int,"reason":str}],"missing_information"?:[str],"related"?:[...]}',
     "plan": '{"kind":"plan","publication_kind":"contract|info","approach":str,"risks":[str],'
     '"contract":{"goal":str,"acceptance_criteria":[{"id":str,"criterion":str,'
     '"verification":str}],"non_goals":[str],"size":"S|M|L","resolved_decisions":'
-    '[{"decision_id":str,"answer":str,"source_event_id":str}]},"open_decision_ids":[str]}',
+    '[{"decision_id":str,"answer":str,"source_event_id":str}]},"open_decision_ids":[str],"related"?:[{"issue":int,'
+    '"relation":"depends_on|blocks|duplicate|overlaps|conflicts|supersedes","note":str}]}',
     "build_ready": '{"kind":"build_ready","pr_number":int>=1,"branch":str,"head_sha":sha40,'
     '"summary":str,"verification":[{"command":str,"file_set":[str],'
     '"outcome":"passed|failed|not_run","evidence":str}],"review":{"implementation_vendor":str,'
     '"review_vendor":str,"reviewed_head":sha40,"artifact_reference":str,'
     '"artifact_sha256":sha256,"accepted":bool},"findings":[{"id":str,"source":str,'
     '"severity":str,"disposition":str,"evidence":str}],"remediation_batches_used":0|1,'
-    '"targeted_rechecks_used":0|1,"release_readiness":"ready|needs_owner"}',
+    '"targeted_rechecks_used":0|1,"release_readiness":"ready|needs_owner","related"?:[...]}',
     "checkpoint": '{"kind":"checkpoint","grant_id":str,"head_sha":sha40|null,"done":[str],'
     '"remaining":[str],"risks":[str],"worktree_state":str,"elicitation_id":str|null}',
-    "blocked": '{"kind":"blocked","reason":str,"done":[str]}',
+    "blocked": '{"kind":"blocked","reason":str,"done":[str],"related"?:[{"issue":int,'
+    '"relation":"depends_on|blocks|...","note":str}]}',
 }
 
 
@@ -241,6 +283,9 @@ class Correlation:
     in_checkpoint: bool = False
     #: The parcel's own issue number (a triage may not relate the issue to itself).
     issue_number: int | None = None
+    #: The issue is an epic: its sub-issue numbers (empty when not all could be read).
+    #: None: not an epic (an epic is triaged with ``epic_triage``, never ``triage``).
+    sub_issues: frozenset[int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +297,30 @@ class ParsedResult:
 def _check_ids(values: list[str], what: str) -> None:
     if len(set(values)) != len(values):
         raise ResultError(f"duplicate {what} id")
+
+
+def _check_epic_triage(r: EpicTriageResult, expected: Correlation) -> None:
+    if expected.stage != "triage":
+        raise ResultError("epic_triage result from non-triage stage")
+    if expected.sub_issues is None:
+        raise ResultError("epic_triage is only for an epic (an issue with sub-issues)")
+    known = expected.sub_issues
+    order = [item.issue for item in r.build_order]
+    if len(set(order)) != len(order):
+        raise ResultError("build_order: each sub-issue at most once")
+    pairs = [(item.issue, item.blocked_by) for item in r.links]
+    if len(set(pairs)) != len(pairs):
+        raise ResultError("links: each pair at most once")
+    if any(a == b for a, b in pairs):
+        raise ResultError("links: an issue cannot block itself")
+    named = set(order) | {n for pair in pairs for n in pair}
+    outside = sorted(named - known) if known else []
+    if outside:
+        raise ResultError(
+            "build_order/links: only this epic's sub-issues ("
+            + ", ".join(f"#{n}" for n in outside[:10])
+            + " are not)"
+        )
 
 
 def validate_result(result: Mapping[str, object], expected: Correlation) -> ParsedResult:
@@ -283,26 +352,30 @@ def validate_result(result: Mapping[str, object], expected: Correlation) -> Pars
         details = validation_details(exc)
         raise ResultError("schema: " + "; ".join(details), details) from exc
     r = result_model.result
+    related = [item.issue for item in getattr(r, "related", [])]
+    if len(set(related)) != len(related):
+        raise ResultError("related: each issue at most once")
+    if expected.issue_number is not None and expected.issue_number in related:
+        raise ResultError("related: an issue cannot relate to itself")
     contract_bytes: bytes | None = None
     if isinstance(r, BlockedResult):
         pass  # any stage may report that it could not finish
     elif isinstance(r, CheckpointResult):
         if not expected.in_checkpoint:
             raise ResultError("checkpoint result outside checkpoint")
+    elif isinstance(r, EpicTriageResult):
+        _check_epic_triage(r, expected)
     elif isinstance(r, TriageResult):
         if expected.stage != "triage":
             raise ResultError("triage result from non-triage stage")
+        if expected.sub_issues is not None:
+            raise ResultError("this issue is an epic (it has sub-issues): submit epic_triage")
         if (r.recommendation == "duplicate") != (r.duplicate_issue is not None):
             raise ResultError("duplicate_issue present iff recommendation is duplicate")
         if len(set(r.labels)) != len(r.labels):
             raise ResultError("labels must be unique")
         if any(label.lower().startswith("factory:") for label in r.labels):
             raise ResultError("factory:* labels are control labels")
-        related = [item.issue for item in r.related]
-        if len(set(related)) != len(related):
-            raise ResultError("related: each issue at most once")
-        if expected.issue_number is not None and expected.issue_number in related:
-            raise ResultError("related: an issue cannot relate to itself")
     elif isinstance(r, PlanResult):
         if expected.stage == "plan" and r.publication_kind != "contract":
             raise ResultError("plan stage must publish a contract")

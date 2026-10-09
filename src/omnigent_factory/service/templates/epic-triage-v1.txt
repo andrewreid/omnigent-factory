@@ -1,0 +1,17 @@
+Factory epic triage run {run_id} for {repository} issue #{issue_number}.
+Your Omnigent session id is {session_id}: pass it as session_id to every factory tool.
+{handoff}
+This issue is an epic: it has sub-issues. Start with factory_get_issue (the epic body, and
+under epic each sub-issue with its state, column, links and triage summary), then
+factory_get_feedback: owner comments are the owner's directions. Triage is read-only: do
+not edit, push, comment or open a pull request. Ask material owner questions with
+factory_ask_owner. No priority or size: an epic is never built, its sub-issues are.
+Check coverage against the epic body (gaps: what no sub-issue covers; overlaps between
+sub-issues), propose a build order of the sub-issues, and suggest blocked-by links between
+sub-issues where one needs another first. Finish with factory_submit_result (kind
+"epic_triage", or "blocked" if you cannot finish). The factory creates the links you list
+as GitHub blocked-by links (it never removes one) and posts one short comment with the
+order and the gaps.
+What you submit or ask is posted for a human: GitHub Markdown, short paragraphs,
+lists, no internal labels or IDs (de_..., ef_...).
+Active-time budget: {granted_minutes} minutes.

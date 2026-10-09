@@ -83,6 +83,19 @@ seen: drag it again or add a factory: label`.
 | Ready → Building | Stops, then reworks the build under the same approval (see [Rework](#steering-by-comment)); if rework is refused the card stays in Building, stopped, with `Rework refused: <reason>`. |
 | Any other leftward move | Stop only; nothing starts. |
 
+**Build slots count running builds only.** A build (or rework) holds a `max_building`
+slot, and an auto-build also an `auto_build_concurrency` slot, only while its run works,
+winds down or is about to start. A parked build releases them: `Blocked` or `Needs you`
+with its tree seen idle, a checkpoint once its wrap-up has drained, or idle in Building
+waiting on checks or the review bot. A tree that could not be read completely, or is seen
+busy again, counts as running (even over the cap). When a parked build must work again
+(your comment or answer, `/continue`, a checks, findings or conflict wake, an operator
+note), the message takes a free slot at once; with none free it is held, the card shows
+`Queued: waiting for a build slot to resume`, and it is delivered exactly once when the
+build is admitted. Resuming builds are admitted before new ones (then manual builds, then
+auto-builds). Open PRs still count towards `max_open_bot_prs` while parked. `status`
+lists running and parked builds separately.
+
 At most `triage_concurrency` triage runs (default 1) run at once, whatever started them
 (drag, label, command, comment or auto-triage). A further triage request is not dropped:
 the card moves to Triage with the note `Queued: triage starts when a triage slot is free`
@@ -118,7 +131,7 @@ starts a rework). Not after `/stop` or once merged. See
 | `Bot` | Meaning |
 |---|---|
 | `Working` | A run is doing work. |
-| `Queued` | Approved build waiting for a slot; note `Queued: 2nd in line`. |
+| `Queued` | Approved build waiting for a slot; note `Queued: 2nd in line (1/1 running: #673)`, `Queued: waiting for a build slot to resume` or `Waiting for an auto-build slot (1/1 in use: #673)`. |
 | `Needs you` | An open question, or a hold only the owner can clear. |
 | `Checkpoint` | The run used its time block; comment `/continue`. |
 | `Blocked` | Something failed, or a required check is red on Ready; the note says what. |
@@ -140,6 +153,43 @@ you (`Needs you`), and a clash with Building or Ready work is flagged. Each rela
 open on the board gets the `Related: ...` note above, without a comment. Plan and build
 runs read the list and its agreed outcome, so later stages keep to this issue's side of a
 split.
+
+### Native issue links and epics
+
+The factory reads GitHub's own issue links (parent, sub-issues, blocked by, blocking) with
+the reads it already makes: the per-issue read stores them on the parcel and the board
+diff compares them (a blocker closing changes the card it blocks, though GitHub does not
+move that card's `updatedAt`). The App's `sub_issues` and `issue_dependencies` webhooks
+(Issues read; `doctor` warns when the installation is not subscribed) and a closed or
+reopened blocker re-read the issues they name at once; without them a change is seen
+within one board diff interval. Rosie sees the links: `factory_get_issue` lists them with
+state and title, `factory_list_issues` adds e.g. `parent #821; blocked by #823 (open);
+blocks #825` to each line.
+
+| Rule | What happens |
+|---|---|
+| Auto-build and blockers | A queued card with an open blocker does not start: note `Waiting on #823`, `auto-build status` shows `waiting on #823`. It starts by itself once a read shows every blocker closed. A start whose fresh read cannot see every blocker is refused (fails closed; manual builds are not affected). |
+| Manual builds and blockers | A drag, `/approve` or `factory:build` still builds; the note reads `Started despite open blocker #823` (no comment). |
+| Ranking | After Rosie's ranking, a blocker always ranks above what it blocks, and sub-issues of one parent stay together where that rule allows. An owner-pinned Rank is kept even when it forces a violation; that is logged. |
+| Dependency links | Every result Rosie submits (triage, epic triage, plan, build, blocked) may list `related` issues; each `depends_on` or `blocks` entry becomes a native blocked-by link (`addBlockedBy`) once the result is accepted, created by the factory (Rosie needs no write access, and never asks you to add one): only between issues of this repository (an epic may be the blocker), skipped when it exists, never removing one, each logged. Parent/sub-issue links are not created (that would turn an issue into an epic, which changes what may be built). |
+
+An issue with at least one sub-issue is an **epic**. It is never built: a drag, `/approve`
+or `factory:build` on it is refused with the note `Epic: build its sub-issues` (a drag is
+moved back), an `Auto-build` mark on it is cleared, and auto-build never starts one. Its
+card note shows progress, e.g. `Epic · 1/8 done · next: #823` (next: the best-ranked open
+sub-issue on the board with no open blocker), written after a board diff only when it
+changes. Triage of an epic (a drag to Triage, `/triage`, or auto-triage, once like any
+issue) is the **epic triage**: Rosie gets the epic body and each sub-issue with its state,
+column, links and triage summary, and submits `epic_triage` (coverage gaps and overlaps
+against the epic body, a build order, suggested blocked-by links between sub-issues; no
+priority or size). The factory creates those links (same rules as above) and posts one
+short comment with the order and the gaps; the card ends `Idle` in Triage.
+
+When the repository has an `Epic` issue type, every epic without a type gets it; a type the
+owner set is never changed (logged). Without one (`doctor` warns, naming the types that
+exist) this is a no-op. `setup render` also lists an `Epics` table view
+(`createProjectV2View`, then `updateProjectV2View` for its filter
+`is:issue is:open has:sub-issues-progress`); it is not applied by the factory.
 
 ### Idle-time auto-triage
 
@@ -192,6 +242,9 @@ last), then the oldest issue. Manually approved builds (drag, `/approve`,
 `factory:build`) always go first: no auto-build starts while one waits for a slot, and an
 approved manual build is admitted before a queued auto-build. Auto-builds count towards
 `max_building`; at most `auto_build_concurrency` (1) of them hold a build slot at once.
+A queued auto-build that waits only for that cap says so, naming the running ones:
+`Waiting for an auto-build slot (1/1 in use: #673)` (also `waiting_on` in `auto-build
+status`, which lists running and parked auto-builds separately).
 Optionally `auto_build_daily_limit` caps starts per local day (0, the default, is
 unlimited; `auto-build grant <n>` adds more for today). The audit records each start as
 an `AutoBuild` event from the trusted clock carrying your mark's approval (owner, event,
@@ -212,7 +265,7 @@ change in the Triage or Planning column, one read-only Omnigent session (`Factor
 <date>`) ranks the Triage and Planning columns together on one scale: a single `Rank`
 1..N across both columns (no two cards share a rank), so planned cards and triaged ones
 are weighed against each other and auto-build starts queued plans in that order. It weighs
-priority, size, dependencies and blockers from each triage's related list, overlaps,
+priority, size, dependencies and blockers (native links and each triage's related list), overlaps,
 clashes with Building or Ready work, stale or likely-done findings, how ready an issue is
 and age; it reads with `factory_list_issues` and `factory_get_issue` and submits
 once with `factory_submit_ranking`. It never moves cards, starts stages or closes issues,
@@ -268,8 +321,8 @@ waits up to 90 s for it instead of failing.
 
 | Command | What it does |
 |---|---|
-| `status` | Readiness, pause state, building count/cap, queue, pending/unknown effects, parked deliveries. |
-| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. It also reads the configured agent's bundle (through its newest session, or the `--live` probe) and fails naming any factory MCP tool the agent's `tools:` allowlist for the factory server leaves out (a warning when the bundle cannot be read). It warns when the App installation is not subscribed to `push` (tick Push in the App settings), when the subscribed events can be read. |
+| `status` | Readiness, pause state, building count/cap with the running and parked builds, queue, pending/unknown effects, parked deliveries. |
+| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. It also reads the configured agent's bundle (through its newest session, or the `--live` probe) and fails naming any factory MCP tool the agent's `tools:` allowlist for the factory server leaves out (a warning when the bundle cannot be read). It warns when the App installation is not subscribed to `push` (tick Push in the App settings) or to `sub_issues`/`issue_dependencies` (Sub issues, Issue dependencies), when the subscribed events can be read, and when the repository has no `Epic` issue type (epics are then not typed). |
 | `explain <parcel>` | The parcel's persisted state: stage, bot, sessions, holds, effects. |
 | `recovery` | Failed/unknown effects and parked webhook deliveries. |
 | `retry-effect <effect_id>` | Requeue a failed/unknown `publish_triage`/`publish_report`/`post_comment`; it adopts an existing comment by its marker, so it never duplicates. |

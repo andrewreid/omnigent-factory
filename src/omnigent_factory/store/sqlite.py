@@ -317,6 +317,7 @@ def snapshot_key(snap: IssueSnapshot) -> tuple[object, ...]:
         body,
         snap.bot,
         snap.note,
+        snap.links,
     )
 
 
@@ -495,13 +496,17 @@ class SqliteStore:
                 r["approval_sequence"],
                 QueueStatus(r["status"]),
                 auto=bool(r["auto"]),
+                resume=bool(r["resume"]),
+                issue_number=r["issue_number"],
             )
             for r in conn.execute(
                 "SELECT q.*, COALESCE(("
                 "json_extract(p.aggregate_json, '$.parcel.auto_build.approval_id') "
                 "= q.approval_id AND "
                 "json_extract(p.aggregate_json, '$.parcel.auto_build.sequence') "
-                "= q.approval_sequence), 0) AS auto "
+                "= q.approval_sequence), 0) AS auto, "
+                "COALESCE(json_extract(p.aggregate_json, '$.parcel.slot_parked'), 0) AS resume, "
+                "p.issue_number AS issue_number "
                 "FROM queue q LEFT JOIN parcels p ON p.parcel_id = q.parcel_id "
                 "WHERE q.repo_id = ? ORDER BY q.approval_sequence",
                 (repo_id,),

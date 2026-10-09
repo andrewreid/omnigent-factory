@@ -304,6 +304,60 @@ class DecisionImpact(enum.StrEnum):
     UNKNOWN = "unknown"
 
 
+#: Linked issues kept per list (sub-issues, blockers, blocked); a longer list is cut.
+MAX_LINKED_ISSUES = 50
+#: Linked-issue titles are cut to this length (display only).
+LINK_TITLE_MAX = 120
+
+
+@dataclass(frozen=True, slots=True)
+class LinkedIssue:
+    """One GitHub-native issue link target (number, open/closed, title; untrusted title).
+
+    ``repo`` is "" for an issue of the configured repository, else ``owner/name``.
+    """
+
+    number: int
+    open: bool
+    title: str = ""
+    repo: str = ""
+
+    @property
+    def ref(self) -> str:
+        return f"#{self.number}" if not self.repo else f"{self.repo}#{self.number}"
+
+
+@dataclass(frozen=True, slots=True)
+class IssueLinks:
+    """GitHub-native links of one issue from a fresh read: parent, sub-issues, blocked-by
+    and blocking. A read that could not see every blocker is never an ``IssueLinks``
+    (it is None: unreadable, which fails closed for auto-build)."""
+
+    parent: LinkedIssue | None = None
+    #: Sub-issues (at most ``MAX_LINKED_ISSUES``); the totals are GitHub's summary.
+    sub_issues: tuple[LinkedIssue, ...] = ()
+    sub_total: int = 0
+    sub_completed: int = 0
+    blocked_by: tuple[LinkedIssue, ...] = ()
+    blocking: tuple[LinkedIssue, ...] = ()
+
+    @property
+    def epic(self) -> bool:
+        """An issue with at least one sub-issue is an epic."""
+        return self.sub_total > 0 or bool(self.sub_issues)
+
+    @property
+    def open_blockers(self) -> tuple[LinkedIssue, ...]:
+        return tuple(b for b in self.blocked_by if b.open)
+
+
+def blockers_text(blockers: tuple[LinkedIssue, ...], limit: int = 3) -> str:
+    """``#823, #822`` (``+N more`` past ``limit``)."""
+    refs = [b.ref for b in blockers[:limit]]
+    extra = len(blockers) - limit
+    return ", ".join(refs) + (f" +{extra} more" if extra > 0 else "")
+
+
 @dataclass(frozen=True, slots=True)
 class IssueSnapshot:
     """Fresh GitHub read evidence for one issue (supplied by the GitHub adapter).
@@ -331,6 +385,9 @@ class IssueSnapshot:
     #: The board's "Auto-build" option name when read ("" = empty, "?" = an option the
     #: config does not know); None when not read (no field configured).
     auto_build: str | None = None
+    #: GitHub-native links (parent, sub-issues, blocked-by, blocking); None when not read
+    #: or unreadable (e.g. more blockers than one read returns).
+    links: IssueLinks | None = None
 
     @property
     def eligible(self) -> bool:
@@ -612,6 +669,26 @@ class QueueEntry:
     #: build and within ``auto_build_concurrency``. Derived on load from the parcel's
     #: mark (``AutoBuildMark.approval_id``/``sequence``), never stored in the queue table.
     auto: bool = False
+    #: A parked build waiting to re-acquire its slot (admitted before new builds). Derived
+    #: on load from the parcel's ``slot_parked``, never stored in the queue table.
+    resume: bool = False
+    #: The parcel's issue number (derived on load; display only).
+    issue_number: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HeldWake:
+    """A message to a parked build run, held until the run holds a build slot again.
+
+    Replayed exactly once (as a fresh effect) when the run is re-admitted; dropped if the
+    run is stopped, replaced or ends first.
+    """
+
+    kind: str
+    session_id: str
+    target: str
+    #: The effect's args as canonical JSON (kept as text: the aggregate stays hashable).
+    args_json: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -761,6 +838,16 @@ class Parcel:
     auto_build_field: str = ""
     #: When ``auto_build_field`` last changed: a read taken before then is stale.
     auto_build_field_at_us: int = 0
+    #: GitHub-native links from the newest read that carried them (None: never read).
+    links: IssueLinks | None = None
+    #: The build episode's run is parked (Blocked, Needs you, a settled checkpoint, or idle
+    #: waiting on checks): its building slot is released until it must work again.
+    slot_parked: bool = False
+    #: Messages for the parked run, held until it is re-admitted (``HeldWake``).
+    held_wakes: tuple[HeldWake, ...] = ()
+    #: An epic's progress note (``Epic · 1/8 done · next: #823``), set by the factory's
+    #: board pass only when it changes ("" = none).
+    epic_note: str = ""
     applied_event_ids: frozenset[str] = frozenset()
 
     def session(self, session_id: str | None) -> StageSession | None:
@@ -849,8 +936,26 @@ class AdmissionSnapshot:
 
     @property
     def auto_build_count(self) -> int:
-        """Builds started from an auto-build mark that hold their building slot."""
+        """Builds started from an auto-build mark that hold their building slot (running;
+        a parked one has released it)."""
         return sum(1 for q in self.queue if q.auto and q.status == QueueStatus.RESERVED)
+
+    def running(self, *, auto: bool | None = None) -> tuple[QueueEntry, ...]:
+        """Build episodes holding their building slot (``auto``: only auto-builds or only
+        manual ones; None: all), oldest first."""
+        return tuple(
+            q
+            for q in self.queue
+            if q.status == QueueStatus.RESERVED and (auto is None or q.auto == auto)
+        )
+
+    def parked(self) -> tuple[QueueEntry, ...]:
+        """Build episodes whose run is parked: slot released, held or waiting to resume."""
+        return tuple(
+            q
+            for q in self.queue
+            if q.status == QueueStatus.HELD or (q.status == QueueStatus.QUEUED and q.resume)
+        )
 
     def queue_entry(self, parcel_id: str) -> QueueEntry | None:
         for q in self.queue:

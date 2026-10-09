@@ -11,6 +11,7 @@ from omnigent_factory.core.canonical import canonical_contract
 from omnigent_factory.core.events import Event, EventBody, EventClass, Provenance
 from omnigent_factory.core.types import (
     MICROS_PER_SECOND,
+    IssueLinks,
     IssueSnapshot,
     Stage,
     TrustedConfig,
@@ -20,6 +21,8 @@ OWNER_ID = 114979
 OTHER_USER_ID = 4242
 REPO_ID = "R_kgDOTC12Fg"
 T0 = 1_800_000_000_000_000
+#: A read whose native links were readable and empty (the builder's default).
+_NO_LINKS = IssueLinks()
 
 
 def config(**overrides: object) -> TrustedConfig:
@@ -41,6 +44,7 @@ def snapshot(
     bot: str | None = None,
     note: str | None = None,
     auto_build: str | None = None,
+    links: IssueLinks | None = _NO_LINKS,
 ) -> IssueSnapshot:
     return IssueSnapshot(
         open=open,
@@ -55,6 +59,7 @@ def snapshot(
         bot=bot,
         note=note,
         auto_build=auto_build,
+        links=links,
     )
 
 

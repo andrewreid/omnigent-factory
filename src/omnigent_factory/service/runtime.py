@@ -171,6 +171,10 @@ class FactoryService:
         #: Board-wide diff (composition; ``service.board_diff.BoardDiff``). None: not
         #: wired, and parcels without live work are read on the slow completed cadence.
         self.board_diff: Any = None
+        #: GitHub-native links: epic notes and issue types after each board diff, link
+        #: writes and re-reads (composition; ``service.links.NativeLinks``). None: not
+        #: wired.
+        self.native_links: Any = None
         #: Per tracked parcel: (loop time its next per-issue read is due, the cadence
         #: that time was scheduled for) (reconcile loop).
         self._reconcile_due: dict[str, tuple[float, float]] = {}
@@ -663,7 +667,10 @@ class FactoryService:
         if await self.db.call(lambda store: store.has_pending_delivery()):
             return
         head = None
+        auto_full = not auto_build_capacity_available(admission, self.config.trusted)
         for candidate in queued:
+            if candidate.auto and auto_full:
+                continue  # an auto-build waiting for an auto-build slot holds up no one
             if not self.parked.blocks(candidate.parcel_id):
                 head = candidate
                 break
@@ -671,9 +678,8 @@ class FactoryService:
             return
         parcel = await self.db.call(partial(_load_parcel, parcel_id=head.parcel_id))
         if not (
-            not admission.paused
+            (not admission.paused or head.resume)  # a parked build resuming is in flight
             and admission.building_count < self.config.max_building
-            and (not head.auto or auto_build_capacity_available(admission, self.config.trusted))
             and (
                 _has_own_pr(parcel, admission)  # e.g. a rework: its PR is already open
                 or admission.prospective_pr_count < self.config.max_open_bot_prs
@@ -775,6 +781,15 @@ class FactoryService:
         # Never compared before (e.g. the first diff ever): read once, spread over the
         # reconcile interval; the digest is stored after that read.
         self._digests_after_read.update(diff.unknown)
+        if self.native_links is not None:
+            try:
+                await self.native_links.epic_pass()
+            except Exception:
+                LOG.warning("epic pass failed")
+
+    async def reread(self, parcel_id: str) -> None:
+        """A per-issue read now (e.g. a native link of the issue changed)."""
+        await self._reconcile(parcel_id)
 
     async def _reconcile(self, parcel_id: str, *, digest: str | None = None) -> None:
         """Apply one ``ReconcileDue`` (the reducer issues the per-issue read)."""
@@ -1249,6 +1264,8 @@ class FactoryService:
             "paused": admission.paused,
             "building": admission.building_count,
             "building_cap": self.config.max_building,
+            "building_running": [q.issue_number for q in admission.running()],
+            "building_parked": [q.issue_number for q in admission.parked()],
             "open_bot_pr_cap": self.config.max_open_bot_prs,
             "queued": sum(q.status == QueueStatus.QUEUED for q in admission.queue),
             "pending_effects": pending,

@@ -32,7 +32,7 @@ from omnigent_factory.core.events import (
     ChecksState,
     FindingRef,
 )
-from omnigent_factory.core.types import IssueSnapshot, Stage
+from omnigent_factory.core.types import IssueLinks, IssueSnapshot, Stage
 from omnigent_factory.github.client import (
     AmbiguousRequest,
     GitHubAPIError,
@@ -40,6 +40,7 @@ from omnigent_factory.github.client import (
     GitHubRejected,
     RateLimited,
 )
+from omnigent_factory.github.links import BOARD_LINK_FIELDS, ISSUE_LINK_FIELDS, parse_links
 from omnigent_factory.ports.github import (
     GITHUB_EFFECT_KINDS,
     STATUS_OPTION_IDS,
@@ -201,7 +202,9 @@ class GitHubAPIAdapter:
             )
             if not isinstance(issue, dict) or issue.get("node_id") != ref.parcel_id:
                 return RetryableReadFailure("issue identity did not match requested parcel")
-            stage, in_project, bot, note, auto_build = await self._project_stage(ref.parcel_id)
+            stage, in_project, bot, note, auto_build, links = await self._project_stage(
+                ref.parcel_id
+            )
             assignees = issue.get("assignees")
             human_assigned = not isinstance(assignees, list) or any(
                 not isinstance(user, dict) or user.get("type") != "Bot" for user in assignees
@@ -219,6 +222,7 @@ class GitHubAPIAdapter:
                 bot=bot,
                 note=note,
                 auto_build=auto_build,
+                links=links,
             )
         except RateLimited as exc:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
@@ -314,12 +318,13 @@ class GitHubAPIAdapter:
                 id number title state createdAt repository { id }
                 assignees(first: 1) { totalCount }
                 labels(first: 20) { nodes { name } }
+                __LINKS__
               } }
             }
             pageInfo { hasNextPage endCursor }
           }
         } } }
-        """
+        """.replace("__LINKS__", BOARD_LINK_FIELDS)
         issues: list[BoardIssue] = []
         after: str | None = None
         try:
@@ -372,12 +377,13 @@ class GitHubAPIAdapter:
                 id number title state updatedAt repository { id }
                 assignees(first: 20) { totalCount nodes { id } }
                 labels(first: 50) { totalCount nodes { name } }
+                __LINKS__
               } }
             }
             pageInfo { hasNextPage endCursor }
           }
         } } }
-        """
+        """.replace("__LINKS__", BOARD_LINK_FIELDS)
         cards: list[BoardCard] = []
         after: str | None = None
         try:
@@ -448,6 +454,7 @@ class GitHubAPIAdapter:
             labels=names(content.get("labels"), "name"),
             title=str(content.get("title") or ""),
             updated_at=str(content.get("updatedAt") or ""),
+            links=parse_links(content, self.repository_node_id),
         )
 
     def _board_issue(self, item: object) -> BoardIssue | None:
@@ -484,17 +491,20 @@ class GitHubAPIAdapter:
             ),
             created_at_us=self._parse_time_us(content.get("createdAt")),
             assigned=assigned,
+            links=parse_links(content, self.repository_node_id),
         )
 
     async def _project_stage(
         self, parcel_id: str
-    ) -> tuple[Stage | None, bool, str | None, str | None, str | None]:
+    ) -> tuple[Stage | None, bool, str | None, str | None, str | None, IssueLinks | None]:
         """(stage by Status option ID, in project, current Bot display value or None,
         current Factory note text or None when not read, current Auto-build option name
-        ("" = empty) or None when not configured)."""
+        ("" = empty) or None when not configured, the issue's native links or None when
+        unreadable)."""
         query = """
         query($id: ID!, $after: String) {
           node(id: $id) { ... on Issue {
+            __LINKS__
             projectItems(first: 100, after: $after) {
               nodes { id project { id } fieldValueByName(name: "Status") {
                 ... on ProjectV2ItemFieldSingleSelectValue {
@@ -518,14 +528,17 @@ class GitHubAPIAdapter:
             }
           } }
         }
-        """
+        """.replace("__LINKS__", ISSUE_LINK_FIELDS)
         after: str | None = None
+        links: IssueLinks | None = None
         while True:
             data = await self.client.graphql(query, {"id": parcel_id, "after": after})
             node = data.get("node")
             items = node.get("projectItems") if isinstance(node, dict) else None
             if not isinstance(items, dict):
                 raise GitHubAPIError("issue projectItems were unavailable")
+            if after is None and isinstance(node, dict):
+                links = parse_links(node, self.repository_node_id)
             nodes = items.get("nodes")
             if not isinstance(nodes, list):
                 raise GitHubAPIError("issue projectItems nodes were malformed")
@@ -540,7 +553,7 @@ class GitHubAPIAdapter:
                 auto_build = self._auto_build_name(item.get("autoBuild"))
                 value = item.get("fieldValueByName")
                 if value is None:
-                    return None, True, bot, note, auto_build
+                    return None, True, bot, note, auto_build, links
                 if not isinstance(value, dict):
                     raise GitHubAPIError("Status field value was malformed")
                 field = value.get("field")
@@ -548,10 +561,10 @@ class GitHubAPIAdapter:
                     raise GitHubAPIError("Status field identity changed")
                 # Read by option ID only: a renamed option must not change the stage.
                 stage = stage_for_option(value.get("optionId"), self.status_options)
-                return stage, True, bot, note, auto_build
+                return stage, True, bot, note, auto_build, links
             page = items.get("pageInfo")
             if not isinstance(page, dict) or not page.get("hasNextPage"):
-                return None, False, None, None, None
+                return None, False, None, None, None, links
             after_value = page.get("endCursor")
             if not isinstance(after_value, str):
                 raise GitHubAPIError("projectItems pagination cursor was missing")

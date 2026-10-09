@@ -114,6 +114,8 @@ async def run_doctor(
             client = GitHubClient(github_http, daemon.token, api_url=config.github_api_url)
             await _check_github(config, client, jwt, report)
             await _check_push_events(config, github_http, jwt, report)
+            await _check_link_events(config, github_http, jwt, report)
+            await _check_epic_issue_type(config, client, report)
         await _check_omnigent(config, omnigent, report)
         probe = await _check_live_session(config, omnigent, report) if live else None
         await _check_agent_factory_tools(config, omnigent, report, session_id=probe)
@@ -273,6 +275,83 @@ async def _check_push_events(
         "the App installation is not subscribed to push: tick Push under Subscribe to events "
         "in the GitHub App settings (and accept the change on the installation), so a push "
         "to the default branch re-checks open bot PRs for merge conflicts",
+    )
+
+
+#: Native link webhooks (Issues read permission); without them link changes are seen at
+#: the board diff (``board_diff_interval_minutes``) instead of at once.
+LINK_EVENTS = ("sub_issues", "issue_dependencies")
+
+
+async def _check_link_events(
+    config: ServiceConfig, http: httpx.AsyncClient, jwt: str, report: DoctorReport
+) -> None:
+    """Warn when the installation does not receive the native link events.
+
+    Skipped silently whenever the installation's subscribed events cannot be read.
+    """
+    try:
+        response = await http.get(
+            f"{config.github_api_url}/app/installations/{config.github_installation_id}",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {jwt}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        data: Any = response.json() if response.status_code == 200 else None
+    except (httpx.HTTPError, ValueError):
+        return
+    events = data.get("events") if isinstance(data, dict) else None
+    if not isinstance(events, list) or not all(isinstance(e, str) for e in events):
+        return
+    missing = [name for name in LINK_EVENTS if name not in events]
+    if not missing:
+        report.pass_check(
+            "github_link_events", "installation receives sub_issues and issue_dependencies"
+        )
+        return
+    report.warn(
+        "github_link_events",
+        f"the App installation is not subscribed to {', '.join(missing)}: tick Sub issues "
+        "and Issue dependencies under Subscribe to events in the GitHub App settings (and "
+        "accept the change on the installation); until then native link changes are seen "
+        "at the board diff",
+    )
+
+
+async def _check_epic_issue_type(
+    config: ServiceConfig, client: GitHubClient, report: DoctorReport
+) -> None:
+    """Warn when epics cannot get GitHub's "Epic" issue type (setting it is then a no-op)."""
+    owner, _, name = config.repository.partition("/")
+    query = """
+    query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {
+      issueTypes(first: 50) { nodes { name } }
+    } }
+    """
+    try:
+        data = await client.graphql(query, {"owner": owner, "name": name})
+    except GitHubAPIError as exc:
+        report.warn(
+            "github_epic_issue_type",
+            f"issue types could not be read ({exc}); epics are not typed",
+        )
+        return
+    repo = data.get("repository")
+    types = repo.get("issueTypes") if isinstance(repo, dict) else None
+    nodes = types.get("nodes") if isinstance(types, dict) else None
+    if not isinstance(nodes, list):
+        report.warn("github_epic_issue_type", "issue types are unavailable; epics are not typed")
+        return
+    names = [str(n.get("name")) for n in nodes if isinstance(n, dict)]
+    if any(n.lower() == "epic" for n in names):
+        report.pass_check("github_epic_issue_type", "an 'Epic' issue type exists")
+        return
+    report.warn(
+        "github_epic_issue_type",
+        f"no 'Epic' issue type (types: {', '.join(names) or 'none'}): create one in the "
+        "organization settings to have epics typed; until then this is a no-op",
     )
 
 

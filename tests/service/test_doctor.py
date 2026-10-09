@@ -454,3 +454,68 @@ async def test_doctor_warns_when_the_installation_is_not_subscribed_to_push(resp
     else:
         [warning] = report.warnings
         assert warning.startswith("github_push_events: ") and "tick Push" in warning
+
+
+@pytest.mark.parametrize(
+    ("events", "expected"),
+    [
+        (["issues", "push"], "warning"),
+        (["issues", "sub_issues"], "warning"),
+        (["issues", "sub_issues", "issue_dependencies"], "pass"),
+        (None, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_doctor_expects_the_native_link_events(events, expected):
+    from omnigent_factory.service.doctor import _check_link_events
+
+    config = ServiceConfig(repo_id="R", owners=frozenset({1}))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"events": events} if events is not None else {})
+
+    report = DoctorReport()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        await _check_link_events(config, http, "app-jwt", report)
+    assert report.ok
+    if expected is None:
+        assert "github_link_events" not in report.checks and not report.warnings
+    elif expected == "pass":
+        assert "github_link_events" in report.checks
+    else:
+        [warning] = report.warnings
+        assert warning.startswith("github_link_events: ") and "issue_dependencies" in warning
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ({"repository": {"issueTypes": {"nodes": [{"name": "Task"}, {"name": "Epic"}]}}}, "pass"),
+        ({"repository": {"issueTypes": {"nodes": [{"name": "Task"}]}}}, "no 'Epic' issue type"),
+        ({"repository": {"issueTypes": None}}, "unavailable"),
+        ("error", "could not be read"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_doctor_warns_when_epics_cannot_be_typed(answer, expected):
+    from omnigent_factory.github.client import GitHubAPIError
+    from omnigent_factory.service.doctor import _check_epic_issue_type
+
+    class Client:
+        async def graphql(self, query: str, variables: object) -> object:
+            if answer == "error":
+                raise GitHubAPIError("Resource not accessible by integration")
+            return answer
+
+    report = DoctorReport()
+    await _check_epic_issue_type(
+        ServiceConfig(repo_id="R", owners=frozenset({1})),
+        Client(),  # type: ignore[arg-type]
+        report,
+    )
+    assert report.ok  # a warning at most: typing epics is optional
+    if expected == "pass":
+        assert "github_epic_issue_type" in report.checks
+    else:
+        [warning] = report.warnings
+        assert expected in warning

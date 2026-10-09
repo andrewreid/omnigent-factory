@@ -102,7 +102,9 @@ class ServiceDispatchDirectory:
         branch = f"factory/issue-{issue or _safe(parcel.parcel_id)}"
         previous = await self._previous_worktree(parcel, session, branch)
         template_name = _FIRST_TEMPLATES[session.kind]
-        if session.kind == SessionKind.TRIAGE and self.latest_triage(parcel) is not None:
+        if session.kind == SessionKind.TRIAGE and parcel.links is not None and parcel.links.epic:
+            template_name = _EPIC_TRIAGE_TEMPLATE  # an epic: coverage, order and links
+        elif session.kind == SessionKind.TRIAGE and self.latest_triage(parcel) is not None:
             template_name = _RETRIAGE_TEMPLATE  # a re-run on owner feedback
         auth = parcel.authorization(session.authorization_id)
         if session.kind == SessionKind.BUILD and auth is not None and auth.rework:
@@ -263,7 +265,9 @@ class ServiceDispatchDirectory:
         if stages:
             lines.append(f"- earlier runs: {', '.join(stages)}")
         triage = self.latest_triage(parcel)
-        if triage is not None:
+        if triage is not None and triage.get("kind") == "epic_triage":
+            lines.append("- epic triage posted")
+        elif triage is not None:
             lines.append(
                 f"- triage: {triage.get('recommendation')}, priority {triage.get('priority')},"
                 f" size {triage.get('size')}"
@@ -286,7 +290,7 @@ class ServiceDispatchDirectory:
             stored = self.latest_result(session.session_id)
             record = stored.get("factory_result") if stored is not None else None
             body = record.get("result") if isinstance(record, dict) else None
-            if isinstance(body, dict) and body.get("kind") == "triage":
+            if isinstance(body, dict) and body.get("kind") in ("triage", "epic_triage"):
                 return body
         return None
 
@@ -899,6 +903,8 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
         if related:
             lines += ["", "**Related:**", *related]
         return "\n".join(lines)
+    if kind == "epic_triage":
+        return _epic_triage_text(result)
     if kind == "plan":
         contract = result.get("contract")
         contract = contract if isinstance(contract, dict) else {}
@@ -938,6 +944,44 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
             f"release readiness: {result.get('release_readiness')}."
         )
     return "Report recorded."
+
+
+def _epic_triage_text(result: Mapping[str, Any]) -> str:
+    """One short epic comment: the summary, the build order and the coverage gaps."""
+    lines = ["### Epic triage", "", " ".join(str(result.get("summary", "")).split())]
+    order = [
+        item
+        for item in (result.get("build_order") or [])
+        if isinstance(item, dict) and isinstance(item.get("issue"), int)
+    ]
+    if order:
+        lines += ["", "**Build order:**"]
+        lines += [
+            f"{n}. #{item['issue']}"
+            + (f": {' '.join(str(item.get('reason') or '').split())}" if item.get("reason") else "")
+            for n, item in enumerate(order, start=1)
+        ]
+    coverage = result.get("coverage")
+    coverage = coverage if isinstance(coverage, dict) else {}
+    gaps = _bullets(coverage.get("gaps"))
+    lines += ["", "**Gaps:**", gaps or "- none found"]
+    overlaps = _bullets(coverage.get("overlaps"))
+    if overlaps:
+        lines += ["", "**Overlaps:**", overlaps]
+    links = [
+        item
+        for item in (result.get("links") or [])
+        if isinstance(item, dict)
+        and isinstance(item.get("issue"), int)
+        and isinstance(item.get("blocked_by"), int)
+    ]
+    if links:
+        lines += ["", "**Blocked by:**"]
+        lines += [f"- #{item['issue']} after #{item['blocked_by']}" for item in links]
+    missing = _bullets(result.get("missing_information"))
+    if missing:
+        lines += ["", "**Missing information:**", missing]
+    return "\n".join(lines)
 
 
 #: How each related issue reads in the triage comment: "- Overlaps #12: note".
@@ -1086,12 +1130,14 @@ def _new_boundary() -> str:
 
 #: First-message template of each stage run (the dispatch snapshot pins name and bytes).
 _FIRST_TEMPLATES = {
-    SessionKind.TRIAGE: "triage-v6.txt",
-    SessionKind.PLAN: "plan-v6.txt",
-    SessionKind.BUILD: "build-v8.txt",
+    SessionKind.TRIAGE: "triage-v7.txt",
+    SessionKind.PLAN: "plan-v7.txt",
+    SessionKind.BUILD: "build-v9.txt",
 }
 _RETRIAGE_TEMPLATE = "triage-feedback-v4.txt"
-_REWORK_TEMPLATE = "build-rework-v5.txt"
+#: The triage of an epic (an issue with sub-issues), first run and re-runs alike.
+_EPIC_TRIAGE_TEMPLATE = "epic-triage-v1.txt"
+_REWORK_TEMPLATE = "build-rework-v6.txt"
 #: A rework run, or a wake of the waiting build run, for a merge conflict with the base.
 _CONFLICT_TEMPLATE = "build-conflict-v1.txt"
 _CONFLICT_WAKE_TEMPLATE = "readiness-conflict-wake-v1.txt"

@@ -59,6 +59,7 @@ from omnigent_factory.service.github_delivery import (
     GitHubWebhookVerifier,
 )
 from omnigent_factory.service.label_recovery import LabelRecovery
+from omnigent_factory.service.links import NativeLinks
 from omnigent_factory.service.locking import ProcessLock
 from omnigent_factory.service.mcp import McpEndpoint, build_endpoint
 from omnigent_factory.service.observer import OmnigentObserver
@@ -394,9 +395,18 @@ async def build_production(
     service.board_diff = BoardDiff(service, github.board_cards)
     service.label_recovery = LabelRecovery(service, github.label_events, github.issue_snapshot)
     board = BoardIndex(github.board_issues, clock)
-    github.related_marker = RelatedMarker(service, board, directory).schedule
     service.auto_triager = AutoTriager(service, board, github.issue_snapshot)
     ranking_board = RankingBoard(github)
+    marker = RelatedMarker(service, board, directory)
+    native_links = NativeLinks(
+        service,
+        github.client,
+        directory.latest_result,
+        lambda: ranking_board.cards(service.config.rank_field_node_id),
+    )
+    service.native_links = native_links
+
+    github.related_marker = marker.schedule
     service.auto_builder = AutoBuilder(
         service,
         github.issue_snapshot,
@@ -428,6 +438,7 @@ async def build_production(
     service.workspace_cleaner = cleaner
     processor = GitHubDeliveryProcessor(service, normalizer, github, clock)
     processor.field_observer = ranker.note_owner_field
+    processor.native_links = native_links
     service.bind_integrations(
         adapters=(github, recording_omnigent, broker, CleanupAdapter(cleaner)),
         delivery_processor=processor,
@@ -436,7 +447,14 @@ async def build_production(
     return ProductionComposition(
         service,
         GitHubWebhookVerifier(config.resolved_webhook_secret_file, normalizer, clock),
-        build_endpoint(service, directory, config, board=board, ranker=ranker),
+        build_endpoint(
+            service,
+            directory,
+            config,
+            board=board,
+            ranker=ranker,
+            link_writer=native_links.schedule_result,
+        ),
     )
 
 

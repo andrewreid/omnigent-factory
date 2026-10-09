@@ -519,6 +519,8 @@ def test_S7_manifest_is_exact_allowlist():
         "workflow_run",
         "projects_v2_item",
         "push",
+        "sub_issues",
+        "issue_dependencies",
     ]
 
 

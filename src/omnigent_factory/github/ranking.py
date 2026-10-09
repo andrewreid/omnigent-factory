@@ -20,6 +20,7 @@ from typing import Any
 from omnigent_factory.core.effects import RetryableReadFailure
 from omnigent_factory.github.adapter import GitHubAPIAdapter
 from omnigent_factory.github.client import GitHubAPIError, GitHubRejected, RateLimited
+from omnigent_factory.github.links import BOARD_LINK_FIELDS, parse_links
 from omnigent_factory.ports.github import IssueRef, RankingCard, stage_for_option
 
 PRIORITY_FIELD = "Priority"
@@ -76,12 +77,13 @@ class RankingBoard:
               } }
               content { __typename ... on Issue {
                 id number title state createdAt repository { id }
+                __LINKS__
               } }
             }
             pageInfo { hasNextPage endCursor }
           }
         } } }
-        """
+        """.replace("__LINKS__", BOARD_LINK_FIELDS)
         cards: list[RankingCard] = []
         after: str | None = None
         try:
@@ -155,6 +157,7 @@ class RankingBoard:
             created_at_us=self.adapter._parse_time_us(content.get("createdAt")),
             rank=rank,
             priority=priority,
+            links=parse_links(content, self.adapter.repository_node_id),
         )
 
     # ------------------------------------------------------------------ writes

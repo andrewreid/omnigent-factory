@@ -8,6 +8,7 @@ import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from omnigent_factory.core.effects import RetryableReadFailure
 from omnigent_factory.core.events import Event, EventKind, Provenance
@@ -27,6 +28,7 @@ from omnigent_factory.ports.clock import Clock
 from omnigent_factory.ports.github import IssueRef
 from omnigent_factory.service.interfaces import NonRetryableDelivery, WebhookRejected
 from omnigent_factory.service.label_recovery import label_event_id, newest_label_event
+from omnigent_factory.service.links import LINK_EVENTS
 from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.store.sqlite import DeliveryRecord
 
@@ -167,6 +169,10 @@ class GitHubDeliveryProcessor:
         #: Told about every authenticated ``projects_v2_item`` delivery (the ranking's
         #: owner Rank/Priority edits, ``service.ranking.Ranker.note_owner_field``).
         self.field_observer: Callable[[bytes], Awaitable[None]] | None = None
+        #: GitHub-native links (``service.links.NativeLinks``): re-reads the issues a
+        #: ``sub_issues``/``issue_dependencies`` delivery names, and those a closed or
+        #: reopened issue blocks. None: not wired.
+        self.native_links: Any = None
 
     async def process(self, delivery: DeliveryRecord) -> None:
         try:
@@ -185,6 +191,13 @@ class GitHubDeliveryProcessor:
                 await self._ignore(delivery, f"unreadable {delivery.event_name}: {exc}")
                 return
             raise NonRetryableDelivery(f"unreadable {delivery.event_name}: {exc}") from exc
+
+        if self.native_links is not None and delivery.event_name in LINK_EVENTS:
+            try:
+                # Authenticated (normalized above); no state transition of its own.
+                await self.native_links.on_link_delivery(delivery.event_name, delivery.body)
+            except Exception:
+                LOG.warning("native link re-read failed delivery_guid=%s", delivery.delivery_guid)
 
         if self.field_observer is not None and delivery.event_name == "projects_v2_item":
             try:
@@ -275,6 +288,16 @@ class GitHubDeliveryProcessor:
         if delivery.event_name == "pull_request_review" and event.kind == EventKind.PLAN_FEEDBACK:
             await self._record_review_comments(delivery, event)
         await self.service.apply_event(event, delivery_status="processed")
+        if (
+            self.native_links is not None
+            and delivery.event_name == "issues"
+            and event.parcel_id is not None
+            and _body_action(delivery.body) in ("closed", "reopened")
+        ):
+            try:
+                await self.native_links.on_issue_state(event.parcel_id)
+            except Exception:
+                LOG.warning("native link re-read failed delivery_guid=%s", delivery.delivery_guid)
 
     async def _base_pushed(self, event: Event, delivery: DeliveryRecord) -> None:
         """A push to the default branch: every Building or Ready parcel with a recorded PR

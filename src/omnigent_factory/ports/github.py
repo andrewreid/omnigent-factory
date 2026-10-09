@@ -48,7 +48,7 @@ from typing import Protocol, runtime_checkable
 
 from omnigent_factory.core.effects import EffectKind, RetryableReadFailure
 from omnigent_factory.core.events import MERGE_CONFLICT, ChecksState, FindingRef
-from omnigent_factory.core.types import IssueSnapshot, Stage
+from omnigent_factory.core.types import IssueLinks, IssueSnapshot, Stage
 from omnigent_factory.ports.adapter import EffectAdapter
 
 GITHUB_EFFECT_KINDS = frozenset(
@@ -142,6 +142,22 @@ class BoardIssue:
     created_at_us: int
     #: Anyone is assigned (GitHub assignees are people).
     assigned: bool
+    #: Native links (no titles or sub-issue list: a child names its parent); None when
+    #: unreadable.
+    links: IssueLinks | None = None
+
+
+def links_digest(links: IssueLinks | None) -> str:
+    """Change key of a card's links for the board diff ("" = none or unreadable)."""
+    if links is None or links == IssueLinks():
+        return ""
+    parts = [
+        f"p{links.parent.ref}" if links.parent is not None else "",
+        f"s{links.sub_completed}/{links.sub_total}",
+        "b" + ",".join(sorted(f"{b.ref}{'o' if b.open else 'c'}" for b in links.blocked_by)),
+        "k" + ",".join(sorted(b.ref for b in links.blocking)),
+    ]
+    return ";".join(parts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +182,10 @@ class BoardCard:
     updated_at: str
     #: "Auto-build" option ID ("" = none, or the field is not configured).
     auto_build_option: str = ""
+    #: Native links (parent, sub-issue counts, blocked-by with states, blocking): GitHub
+    #: does not move ``updatedAt`` for every link change, and a blocker closing changes
+    #: only the blocker. None when unreadable.
+    links: IssueLinks | None = None
 
     @property
     def digest(self) -> str:
@@ -182,6 +202,10 @@ class BoardCard:
         if self.auto_build_option:
             # Only when set: a card without one keeps the digest stored before the field.
             values.append(self.auto_build_option)
+        links = links_digest(self.links)
+        if links:
+            # Likewise only with links: an unlinked card keeps its earlier digest.
+            values.append(links)
         text = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -202,6 +226,8 @@ class RankingCard:
     created_at_us: int
     rank: float | None
     priority: str | None
+    #: Native links (parent, blocked-by, blocking; no titles); None when unreadable.
+    links: IssueLinks | None = None
 
 
 @dataclass(frozen=True, slots=True)

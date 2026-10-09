@@ -32,7 +32,7 @@ import hashlib
 import json
 import logging
 import uuid
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import partial
@@ -132,6 +132,88 @@ def assign_ranks(order: Iterable[int], pinned: Mapping[int, float]) -> dict[int,
     return ranks
 
 
+def link_order(
+    order: Sequence[int],
+    cards: Mapping[int, RankingCard],
+    pinned: Mapping[int, float],
+) -> tuple[list[int], list[str]]:
+    """The agent's order made to respect native links (pinned issues stay put).
+
+    A blocker always ranks above an issue it blocks (both ranked): an issue is placed
+    once every unpinned ranked blocker of it is; among the issues that may go next, the
+    agent's order decides (a cycle is broken at the agent's earliest issue). Sub-issues
+    of one parent are kept together: after placing one, its siblings that may go next
+    follow it. A blocked issue the owner pinned above one of its blockers keeps its pin;
+    the blocker is moved as high as the unpinned ranks allow, and a pin that still
+    forces the violation is returned as a message (logged by the caller).
+    """
+    ranked = list(order)
+    members = set(ranked)
+
+    def blockers(n: int) -> set[int]:
+        links = cards[n].links if n in cards else None
+        if links is None:
+            return set()
+        return {b.number for b in links.blocked_by if not b.repo and b.open} & members
+
+    def parent(n: int) -> int | None:
+        links = cards[n].links if n in cards else None
+        p = links.parent if links is not None else None
+        return p.number if p is not None and not p.repo else None
+
+    def place(preferred: list[int]) -> list[int]:
+        done: list[int] = []
+        left = list(preferred)
+        while left:
+            ready = [n for n in left if not (blockers(n) - set(done))]
+            n = ready[0] if ready else left[0]  # a cycle: the agent's earliest goes first
+            done.append(n)
+            left.remove(n)
+            family = parent(n)
+            while family is not None:
+                nxt = [m for m in left if parent(m) == family and not (blockers(m) - set(done))]
+                if not nxt:
+                    break
+                done.append(nxt[0])
+                left.remove(nxt[0])
+        return done
+
+    def all_blockers(n: int) -> set[int]:
+        links = cards[n].links if n in cards else None
+        return {b.number for b in links.blocked_by if not b.repo} if links is not None else set()
+
+    placed = place(ranked)
+    # A pinned blocked issue: pull its unpinned blockers to the front, then re-place.
+    pins = {n: v for n, v in pinned.items() if n in cards}
+    for _ in range(len(placed)):
+        ranks = assign_ranks(placed, pins)
+        late = [
+            b
+            for n, r in pins.items()
+            for b in sorted(all_blockers(n) & members)
+            if ranks.get(b, 0) > r and placed.index(b) > 0
+        ]
+        if not late:
+            break
+        moved = late[0]
+        placed = place([moved, *[n for n in placed if n != moved]])
+    ranks = assign_ranks(placed, pins)
+    messages: list[str] = []
+    for n, card in cards.items():
+        links = card.links
+        if n not in ranks or links is None:
+            continue
+        for b in links.blocked_by:
+            if b.repo or not b.open or b.number not in ranks:
+                continue
+            if ranks[b.number] > ranks[n] and (n in pins or b.number in pins):
+                messages.append(
+                    f"#{b.number} (rank {rank_text(ranks[b.number])}) blocks "
+                    f"#{n} (rank {rank_text(ranks[n])}): an owner pin keeps it so"
+                )
+    return placed, messages
+
+
 def validate_submission(
     raw: Mapping[str, Any],
     triage: Mapping[int, RankingCard],
@@ -219,11 +301,17 @@ def validate_submission(
         raise RankingToolError(
             "invalid ranking (fix these and resend):\n" + "\n".join(f"- {e}" for e in errors)
         )
+    reasons = dict(order)
+    linked, violations = link_order([n for n, _ in order], triage, pinned)
+    for message in violations:
+        LOG.warning("ranking link order kept by owner pin: %s", message)
+    if linked != [n for n, _ in order]:
+        LOG.info("ranking reordered by native links: blockers above what they block")
     return Submission(
-        order=tuple(order),
+        order=tuple((n, reasons[n]) for n in linked),
         priority_changes=tuple(changes),
         summary=summary,
-        ranks=assign_ranks((n for n, _ in order), pinned),
+        ranks=assign_ranks(linked, pinned),
     )
 
 
@@ -1144,6 +1232,7 @@ __all__ = [
     "RankingToolError",
     "Submission",
     "assign_ranks",
+    "link_order",
     "rank_text",
     "triage_digest",
     "validate_submission",

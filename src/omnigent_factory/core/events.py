@@ -105,6 +105,7 @@ class EventKind(enum.StrEnum):
     RESULT_CANDIDATE = "ResultCandidate"
     ISSUE_SESSION_CLOSED = "IssueSessionClosed"
     RELATED_MARKED = "RelatedMarked"
+    EPIC_PROGRESS = "EpicProgress"
     TREE_QUIESCENT = "TreeQuiescent"
     STOP_TIMEOUT = "StopTimeout"
     SESSION_CRASHED = "SessionCrashed"
@@ -787,6 +788,19 @@ class RelatedMarked(_Body):
 
 
 @dataclass(frozen=True, slots=True)
+class EpicProgress(_Body):
+    """An epic's progress line for its card (``Epic · 1/8 done · next: #823``; "" clears).
+
+    Display only, from the factory's board pass (sub-issue states, ranks and blockers
+    span several issues, so the reducer cannot derive it); never authority.
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.EPIC_PROGRESS
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    text: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class ResultCandidate(_Body):
     """A stage result accepted from ``factory_submit_result``, already validated.
 
@@ -955,6 +969,7 @@ EventBody = (
     | ResultCandidate
     | IssueSessionClosed
     | RelatedMarked
+    | EpicProgress
     | TreeQuiescent
     | StopTimeout
     | SessionCrashed
@@ -1027,6 +1042,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         ResultCandidate,
         IssueSessionClosed,
         RelatedMarked,
+        EpicProgress,
         TreeQuiescent,
         StopTimeout,
         SessionCrashed,
@@ -1117,6 +1133,7 @@ __all__ = [
     "ElicitationGone",
     "ElicitationOpened",
     "ElicitationResolved",
+    "EpicProgress",
     "Event",
     "EventBody",
     "EventClass",

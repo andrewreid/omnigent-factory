@@ -19,6 +19,7 @@ work effect and at most one explanation. There is no "otherwise resume" path.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
@@ -61,6 +62,7 @@ from omnigent_factory.core.predicates import (
 )
 from omnigent_factory.core.projection import (
     NOTE_MAX,
+    admissible_head,
     admission_key,
     auto_build_capacity_available,
     building_capacity_available,
@@ -69,6 +71,7 @@ from omnigent_factory.core.projection import (
     project_note,
     queue_head,
     ready_bot_ok,
+    running_text,
     startable_build,
     sync_red_note,
     triage_queued_note,
@@ -94,6 +97,7 @@ from omnigent_factory.core.types import (
     DecisionStatus,
     FenceKind,
     Grant,
+    HeldWake,
     Hold,
     InboxHold,
     InboxHoldReason,
@@ -120,6 +124,7 @@ from omnigent_factory.core.types import (
     UnknownEffect,
     Via,
     WaitReason,
+    blockers_text,
     is_leftward,
     issue_session_title,
 )
@@ -129,12 +134,19 @@ class Rejected(Exception):
     """No transition row matched; carries the audit reason and optional explanation."""
 
     def __init__(
-        self, reason: str, *, explain: bool = False, rollback_to: Stage | None = None
+        self,
+        reason: str,
+        *,
+        explain: bool = False,
+        rollback_to: Stage | None = None,
+        note: str | None = None,
     ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.explain = explain
         self.rollback_to = rollback_to
+        #: The owner-facing note instead of ``Command refused: <reason>``.
+        self.note = note
 
 
 @dataclass(frozen=True, slots=True)
@@ -520,8 +532,13 @@ def _release_build(ctx: _Ctx, *, keep_pr: bool) -> None:
         ),
     )
     entry = ctx.admission.queue_entry(pid)
-    if entry is not None and entry.status == QueueStatus.RESERVED:
-        _set_queue(ctx, replace(entry, status=QueueStatus.RELEASED), pid)
+    if entry is not None and (
+        entry.status in (QueueStatus.RESERVED, QueueStatus.HELD)
+        or (entry.status == QueueStatus.QUEUED and entry.resume)
+    ):
+        _set_queue(ctx, replace(entry, status=QueueStatus.RELEASED, resume=False), pid)
+    if ctx.p.slot_parked or ctx.p.held_wakes:
+        ctx.update(slot_parked=False, held_wakes=())
 
 
 def _release_pr(ctx: _Ctx, pr_number: int | None) -> None:
@@ -800,6 +817,8 @@ def _apply_evidence(ctx: _Ctx) -> None:
     was_eligible = ctx.p.eligible
     was_in_project = ctx.p.in_project
     ctx.update(eligible=snap.eligible, in_project=snap.in_project)
+    if snap.links is not None and snap.links != ctx.p.links:
+        ctx.update(links=snap.links)
     _sync_session_title(ctx, snap)
     _observe_auto_build(ctx, snap)
     if snap.in_project:
@@ -1215,9 +1234,16 @@ def _enqueue_build(
     if rework:
         ctx.put_authorization(replace(auth, rework=True, conflict=conflict))
     seq = ctx.admission.next_sequence
+    ctx.update(slot_parked=False, held_wakes=())  # a new episode: any parked one is over
     _set_queue(
         ctx,
-        QueueEntry(ctx.p.parcel_id, approval.approval_id, seq, QueueStatus.QUEUED),
+        QueueEntry(
+            ctx.p.parcel_id,
+            approval.approval_id,
+            seq,
+            QueueStatus.QUEUED,
+            issue_number=ctx.p.issue_number,
+        ),
         ctx.p.parcel_id,
     )
     ctx.admission = replace(ctx.admission, next_sequence=seq + 1)
@@ -1268,6 +1294,7 @@ def _approval_active(ctx: _Ctx) -> bool:
         in (
             QueueStatus.QUEUED,
             QueueStatus.RESERVED,
+            QueueStatus.HELD,
         )
     ):
         return True
@@ -1435,6 +1462,32 @@ def _h_related_marked(ctx: _Ctx, body: ev.RelatedMarked) -> None:
     ctx.update(related_marks=(*rest, mark)[-_MAX_RELATED_MARKS:])
 
 
+def _h_epic_progress(ctx: _Ctx, body: ev.EpicProgress) -> None:
+    """The factory's board pass computed this epic's progress line (display only)."""
+    text = " ".join(body.text.split())[:NOTE_MAX]
+    if text == ctx.p.epic_note:
+        raise Rejected("epic-progress-unchanged")
+    ctx.update(epic_note=text)
+
+
+EPIC_BUILD_NOTE = "Epic: build its sub-issues"
+
+
+def _refuse_epic_build(ctx: _Ctx, rollback: Stage | None) -> None:
+    """An epic (an issue with sub-issues) is never built: its sub-issues are."""
+    links = ctx.p.links
+    if links is not None and links.epic:
+        raise Rejected("epic", explain=True, rollback_to=rollback, note=EPIC_BUILD_NOTE)
+
+
+def _started_despite_blockers(ctx: _Ctx) -> None:
+    """A manual build of an issue with open blockers proceeds; the note says so."""
+    links = ctx.p.links
+    blockers = links.open_blockers if links is not None else ()
+    if blockers:
+        ctx.note(f"Started despite open blocker {blockers_text(blockers)}")
+
+
 # ------------------------------------------------------------------ auto-build
 
 
@@ -1496,6 +1549,8 @@ def _mark_refusal(ctx: _Ctx) -> str | None:
         return PLAN_REVISED_NOTE
     if _build_blocked_by_live(ctx) or _approval_active(ctx):
         return "Auto-build cleared: a build is already approved"
+    if p.links is not None and p.links.epic:
+        return f"Auto-build cleared: {EPIC_BUILD_NOTE}"
     return None
 
 
@@ -1589,6 +1644,14 @@ def _h_auto_build(ctx: _Ctx, body: ev.AutoBuild) -> None:
         raise Rejected("open-decisions")
     if not plan_ok(p) or _plan_revised(p, mark):
         raise Rejected("auto-build-plan-changed")
+    links = ctx.event.evidence.links
+    if links is None:
+        # Fail closed for auto-build only: an unread link set could hide a blocker.
+        raise Rejected("auto-build-links-unreadable")
+    if links.epic:
+        raise Rejected("auto-build-epic")
+    if links.open_blockers:
+        raise Rejected("auto-build-blocked")
     if _build_blocked_by_live(ctx) or _approval_active(ctx):
         raise Rejected("auto-build-build-live")
     if queue_head(ctx.admission) is not None:
@@ -1628,6 +1691,12 @@ def _observe_auto_build(ctx: _Ctx, snap: IssueSnapshot) -> None:
     """
     value = snap.auto_build
     p = ctx.p
+    if value == AUTO_BUILD_QUEUED and _auto_build_live(p):
+        # Queued on a build its mark started: the read predates the factory's own
+        # "Started" write (or that write was lost). Never a new mark: write Started again.
+        ctx.update(auto_build_field=AUTO_BUILD_QUEUED)
+        _write_auto_build(ctx, AUTO_BUILD_STARTED)
+        return
     if (
         value is None
         or snap.read_at_us <= p.auto_build_field_at_us
@@ -2080,6 +2149,7 @@ def _h_approve_plan(ctx: _Ctx, body: ev.ApprovePlan) -> None:
         raise Rejected("approval-stage-invalid", explain=True, rollback_to=rollback)
     if not plan_ok(ctx.p):
         raise Rejected("plan-not-approvable", explain=True, rollback_to=rollback)
+    _refuse_epic_build(ctx, rollback)
     if body.hash_text is not None:
         digests = [c.full_hash for c in ctx.p.contracts if c.published]
         if resolve_hash(body.hash_text, digests) != latest.full_hash:
@@ -2092,6 +2162,7 @@ def _h_approve_plan(ctx: _Ctx, body: ev.ApprovePlan) -> None:
         ctx, ApprovalKind.PLAN, latest.full_hash, contract_id=latest.contract_id
     )
     _after_approval(ctx, approval, duration, body.via)
+    _started_despite_blockers(ctx)
 
 
 def _h_waive_plan(ctx: _Ctx, body: ev.WaivePlan) -> None:
@@ -2125,9 +2196,11 @@ def _h_waive_plan(ctx: _Ctx, body: ev.WaivePlan) -> None:
     stage_ok = ctx.origin_stage in (None, Stage.INBOX, Stage.TRIAGED) or body.via == Via.LABEL
     if not stage_ok or _build_blocked_by_live(ctx) or _approval_active(ctx):
         raise Rejected("waiver-stage-invalid", explain=True, rollback_to=rollback)
+    _refuse_epic_build(ctx, rollback)
     duration = _grant_duration(ctx, body.duration_us, Size.M)
     approval = _new_approval(ctx, ApprovalKind.SKIP, digest, snapshot=canonical.decode("utf-8"))
     _after_approval(ctx, approval, duration, body.via)
+    _started_despite_blockers(ctx)
 
 
 def _h_decide(ctx: _Ctx, body: ev.Decide) -> None:
@@ -3071,6 +3144,10 @@ def _reopen_for_late_findings(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidenc
         ctx.new_id("rs"), ctx.p.parcel_id, ReservationKind.BUILDING, a.approval_id
     )
     ctx.admission = replace(ctx.admission, reservations=(*ctx.admission.reservations, building))
+    entry = ctx.admission.queue_entry(ctx.p.parcel_id)
+    if entry is not None and entry.approval_id == a.approval_id:
+        # The re-opened run holds the slot again (it is released when the run parks).
+        _set_queue(ctx, replace(entry, status=QueueStatus.RESERVED, resume=False), entry.parcel_id)
     ctx.update(
         readiness=replace(
             r,
@@ -4169,6 +4246,9 @@ def _malformed(ctx: _Ctx, s: StageSession) -> None:
 
 def _h_tree_quiescent(ctx: _Ctx, body: ev.TreeQuiescent) -> None:
     s = _session(ctx, body.session_id)
+    if any(w.session_id == s.session_id for w in ctx.p.held_wakes):
+        # Its message is held until it has a build slot: an idle tree is no turn ending.
+        return
     if not body.complete or body.busy:
         s = ctx.put_session(replace(s, quiescent=False))
         if s.lifecycle in (Lifecycle.DRAINING, Lifecycle.BLOCKED) and s.root_id is not None:
@@ -4378,14 +4458,17 @@ def _h_capacity(ctx: _Ctx, body: ev.CapacityAvailable) -> None:
         _set_queue(ctx, replace(entry, status=QueueStatus.CANCELLED), ctx.p.parcel_id)
         ctx.note("Queued build dropped: its approval is no longer valid")
         return
+    if entry.resume:
+        _admit_resume(ctx, entry)
+        return
     if ctx.admission.paused:
         raise Rejected("paused")
-    if queue_head(ctx.admission) != entry:
-        raise Rejected("not-queue-head")
     if not building_capacity_available(ctx.admission, ctx.config):
         raise Rejected("building-cap")
     if entry.auto and not auto_build_capacity_available(ctx.admission, ctx.config):
         raise Rejected("auto-build-cap")
+    if admissible_head(ctx.admission, ctx.config) != entry:
+        raise Rejected("not-queue-head")
     has_pr = ctx.p.pr_number is not None and ctx.p.pr_number in ctx.admission.open_bot_prs
     has_pr_reservation = any(
         r.parcel_id == ctx.p.parcel_id and r.kind == ReservationKind.OPEN_PR and r.live
@@ -4414,6 +4497,22 @@ def _h_capacity(ctx: _Ctx, body: ev.CapacityAvailable) -> None:
     _set_queue(ctx, replace(entry, status=QueueStatus.RESERVED), ctx.p.parcel_id)
     if auth.rework:
         ctx.note(_REWORK_NOTE)  # Queued -> Working keeps the reason on the card
+
+
+def _admit_resume(ctx: _Ctx, entry: QueueEntry) -> None:
+    """A parked build re-acquires its slot (in-flight work: also while paused) and gets
+    its held messages, exactly once."""
+    s = ctx.p.current_session
+    if s is None or not _resumable(s):
+        raise Rejected("resume-run-gone")
+    if not building_capacity_available(ctx.admission, ctx.config):
+        raise Rejected("building-cap")
+    if entry.auto and not auto_build_capacity_available(ctx.admission, ctx.config):
+        raise Rejected("auto-build-cap")
+    if admissible_head(ctx.admission, ctx.config) != entry:
+        raise Rejected("not-queue-head")
+    _acquire_slot(ctx, entry)
+    _replay_held(ctx)
 
 
 def _h_retry_due(ctx: _Ctx, body: ev.RetryDue) -> None:
@@ -4577,6 +4676,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.AUTO_BUILD_MARKED: _h_auto_build_marked,
     EventKind.AUTO_BUILD: _h_auto_build,
     EventKind.RELATED_MARKED: _h_related_marked,
+    EventKind.EPIC_PROGRESS: _h_epic_progress,
     EventKind.CONTRACT_PUBLISHED: _h_contract_published,
     EventKind.PUBLICATION_ACKED: _h_publication_acked,
     EventKind.SESSION_CREATED: _h_session_created,
@@ -4622,7 +4722,7 @@ def _explanation(ctx: _Ctx, rejection: Rejected) -> None:
         return
     if e.actor_id is None or e.actor_id not in ctx.config.owners:
         return
-    note = f"Command refused: {rejection.reason}"
+    note = rejection.note or f"Command refused: {rejection.reason}"
     if rejection.rollback_to is not None:
         note += f"; card moved back to {rejection.rollback_to.value}"
     ctx.note(note)
@@ -4657,20 +4757,218 @@ def _react(ctx: _Ctx, accepted: bool) -> None:
 
 
 def _queued_note(ctx: _Ctx) -> str:
-    """The parcel's current place in the build queue (1st = next to be admitted)."""
+    """Why the parcel's queued build waits: an auto-build slot (naming the running
+    auto-builds), else its place in line for a build slot (naming the running builds)."""
     entry = ctx.admission.queue_entry(ctx.p.parcel_id)
     if entry is None or entry.status != QueueStatus.QUEUED:
         return ""
-    key = admission_key(entry)
-    ahead = sum(
-        1 for q in ctx.admission.queue if q.status == QueueStatus.QUEUED and admission_key(q) < key
-    )
-    return f"Queued: {_ordinal(ahead + 1)} in line"
+    admission, config = ctx.admission, ctx.config
+    if (
+        entry.auto
+        and building_capacity_available(admission, config)
+        and not auto_build_capacity_available(admission, config)
+    ):
+        running = admission.running(auto=True)
+        return (
+            f"Waiting for an auto-build slot ({len(running)}/{config.auto_build_concurrency}"
+            f" in use: {running_text(running)})"
+        )
+    if entry.resume:
+        text = "Queued: waiting for a build slot to resume"
+    else:
+        key = admission_key(entry)
+        ahead = sum(
+            1 for q in admission.queue if q.status == QueueStatus.QUEUED and admission_key(q) < key
+        )
+        text = f"Queued: {_ordinal(ahead + 1)} in line"
+    running = admission.running()
+    if running and not building_capacity_available(admission, config):
+        text += f" ({len(running)}/{config.max_building} running: {running_text(running)})"
+    return text
+
+
+def _queue_note_refreshable(note: str) -> bool:
+    return not note or note.startswith(("Queued: ", "Waiting for an auto-build slot"))
 
 
 def _queued(ctx: _Ctx) -> bool:
     entry = ctx.admission.queue_entry(ctx.p.parcel_id)
     return entry is not None and entry.status == QueueStatus.QUEUED
+
+
+# ------------------------------------------------------------------ build slots
+
+_WAKE_KINDS = (EffectKind.SEND_MESSAGE, EffectKind.RESOLVE_ELICITATION)
+
+
+def build_parked(p: Parcel) -> bool:
+    """The current build run holds no turn and waits on someone else: Blocked or Needs
+    you with its tree seen idle, idle waiting on checks or the review bot, or a settled
+    checkpoint. An unread or busy tree (``quiescent`` false) is running: it is counted."""
+    s = p.current_session
+    if s is None or s.kind != SessionKind.BUILD or s.restart_pending or s.execution_closed:
+        return False
+    if s.lifecycle == Lifecycle.FENCED:
+        return s.fences == frozenset({FenceKind.CHECKPOINT})
+    if (
+        s.lifecycle not in (Lifecycle.ACTIVE, Lifecycle.WAITING)
+        or s.fences
+        or not s.quiescent
+        or s.comment_pending
+        or s.external_active
+        or message_uncertain(p, s)
+    ):
+        return False
+    if s.lifecycle == Lifecycle.WAITING and s.wait_reason == WaitReason.CHECKS:
+        return True
+    return project_bot(p) in (BotState.BLOCKED, BotState.NEEDS_YOU)
+
+
+def _resumable(s: StageSession) -> bool:
+    """A parked run that a message can wake (not stopping, replaced or closed)."""
+    return (
+        s.kind == SessionKind.BUILD
+        and not s.fences
+        and not s.execution_closed
+        and s.lifecycle in (Lifecycle.ACTIVE, Lifecycle.WAITING)
+    )
+
+
+def _slot_free(ctx: _Ctx, entry: QueueEntry) -> bool:
+    """A resume may take a building slot now (resumes go first; pause does not hold
+    in-flight work)."""
+    if not building_capacity_available(ctx.admission, ctx.config):
+        return False
+    if entry.auto and not auto_build_capacity_available(ctx.admission, ctx.config):
+        return False
+    key = admission_key(replace(entry, status=QueueStatus.QUEUED, resume=True))
+    return not any(
+        q.status == QueueStatus.QUEUED
+        and q.resume
+        and q.parcel_id != entry.parcel_id
+        and admission_key(q) < key
+        for q in ctx.admission.queue
+    )
+
+
+def _acquire_slot(ctx: _Ctx, entry: QueueEntry) -> None:
+    building = Reservation(
+        ctx.new_id("rs"), ctx.p.parcel_id, ReservationKind.BUILDING, entry.approval_id
+    )
+    ctx.admission = replace(ctx.admission, reservations=(*ctx.admission.reservations, building))
+    _set_queue(ctx, replace(entry, status=QueueStatus.RESERVED, resume=False), ctx.p.parcel_id)
+    ctx.update(slot_parked=False)
+    if ctx.p.note.startswith(("Queued: ", "Waiting for an auto-build slot")):
+        ctx.update(note="")
+
+
+def _replay_held(ctx: _Ctx) -> None:
+    """Send the held messages to the re-admitted run, once (fresh effects)."""
+    held, s = ctx.p.held_wakes, ctx.p.current_session
+    ctx.update(held_wakes=())
+    for w in held:
+        if s is None or w.session_id != s.session_id:
+            continue
+        ctx.emit(EffectKind(w.kind), session=s, target=w.target, args=json.loads(w.args_json))
+
+
+def _hold_wakes(ctx: _Ctx, wakes: list[EffectIntent]) -> None:
+    ids = {e.effect_id for e in wakes}
+    ctx.effects = [e for e in ctx.effects if e.effect_id not in ids]
+    held = tuple(
+        HeldWake(
+            kind=e.kind.value,
+            session_id=e.preconditions.session_id or "",
+            target=e.target,
+            args_json=json.dumps(e.args, sort_keys=True, separators=(",", ":")),
+        )
+        for e in wakes
+    )
+    ctx.update(
+        held_wakes=(*ctx.p.held_wakes, *held),
+        sent_effects=tuple(x for x in ctx.p.sent_effects if x[0] not in ids),
+    )
+
+
+def _settle_build_slot(ctx: _Ctx) -> None:
+    """After every event: a build holds a building slot only while its run works, winds
+    down or is about to start. A parked run releases it; a message for a parked run takes
+    a free slot at once, else it is held and the build queues to resume (ahead of new
+    builds); a parked run seen busy again is counted at once (fail closed)."""
+    p = ctx.p
+    pid = p.parcel_id
+    entry = ctx.admission.queue_entry(pid)
+    s = p.current_session
+    a = p.current_approval
+    auth = p.authorization(s.authorization_id) if s is not None else None
+    episode = (
+        entry is not None
+        and s is not None
+        and s.kind == SessionKind.BUILD
+        and a is not None
+        and entry.approval_id == a.approval_id
+        and auth is not None
+        and auth.approval_id == entry.approval_id
+    )
+    parked_entry = entry is not None and (
+        entry.status == QueueStatus.HELD or (entry.status == QueueStatus.QUEUED and entry.resume)
+    )
+    if not episode or entry is None or s is None:
+        if parked_entry and entry is not None:
+            status = (
+                QueueStatus.CANCELLED
+                if entry.status == QueueStatus.QUEUED
+                else (QueueStatus.RELEASED)
+            )
+            _set_queue(ctx, replace(entry, status=status, resume=False), pid)
+        if p.slot_parked or p.held_wakes:
+            ctx.update(slot_parked=False, held_wakes=())
+        return
+    wakes = [
+        e
+        for e in ctx.effects
+        if e.kind in _WAKE_KINDS and e.preconditions.session_id == s.session_id
+    ]
+    holds_slot = any(
+        r.parcel_id == pid for r in ctx.admission.live_reservations(ReservationKind.BUILDING)
+    )
+    if entry.status == QueueStatus.RESERVED:
+        if holds_slot and not wakes and build_parked(ctx.p):
+            ctx.admission = replace(
+                ctx.admission,
+                reservations=tuple(
+                    replace(r, live=False)
+                    if r.parcel_id == pid and r.live and r.kind == ReservationKind.BUILDING
+                    else r
+                    for r in ctx.admission.reservations
+                ),
+            )
+            _set_queue(ctx, replace(entry, status=QueueStatus.HELD, resume=True), pid)
+            ctx.update(slot_parked=True)
+        return
+    if not parked_entry:
+        return
+    if not _resumable(s):
+        # Stopping, fenced or settled at a checkpoint: no message may reach it now.
+        if p.held_wakes:
+            ctx.update(held_wakes=())
+        if entry.status == QueueStatus.QUEUED:
+            _set_queue(ctx, replace(entry, status=QueueStatus.HELD), pid)
+        return
+    if wakes or p.held_wakes:
+        if _slot_free(ctx, entry):
+            _acquire_slot(ctx, entry)
+            _replay_held(ctx)
+            return
+        _hold_wakes(ctx, wakes)
+        if entry.status != QueueStatus.QUEUED:
+            _set_queue(ctx, replace(entry, status=QueueStatus.QUEUED, resume=True), pid)
+            ctx.note(_queued_note(ctx))
+        return
+    if not build_parked(ctx.p):
+        # Running again without a message (a busy read after a stale idle one): it holds
+        # a slot whether or not one is free.
+        _acquire_slot(ctx, entry)
 
 
 def _settle_observed_move(ctx: _Ctx, accepted: bool) -> None:
@@ -4700,7 +4998,7 @@ def _project_board(ctx: _Ctx) -> None:
         drained = old_bot == BotState.WORKING and bot == BotState.IDLE
         if ctx.p.stage != ctx.origin_stage or (bot != old_bot and not drained):
             ctx.update(note="")
-    if bot == BotState.QUEUED and (not ctx.p.note or ctx.p.note.startswith("Queued: ")):
+    if bot == BotState.QUEUED and _queue_note_refreshable(ctx.p.note):
         # Builds ahead are admitted without an event here: every event (at least the
         # periodic reconcile) refreshes the position; the board is written on change.
         ctx.update(note=_queued_note(ctx) or ctx.p.note)
@@ -4802,6 +5100,7 @@ def transition(state: State, event: Event) -> TransitionResult:
     if new_parcel is not None:
         _settle_observed_move(ctx, accepted)
         _settle_auto_build(ctx)
+        _settle_build_slot(ctx)
         _project_board(ctx)
         new_parcel = ctx.p
         kept: list[EffectIntent] = []

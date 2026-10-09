@@ -34,6 +34,9 @@
           "$ref": "#/$defs/triage"
         },
         {
+          "$ref": "#/$defs/epic_triage"
+        },
+        {
           "$ref": "#/$defs/plan"
         },
         {
@@ -247,6 +250,101 @@
         }
       }
     },
+    "epic_triage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "summary",
+        "coverage",
+        "build_order"
+      ],
+      "properties": {
+        "kind": {
+          "const": "epic_triage"
+        },
+        "summary": {
+          "$ref": "#/$defs/text"
+        },
+        "coverage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "gaps",
+            "overlaps"
+          ],
+          "properties": {
+            "gaps": {
+              "$ref": "#/$defs/texts"
+            },
+            "overlaps": {
+              "$ref": "#/$defs/texts"
+            }
+          }
+        },
+        "build_order": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "issue",
+              "reason"
+            ],
+            "properties": {
+              "issue": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              }
+            }
+          }
+        },
+        "links": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "issue",
+              "blocked_by",
+              "reason"
+            ],
+            "properties": {
+              "issue": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "blocked_by": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              }
+            }
+          }
+        },
+        "missing_information": {
+          "$ref": "#/$defs/texts"
+        },
+        "related": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "$ref": "#/$defs/related"
+          }
+        }
+      }
+    },
     "plan": {
       "type": "object",
       "additionalProperties": false,
@@ -279,6 +377,13 @@
         },
         "open_decision_ids": {
           "$ref": "#/$defs/texts"
+        },
+        "related": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "$ref": "#/$defs/related"
+          }
         }
       }
     },
@@ -447,6 +552,13 @@
             "ready",
             "needs_owner"
           ]
+        },
+        "related": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "$ref": "#/$defs/related"
+          }
         }
       }
     },
@@ -518,6 +630,13 @@
         },
         "done": {
           "$ref": "#/$defs/texts"
+        },
+        "related": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "$ref": "#/$defs/related"
+          }
         }
       }
     }

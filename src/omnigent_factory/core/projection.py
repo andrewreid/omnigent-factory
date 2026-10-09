@@ -14,6 +14,7 @@ from omnigent_factory.core.types import (
     NEEDS_YOU_HOLDS,
     RELATIONS,
     AdmissionSnapshot,
+    AutoBuildStatus,
     BotState,
     FenceKind,
     Hold,
@@ -26,6 +27,7 @@ from omnigent_factory.core.types import (
     StageSession,
     TrustedConfig,
     WaitReason,
+    blockers_text,
     is_leftward,
 )
 
@@ -229,11 +231,23 @@ def project_note(p: Parcel, bot: BotState) -> str:
     elif bot == BotState.IDLE and unexplained_move(p):
         assert p.stage is not None  # noqa: S101 - unexplained_move checks it
         text = unexplained_move_note(p.stage)
+    elif waiting_on_note(p):
+        text = waiting_on_note(p)
     else:
-        # Lowest precedence: other issues' triage named this one. Any status reason or
-        # derived Blocked/Needs you/Checkpoint/Queued note above outranks it.
-        text = related_note(p)
+        # Lowest precedence: an epic's progress, else other issues' triage named this
+        # one. Any status reason or derived Blocked/Needs you/Checkpoint/Queued note
+        # above outranks it.
+        text = p.epic_note or related_note(p)
     return text[:NOTE_MAX]
+
+
+def waiting_on_note(p: Parcel) -> str:
+    """``Waiting on #823``: a queued auto-build mark held by open blockers ("" if none)."""
+    mark = p.auto_build
+    if mark is None or mark.status != AutoBuildStatus.QUEUED or p.links is None:
+        return ""
+    blockers = p.links.open_blockers
+    return f"Waiting on {blockers_text(blockers)}" if blockers else ""
 
 
 #: How a related mark reads on the marked card (the source issue's relation to it).
@@ -269,10 +283,10 @@ def triage_queued_note() -> str:
     return "Queued: triage starts when a triage slot is free"
 
 
-def admission_key(q: QueueEntry) -> tuple[bool, int, str]:
-    """Admission order: every manually approved build before any auto-build, then the
-    persisted approval sequence, then parcel ID."""
-    return (q.auto, q.sequence, q.parcel_id)
+def admission_key(q: QueueEntry) -> tuple[bool, bool, int, str]:
+    """Admission order: parked builds resuming first, then every manually approved build
+    before any auto-build, then the persisted approval sequence, then parcel ID."""
+    return (not q.resume, q.auto, q.sequence, q.parcel_id)
 
 
 def queue_head(admission: AdmissionSnapshot) -> QueueEntry | None:
@@ -281,6 +295,25 @@ def queue_head(admission: AdmissionSnapshot) -> QueueEntry | None:
     if not queued:
         return None
     return min(queued, key=admission_key)
+
+
+def admissible_head(admission: AdmissionSnapshot, config: TrustedConfig) -> QueueEntry | None:
+    """The next queued entry capacity may admit: the queue head, passing over auto-build
+    entries while every auto-build slot is taken (they never hold up a manual build)."""
+    queued = sorted(
+        (q for q in admission.queue if q.status == QueueStatus.QUEUED), key=admission_key
+    )
+    auto_full = not auto_build_capacity_available(admission, config)
+    for q in queued:
+        if q.auto and auto_full:
+            continue
+        return q
+    return None
+
+
+def running_text(entries: tuple[QueueEntry, ...]) -> str:
+    """``#673, #680`` for running build episodes (``?`` for an unknown issue)."""
+    return ", ".join(f"#{q.issue_number}" if q.issue_number else "?" for q in entries)
 
 
 def auto_build_capacity_available(admission: AdmissionSnapshot, config: TrustedConfig) -> bool:
@@ -303,10 +336,8 @@ def startable_build(admission: AdmissionSnapshot, config: TrustedConfig) -> Queu
     slot) and an open-PR slot free unless the head already holds one: the repository-wide
     checks of ``CapacityAvailable`` (its per-parcel preconditions are the parcel's own).
     """
-    head = queue_head(admission)
+    head = admissible_head(admission, config)
     if head is None or admission.paused or not building_capacity_available(admission, config):
-        return None
-    if head.auto and not auto_build_capacity_available(admission, config):
         return None
     holds_pr = any(
         r.parcel_id == head.parcel_id for r in admission.live_reservations(ReservationKind.OPEN_PR)

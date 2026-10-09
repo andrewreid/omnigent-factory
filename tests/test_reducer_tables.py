@@ -1034,7 +1034,9 @@ def test_D07_D09_checkpoint_report_then_quiescent_fence():
     h.quiesce(P, b.session_id)
     s = h.cur()
     assert s.lifecycle == Lifecycle.FENCED and s.fences == {FenceKind.CHECKPOINT}
-    assert h.admission.building_count == 1  # checkpoint retains its slot
+    # The wrap-up drain is over: the settled checkpoint parks and frees its slot.
+    assert h.admission.building_count == 0
+    assert h.admission.queue_entry(P).status == QueueStatus.HELD and h.p().slot_parked
     assert h.p().bot == BotState.CHECKPOINT
 
 
