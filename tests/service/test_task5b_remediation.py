@@ -224,6 +224,9 @@ class _ObserverService:
     async def _parcel_ids(self) -> list[str]:
         return [self.parcel.parcel_id]
 
+    async def open_run_parcel_ids(self) -> list[str]:
+        return [self.parcel.parcel_id]
+
     async def apply_event(self, event: Event, **_: object) -> SimpleNamespace:
         self.events.append(event)
         return SimpleNamespace()
@@ -252,6 +255,9 @@ class _BrokenObserverAdapter:
     async def observe_tree(self, root_id: str) -> None:
         del root_id
         raise OmnigentReadError("stale")
+
+    async def observe_trees(self, root_ids: list[str]) -> list[OmnigentReadError]:
+        return [OmnigentReadError("stale") for _ in root_ids]
 
 
 @pytest.mark.asyncio

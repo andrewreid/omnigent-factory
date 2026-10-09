@@ -14,12 +14,21 @@ from typing import Any
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.events import Event, Provenance
-from omnigent_factory.core.predicates import settled
-from omnigent_factory.core.types import DecisionSource, Parcel
+from omnigent_factory.core.predicates import run_closed, settled
+from omnigent_factory.core.types import (
+    BotState,
+    DecisionSource,
+    Hold,
+    Lifecycle,
+    Parcel,
+    StageSession,
+    WaitReason,
+)
 from omnigent_factory.omnigent.activity import ActivityTracker
 from omnigent_factory.omnigent.adapter import OmnigentExecutionAdapter
 from omnigent_factory.omnigent.observe import StreamNormalizer
 from omnigent_factory.omnigent.rest import OmnigentReadError
+from omnigent_factory.omnigent.tree import TreeObservation
 from omnigent_factory.ports.clock import Clock
 from omnigent_factory.service.directory import ServiceDispatchDirectory
 from omnigent_factory.service.runtime import FactoryService
@@ -108,16 +117,28 @@ class OmnigentObserver:
                 await asyncio.wait_for(self._stop.wait(), self.interval_seconds)
 
     async def observe_once(self) -> frozenset[str]:
-        """Take one complete pass; successful roots are safe for boot re-enable checks."""
-        observed: set[str] = set()
+        """Take one complete pass; successful roots are safe for boot re-enable checks.
+
+        Every tree due in the pass is scanned with one shared inventory refresh
+        (``observe_trees``); a failed refresh makes each scan incomplete, never idle.
+        """
+        due: list[tuple[Parcel, StageSession, str]] = []
         for parcel in await self._parcels():
             session = parcel.current_session
-            if session is None or session.root_id is None or session.execution_closed:
+            if session is None or session.root_id is None or run_closed(parcel, session):
                 continue
-            if not self._due(session.session_id, settled_now=settled(session)):
-                continue
+            slow = settled(session) or self._parked_on_owner(parcel, session)
+            if self._due(session.session_id, settled_now=slow):
+                due.append((parcel, session, session.root_id))
+        if not due:
+            return frozenset()
+        results = await self.adapter.observe_trees([root for _, _, root in due])
+        observed: set[str] = set()
+        for (parcel, session, _root), result in zip(due, results, strict=True):
             try:
-                await self._observe(parcel)
+                if not isinstance(result, TreeObservation):
+                    raise result
+                await self._observe(parcel, result)
             except (OmnigentReadError, OSError, ValueError):
                 tracker = self._tracker(
                     session.session_id, session.grant.grant_id, session.grant.consumed_us
@@ -128,11 +149,10 @@ class OmnigentObserver:
                 observed.add(session.session_id)
         return frozenset(observed)
 
-    async def _observe(self, parcel: Parcel) -> None:
+    async def _observe(self, parcel: Parcel, observation: TreeObservation) -> None:
         session = parcel.current_session
         if session is None or session.root_id is None:
             return
-        observation = await self.adapter.observe_tree(session.root_id)
         # The tree read is slow and successive runs share the root: a run admitted
         # meanwhile owns what was observed. Crediting its activity to the stale run
         # (settled, so "external") would hold the parcel; the next pass reads it fresh.
@@ -198,6 +218,22 @@ class OmnigentObserver:
                 f"crash:{session.session_id}",
             )
             self._crashed.add(session.session_id)
+
+    def _parked_on_owner(self, parcel: Parcel, session: StageSession) -> bool:
+        """A WAITING run last observed idle, waiting on the owner (an open decision, a
+        plan approval, a Needs-you card): only watched for external activity, like a
+        settled tree, until the factory relays the owner's move (which wakes it)."""
+        if session.lifecycle != Lifecycle.WAITING:
+            return False
+        tree = self._last_tree.get(session.session_id)
+        if tree is None or not tree[0] or tree[1]:
+            return False  # not yet observed complete and idle
+        return (
+            bool(parcel.open_decisions)
+            or session.wait_reason in (WaitReason.DECISION, WaitReason.PLAN_APPROVAL)
+            or parcel.bot == BotState.NEEDS_YOU
+            or Hold.AWAITING_OWNER in parcel.holds
+        )
 
     def _due(self, session_id: str, *, settled_now: bool) -> bool:
         if not settled_now:
@@ -266,7 +302,9 @@ class OmnigentObserver:
         )
 
     async def _parcels(self) -> list[Parcel]:
-        ids = await self.service._parcel_ids()
+        """Parcels whose current run is open (a closed run is never scanned, so idle
+        parcels are not loaded every pass)."""
+        ids = await self.service.open_run_parcel_ids()
         values = await asyncio.gather(*(self._load_parcel(parcel_id) for parcel_id in ids))
         return [parcel for parcel in values if parcel is not None]
 

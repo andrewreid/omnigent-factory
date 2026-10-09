@@ -31,19 +31,20 @@ import json
 import logging
 import secrets
 import sqlite3
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from omnigent_factory.core import codec
-from omnigent_factory.core.effects import EffectIntent, EffectKind
+from omnigent_factory.core.effects import READ_ONLY_KINDS, EffectIntent, EffectKind
 from omnigent_factory.core.events import EffectReconciled, Event, EventKind, MessageAck
 from omnigent_factory.core.predicates import RUNNING_LIFECYCLES
 from omnigent_factory.core.reducer import TransitionResult, transition
 from omnigent_factory.core.types import (
     FENCE_BITS,
     AdmissionSnapshot,
+    IssueSnapshot,
     Lifecycle,
     Parcel,
     QueueEntry,
@@ -124,6 +125,9 @@ _BODY_UNREAD_KINDS_JSON = json.dumps(
         }
     )
 )
+#: Issue-read event IDs (reconcile reads, boot reads) whose unchanged reads are not
+#: stored: the IDs never recur, so no duplicate check depends on them.
+UNSTORED_SNAPSHOT_PREFIXES = ("effect:", "startup-github:")
 _SETTLED_EFFECT_STATES = frozenset({"done", "cancelled", "failed"})
 #: Effects pruned with their observation event: reads and board drift corrections, which
 #: nothing (operator retry/re-render, recovery) looks up once settled.
@@ -212,6 +216,9 @@ class ApplyResult:
     effects: tuple[EffectIntent, ...]
     parcel: Parcel | None
     admission: AdmissionSnapshot
+    #: False for a periodic issue read identical to the newest stored one (nothing was
+    #: written: see :meth:`SqliteStore._unchanged_snapshot`).
+    persisted: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +289,27 @@ def _persisted(parcel: Parcel) -> Parcel:
     return replace(parcel, applied_event_ids=frozenset())
 
 
+def snapshot_key(snap: IssueSnapshot) -> tuple[object, ...]:
+    """An issue read's values without its read time (body as its sha256)."""
+    body = (
+        hashlib.sha256(snap.body.encode("utf-8")).hexdigest()
+        if snap.body is not None
+        else snap.body_sha256
+    )
+    return (
+        snap.open,
+        snap.human_assigned,
+        snap.repo_matches,
+        snap.identity_resolved,
+        snap.in_project,
+        snap.stage,
+        snap.title,
+        body,
+        snap.bot,
+        snap.note,
+    )
+
+
 def _digest(text: str | None) -> str | None:
     if text is None:
         return None
@@ -310,6 +338,8 @@ class SqliteStore:
         self._clock = clock
         self._fault = fault_hook
         self._parcel_cache: dict[str, tuple[tuple[int, int], str, Parcel]] = {}
+        #: Aggregates decoded by :meth:`load_parcel` (a cache miss; for measurements).
+        self.parcel_decodes = 0
 
     # ------------------------------------------------------------ lifecycle
 
@@ -659,6 +689,91 @@ class SqliteStore:
             )
         return cur.rowcount
 
+    def retire_delivery(self, delivery_guid: str) -> None:
+        """Mark a delivery that produced no event ``processed`` and drop its body at once.
+
+        Nothing reads such a body back (no event points at it). The row keeps its GUID and
+        ``body_sha256``, so duplicate and recovery matching still work. A delivery an event
+        references (e.g. a re-processed one) keeps its body for the normal retention.
+        """
+        with self._txn() as conn:
+            self._mark_delivery(conn, delivery_guid, "processed")
+            conn.execute(
+                "UPDATE deliveries SET body = X'', headers_json = '{}', body_pruned_at_us = ? "
+                "WHERE delivery_guid = ? AND body_pruned_at_us IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.delivery_guid = ?) "
+                "AND NOT EXISTS (SELECT 1 FROM parked_deliveries p WHERE p.delivery_guid = ?)",
+                (self._clock.now_utc_us(), delivery_guid, delivery_guid, delivery_guid),
+            )
+
+    def prune_delivery_rows(
+        self,
+        before_us: int,
+        held: Sequence[str] = (),
+        *,
+        limit: int = 500,
+        dry_run: bool = False,
+    ) -> tuple[int, int]:
+        """Delete fully pruned deliveries and old delivery attempts (one short transaction).
+
+        A delivery row goes only when it is ``processed``, its body was pruned, it finished
+        before ``before_us``, and no event, parked delivery, parcel hold (``held`` GUIDs)
+        or stored review comment references it. An attempt goes when it is older than
+        ``before_us``, is not a quarantined copy, and its delivery row is gone or fully
+        pruned and not parked. Returns (deliveries, attempts), each at most ``limit``.
+        """
+        rows = (
+            "SELECT d.delivery_guid FROM deliveries d "
+            "WHERE d.status = 'processed' AND d.body_pruned_at_us IS NOT NULL "
+            "AND COALESCE(d.processed_at_us, d.received_at_us) < :before "
+            "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.delivery_guid = d.delivery_guid) "
+            "AND NOT EXISTS (SELECT 1 FROM parked_deliveries p "
+            "WHERE p.delivery_guid = d.delivery_guid) "
+            "AND NOT EXISTS (SELECT 1 FROM pr_review_comments r "
+            "WHERE r.delivery_guid = d.delivery_guid) "
+            "AND d.delivery_guid NOT IN (SELECT value FROM json_each(:held)) LIMIT :limit"
+        )
+        attempts = (
+            "SELECT a.id FROM delivery_attempts a WHERE a.received_at_us < :before "
+            "AND a.outcome != 'quarantined' "
+            "AND NOT EXISTS (SELECT 1 FROM parked_deliveries p "
+            "WHERE p.delivery_guid = a.delivery_guid) "
+            "AND a.delivery_guid NOT IN (SELECT value FROM json_each(:held)) "
+            "AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.delivery_guid = a.delivery_guid "
+            "AND (d.status != 'processed' OR d.body_pruned_at_us IS NULL)) LIMIT :limit"
+        )
+        params = {"before": before_us, "held": codec.dumps(list(held)), "limit": limit}
+        if dry_run:
+            count_rows = self._conn.execute(f"SELECT COUNT(*) FROM ({rows})", params)
+            count_attempts = self._conn.execute(f"SELECT COUNT(*) FROM ({attempts})", params)
+            return int(count_rows.fetchone()[0]), int(count_attempts.fetchone()[0])
+        with self._txn() as conn:
+            deleted = conn.execute(
+                f"DELETE FROM deliveries WHERE delivery_guid IN ({rows})", params
+            ).rowcount
+            removed = conn.execute(
+                f"DELETE FROM delivery_attempts WHERE id IN ({attempts})", params
+            ).rowcount
+        return deleted, removed
+
+    # ------------------------------------------------------------ board diff
+
+    def board_digests(self) -> dict[str, str]:
+        rows = self._conn.execute("SELECT parcel_id, digest FROM board_digests").fetchall()
+        return {str(r[0]): str(r[1]) for r in rows}
+
+    def save_board_digests(self, digests: Mapping[str, str]) -> None:
+        if not digests:
+            return
+        now = self._clock.now_utc_us()
+        with self._txn() as conn:
+            conn.executemany(
+                "INSERT INTO board_digests (parcel_id, digest, seen_at_us) VALUES (?, ?, ?) "
+                "ON CONFLICT (parcel_id) DO UPDATE SET digest = excluded.digest, "
+                "seen_at_us = excluded.seen_at_us",
+                [(pid, digest, now) for pid, digest in sorted(digests.items())],
+            )
+
     def prune_observations(
         self,
         before_us: int,
@@ -871,6 +986,7 @@ class SqliteStore:
             parcel = cached[2]
         else:
             parcel = codec.parcel_from_json(text)
+            self.parcel_decodes += 1
         if len(self._parcel_cache) >= _PARCEL_CACHE_LIMIT:
             self._parcel_cache.clear()
         self._parcel_cache[parcel_id] = (epoch, text, parcel)
@@ -1024,6 +1140,20 @@ class SqliteStore:
         new = result.state
         if new.parcel is not None:
             new = replace(new, parcel=_persisted(new.parcel))
+        if self._unchanged_snapshot(
+            conn, event, old=old_parcel, new=new, admission=admission, result=result
+        ):
+            LOG.debug("issue read unchanged, not stored parcel=%s", event.parcel_id)
+            return ApplyResult(
+                duplicate=False,
+                sequence=None,
+                accepted=True,
+                reason=result.audit.reason,
+                effects=(),
+                parcel=old_parcel,
+                admission=admission,
+                persisted=False,
+            )
         self._check_caps(admission, new.admission, config)
         seq_row = conn.execute("SELECT COALESCE(MAX(sequence), 0) + 1 AS s FROM events")
         sequence = int(seq_row.fetchone()["s"])
@@ -1054,6 +1184,8 @@ class SqliteStore:
             ),
         )
         self._hook("after-event-insert")
+        if event.evidence is not None and new.parcel is not None:
+            self._supersede_evidence(conn, new.parcel.parcel_id, sequence)
         if result.audit.accepted:
             resolution = _resolution(event)
             if resolution is not None:
@@ -1095,6 +1227,73 @@ class SqliteStore:
             effects=result.effects,
             parcel=new.parcel,
             admission=new.admission,
+        )
+
+    @staticmethod
+    def _unchanged_snapshot(
+        conn: sqlite3.Connection,
+        event: Event,
+        *,
+        old: Parcel | None,
+        new: State,
+        admission: AdmissionSnapshot,
+        result: TransitionResult,
+    ) -> bool:
+        """A periodic issue read that changes nothing is not stored.
+
+        Only reconcile and startup reads (their event IDs never recur, so no duplicate
+        check depends on them): accepted, no effects, the same aggregate and admission,
+        and the same issue values (read time aside) as the parcel's newest stored read,
+        which stays the current evidence (``issue_evidence`` reads it back).
+        """
+        snap = event.evidence
+        if (
+            event.kind != EventKind.GITHUB_SNAPSHOT
+            or snap is None
+            or old is None
+            or new.parcel is None
+            or not event.event_id.startswith(UNSTORED_SNAPSHOT_PREFIXES)
+            or not result.audit.accepted
+            or result.effects
+            or new.admission != admission
+            or replace(new.parcel, version=old.version) != _persisted(old)
+        ):
+            return False
+        row = conn.execute(
+            "SELECT payload_json FROM events WHERE parcel_id = ? AND kind = ? "
+            "ORDER BY sequence DESC LIMIT 1",
+            (old.parcel_id, EventKind.GITHUB_SNAPSHOT.value),
+        ).fetchone()
+        if row is None:
+            return False
+        stored = codec.event_from_json(row["payload_json"]).evidence
+        return stored is not None and snapshot_key(stored) == snapshot_key(snap)
+
+    @staticmethod
+    def _supersede_evidence(conn: sqlite3.Connection, parcel_id: str, sequence: int) -> None:
+        """Replace the issue body of the parcel's previous issue read with its sha256.
+
+        Only the newest read's text is read back (``issue_evidence``: the issue as the
+        agent sees it); an older read keeps its values and a body hash for change
+        detection and diagnostics.
+        """
+        row = conn.execute(
+            "SELECT event_id, payload_json FROM events WHERE parcel_id = ? AND sequence < ? "
+            "AND payload_json LIKE '%\"evidence\":{%' ORDER BY sequence DESC LIMIT 1",
+            (parcel_id, sequence),
+        ).fetchone()
+        if row is None:
+            return
+        data = json.loads(row["payload_json"])
+        evidence = data.get("evidence")
+        body = evidence.get("body") if isinstance(evidence, dict) else None
+        if not isinstance(body, str):
+            return
+        evidence["body"] = None
+        evidence["body_sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        conn.execute(
+            "UPDATE events SET payload_json = ? WHERE event_id = ?",
+            (codec.dumps(data), row["event_id"]),
         )
 
     @staticmethod
@@ -1537,6 +1736,14 @@ class SqliteStore:
                 else None
             )
             self._hook("after-outcome-event")
+            if applied is not None and not applied.persisted:
+                # An unchanged periodic read leaves no trace: its settled read effect goes
+                # too (nothing looks a settled read up; retention would delete it later).
+                conn.execute(
+                    "DELETE FROM effects WHERE effect_id = ? AND kind = ?",
+                    (effect_id, EffectKind.RECONCILE_PARCEL.value),
+                )
+                return EffectOutcomeResult(True, applied)
             updated = self._update_effect(
                 conn,
                 effect_id,
@@ -2050,7 +2257,13 @@ def _log_transition(
     """One line per applied event: stage/Bot movement, reason and emitted effects."""
     before = (old.stage, old.bot) if old is not None else (None, None)
     after = (new.stage, new.bot) if new is not None else (None, None)
-    quiet = event.kind in _QUIET_KINDS and result.audit.accepted and before == after
+    # A routine sample, or an accepted event that moves nothing and writes nothing (no
+    # effect beyond a read): DEBUG. Refusals and every real change stay INFO.
+    quiet = (
+        result.audit.accepted
+        and before == after
+        and (event.kind in _QUIET_KINDS or all(e.kind in READ_ONLY_KINDS for e in result.effects))
+    )
     LOG.log(
         logging.DEBUG if quiet else logging.INFO,
         "parcel transition kind=%s parcel=%s issue=%s accepted=%s reason=%s "

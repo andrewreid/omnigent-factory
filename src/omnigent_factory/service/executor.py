@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterable
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.effects import (
+    READ_ONLY_KINDS,
     Ack,
     AdapterOutcome,
     AmbiguousWrite,
@@ -246,7 +247,8 @@ class EffectExecutor:
             parcel_version=parcel.version if parcel is not None else 0,
             attempt=claimed.attempts,
         )
-        LOG.info(
+        LOG.log(
+            logging.DEBUG if effect.kind in READ_ONLY_KINDS else logging.INFO,
             "effect start kind=%s effect_id=%s parcel=%s attempt=%s",
             effect.kind.value,
             effect.effect_id,
@@ -694,7 +696,8 @@ def _log_ack(effect: EffectIntent, ack: Ack) -> None:
             effect.parcel_id,
             effect.args.get("stage"),
         )
-    LOG.info(
+    LOG.log(
+        logging.DEBUG if effect.kind in READ_ONLY_KINDS else logging.INFO,
         "effect done kind=%s effect_id=%s parcel=%s remote_id=%s",
         effect.kind.value,
         effect.effect_id,

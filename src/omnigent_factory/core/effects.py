@@ -78,6 +78,18 @@ WORK_BEARING_KINDS = frozenset(
 )
 
 
+#: Effects that only read (GitHub issue/PR reads, Omnigent tree scans): routine, so their
+#: start/done log lines are DEBUG.
+READ_ONLY_KINDS = frozenset(
+    {
+        EffectKind.RECONCILE_PARCEL,
+        EffectKind.FETCH_PR_EVIDENCE,
+        EffectKind.SCAN_TREE,
+        EffectKind.RECONCILE_SESSION,
+    }
+)
+
+
 class MessagePurpose(enum.StrEnum):
     FIRST = "first"
     FEEDBACK = "feedback"

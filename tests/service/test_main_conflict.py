@@ -111,12 +111,14 @@ async def test_push_to_another_branch_is_ignored_with_a_log_line(
     async with started(config_for(service_config)) as rig:
         await to_ready(rig)
         reads = len(rig.executed(EffectKind.FETCH_PR_EVIDENCE))
-        with caplog.at_level(logging.INFO):
+        with caplog.at_level(logging.DEBUG):
             await deliver_push(
                 rig, push_payload(repo_of(rig), "refs/heads/factory/issue-42"), "d-feat"
             )
         assert await status(rig, "d-feat") == "processed"  # retired, never set aside
-        assert "push to a branch other than the default branch" in caplog.text
+        # Routine: logged at DEBUG only.
+        ignored = [r for r in caplog.records if "push to a branch other than" in r.getMessage()]
+        assert [r.levelno for r in ignored] == [logging.DEBUG]
         assert await pushes_applied(rig) == 0
         assert len(rig.executed(EffectKind.FETCH_PR_EVIDENCE)) == reads
         assert (await rig.parcel()).stage == Stage.READY

@@ -585,6 +585,18 @@ def _begin_drain(
 _HARD_FENCES = frozenset({FenceKind.SAFETY, FenceKind.STOPPED, FenceKind.REVOKED})
 
 
+def _terminally_fenced(ctx: _Ctx, lifecycle: Lifecycle, fences: frozenset[FenceKind]) -> bool:
+    """A hard-fenced, stopped run of a completed parcel can never run again.
+
+    Closing an issue makes its fresh read ineligible, which fences the live run (safety)
+    before completion drains it, so the drain ends FENCED, not RETIRED. Only a checkpoint
+    fence alone can resume a FENCED run, and a completed parcel restarts only through a
+    fresh owner control (a new run): the run is closed like a retired one, so nothing
+    keeps watching its tree.
+    """
+    return lifecycle == Lifecycle.FENCED and bool(fences & _HARD_FENCES) and _completed(ctx)
+
+
 def _end_build_episode(ctx: _Ctx, s: StageSession) -> None:
     """A settled build that can never resume releases its admission slot."""
     if s.kind == SessionKind.BUILD and not s.restart_pending:
@@ -599,7 +611,9 @@ def _finish_drain(ctx: _Ctx, s: StageSession) -> None:
             lifecycle=target,
             drain_target=None,
             quiescent=True,
-            execution_closed=s.execution_closed or target == Lifecycle.RETIRED,
+            execution_closed=s.execution_closed
+            or target == Lifecycle.RETIRED
+            or _terminally_fenced(ctx, target, s.fences),
             external_active=False,
             drain_started_us=0,
         )
@@ -2187,6 +2201,9 @@ def _complete(ctx: _Ctx) -> None:
     cur = ctx.p.current_session
     if cur is not None and not settled(cur) and cur.lifecycle != Lifecycle.DRAINING:
         _begin_drain(ctx, cur)
+    for s in ctx.p.sessions:
+        if settled(s) and not s.execution_closed and _terminally_fenced(ctx, s.lifecycle, s.fences):
+            ctx.put_session(replace(s, execution_closed=True))
 
 
 def _merged(ctx: _Ctx, pr_number: int) -> None:
@@ -2523,16 +2540,16 @@ def _refresh_ready_report(ctx: _Ctx, checks_summary: str) -> None:
     ctx.update(readiness=replace(r, report_key=key))
 
 
-def _report_line_pending(ctx: _Ctx, r: Readiness) -> bool:
+def _report_line_pending_at(p: Parcel, r: Readiness, now_us: int) -> bool:
     """A Ready card whose report still says the review bot gave no response: re-read on
     each reconcile (reactions send no webhook) for up to a day after the grace."""
     return (
-        ctx.p.stage == Stage.READY
+        p.stage == Stage.READY
         and r.ready
         and bool(r.report_effect_id)
         and not r.review_bot_done
         and r.review_bot in (_NO_BOT_RESPONSE, _BOT_ASKED)
-        and ctx.now < r.settle_at_us + _REPORT_POLL_CAP_US
+        and now_us < r.settle_at_us + _REPORT_POLL_CAP_US
     )
 
 
@@ -4213,19 +4230,26 @@ def _h_operator_resume(ctx: _Ctx, body: ev.OperatorResume) -> None:
 
 
 def _awaiting_evidence(ctx: _Ctx) -> bool:
+    return awaiting_evidence(ctx.p, ctx.now)
+
+
+def awaiting_evidence(p: Parcel, now_us: int) -> bool:
     """A linked, non-terminal PR whose readiness is not verified on its current head:
-    Building, Ready (a new head or a re-run) or Needs you, live session or not."""
-    r = ctx.p.readiness
+    Building, Ready (a new head or a re-run) or Needs you, live session or not.
+
+    A reconcile of such a parcel issues a catch-up PR read (the service keeps reading
+    it every reconcile interval)."""
+    r = p.readiness
     return (
         r is not None
         and (
             not r.verified
             or (not r.ready and _in_review_grace(r))
-            or _report_line_pending(ctx, r)
+            or _report_line_pending_at(p, r, now_us)
             or r.merge_unknown  # GitHub had not computed mergeability: ask again
         )
-        and not _completed(ctx)
-        and Hold.PR_CLOSED not in ctx.p.holds
+        and Hold.COMPLETED not in p.holds
+        and Hold.PR_CLOSED not in p.holds
     )
 
 
@@ -4572,6 +4596,7 @@ __all__ = [
     "AuditRecord",
     "Rejected",
     "TransitionResult",
+    "awaiting_evidence",
     "derive_id",
     "mcp_question_id",
     "transition",

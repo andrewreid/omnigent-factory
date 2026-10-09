@@ -54,6 +54,9 @@ HOT_RELOAD_KEYS = frozenset(
         "ranking_status_update",
         "rank_field_node_id",
         "session_retention_days",
+        "board_diff_interval_minutes",
+        "session_inventory_resync_hours",
+        "delivery_row_retention_days",
     }
 )
 
@@ -199,6 +202,12 @@ class ServiceConfig(BaseModel):
     #: Reconcile cadence of a completed parcel with no live session or open decision (a
     #: missed reopen webhook is still caught, without a GitHub read every cycle).
     completed_reconcile_interval_seconds: float = Field(default=3600.0, gt=0)
+    #: Minutes between board-wide diffs: one Projects read compares every card's column,
+    #: Bot, open/closed, assignees, labels, title and ``updatedAt`` with the values seen
+    #: last time; only a parcel whose values changed gets a per-issue read. Parcels with
+    #: live work are read every ``reconcile_interval_seconds`` instead. A missed webhook
+    #: (close, reopen, move, edit, label, assignment) is applied within one interval.
+    board_diff_interval_minutes: float = Field(default=5.0, gt=0)
     clock_interval_seconds: float = Field(default=1.0, gt=0)
     effect_poll_seconds: float = Field(default=0.05, gt=0)
     #: Longest the delivery loop sleeps with nothing due. A committed webhook delivery or
@@ -207,6 +216,11 @@ class ServiceConfig(BaseModel):
     #: Days a processed delivery keeps its body/headers when nothing reads it back (no
     #: event, or only check, pull-request and review observations, references it).
     delivery_body_retention_days: float = Field(default=1.0, gt=0)
+    #: Days a processed delivery whose body was pruned keeps its row (GUID + sha256 for
+    #: duplicate and recovery matching; GitHub redelivers for days, not weeks), and its
+    #: delivery attempts. Rows an event, a parked delivery or a parcel hold references,
+    #: and unsettled deliveries, are never deleted.
+    delivery_row_retention_days: float = Field(default=14.0, gt=0)
     #: Hours periodic observation events (reconcile wake-ups, issue snapshots, check,
     #: readiness and tree reads, cost/runtime samples) are kept with their settled read
     #: effects and audit rows. Each parcel's newest event of each kind is always kept;
@@ -224,6 +238,9 @@ class ServiceConfig(BaseModel):
     #: Observation cadence of a settled stage session (tree observed quiescent, nothing of
     #: ours running): it is only watched for external activity.
     settled_observation_interval_seconds: float = Field(default=60.0, gt=0)
+    #: Hours between full reads of the archive-inclusive Omnigent session inventory (tree
+    #: scans otherwise read only sessions created since the last read).
+    session_inventory_resync_hours: float = Field(default=6.0, gt=0)
 
     @field_validator("owners")
     @classmethod

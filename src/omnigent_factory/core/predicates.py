@@ -13,6 +13,7 @@ from omnigent_factory.core.types import (
     Approval,
     ApprovalKind,
     FenceKind,
+    Hold,
     Lifecycle,
     Parcel,
     SessionKind,
@@ -65,6 +66,23 @@ def no_open_decisions(p: Parcel) -> bool:
 def settled(s: StageSession) -> bool:
     """The session's tree was observed quiescent (or never existed remotely)."""
     return s.lifecycle in SETTLED_LIFECYCLES and not s.external_active
+
+
+_HARD_FENCES = frozenset({FenceKind.SAFETY, FenceKind.STOPPED, FenceKind.REVOKED})
+
+
+def run_closed(p: Parcel, s: StageSession) -> bool:
+    """``s`` can never execute again, so nothing needs to watch its tree.
+
+    Closed runs, plus a settled hard-fenced FENCED run of a completed parcel: the reducer
+    closes those now, but runs stored before it did stay FENCED and open forever.
+    """
+    return s.execution_closed or (
+        s.lifecycle == Lifecycle.FENCED
+        and bool(s.fences & _HARD_FENCES)
+        and settled(s)
+        and Hold.COMPLETED in p.holds
+    )
 
 
 #: Ambiguous effect kinds that may have started (or queued) agent work.

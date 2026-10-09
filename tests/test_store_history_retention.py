@@ -38,11 +38,12 @@ def _reconcile(h, parcel_id: str, now: int) -> Event:
 
 
 def _snapshot_ack(h, parcel_id: str, effect_id: str, now: int) -> Event:
+    # Each read shows an edited body: an unchanged read would not be stored at all.
     return h.f(parcel_id).make(
         ev.GitHubSnapshot(),
         provenance=Provenance.ADAPTER,
         event_id=f"effect:{effect_id}:ack",
-        evidence=snapshot(read_at_us=now),
+        evidence=snapshot(read_at_us=now, body=f"Body text {now}"),
     )
 
 
@@ -112,7 +113,7 @@ def test_v8_aggregates_lose_their_event_id_sets_on_upgrade(db: Path):
     old.close()
 
     store = SqliteStore.open(db, clock)
-    assert store.schema_version() == 12
+    assert store.schema_version() == 13
     loaded = store.load_parcel(P)
     assert loaded is not None and loaded.applied_event_ids == frozenset()
     assert replace(loaded, applied_event_ids=bloated.applied_event_ids) == bloated

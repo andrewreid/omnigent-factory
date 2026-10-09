@@ -39,6 +39,8 @@ references for that PR contain exactly this parcel's issue node.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -123,6 +125,43 @@ class BoardIssue:
     created_at_us: int
     #: Anyone is assigned (GitHub assignees are people).
     assigned: bool
+
+
+@dataclass(frozen=True, slots=True)
+class BoardCard:
+    """One repository issue on the project board, open or closed (a board-diff read).
+
+    Everything a missed webhook can change that the factory acts on: column, Bot,
+    open/closed, assignees, labels, title, and the issue's ``updatedAt`` (an edit, label,
+    assignment or close moves it; a column or field change does not).
+    """
+
+    node_id: str
+    number: int
+    open: bool
+    #: Status option ID ("" = none).
+    status_option: str
+    #: Bot option ID ("" = none).
+    bot_option: str
+    assignees: tuple[str, ...]
+    labels: tuple[str, ...]
+    title: str
+    updated_at: str
+
+    @property
+    def digest(self) -> str:
+        """Change key of the card's values (stable across reads of an unchanged card)."""
+        values = [
+            self.open,
+            self.status_option,
+            self.bot_option,
+            sorted(self.assignees),
+            sorted(self.labels),
+            self.title,
+            self.updated_at,
+        ]
+        text = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)

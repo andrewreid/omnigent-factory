@@ -234,7 +234,7 @@ class GitHubDeliveryProcessor:
                     return
                 if normalized.ignored_reason == NO_PROJECT_TRANSITION:
                     # Resolved to our issue; no field the factory reads changed.
-                    LOG.info(
+                    LOG.debug(
                         "project delivery has no transition delivery_guid=%s",
                         delivery.delivery_guid,
                     )
@@ -254,10 +254,8 @@ class GitHubDeliveryProcessor:
             await self._ignore(delivery, "push to a branch other than the default branch")
             return
         if not normalized.events:
-            LOG.info("delivery has no transition delivery_guid=%s", delivery.delivery_guid)
-            await self.service.db.call(
-                lambda store: store.mark_delivery(delivery.delivery_guid, "processed")
-            )
+            LOG.debug("delivery has no transition delivery_guid=%s", delivery.delivery_guid)
+            await self.service.ignore_delivery(delivery.delivery_guid)
             return
 
         if normalized.events[0].kind == EventKind.BASE_PUSHED:
@@ -326,15 +324,13 @@ class GitHubDeliveryProcessor:
         await self.service.db.call(lambda store: store.record_review_comments(guid, text))
 
     async def _ignore(self, delivery: DeliveryRecord, reason: str) -> None:
-        LOG.info(
+        LOG.debug(
             "delivery ignored delivery_guid=%s event=%s reason=%s",
             delivery.delivery_guid,
             delivery.event_name,
             reason[:300],
         )
-        await self.service.db.call(
-            lambda store: store.mark_delivery(delivery.delivery_guid, "processed")
-        )
+        await self.service.ignore_delivery(delivery.delivery_guid)
 
     async def _set_aside(
         self, delivery_guid: str, content_id: str, reason: str, retry_after_us: int | None

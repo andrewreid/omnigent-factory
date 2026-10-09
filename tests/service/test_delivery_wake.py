@@ -162,6 +162,8 @@ async def test_stop_is_prompt_while_the_delivery_loop_is_idle(service_config: Se
 async def test_clock_loop_prunes_old_unreferenced_delivery_bodies(
     service_config: ServiceConfig,
 ):
+    # Rows themselves outlive this test's 15 days (row retention is its own test).
+    service_config = service_config.model_copy(update={"delivery_row_retention_days": 30})
     clock = FakeClock()
     store = SqliteStore.open(service_config.database_path, clock)
     store.ensure_repository(service_config.trusted)

@@ -43,6 +43,7 @@ from omnigent_factory.github.client import (
 from omnigent_factory.ports.github import (
     GITHUB_EFFECT_KINDS,
     STATUS_OPTION_IDS,
+    BoardCard,
     BoardIssue,
     ContractPublication,
     IssueRef,
@@ -263,6 +264,103 @@ class GitHubAPIAdapter:
         except GitHubAPIError as exc:
             return RetryableReadFailure(str(exc))
         return issues
+
+    async def board_cards(self) -> list[BoardCard] | RetryableReadFailure:
+        """Every repository issue on the board, open or closed, for the board diff.
+
+        Fails (never a partial list) when any page is unreadable or the board has more
+        than ``_BOARD_MAX_PAGES`` pages: a partial list would look like removed cards.
+        """
+        query = """
+        query($id: ID!, $after: String) { node(id: $id) { ... on ProjectV2 {
+          items(first: 100, after: $after) {
+            nodes {
+              status: fieldValueByName(name: "Status") {
+                ... on ProjectV2ItemFieldSingleSelectValue { optionId }
+              }
+              bot: fieldValueByName(name: "Bot") {
+                ... on ProjectV2ItemFieldSingleSelectValue { optionId }
+              }
+              content { __typename ... on Issue {
+                id number title state updatedAt repository { id }
+                assignees(first: 20) { totalCount nodes { id } }
+                labels(first: 50) { totalCount nodes { name } }
+              } }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        } } }
+        """
+        cards: list[BoardCard] = []
+        after: str | None = None
+        try:
+            for _ in range(_BOARD_MAX_PAGES):
+                data = await self.client.graphql(
+                    query, {"id": self.project_node_id, "after": after}
+                )
+                node = data.get("node")
+                items = node.get("items") if isinstance(node, dict) else None
+                nodes = items.get("nodes") if isinstance(items, dict) else None
+                if not isinstance(items, dict) or not isinstance(nodes, list):
+                    return RetryableReadFailure("project items were unavailable")
+                for item in nodes:
+                    card = self._board_card(item)
+                    if card is not None:
+                        cards.append(card)
+                page = items.get("pageInfo")
+                if not isinstance(page, dict) or not page.get("hasNextPage"):
+                    return cards
+                cursor = page.get("endCursor")
+                if not isinstance(cursor, str):
+                    return RetryableReadFailure("project items pagination cursor was missing")
+                after = cursor
+        except RateLimited as exc:
+            return RetryableReadFailure(str(exc), exc.retry_after_us)
+        except GitHubAPIError as exc:
+            return RetryableReadFailure(str(exc))
+        return RetryableReadFailure("project board has more items than one diff reads")
+
+    def _board_card(self, item: object) -> BoardCard | None:
+        if not isinstance(item, dict):
+            return None
+        content = item.get("content")
+        if not isinstance(content, dict) or content.get("__typename") != "Issue":
+            return None
+        repository = content.get("repository")
+        if not isinstance(repository, dict) or repository.get("id") != self.repository_node_id:
+            return None
+        node_id, number = content.get("id"), content.get("number")
+        if not isinstance(node_id, str) or not isinstance(number, int) or isinstance(number, bool):
+            return None
+
+        def option(value: object) -> str:
+            found = value.get("optionId") if isinstance(value, dict) else None
+            return found if isinstance(found, str) else ""
+
+        def names(connection: object, key: str) -> tuple[str, ...]:
+            if not isinstance(connection, dict):
+                return ("?",)  # unreadable: never equal to a readable value
+            nodes = connection.get("nodes")
+            values = tuple(
+                str(entry[key])
+                for entry in (nodes if isinstance(nodes, list) else [])
+                if isinstance(entry, dict) and isinstance(entry.get(key), str)
+            )
+            total = connection.get("totalCount")
+            # More than one page: the count still changes with any addition or removal.
+            return (*values, f"#{total}") if isinstance(total, int) else values
+
+        return BoardCard(
+            node_id=node_id,
+            number=number,
+            open=content.get("state") == "OPEN",
+            status_option=option(item.get("status")),
+            bot_option=option(item.get("bot")),
+            assignees=names(content.get("assignees"), "id"),
+            labels=names(content.get("labels"), "name"),
+            title=str(content.get("title") or ""),
+            updated_at=str(content.get("updatedAt") or ""),
+        )
 
     def _board_issue(self, item: object) -> BoardIssue | None:
         if not isinstance(item, dict):

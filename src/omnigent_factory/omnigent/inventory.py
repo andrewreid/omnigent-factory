@@ -13,7 +13,8 @@ kept here and refreshed incrementally:
   stops after the first page reaching ``overlap_s`` below the newest ``created_at`` of
   the last complete read (absorbs replica clock skew and same-second ties);
 * a full read replaces the map whenever none exists yet and every ``resync_s`` (drops
-  deleted sessions, bounds any drift).
+  deleted sessions, bounds any drift; default 6 h, the daemon's
+  ``session_inventory_resync_hours``).
 
 Refreshes are single-flight: concurrent callers share one read that *started after they
 asked*, so no caller is answered from a read older than its request. A failed read
@@ -38,7 +39,9 @@ _INVENTORY: Mapping[str, str] = {
     "sort_by": "created_at",
 }
 DEFAULT_OVERLAP_S = 300
-DEFAULT_RESYNC_S = 900.0
+#: Full reads drop deleted sessions and bound any drift; incremental reads (sessions
+#: created since the last read) keep the map current in between.
+DEFAULT_RESYNC_S = 6 * 3600.0
 
 
 def _created(row: Mapping[str, Any]) -> int | None:
@@ -66,6 +69,9 @@ class SessionIndex:
         self._lock = asyncio.Lock()
         self._started = 0
         self._finished = 0
+
+    def set_resync(self, seconds: float) -> None:
+        self._resync_us = int(seconds * 1_000_000)
 
     def children(self, session_id: str) -> Iterable[str]:
         return tuple(sorted(self._children.get(session_id, ())))

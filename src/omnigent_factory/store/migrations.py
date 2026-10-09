@@ -653,6 +653,17 @@ ALTER TABLE board_fields ADD COLUMN owner_probe INTEGER NOT NULL DEFAULT 0
     CHECK (owner_probe IN (0, 1));
 """
 
+# Board diff: per parcel, the digest of its board card's values when the factory last
+# scheduled (or skipped, nothing having changed) a per-issue read; "absent" = the card was
+# not on the board. A parcel without a row is unknown: its first diff reads it.
+V13_SQL = """
+CREATE TABLE board_digests (
+    parcel_id TEXT PRIMARY KEY,
+    digest TEXT NOT NULL,
+    seen_at_us INTEGER NOT NULL
+);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -666,4 +677,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(10, "auto-triage", V10_SQL),
     Migration(11, "triage-ranking-and-session-retention", V11_SQL),
     Migration(12, "owner-choice-evidence", V12_SQL),
+    Migration(13, "board-diff-digests", V13_SQL),
 )

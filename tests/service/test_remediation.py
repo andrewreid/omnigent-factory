@@ -433,7 +433,10 @@ async def test_service_installs_formatted_log_redaction(
 async def test_reconcile_ids_are_per_parcel_and_workers_are_interparcel_fair(
     service_config: ServiceConfig,
 ):
-    config = service_config.model_copy(update={"reconcile_interval_seconds": 0.02})
+    # Idle parcels (no board diff wired): read on the completed cadence, made fast here.
+    config = service_config.model_copy(
+        update={"reconcile_interval_seconds": 0.02, "completed_reconcile_interval_seconds": 0.02}
+    )
     clock = FakeClock()
     seed_parcels(config, clock, "A-slow", "B-fast", "C-fast")
     github = FairGitHub()
@@ -614,6 +617,9 @@ async def test_idle_operator_client_cannot_block_shutdown(service_config: Servic
 
 @pytest.mark.asyncio
 async def test_lease_epoch_advances_after_restart(service_config: ServiceConfig):
+    service_config = service_config.model_copy(
+        update={"reconcile_interval_seconds": 0.02, "completed_reconcile_interval_seconds": 0.02}
+    )
     clock = FakeClock()
     seed_parcels(service_config, clock, "P-epoch")
     first_adapter = FakeGitHub()

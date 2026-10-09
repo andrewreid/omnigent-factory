@@ -280,6 +280,10 @@ class _CountingAdapter:
         self.reads.append(root_id)
         raise OmnigentReadError("not needed")
 
+    async def observe_trees(self, root_ids: list[str]) -> list[Any]:
+        self.reads.extend(root_ids)
+        return [OmnigentReadError("not needed") for _ in root_ids]
+
 
 def _with_lifecycle(p: Parcel, lifecycle: Lifecycle) -> Parcel:
     cur = p.current_session
@@ -330,3 +334,30 @@ async def test_observer_reads_settled_trees_at_the_slower_cadence() -> None:
     for _ in range(3):
         await observer.observe_once()
     assert len(adapter.reads) == 5
+
+
+async def test_an_observer_pass_shares_one_inventory_read(git_env: GitEnv) -> None:
+    """``observe_trees``: every walk, then one inventory read, then each scan's snapshots.
+
+    The read still starts after each tree's walk (an archived intermediate parent is
+    found), and a failed read makes every scan of the pass incomplete, never idle.
+    """
+    rig = make_rig(git_env, page_limit=100)
+    _unrelated(rig.server, 50)
+    _tree(rig.server)
+    for i in range(2):
+        rig.server.add(FakeSession(id=f"conv_r{i}", agent_id=AGENT, created_at=NEW))
+    roots = [ROOT, "conv_r0", "conv_r1"]
+    await rig.adapter.observe_tree(ROOT)  # the first, full inventory read
+    before = rig.server.count(*LIST)
+    results = await rig.adapter.observe_trees(roots)
+    assert rig.server.count(*LIST) == before + 1  # one read for three trees
+    first = results[0]
+    assert not isinstance(first, Exception)
+    assert first.complete and first.busy and {"conv_arch", "conv_hidden"} <= set(first.nodes)
+    assert all(not isinstance(r, Exception) and r.quiescent for r in results[1:])
+    rig.server.fail_paths.add("/v1/sessions")
+    failed = await rig.adapter.observe_trees(["conv_r0", "conv_r1"])
+    for result in failed:
+        assert not isinstance(result, Exception)
+        assert not result.complete and not result.quiescent

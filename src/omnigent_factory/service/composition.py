@@ -36,6 +36,7 @@ from omnigent_factory.omnigent.rest import OmnigentReadError, OmnigentRest
 from omnigent_factory.ports.clock import SystemClock
 from omnigent_factory.ports.github import IssueRef
 from omnigent_factory.service.auto_triage import AutoTriager
+from omnigent_factory.service.board_diff import BoardDiff
 from omnigent_factory.service.board_index import BoardIndex
 from omnigent_factory.service.cleanup import CleanupAdapter, WorkspaceCleaner
 from omnigent_factory.service.config import ConfigError, ServiceConfig
@@ -119,6 +120,7 @@ class ProductionRuntime:
         await self.broker.restore()
         await self.broker_server.restore()
         github_observed = await self._github_reconcile()
+        # Only open runs are scanned (the observer skips closed ones): live parcels.
         omnigent_observed = await self.observer.observe_once()
         parcels = [
             parcel
@@ -184,9 +186,15 @@ class ProductionRuntime:
         return frozenset(held)
 
     async def _github_reconcile(self) -> frozenset[str]:
+        """Fresh issue reads of the parcels with live work (``reconcile_live``) only.
+
+        Everything else changes only on GitHub: the reconcile loop's board diff catches
+        what changed while the daemon was down, without a per-issue read of each.
+        """
         observed: set[str] = set()
+        live, _idle = await self.service.live_parcel_ids()
         for parcel in await _load_parcels(self.service):
-            if parcel.issue_number is None or parcel.current_session is None:
+            if parcel.issue_number is None or parcel.parcel_id not in live:
                 continue
             snapshot = await self.github.issue_snapshot(
                 IssueRef(self.config.repo_id, parcel.issue_number, parcel.parcel_id)
@@ -205,6 +213,9 @@ class ProductionRuntime:
                 )
             )
             observed.add(parcel.parcel_id)
+        # Read now: the reconcile loop's first periodic read of each is a full interval
+        # away (no burst right after boot).
+        self.service.note_reconciled(observed)
         return frozenset(observed)
 
     async def close(self) -> None:
@@ -232,7 +243,7 @@ async def build_production(
     process_lock = ProcessLock(config.state_dir)
     process_lock.acquire()
     clock = SystemClock()
-    github_http = httpx.AsyncClient(transport=github_transport, timeout=15.0)
+    github_http = github_http_client(github_transport)
     authenticator = AppAuthenticator(
         config.github_app_id, _private_file(config.resolved_app_private_key_file)
     )
@@ -352,6 +363,7 @@ async def build_production(
         broker_socket=config.broker_socket,
         helper_command=helper_command,
     )
+    omnigent_adapter.set_inventory_resync(config.session_inventory_resync_hours * 3600)
     recording_omnigent = RecordingOmnigentAdapter(omnigent_adapter, directory)
     observer = OmnigentObserver(
         service,
@@ -373,6 +385,7 @@ async def build_production(
         omnigent=omnigent,
         omnigent_adapter=omnigent_adapter,
     )
+    service.board_diff = BoardDiff(service, github.board_cards)
     board = BoardIndex(github.board_issues, clock)
     github.related_marker = RelatedMarker(service, board, directory).schedule
     service.auto_triager = AutoTriager(service, board, github.issue_snapshot)
@@ -395,6 +408,7 @@ async def build_production(
         github.independent_reviewer_ids = new.independent_reviewer_ids
         github.review_bot_login = new.review_bot_login
         github.review_bot_mention = new.review_bot_mention
+        omnigent_adapter.set_inventory_resync(new.session_inventory_resync_hours * 3600)
 
     service.config_listeners.append(adopt_reloaded)
     cleaner = WorkspaceCleaner(directory, workspaces, config.worktree_root)
@@ -410,6 +424,24 @@ async def build_production(
         service,
         GitHubWebhookVerifier(config.resolved_webhook_secret_file, normalizer, clock),
         build_endpoint(service, directory, config, board=board, ranker=ranker),
+    )
+
+
+#: GitHub connection pool. httpx's default keeps an idle connection only 5 s, so reads
+#: spaced (or bursting) further apart opened a new TLS connection almost every request;
+#: GitHub keeps idle connections far longer. A bounded pool also stops a burst of
+#: per-parcel effects from opening one connection each (they queue for a free one).
+GITHUB_HTTP_LIMITS = httpx.Limits(
+    max_connections=16, max_keepalive_connections=16, keepalive_expiry=120.0
+)
+#: Waiting for a pooled connection is not a GitHub timeout: allow a queue behind a burst.
+GITHUB_HTTP_TIMEOUT = httpx.Timeout(15.0, pool=60.0)
+
+
+def github_http_client(transport: httpx.AsyncBaseTransport | None = None) -> httpx.AsyncClient:
+    """The daemon's single, shared GitHub HTTP client (one pool for every call)."""
+    return httpx.AsyncClient(
+        transport=transport, timeout=GITHUB_HTTP_TIMEOUT, limits=GITHUB_HTTP_LIMITS
     )
 
 

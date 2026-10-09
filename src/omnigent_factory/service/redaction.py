@@ -58,6 +58,39 @@ def install_redaction_filter() -> SecretRedactionFilter:
     return installed
 
 
+class DemoteToDebug(logging.Filter):
+    """Re-level a library's routine INFO lines (by message prefix) to DEBUG.
+
+    The library logs them at INFO; a logger filter runs before the handlers, so the
+    record is re-levelled and then dropped unless DEBUG is enabled for that logger.
+    """
+
+    def __init__(self, *prefixes: str) -> None:
+        super().__init__()
+        self.prefixes = prefixes
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno == logging.INFO and str(record.msg).startswith(self.prefixes):
+            record.levelno, record.levelname = logging.DEBUG, "DEBUG"
+            return logging.getLogger(record.name).isEnabledFor(logging.DEBUG)
+        return True
+
+
+#: Library loggers whose routine lines are DEBUG for the daemon.
+_DEMOTED: dict[str, tuple[str, ...]] = {
+    # One per MCP request: the streamable-HTTP transport is stateless.
+    "mcp.server.streamable_http": ("Terminating session",),
+}
+
+
+def demote_routine_library_logs() -> None:
+    """Idempotently install :class:`DemoteToDebug` on the :data:`_DEMOTED` loggers."""
+    for name, prefixes in _DEMOTED.items():
+        logger = logging.getLogger(name)
+        if not any(isinstance(f, DemoteToDebug) for f in logger.filters):
+            logger.addFilter(DemoteToDebug(*prefixes))
+
+
 def configure_logging(level: int = logging.INFO) -> None:
     """Daemon logging to stderr (journald) with secret redaction on every handler."""
     root = logging.getLogger()
@@ -69,4 +102,5 @@ def configure_logging(level: int = logging.INFO) -> None:
     # Per-request HTTP client lines add noise and carry full URLs; keep them quiet.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    demote_routine_library_logs()
     install_redaction_filter()

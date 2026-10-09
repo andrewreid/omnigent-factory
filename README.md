@@ -468,6 +468,26 @@ touched; a worktree with uncommitted changes is kept unless the PR is merged; th
 branch is deleted only when the PR is merged or its tip is the verified Ready head.
 Skipped items are logged. `cleanup` runs the same step by hand.
 
+### Reconciliation and observation load
+
+Only parcels with live work get a per-issue GitHub read every `reconcile_interval_seconds`
+(spread over the interval, never one burst): an open (or stopping, fenced, checkpointed)
+run, an unsettled tree, an ambiguous or unsettled write, an open owner decision, stage
+authority waiting to start, an in-flight board write, a queued or admitted build, or a PR
+whose readiness is unverified (review bot pending, merge unknown). Every other parcel is
+covered by a board-wide diff every `board_diff_interval_minutes` (default `5`,
+hot-reloadable): one Projects read compares each card's column, Bot, open/closed,
+assignees, labels, title and `updatedAt` with the values stored at the last diff, and only
+a changed card (or one never compared) gets a per-issue read. A missed webhook (close,
+reopen, move, edit, label, assignment) is thus applied within one diff interval. Boot reads
+only live parcels.
+
+The Omnigent observer scans only open runs; a WAITING run parked on the owner (open
+decision, plan approval, Needs you) is read on the settled cadence. All trees due in one
+pass share one archive-inclusive inventory read (taken after every tree's child walk); its
+full resync runs every `session_inventory_resync_hours` (default `6`, hot-reloadable). A
+failed read still makes every scan of the pass incomplete, never idle.
+
 ### State database size
 
 The parcel aggregate (`parcels.aggregate_json`) is the state; events are history the
@@ -477,7 +497,13 @@ reducer never replays. Retention runs every 15 minutes in the daemon, in short b
 |---|---|---|
 | `observation_retention_hours` | `2` | Periodic observation events (`ReconcileDue`, `GitHubSnapshot`, delivery-keyed `ChecksChanged`, `ReadinessEvidence`, `TreeQuiescent`, cost/runtime samples, `CapacityAvailable`), their audit rows and the settled read/board-drift effects they spawned. |
 | `delivery_body_retention_days` | `1` | Body and headers of processed deliveries that no event, or only check/PR/review observations, references. The row and its GUID stay for duplicate detection. |
-| `completed_reconcile_interval_seconds` | `3600` | Not a deletion: a completed parcel with no live session or open decision is reconciled hourly instead of every `reconcile_interval_seconds`. |
+| `delivery_row_retention_days` | `14` | Rows (and delivery attempts) of processed deliveries whose body was pruned, unless an event, a parked delivery, a parcel hold or stored review comments reference them; quarantined attempts are kept. A delivery that produced no event (ignored, no transition) loses its body and headers as soon as it is processed (GUID and sha256 stay). |
+| `completed_reconcile_interval_seconds` | `3600` | Not a deletion: only when no board diff is wired, a parcel with no live work is reconciled at this cadence instead of every `reconcile_interval_seconds`. |
+
+An issue read (`GitHubSnapshot`) whose values equal the parcel's newest stored read and
+changes nothing is not stored at all (nor its read effect or audit row); when a newer read
+is stored, the previous one keeps a sha256 of the issue body instead of the text (only the
+newest read's text is read back, as the issue the agent sees).
 
 Never removed: each parcel's newest event of each kind (read back as current issue
 evidence and readiness), events referenced by authorizations, fences, approvals or

@@ -80,7 +80,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -125,7 +125,15 @@ from omnigent_factory.omnigent.rest import (
     as_map,
     classify_write,
 )
-from omnigent_factory.omnigent.tree import DEFAULT_MAX_NODES, TreeObservation, scan_tree
+from omnigent_factory.omnigent.tree import (
+    DEFAULT_MAX_NODES,
+    ScanWalk,
+    TreeObservation,
+    begin_scan,
+    close_over_index,
+    finish_scan,
+    scan_tree,
+)
 from omnigent_factory.ports.clock import Clock
 from omnigent_factory.ports.omnigent import OMNIGENT_EFFECT_KINDS, SessionMatch, TreeScan
 
@@ -318,6 +326,10 @@ class OmnigentExecutionAdapter:
             for row in rows
         ]
 
+    def set_inventory_resync(self, seconds: float) -> None:
+        """Interval between full inventory reads (hot-reloadable)."""
+        self._index.set_resync(seconds)
+
     async def observe_tree(self, root_id: str) -> TreeObservation:
         known = self._known_nodes.setdefault(root_id, {root_id})
         obs = await scan_tree(
@@ -327,13 +339,56 @@ class OmnigentExecutionAdapter:
             max_nodes=self.config.max_tree_nodes,
             index=self._index,
         )
-        known.update(obs.nodes)
+        self._record_scan(root_id, obs)
+        return obs
+
+    async def observe_trees(
+        self, root_ids: Sequence[str]
+    ) -> list[TreeObservation | OmnigentReadError | OSError | ValueError]:
+        """Scan several trees with one inventory refresh (an observer pass).
+
+        Every tree's child walk runs first; then one inventory read, which starts after
+        all of them (the same guarantee a single scan's refresh gives); then each scan
+        is finished. A failed refresh makes every scan incomplete, never idle. Results
+        are in ``root_ids`` order; a scan that raised is its exception.
+        """
+        limit = self.config.max_tree_nodes
+        walks: list[ScanWalk | OmnigentReadError | OSError | ValueError] = []
+        for root_id in root_ids:
+            try:
+                walks.append(await begin_scan(self.rest, root_id, max_nodes=limit))
+            except (OmnigentReadError, OSError, ValueError) as exc:
+                walks.append(exc)
+        inventory_error: str | None = None
+        try:
+            await self._index.refresh()
+        except OmnigentReadError as exc:
+            inventory_error = exc.reason
+        results: list[TreeObservation | OmnigentReadError | OSError | ValueError] = []
+        for root_id, walk in zip(root_ids, walks, strict=True):
+            if not isinstance(walk, ScanWalk):
+                results.append(walk)
+                continue
+            try:
+                close_over_index(self._index, walk, limit, inventory_error)
+                known = self._known_nodes.setdefault(root_id, {root_id})
+                obs = await finish_scan(
+                    self.rest, root_id, walk, known_ids=tuple(known), max_nodes=limit
+                )
+            except (OmnigentReadError, OSError, ValueError) as exc:
+                results.append(exc)
+                continue
+            self._record_scan(root_id, obs)
+            results.append(obs)
+        return results
+
+    def _record_scan(self, root_id: str, obs: TreeObservation) -> None:
+        self._known_nodes.setdefault(root_id, {root_id}).update(obs.nodes)
         if obs.quiescent:
             self._unquiet_at.pop(root_id, None)
         else:
             self._unquiet_at[root_id] = self.clock.monotonic_us()
         self._busy_nodes[root_id] = tuple(sorted(n.node_id for n in obs.nodes.values() if n.busy))
-        return obs
 
     def busy_nodes(self, root_id: str) -> tuple[str, ...]:
         """Busy node IDs from the latest scan of ``root_id`` (empty if never scanned)."""

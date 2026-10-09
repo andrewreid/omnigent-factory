@@ -216,7 +216,7 @@ def node_from_snapshot(
 
 
 @dataclass
-class _Walk:
+class ScanWalk:
     parents: dict[str, str | None] = field(default_factory=dict)
     summaries: dict[str, Mapping[str, Any]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
@@ -231,9 +231,44 @@ async def scan_tree(
     index: SessionIndex | None = None,
 ) -> TreeObservation:
     """Scan ``root_id``'s tree; ``index`` is shared across scans (a one-off otherwise)."""
-    walk = _Walk(parents={root_id: None})
-    await _walk_children(rest, root_id, walk, max_nodes)
+    walk = await begin_scan(rest, root_id, max_nodes=max_nodes)
     await _close_over_inventory(index or SessionIndex(rest), walk, max_nodes)
+    return await finish_scan(rest, root_id, walk, known_ids=known_ids, max_nodes=max_nodes)
+
+
+async def begin_scan(rest: OmnigentRest, root_id: str, *, max_nodes: int) -> ScanWalk:
+    """Step 1 of a scan: walk the (non-archived) child lists from ``root_id``.
+
+    Steps 2-3 (:func:`close_over_index`, :func:`finish_scan`) must follow with an
+    inventory refreshed by a read that started after this walk: several scans may share
+    one such refresh (an observer pass walks every due tree, refreshes once, then
+    finishes each scan).
+    """
+    walk = ScanWalk(parents={root_id: None})
+    await _walk_children(rest, root_id, walk, max_nodes)
+    return walk
+
+
+def close_over_index(
+    index: SessionIndex, walk: ScanWalk, max_nodes: int, inventory_error: str | None
+) -> None:
+    """Step 2: close the walk over the refreshed inventory (or record its failure, which
+    makes the scan incomplete: never idle)."""
+    if inventory_error is not None:
+        walk.errors.append(f"inventory: {inventory_error}")
+        return
+    _close_over_index(index, walk, max_nodes)
+
+
+async def finish_scan(
+    rest: OmnigentRest,
+    root_id: str,
+    walk: ScanWalk,
+    *,
+    known_ids: Iterable[str] = (),
+    max_nodes: int = DEFAULT_MAX_NODES,
+) -> TreeObservation:
+    """Step 3: read every node's current snapshot, root included."""
     for kid in known_ids:
         if kid not in walk.parents:
             walk.parents[kid] = None  # retained: parent resolved from its snapshot
@@ -278,7 +313,7 @@ def _unread_mirror_owners(nodes: Mapping[str, NodeState]) -> list[str]:
     return sorted(owners)
 
 
-async def _walk_children(rest: OmnigentRest, root_id: str, walk: _Walk, max_nodes: int) -> None:
+async def _walk_children(rest: OmnigentRest, root_id: str, walk: ScanWalk, max_nodes: int) -> None:
     frontier = [root_id]
     visited: set[str] = set()
     while frontier:
@@ -302,12 +337,16 @@ async def _walk_children(rest: OmnigentRest, root_id: str, walk: _Walk, max_node
             frontier.append(child)
 
 
-async def _close_over_inventory(index: SessionIndex, walk: _Walk, max_nodes: int) -> None:
+async def _close_over_inventory(index: SessionIndex, walk: ScanWalk, max_nodes: int) -> None:
     try:
         await index.refresh()
     except OmnigentReadError as exc:
         walk.errors.append(f"inventory: {exc.reason}")
         return
+    _close_over_index(index, walk, max_nodes)
+
+
+def _close_over_index(index: SessionIndex, walk: ScanWalk, max_nodes: int) -> None:
     stack = list(walk.parents)
     while stack and len(walk.parents) <= max_nodes:
         current = stack.pop()

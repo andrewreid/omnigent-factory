@@ -164,5 +164,5 @@ async def test_observer_drops_a_tree_read_whose_run_changed_meanwhile():
         return service.fresh
 
     observer._load_parcel = load  # type: ignore[method-assign]
-    await observer._observe(stale)
+    await observer._observe(stale, await _Adapter().observe_tree("root"))
     assert service.applied == []

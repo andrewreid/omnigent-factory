@@ -311,6 +311,9 @@ class IssueSnapshot:
     bot: str | None = None
     #: The board's current "Factory note" text ("" when empty); None when not read.
     note: str | None = None
+    #: sha256 of ``body`` when a stored read was superseded by a newer one and its body
+    #: dropped (only the newest read's text is ever read back); None otherwise.
+    body_sha256: str | None = None
 
     @property
     def eligible(self) -> bool:

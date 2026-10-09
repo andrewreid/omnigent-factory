@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import logging
 import signal
 import uuid
@@ -14,7 +16,9 @@ from pathlib import Path
 from typing import Any
 
 from omnigent_factory.core import events as ev
+from omnigent_factory.core.codec import parcel_from_json
 from omnigent_factory.core.effects import (
+    READ_ONLY_KINDS,
     Ack,
     AdapterOutcome,
     EffectIntent,
@@ -22,12 +26,14 @@ from omnigent_factory.core.effects import (
     RetryClass,
 )
 from omnigent_factory.core.events import Event, Provenance
-from omnigent_factory.core.predicates import settled
+from omnigent_factory.core.predicates import board_pending, run_closed, settled
+from omnigent_factory.core.reducer import awaiting_evidence
 from omnigent_factory.core.types import (
     MICROS_PER_MINUTE,
     AdmissionSnapshot,
     Hold,
     InboxHoldReason,
+    IssueSessionStatus,
     Lifecycle,
     Parcel,
     QueueStatus,
@@ -55,7 +61,11 @@ from omnigent_factory.service.parked import (
     inbox_hold_event,
     inbox_release_event,
 )
-from omnigent_factory.service.redaction import install_redaction_filter, redact_text
+from omnigent_factory.service.redaction import (
+    demote_routine_library_logs,
+    install_redaction_filter,
+    redact_text,
+)
 from omnigent_factory.store import ranking as ranking_store
 from omnigent_factory.store.sqlite import (
     ApplyResult,
@@ -88,6 +98,26 @@ RETENTION_SWEEP_INTERVAL_SECONDS = 900.0
 #: Observation batches (500 events each) one periodic sweep deletes at most, so the clock
 #: loop is never held for long; a large backlog drains over several sweeps.
 RETENTION_SWEEP_MAX_BATCHES = 20
+
+#: Lifecycles the clock loop acts on (active-time limit, checkpoint grace, drain timeout).
+CLOCKED_LIFECYCLES = frozenset(
+    {
+        Lifecycle.ACTIVE,
+        Lifecycle.WAITING,
+        Lifecycle.CHECKPOINT_GRACE,
+        Lifecycle.CHECKPOINT_WAIT,
+        Lifecycle.DRAINING,
+    }
+)
+_CLOCKED_LIFECYCLES_JSON = json.dumps(sorted(x.value for x in CLOCKED_LIFECYCLES))
+#: A pending read reports by itself: it does not keep its parcel live (that would make
+#: every reconcile of a parcel whose read is retrying schedule another).
+_READ_ONLY_KINDS_JSON = json.dumps(sorted(kind.value for kind in READ_ONLY_KINDS))
+#: Admission queue states that still need the admission and reconcile loops.
+_OPEN_QUEUE_STATES = frozenset({QueueStatus.QUEUED, QueueStatus.RESERVED, QueueStatus.HELD})
+#: Reconcile-loop ticks per reconcile interval: per-parcel reads are spread over the
+#: interval (never one burst), each parcel still read about once per interval.
+RECONCILE_TICKS_PER_INTERVAL = 4
 
 RETRYABLE_PUBLICATION_KINDS = frozenset(
     {
@@ -131,6 +161,16 @@ class FactoryService:
         #: Deletion of long-archived factory sessions (composition;
         #: ``service.session_retention.SessionRetention``). None: not wired.
         self.session_retention: Any = None
+        #: Board-wide diff (composition; ``service.board_diff.BoardDiff``). None: not
+        #: wired, and parcels without live work are read on the slow completed cadence.
+        self.board_diff: Any = None
+        #: Per tracked parcel: (loop time its next per-issue read is due, the cadence
+        #: that time was scheduled for) (reconcile loop).
+        self._reconcile_due: dict[str, tuple[float, float]] = {}
+        #: Loop time of the next board diff (None: at the next reconcile tick).
+        self._next_board_diff_at: float | None = None
+        #: Board digests to store once the read they scheduled has been applied.
+        self._digests_after_read: dict[str, str] = {}
         self._fatal_exit = fatal_exit
         self._fatal_reason: str | None = None
         self._delivery_failures: dict[str, int] = {}
@@ -191,6 +231,7 @@ class FactoryService:
 
     async def start(self) -> None:
         self.config.prepare_private_directories()
+        demote_routine_library_logs()
         install_redaction_filter()
         self.process_lock.acquire()
         try:
@@ -491,8 +532,9 @@ class FactoryService:
         return True
 
     async def ignore_delivery(self, delivery_guid: str) -> None:
-        """Retire a verified Project delivery proven foreign or proven to carry no change."""
-        await self.db.call(partial(_mark_delivery, delivery_guid=delivery_guid, status="processed"))
+        """Retire a verified delivery that produced no event (foreign, ignored, or carrying
+        no change); its body and headers are dropped at once (GUID and sha256 stay)."""
+        await self.db.call(lambda store: store.retire_delivery(delivery_guid))
 
     async def defer_unresolved_delivery(
         self,
@@ -603,10 +645,11 @@ class FactoryService:
         )
         if not queued:
             return
+        if await self.db.call(lambda store: store.has_pending_delivery()):
+            return
         head = None
         for candidate in queued:
-            inbox_pending = await self.db.call(lambda store: store.has_pending_delivery())
-            if not inbox_pending and not self.parked.blocks(candidate.parcel_id):
+            if not self.parked.blocks(candidate.parcel_id):
                 head = candidate
                 break
         if head is None:
@@ -640,38 +683,129 @@ class FactoryService:
         )
 
     async def _reconcile_loop(self) -> None:
-        # Startup reconciliation occurs immediately, then on the configured cadence; a
-        # completed, idle parcel only every completed_reconcile_interval_seconds.
+        """Per-issue reads only for parcels with live work; a board diff for the rest.
+
+        A live parcel (:func:`reconcile_live`) is read about once per reconcile interval,
+        its first read placed at a stable offset within the interval so reads never
+        burst (a parcel boot already read waits a whole interval). Every other parcel is
+        read only when the board diff shows its card changed (``BoardDiff``) or, when no
+        diff is wired, every ``completed_reconcile_interval_seconds``.
+        """
         failures = 0
-        last_at: dict[str, float] = {}
         while not self._stop.is_set():
             try:
-                now = self.clock.now_utc_us()
-                parcel_ids = await self._parcel_ids()
-                for parcel_id in parcel_ids:
-                    loop_now = asyncio.get_running_loop().time()
-                    previous = last_at.get(parcel_id)
-                    if (
-                        previous is not None
-                        and loop_now - previous < self.config.completed_reconcile_interval_seconds
-                    ):
-                        parcel = await self.db.call(partial(_load_parcel, parcel_id=parcel_id))
-                        if parcel is not None and _completed_idle(parcel):
-                            continue
-                    last_at[parcel_id] = loop_now
-                    await self.apply_event(
-                        self._event(
-                            parcel_id,
-                            ev.ReconcileDue(),
-                            f"reconcile:{parcel_id}:{now}",
-                        )
-                    )
+                await self._reconcile_tick()
                 failures = 0
-                await self._wait(self.config.reconcile_interval_seconds)
+                wait = self.config.reconcile_interval_seconds / RECONCILE_TICKS_PER_INTERVAL
+                if self.board_diff is not None and self._next_board_diff_at is not None:
+                    # A diff is never late by a tick: the bound on a missed webhook holds.
+                    until = self._next_board_diff_at - asyncio.get_running_loop().time()
+                    wait = min(wait, max(until, 0.0))
+                await self._wait(wait)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 failures = await self._background_error("reconcile", failures)
+
+    def note_reconciled(self, parcel_ids: Iterable[str]) -> None:
+        """Parcels read at boot: their next periodic read is a whole interval away."""
+        interval = self.config.reconcile_interval_seconds
+        due = asyncio.get_running_loop().time() + interval
+        for parcel_id in parcel_ids:
+            self._reconcile_due[parcel_id] = (due, interval)
+
+    async def _reconcile_tick(self) -> None:
+        loop_now = asyncio.get_running_loop().time()
+        interval = self.config.reconcile_interval_seconds
+        live, idle = await self.live_parcel_ids()
+        if self.board_diff is not None:
+            await self._board_diff_tick(loop_now, live)
+            # Cards never compared before: one read each, spread like live reads.
+            periods = {pid: interval for pid in self._digests_after_read if pid not in live}
+        else:
+            slow = self.config.completed_reconcile_interval_seconds
+            periods = dict.fromkeys(idle, slow)
+        periods.update(dict.fromkeys(live, interval))
+        for parcel_id in [pid for pid in self._reconcile_due if pid not in periods]:
+            del self._reconcile_due[parcel_id]  # idle again: the board diff watches it
+        for parcel_id, period in sorted(periods.items()):
+            first = loop_now + _spread(parcel_id) * period
+            due, scheduled = self._reconcile_due.get(parcel_id, (first, period))
+            if scheduled != period:  # e.g. idle -> live: never later than the new cadence
+                due = min(due, first)
+            self._reconcile_due[parcel_id] = (due, period)
+            if loop_now >= due:
+                self._reconcile_due[parcel_id] = (loop_now + period, period)
+                await self._reconcile(parcel_id)
+
+    async def _board_diff_tick(self, loop_now: float, live: frozenset[str]) -> None:
+        if self._next_board_diff_at is not None and loop_now < self._next_board_diff_at:
+            return
+        diff = await self.board_diff.run_once()
+        if diff is None:
+            # Unreadable board: try again next tick; a failed read never counts as "no
+            # change".
+            return
+        self._next_board_diff_at = loop_now + self.config.board_diff_interval_minutes * 60
+        for parcel_id, digest in sorted(diff.changed.items()):
+            # A card the board shows changed is read now, live or not.
+            await self._reconcile(parcel_id, digest=digest)
+            if parcel_id in live:
+                interval = self.config.reconcile_interval_seconds
+                self._reconcile_due[parcel_id] = (loop_now + interval, interval)
+        # Never compared before (e.g. the first diff ever): read once, spread over the
+        # reconcile interval; the digest is stored after that read.
+        self._digests_after_read.update(diff.unknown)
+
+    async def _reconcile(self, parcel_id: str, *, digest: str | None = None) -> None:
+        """Apply one ``ReconcileDue`` (the reducer issues the per-issue read)."""
+        now = self.clock.now_utc_us()
+        await self.apply_event(
+            self._event(parcel_id, ev.ReconcileDue(), f"reconcile:{parcel_id}:{now}")
+        )
+        # The read is durable in the outbox now: the card's values may be recorded.
+        stored = self._digests_after_read.pop(parcel_id, None)
+        if digest is not None or stored is not None:
+            value = digest or stored or ""
+            await self.db.call(lambda store: store.save_board_digests({parcel_id: value}))
+
+    async def live_parcel_ids(self) -> tuple[frozenset[str], frozenset[str]]:
+        """(live, idle) parcel IDs of the repository (see :func:`reconcile_live`).
+
+        One DB-worker call; aggregates come from the store's decoded-parcel cache.
+        """
+        repo_id = self.config.repo_id
+        now_us = self.clock.now_utc_us()
+
+        def classify(store: SqliteStore) -> tuple[frozenset[str], frozenset[str]]:
+            admission = store.load_admission(repo_id)
+            unsettled = frozenset(
+                str(row[0])
+                for row in store.query(
+                    "SELECT DISTINCT parcel_id FROM effects "
+                    "WHERE state IN ('pending', 'claimed', 'unknown') AND parcel_id IS NOT NULL "
+                    "AND kind NOT IN (SELECT value FROM json_each(?))",
+                    (_READ_ONLY_KINDS_JSON,),
+                )
+            )
+            live: set[str] = set()
+            idle: set[str] = set()
+            for (parcel_id,) in store.query(
+                "SELECT parcel_id FROM parcels WHERE repo_id = ? ORDER BY parcel_id", (repo_id,)
+            ):
+                parcel = store.load_parcel(str(parcel_id))
+                if parcel is None:
+                    continue
+                if reconcile_live(
+                    parcel, admission=admission, unsettled_effects=unsettled, now_us=now_us
+                ):
+                    live.add(parcel.parcel_id)
+                else:
+                    idle.add(parcel.parcel_id)
+            return frozenset(live), frozenset(idle)
+
+        result: tuple[frozenset[str], frozenset[str]] = await self.db.call(classify)
+        return result
 
     async def _auto_triage_loop(self) -> None:
         """One auto-triage decision per reconcile interval (it starts at most one triage).
@@ -716,7 +850,7 @@ class FactoryService:
         failures = 0
         while not self._stop.is_set():
             try:
-                for parcel_id in await self._parcel_ids():
+                for parcel_id in await self._clocked_parcel_ids():
                     parcel = await self.db.call(partial(_load_parcel, parcel_id=parcel_id))
                     if parcel is not None:
                         await self._sample_clock(parcel)
@@ -826,6 +960,34 @@ class FactoryService:
                     f"drain-timeout:{session.session_id}:{started}",
                 )
             )
+
+    async def _clocked_parcel_ids(self) -> list[str]:
+        """Parcels with a run the clock acts on (:data:`CLOCKED_LIFECYCLES`), by the
+        relational session projection: idle parcels are never loaded every tick."""
+        rows = await self.db.call(
+            lambda store: store.query(
+                "SELECT DISTINCT p.parcel_id FROM parcels p "
+                "JOIN stage_sessions s ON s.parcel_id = p.parcel_id "
+                "WHERE p.repo_id = ? AND s.lifecycle IN (SELECT value FROM json_each(?)) "
+                "ORDER BY p.parcel_id",
+                (self.config.repo_id, _CLOCKED_LIFECYCLES_JSON),
+            )
+        )
+        return [str(row[0]) for row in rows]
+
+    async def open_run_parcel_ids(self) -> list[str]:
+        """Parcels whose current run is not closed and has a tree (observer candidates),
+        by the relational session projection."""
+        rows = await self.db.call(
+            lambda store: store.query(
+                "SELECT p.parcel_id FROM parcels p "
+                "JOIN stage_sessions s ON s.session_id = p.current_session_id "
+                "WHERE p.repo_id = ? AND s.execution_closed = 0 "
+                "AND s.issue_root_id IS NOT NULL ORDER BY p.parcel_id",
+                (self.config.repo_id,),
+            )
+        )
+        return [str(row[0]) for row in rows]
 
     async def _parcel_ids(self) -> list[str]:
         rows = await self.db.call(
@@ -1195,6 +1357,50 @@ def _has_own_pr(parcel: Parcel | None, admission: AdmissionSnapshot) -> bool:
     )
 
 
+def reconcile_live(
+    parcel: Parcel,
+    *,
+    admission: AdmissionSnapshot,
+    unsettled_effects: frozenset[str],
+    now_us: int,
+) -> bool:
+    """The parcel has work a periodic per-issue read (``ReconcileDue``) can advance.
+
+    A run that may still execute or is stopping (FENCED/draining/checkpoint included),
+    a tree not yet settled, an ambiguous or unsettled write (a pending read reports by
+    itself), an open owner decision, recorded stage authority waiting to start, an
+    in-flight board write, a queued or admitted build, a PR whose readiness is unverified
+    (review bot pending, merge unknown, report line pending) or a terminal parcel whose
+    issue session still needs archiving. Anything else changes only on GitHub, which the
+    board diff watches.
+    """
+    cur = parcel.current_session
+    queued = admission.queue_entry(parcel.parcel_id)
+    issue = parcel.issue_session
+    return (
+        (cur is not None and not run_closed(parcel, cur))
+        or any(not settled(s) and not run_closed(parcel, s) for s in parcel.sessions)
+        or bool(parcel.unknown_effects)
+        or parcel.parcel_id in unsettled_effects
+        or bool(parcel.open_decisions)
+        or parcel.pending_authorization_id is not None
+        or board_pending(parcel)
+        or (queued is not None and queued.status in _OPEN_QUEUE_STATES)
+        or awaiting_evidence(parcel, now_us)
+        or (
+            Hold.COMPLETED in parcel.holds
+            and issue is not None
+            and issue.status in (IssueSessionStatus.LIVE, IssueSessionStatus.CLOSING)
+        )
+    )
+
+
+def _spread(parcel_id: str) -> float:
+    """A stable offset in [0, 1) of an interval for ``parcel_id`` (no boot burst)."""
+    digest = hashlib.sha256(parcel_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64
+
+
 def _completed_idle(parcel: Parcel) -> bool:
     """Completed, with no live session or open decision: nothing a reconcile can advance."""
     session = parcel.current_session
@@ -1234,7 +1440,8 @@ async def prune_history(
     dry_run: bool = False,
     max_batches: int | None = None,
 ) -> dict[str, int]:
-    """One retention sweep: delivery bodies, then old observation events.
+    """One retention sweep: delivery bodies, old observation events, then delivery rows
+    and attempts past ``delivery_row_retention_days``.
 
     Each batch is its own short transaction, so live work interleaves on the DB worker.
     ``max_batches`` bounds the observation batches (a large backlog then drains over
@@ -1244,6 +1451,10 @@ async def prune_history(
     bodies = await prune_delivery_bodies(call, config, now_us, dry_run=dry_run)
     before_us = now_us - int(config.observation_retention_hours * 3600 * 1_000_000)
     totals = await prune_observations(call, before_us, dry_run=dry_run, max_batches=max_batches)
+    rows, attempts = await prune_delivery_rows(
+        call, config, now_us, dry_run=dry_run, max_batches=max_batches
+    )
+    totals = {**totals, "delivery_rows": rows, "delivery_attempts": attempts}
     if not dry_run:
         free_pages = -1
         while True:
@@ -1255,6 +1466,40 @@ async def prune_history(
     if not dry_run and any(result.values()):
         LOG.info("history pruned %s", " ".join(f"{k}={v}" for k, v in result.items()))
     return result
+
+
+async def prune_delivery_rows(
+    call: StoreCall,
+    config: ServiceConfig,
+    now_us: int,
+    *,
+    dry_run: bool = False,
+    max_batches: int | None = None,
+    limit: int = 500,
+) -> tuple[int, int]:
+    """Delete fully pruned delivery rows and old attempts (see
+    :meth:`SqliteStore.prune_delivery_rows`); a delivery a parcel hold names is kept."""
+    before_us = now_us - int(config.delivery_row_retention_days * 86_400 * 1_000_000)
+    held: list[str] = []
+    for (text,) in await call(
+        lambda store: store.query(
+            "SELECT aggregate_json FROM parcels WHERE holds_json LIKE ?", ('%"inbox"%',)
+        )
+    ):
+        held.extend(hold.delivery_guid for hold in parcel_from_json(str(text)).inbox_holds)
+    if dry_run:
+        counted: tuple[int, int] = await call(
+            lambda store: store.prune_delivery_rows(before_us, held, dry_run=True)
+        )
+        return counted
+    rows = attempts = batches = 0
+    while True:
+        batch: tuple[int, int] = await call(
+            lambda store: store.prune_delivery_rows(before_us, held, limit=limit)
+        )
+        rows, attempts, batches = rows + batch[0], attempts + batch[1], batches + 1
+        if max(batch) < limit or (max_batches is not None and batches >= max_batches):
+            return rows, attempts
 
 
 async def prune_observations(

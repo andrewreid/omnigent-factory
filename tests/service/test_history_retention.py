@@ -10,7 +10,7 @@ import pytest
 
 from omnigent_factory import cli
 from omnigent_factory.core import events as ev
-from omnigent_factory.core.types import Hold
+from omnigent_factory.core.types import Hold, Via
 from omnigent_factory.service.config import ServiceConfig
 from omnigent_factory.service.locking import ProcessLock
 from omnigent_factory.service.runtime import FactoryService, _completed_idle, prune_observations
@@ -45,7 +45,8 @@ def test_completed_idle_needs_completion_without_live_work():
 
 
 @pytest.mark.asyncio
-async def test_completed_parcels_reconcile_on_the_slow_cadence(service_config: ServiceConfig):
+async def test_only_live_parcels_reconcile_on_the_fast_cadence(service_config: ServiceConfig):
+    """No board diff wired: idle and completed parcels fall back to the slow cadence."""
     config = service_config.model_copy(
         update={"reconcile_interval_seconds": 0.02, "completed_reconcile_interval_seconds": 3600}
     )
@@ -54,23 +55,33 @@ async def test_completed_parcels_reconcile_on_the_slow_cadence(service_config: S
     await service.start()
     try:
         factories = {
-            pid: EventFactory(pid, issue_number=n) for pid, n in (("P-open", 1), ("P-done", 2))
+            pid: EventFactory(pid, issue_number=n)
+            for pid, n in (("P-live", 1), ("P-done", 2), ("P-idle", 3))
         }
         for f in factories.values():
             await service.apply_event(
                 f.make(ev.GitHubSnapshot(), evidence=snapshot(read_at_us=f.now))
             )
+        # Owner triage request: its run's create stays pending (no adapter): live.
+        await service.operator_command("unpause", {})
+        await service.apply_event(factories["P-live"].make(ev.RequestTriage(via=Via.DRAG)))
         closed = await service.apply_event(factories["P-done"].make(ev.Closed()))
         assert closed.parcel is not None and _completed_idle(closed.parcel)
-        start_done = await _reconciles(service, "P-done")
-        start_open = await _reconciles(service, "P-open")
+        # Its workspace cleanup has no adapter here: settle it (pending work is live).
+        await service.db.call(
+            lambda store: store.query(
+                "UPDATE effects SET state = 'done' WHERE parcel_id = 'P-done'"
+            )
+        )
+        start = {pid: await _reconciles(service, pid) for pid in factories}
         end = asyncio.get_running_loop().time() + 3
-        while await _reconciles(service, "P-open") < start_open + 5:
-            assert asyncio.get_running_loop().time() < end, "active parcel not reconciled"
+        while await _reconciles(service, "P-live") < start["P-live"] + 5:
+            assert asyncio.get_running_loop().time() < end, "live parcel not reconciled"
             clock.advance(1)  # reconcile event IDs carry the clock
             await asyncio.sleep(0.02)
-        # At most the one first reconcile after completion, never one per cycle.
-        assert await _reconciles(service, "P-done") <= start_done + 1
+        # Idle parcels: at most the one first read placed within the slow interval.
+        assert await _reconciles(service, "P-done") <= start["P-done"] + 1
+        assert await _reconciles(service, "P-idle") <= start["P-idle"] + 1
     finally:
         await service.stop()
 
