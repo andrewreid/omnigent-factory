@@ -306,7 +306,27 @@ class DeliveryNormalizer:
             return self._owner_review(payload, actor_id) or self._review(payload)
         if event_name in {"check_suite", "workflow_run"}:
             return self._checks(payload, event_name)
+        if event_name == "push":
+            return self._push(payload)
         return ()
+
+    @staticmethod
+    def _push(payload: dict[str, Any]) -> tuple[ev.EventBody, ...]:
+        """A push to the repository's default branch (any other ref, or a deletion, is
+        no transition)."""
+        repo = payload.get("repository")
+        default = repo.get("default_branch") if isinstance(repo, dict) else None
+        ref = payload.get("ref")
+        after = payload.get("after")
+        if (
+            not isinstance(default, str)
+            or not default
+            or ref != f"refs/heads/{default}"
+            or payload.get("deleted") is True
+            or not isinstance(after, str)
+        ):
+            return ()
+        return (ev.BasePushed(ref=ref, head_sha=after),)
 
     def _comment(self, text: str, actor_id: int) -> tuple[ev.EventBody, ...]:
         if actor_id == self.identity.bot_user_id:

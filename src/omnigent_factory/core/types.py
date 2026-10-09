@@ -379,6 +379,8 @@ class StageAuthorization:
     cancelled: bool = False
     #: A build re-run on owner feedback after the work was built (same approval).
     rework: bool = False
+    #: That re-run resolves a merge conflict with the base branch (no owner feedback).
+    conflict: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -548,6 +550,9 @@ class Readiness:
     #: When the wait for a review bot whose state cannot be read began (0 = none): such
     #: a wait still ends at the cap.
     unknown_since_us: int = 0
+    #: The latest read could not tell whether the PR merges cleanly into its base (GitHub
+    #: was still computing it): the next catch-up read asks again.
+    merge_unknown: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -662,6 +667,13 @@ class Parcel:
     #: spent still reach the build once (#745).
     findings_wakes: int = 0
     pr_number: int | None = None
+    #: "<PR head>:<base head>" of the last merge-conflict wake (a wake of the build run or
+    #: a conflict rework): at most one per pair, never re-sent after a restart.
+    conflict_wake: str = ""
+    #: The reviewed head current when a merge conflict with the base was seen: its review
+    #: never carries to a later head as a base sync (resolving a conflict is new work
+    #: that needs a fresh cross-vendor review).
+    conflict_reviewed_head: str = ""
     bot: BotState = BotState.IDLE
     #: Latest informational status reason (replaces status comments; "" when none).
     note: str = ""

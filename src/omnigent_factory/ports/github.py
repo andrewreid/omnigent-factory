@@ -45,7 +45,7 @@ from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
 from omnigent_factory.core.effects import EffectKind, RetryableReadFailure
-from omnigent_factory.core.events import ChecksState, FindingRef
+from omnigent_factory.core.events import MERGE_CONFLICT, ChecksState, FindingRef
 from omnigent_factory.core.types import IssueSnapshot, Stage
 from omnigent_factory.ports.adapter import EffectAdapter
 
@@ -176,11 +176,18 @@ class PullRequestEvidence:
     open_findings: tuple[FindingRef, ...] = ()
     #: The review bot also opened threads on earlier commits of the PR.
     findings_earlier_rounds: bool = False
+    #: Merges into its base: "clean", "conflict", "unknown" (not computed yet after the
+    #: bounded re-reads) or "" (not reported).
+    mergeable: str = ""
+    #: The base branch head and name the PR was read against.
+    base_head: str = ""
+    base_ref: str = ""
 
     @property
     def verified(self) -> bool:
         return (
-            self.open
+            self.mergeable != MERGE_CONFLICT
+            and self.open
             and self.bot_authored
             and self.parcel_branch
             and self.closes_issue

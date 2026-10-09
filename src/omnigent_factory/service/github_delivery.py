@@ -10,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from omnigent_factory.core.events import Event, EventKind, Provenance
-from omnigent_factory.core.types import IssueSnapshot
+from omnigent_factory.core.types import IssueSnapshot, Stage
 from omnigent_factory.github.adapter import GitHubAPIAdapter
 from omnigent_factory.github.client import GitHubAPIError, RateLimited
 from omnigent_factory.github.webhook import (
@@ -250,6 +250,9 @@ class GitHubDeliveryProcessor:
             # delivery. Fail closed if a future change violates the inbox retirement
             # boundary instead of acknowledging a partial batch.
             raise NonRetryableDelivery("delivery expands to multiple transitions")
+        if not normalized.events and delivery.event_name == "push":
+            await self._ignore(delivery, "push to a branch other than the default branch")
+            return
         if not normalized.events:
             LOG.info("delivery has no transition delivery_guid=%s", delivery.delivery_guid)
             await self.service.db.call(
@@ -257,6 +260,9 @@ class GitHubDeliveryProcessor:
             )
             return
 
+        if normalized.events[0].kind == EventKind.BASE_PUSHED:
+            await self._base_pushed(normalized.events[0], delivery)
+            return
         event = await self._freshen(normalized.events[0], delivery)
         if event is None:
             await self._ignore(delivery, "PR/check event for no known parcel")
@@ -264,6 +270,42 @@ class GitHubDeliveryProcessor:
         if delivery.event_name == "pull_request_review" and event.kind == EventKind.PLAN_FEEDBACK:
             await self._record_review_comments(delivery, event)
         await self.service.apply_event(event, delivery_status="processed")
+
+    async def _base_pushed(self, event: Event, delivery: DeliveryRecord) -> None:
+        """A push to the default branch: every Building or Ready parcel with a recorded PR
+        re-reads it (GitHub recomputes mergeability against the new base).
+
+        One event per parcel, keyed by delivery and parcel, so a re-processed delivery
+        applies each at most once; the delivery is retired after the last one.
+        """
+        repo_id = self.service.config.repo_id
+        rows = await self.service.db.call(
+            lambda store: store.query(
+                "SELECT parcel_id FROM parcels WHERE repo_id = ? AND "
+                "json_extract(aggregate_json, '$.parcel.stage') IN (?, ?) AND "
+                "json_extract(aggregate_json, '$.parcel.pr_number') IS NOT NULL "
+                "ORDER BY parcel_id",
+                (repo_id, Stage.BUILDING.value, Stage.READY.value),
+            )
+        )
+        parcel_ids = [str(row[0]) for row in rows]
+        LOG.info(
+            "default-branch push delivery_guid=%s parcels=%s",
+            delivery.delivery_guid,
+            len(parcel_ids),
+        )
+        for parcel_id in parcel_ids:
+            await self.service.apply_event(
+                replace(
+                    event,
+                    event_id=f"{event.event_id}:{parcel_id}",
+                    parcel_id=parcel_id,
+                    delivery_guid=None,
+                )
+            )
+        await self.service.db.call(
+            lambda store: store.mark_delivery(delivery.delivery_guid, "processed")
+        )
 
     async def _record_review_comments(self, delivery: DeliveryRecord, event: Event) -> None:
         """Store the inline comments of an owner review for ``factory_get_feedback``.

@@ -190,6 +190,7 @@ async def test_doctor_resolves_live_ids_and_does_not_create_local_state(tmp_path
     assert report.resolved["omnigent_project_id"] == "project-1"
     assert report.resolved["repository_database_id"] == 123
     assert "github_token_revoke" in report.checks
+    assert "github_push_events" not in report.checks  # events unreadable: skipped silently
     assert revoked == 1
     assert before == after
 
@@ -418,3 +419,38 @@ async def test_doctor_warns_when_the_agent_bundle_cannot_be_read():
         assert warning.startswith("agent_factory_tools: agent bundle unreadable") and (
             expected in warning
         ), warning
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (httpx.Response(200, json={"events": ["issues", "pull_request"]}), "warning"),
+        (httpx.Response(200, json={"events": ["issues", "push"]}), "pass"),
+        (httpx.Response(200, json={"id": 1}), None),  # events not readable: skipped
+        (httpx.Response(403, json={"message": "nope"}), None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_doctor_warns_when_the_installation_is_not_subscribed_to_push(response, expected):
+    from omnigent_factory.service.doctor import _check_push_events
+
+    config = ServiceConfig(repo_id="R", owners=frozenset({1}))
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["authorization"])
+        assert request.url.path == f"/app/installations/{config.github_installation_id}"
+        return response
+
+    report = DoctorReport()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        await _check_push_events(config, http, "app-jwt", report)
+    assert seen == ["Bearer app-jwt"]  # read with the App JWT
+    assert report.ok  # never an error
+    if expected is None:
+        assert "github_push_events" not in report.checks and not report.warnings
+    elif expected == "pass":
+        assert report.checks["github_push_events"] == "installation receives push"
+    else:
+        [warning] = report.warnings
+        assert warning.startswith("github_push_events: ") and "tick Push" in warning

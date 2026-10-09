@@ -518,6 +518,7 @@ def test_S7_manifest_is_exact_allowlist():
         "check_suite",
         "workflow_run",
         "projects_v2_item",
+        "push",
     ]
 
 

@@ -548,6 +548,9 @@ class EffectExecutor:
                 review_bot_eyes=_bot_eyes(detail.get("review_bot_eyes")),
                 open_findings=_finding_refs(detail.get("open_findings")),
                 findings_earlier_rounds=detail.get("findings_earlier_rounds") is True,
+                mergeable=_mergeable_state(detail.get("mergeable")),
+                base_head=str(detail.get("base_head") or "")[:64],
+                base_ref=str(detail.get("base_ref") or "")[:255],
             )
         elif effect.kind == EffectKind.RESOLVE_ELICITATION:
             body = ev.ElicitationResolved(
@@ -616,6 +619,12 @@ def _bot_eyes(value: object) -> ev.BotEyes | None:
         return ev.BotEyes(str(value)) if value else None
     except ValueError:
         return None
+
+
+def _mergeable_state(value: object) -> str:
+    """A read's mergeability ("" for anything not a known value: never a conflict)."""
+    known = (ev.MERGE_CLEAN, ev.MERGE_CONFLICT, ev.MERGE_UNKNOWN)
+    return str(value) if value in known else ""
 
 
 def _finding_refs(value: object) -> tuple[ev.FindingRef, ...]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import re
@@ -23,7 +24,14 @@ from omnigent_factory.core.effects import (
     JsonValue,
     RetryableReadFailure,
 )
-from omnigent_factory.core.events import BotEyes, ChecksState, FindingRef
+from omnigent_factory.core.events import (
+    MERGE_CLEAN,
+    MERGE_CONFLICT,
+    MERGE_UNKNOWN,
+    BotEyes,
+    ChecksState,
+    FindingRef,
+)
 from omnigent_factory.core.types import IssueSnapshot, Stage
 from omnigent_factory.github.client import (
     AmbiguousRequest,
@@ -48,6 +56,25 @@ LOG = logging.getLogger(__name__)
 TRIAGE_FIELDS = ("Priority", "Size")
 #: Board pages (100 items each) one ``board_issues`` read takes at most.
 _BOARD_MAX_PAGES = 20
+#: Seconds between re-reads of a PR whose ``mergeable`` GitHub has not computed yet
+#: (about 7 s in all); still null after them is "unknown", asked again at the next read.
+MERGEABLE_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0, 4.0)
+
+
+def _mergeable(pr: Mapping[str, Any]) -> str:
+    """Whether the PR merges into its base, from one PR read ("" = not reported).
+
+    ``mergeable`` false or ``mergeable_state`` "dirty" is a conflict; ``mergeable`` true is
+    clean (a "behind" PR is clean: it is never updated here); null is unknown.
+    """
+    if "mergeable" not in pr:
+        return ""
+    value = pr.get("mergeable")
+    if value is False or pr.get("mergeable_state") == "dirty":
+        return MERGE_CONFLICT
+    if value is True:
+        return MERGE_CLEAN
+    return MERGE_UNKNOWN
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,8 +134,13 @@ class GitHubAPIAdapter:
         cross_vendor_review: Callable[[EffectIntent], Awaitable[bool]] | None = None,
         review_bot_login: str = "",
         review_bot_mention: str = "",
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        mergeable_retry_delays: tuple[float, ...] = MERGEABLE_RETRY_DELAYS,
     ) -> None:
         self.client = client
+        #: Waits between re-reads of a PR whose mergeability GitHub is still computing.
+        self._sleep = sleep
+        self.mergeable_retry_delays = mergeable_retry_delays
         self.repository = repository
         self.repository_node_id = repository_node_id
         self.project_node_id = project_node_id
@@ -361,6 +393,7 @@ class GitHubAPIAdapter:
         *,
         cross_vendor_review: bool = False,
         reviewed_head: str | None = None,
+        sync_carry: bool = True,
     ) -> PullRequestEvidence | RetryableReadFailure:
         """Fresh PR facts for readiness (owner direction: the owner's approval is NOT part
         of Ready; the ruleset requires it at merge).
@@ -369,14 +402,23 @@ class GitHubAPIAdapter:
         (clean verdict, reviewer vendor differs). A GitHub approval from
         ``independent_reviewer_ids`` is required additionally only when configured.
         When it attested ``reviewed_head`` and the PR has moved on, it still counts only
-        if every newer commit merely syncs the base branch (see ``_base_sync_only``).
+        if every newer commit merely syncs the base branch (see ``_base_sync_only``), and
+        never when ``sync_carry`` is false (the review predates a merge conflict: the merge
+        that resolved it needs a fresh review).
+
+        Mergeability is computed lazily by GitHub (``mergeable`` null on a first read): the
+        PR is re-read after each of ``mergeable_retry_delays``; still null after that is
+        "unknown", never a conflict and never clean.
         """
         if ref.repo_id != self.repository_node_id:
             return RetryableReadFailure("pull request repository identity mismatch")
         try:
-            pr: Any = await self.client.get_json(f"/repos/{self.repository}/pulls/{pr_number}")
-            if not isinstance(pr, dict):
-                raise GitHubAPIError("pull request response was malformed")
+            pr = await self._pull(pr_number)
+            for delay in self.mergeable_retry_delays:
+                if pr.get("state") != "open" or pr.get("mergeable", False) is not None:
+                    break
+                await self._sleep(delay)
+                pr = await self._pull(pr_number)
             head = pr.get("head")
             head_sha = head.get("sha") if isinstance(head, dict) else None
             branch = head.get("ref") if isinstance(head, dict) else None
@@ -390,8 +432,10 @@ class GitHubAPIAdapter:
             review_accepted = cross_vendor_review
             base_sync = False
             if review_accepted and reviewed_head and reviewed_head != head_sha:
-                review_accepted = isinstance(base_ref, str) and await self._base_sync_only(
-                    reviewed_head, head_sha, base_ref
+                review_accepted = (
+                    sync_carry
+                    and isinstance(base_ref, str)
+                    and await self._base_sync_only(reviewed_head, head_sha, base_ref)
                 )
                 base_sync = review_accepted
             if review_accepted and self.independent_reviewer_ids:
@@ -425,11 +469,20 @@ class GitHubAPIAdapter:
                 findings_earlier_rounds=any(
                     oid != head_sha for oid in self._last_bot_thread_commits
                 ),
+                mergeable=_mergeable(pr),
+                base_head=str(base.get("sha") or "") if isinstance(base, dict) else "",
+                base_ref=base_ref if isinstance(base_ref, str) else "",
             )
         except RateLimited as exc:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
         except GitHubAPIError as exc:
             return RetryableReadFailure(str(exc))
+
+    async def _pull(self, pr_number: int) -> dict[str, Any]:
+        pr: Any = await self.client.get_json(f"/repos/{self.repository}/pulls/{pr_number}")
+        if not isinstance(pr, dict):
+            raise GitHubAPIError("pull request response was malformed")
+        return pr
 
     async def _review_bot_pending_since(
         self, pr: dict[str, Any], pr_number: int, head_sha: str
@@ -1023,6 +1076,7 @@ class GitHubAPIAdapter:
                     number,
                     cross_vendor_review=review,
                     reviewed_head=reviewed if isinstance(reviewed, str) else None,
+                    sync_carry=effect.args.get("sync_carry") is not False,
                 )
                 if isinstance(evidence, RetryableReadFailure):
                     return evidence

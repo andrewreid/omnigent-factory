@@ -113,6 +113,7 @@ async def run_doctor(
             report.pass_check("github_installation_token", "repository-scoped token minted")
             client = GitHubClient(github_http, daemon.token, api_url=config.github_api_url)
             await _check_github(config, client, jwt, report)
+            await _check_push_events(config, github_http, jwt, report)
         await _check_omnigent(config, omnigent, report)
         probe = await _check_live_session(config, omnigent, report) if live else None
         await _check_agent_factory_tools(config, omnigent, report, session_id=probe)
@@ -239,6 +240,40 @@ async def _check_github(
     else:
         report.pass_check("github_repository_identity")
     await _check_project(config, client, report)
+
+
+async def _check_push_events(
+    config: ServiceConfig, http: httpx.AsyncClient, jwt: str, report: DoctorReport
+) -> None:
+    """Warn when the App installation does not receive ``push``: a move of the default
+    branch then re-checks open bot PRs for merge conflicts only at the periodic reads.
+
+    Skipped silently whenever the installation's subscribed events cannot be read.
+    """
+    try:
+        response = await http.get(
+            f"{config.github_api_url}/app/installations/{config.github_installation_id}",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {jwt}",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        data: Any = response.json() if response.status_code == 200 else None
+    except (httpx.HTTPError, ValueError):
+        return
+    events = data.get("events") if isinstance(data, dict) else None
+    if not isinstance(events, list) or not all(isinstance(e, str) for e in events):
+        return
+    if "push" in events:
+        report.pass_check("github_push_events", "installation receives push")
+        return
+    report.warn(
+        "github_push_events",
+        "the App installation is not subscribed to push: tick Push under Subscribe to events "
+        "in the GitHub App settings (and accept the change on the installation), so a push "
+        "to the default branch re-checks open bot PRs for merge conflicts",
+    )
 
 
 async def _check_project(config: ServiceConfig, client: GitHubClient, report: DoctorReport) -> None:

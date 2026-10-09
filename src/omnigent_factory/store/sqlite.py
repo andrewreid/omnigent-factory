@@ -103,6 +103,7 @@ FaultHook = Callable[[str], None]
 #: is a usage counter.
 PRUNABLE_OBSERVATIONS: dict[str, tuple[str, ...]] = {
     EventKind.CHECKS_CHANGED.value: ("github:workflow_run:", "github:check_suite:"),
+    EventKind.BASE_PUSHED.value: ("github:push:",),
     EventKind.RECONCILE_DUE.value: ("reconcile:",),
     EventKind.GITHUB_SNAPSHOT.value: ("effect:", "startup-github:"),
     EventKind.READINESS_EVIDENCE.value: ("effect:",),

@@ -71,6 +71,7 @@ def render_app_manifest(
             "check_suite",
             "workflow_run",
             "projects_v2_item",
+            "push",
         ],
     }
 

@@ -1,0 +1,8 @@
+Factory readiness check for run {run_id}: PR #{pr_number} at head `{head_sha}` has a merge
+conflict with {base_ref}.
+
+Fetch and merge origin/{base_ref} into the issue branch, resolve the conflicts within the
+approved plan without adding new work, run the checks, and push. The merge needs a fresh
+cross-vendor review: submit build_ready for the pushed head (reviewed_head must equal that
+head; echo the plan_hash from factory_get_plan). Never merge the PR or rebase or force-push
+the branch. Submit kind "blocked" only if the conflict cannot be resolved within scope.

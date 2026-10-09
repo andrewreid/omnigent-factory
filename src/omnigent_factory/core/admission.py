@@ -91,6 +91,8 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.CHECKS_CHANGED: Admission(_OBSERVED),
     EventKind.REVIEW_CHANGED: Admission(_OBSERVED),
     EventKind.READINESS_EVIDENCE: Admission(_ADAPTER),
+    # a push to the default branch: only ever triggers a fresh read of the parcel's PR
+    EventKind.BASE_PUSHED: Admission(_GITHUB_OR_READ),
     EventKind.CONTRACT_PUBLISHED: Admission(_ADAPTER),
     EventKind.PUBLICATION_ACKED: Admission(_ADAPTER),
     # daemon effect outcomes and Omnigent observations: executor/observer only

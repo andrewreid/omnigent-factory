@@ -222,7 +222,7 @@ waits up to 90 s for it instead of failing.
 | Command | What it does |
 |---|---|
 | `status` | Readiness, pause state, building count/cap, queue, pending/unknown effects, parked deliveries. |
-| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. It also reads the configured agent's bundle (through its newest session, or the `--live` probe) and fails naming any factory MCP tool the agent's `tools:` allowlist for the factory server leaves out (a warning when the bundle cannot be read). |
+| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. It also reads the configured agent's bundle (through its newest session, or the `--live` probe) and fails naming any factory MCP tool the agent's `tools:` allowlist for the factory server leaves out (a warning when the bundle cannot be read). It warns when the App installation is not subscribed to `push` (tick Push in the App settings), when the subscribed events can be read. |
 | `explain <parcel>` | The parcel's persisted state: stage, bot, sessions, holds, effects. |
 | `recovery` | Failed/unknown effects and parked webhook deliveries. |
 | `retry-effect <effect_id>` | Requeue a failed/unknown `publish_triage`/`publish_report`/`post_comment`; it adopts an existing comment by its marker, so it never duplicates. |
@@ -436,6 +436,29 @@ summary, a red check) edits the report in place (found by its marker; edits do n
 notify), never posting a second one. GitHub sends no webhook for a +1 reaction, so a
 Ready card whose report still shows no bot response is re-read on each reconcile, for up
 to 24 hours after the wait. A new head, withdrawal or rework never edits it.
+
+### Merge conflicts with main
+
+A push to the default branch (the App's `push` event) re-reads the PR of every Building
+or Ready card that has one; pushes to other branches are ignored. Each PR read (also the
+periodic catch-up reads, the backstop for a lost webhook) asks GitHub whether the PR
+merges into its base. GitHub computes that lazily: a read that gets no answer re-reads it
+a few times over about 7 seconds, and still no answer is unknown, asked again at the next
+catch-up read (never taken as a conflict, nor as clean). A PR that is only behind but
+merges cleanly needs nothing: the factory never updates the branch.
+
+On a conflict, once per (PR head, main head):
+
+| Card | What happens |
+|---|---|
+| Ready, or Building with its build run closed | Back to Building with the note `Merge conflict with main` and a conflict rework under the same approval (admitted like any build, `Queued` while no slot is free): its first message tells the agent to merge `origin/main` into the issue branch, resolve within the approved plan, run the checks, push and resubmit. |
+| Building, the build run waiting on checks or idle | One conflict wake to that run with the same instruction. |
+| Building, the build run mid-turn | Recorded only; the run is not interrupted. The next read after its turn ends decides. |
+
+If the run ends without resolving it, the card is `Needs you` with one comment. A
+cross-vendor review given before a conflict was seen is never carried to a later head as
+a base sync: the merge that resolves the conflict needs a fresh review before Ready.
+Clean syncs (an owner "Update branch" with no conflict seen) keep the review as before.
 
 ### Finished parcels
 

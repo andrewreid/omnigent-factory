@@ -1182,11 +1182,16 @@ def _relay_answers(ctx: _Ctx, s: StageSession) -> None:
 
 
 def _enqueue_build(
-    ctx: _Ctx, approval: Approval, duration_us: int, *, rework: bool = False
+    ctx: _Ctx,
+    approval: Approval,
+    duration_us: int,
+    *,
+    rework: bool = False,
+    conflict: bool = False,
 ) -> None:
     auth = _new_authorization(ctx, SessionKind.BUILD, duration_us, approval.approval_id)
     if rework:
-        ctx.put_authorization(replace(auth, rework=True))
+        ctx.put_authorization(replace(auth, rework=True, conflict=conflict))
     seq = ctx.admission.next_sequence
     _set_queue(
         ctx,
@@ -1759,12 +1764,14 @@ def _rework_queued(ctx: _Ctx) -> bool:
     )
 
 
-def _rework(ctx: _Ctx, via: Via | None) -> None:
+def _rework(ctx: _Ctx, via: Via | None, *, conflict: str = "") -> None:
     """Owner feedback on the built work: back to Building under the same approval.
 
     A new build episode on the parcel's branch and PR (admitted like any build, so it may
     queue for a slot) with a fresh time block and a fresh fix budget. The first message
     points the issue session at the feedback; Ready is then re-evaluated as usual.
+    ``conflict`` (the base branch name): the episode instead resolves a merge conflict
+    with that branch, and its first message says so.
     """
     a = ctx.p.current_approval
     assert a is not None  # noqa: S101 - approval_ok checked by the caller
@@ -1772,8 +1779,10 @@ def _rework(ctx: _Ctx, via: Via | None) -> None:
     ctx.update(readiness=None, readiness_wakes=0, findings_wakes=0)
     _cancel_pending(ctx)
     _move(ctx, Stage.BUILDING, via)
-    _enqueue_build(ctx, a, ctx.config.block_us(ctx.p.size or Size.M), rework=True)
-    ctx.note(_REWORK_NOTE)
+    _enqueue_build(
+        ctx, a, ctx.config.block_us(ctx.p.size or Size.M), rework=True, conflict=bool(conflict)
+    )
+    ctx.note(_conflict_note(conflict) if conflict else _REWORK_NOTE)
 
 
 _REWORK_NOTE = "Rework: owner feedback"
@@ -2275,17 +2284,23 @@ def _invalidate_ready(ctx: _Ctx, reason: str) -> None:
 
 
 def _fetch_evidence(ctx: _Ctx, r: Readiness) -> None:
-    """A fresh read of the linked PR: actual head, current checks, review and findings."""
-    ctx.emit(
-        EffectKind.FETCH_PR_EVIDENCE,
-        args={
-            "pr_number": r.pr_number,
-            "head_sha": r.head_sha,
-            "reviewed_head": r.reviewed_head or r.head_sha,
-            "session_id": r.session_id,
-            "issue_number": ctx.p.issue_number,
-        },
-    )
+    """A fresh read of the linked PR: actual head, current checks, review, findings and
+    whether it merges into its base.
+
+    A review that predates a merge conflict seen on the PR never carries to a newer head
+    as a base sync (``sync_carry`` false): the merge that resolved it is new work.
+    """
+    reviewed = r.reviewed_head or r.head_sha
+    args: dict[str, JsonValue] = {
+        "pr_number": r.pr_number,
+        "head_sha": r.head_sha,
+        "reviewed_head": reviewed,
+        "session_id": r.session_id,
+        "issue_number": ctx.p.issue_number,
+    }
+    if reviewed == ctx.p.conflict_reviewed_head:
+        args["sync_carry"] = False
+    ctx.emit(EffectKind.FETCH_PR_EVIDENCE, args=args)
 
 
 def _readiness_for(ctx: _Ctx, pr_number: int, unknown: str) -> Readiness:
@@ -2364,6 +2379,12 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
     )
     if body.remediation_exhausted:
         ctx.hold(Hold.REMEDIATION_EXHAUSTED)
+    if r.merge_unknown != (body.mergeable == ev.MERGE_UNKNOWN):
+        r = replace(r, merge_unknown=body.mergeable == ev.MERGE_UNKNOWN)
+        ctx.update(readiness=r)
+    if body.mergeable == ev.MERGE_CONFLICT and body.pr_open:
+        _merge_conflict(ctx, r, body)
+        return
     r = _restore_withdrawn(ctx, r, body)
     in_ready = ctx.p.stage == Stage.READY and (r.ready or _refreshing(ctx))
     run = _open_run(ctx, r) if in_ready else None
@@ -3027,6 +3048,131 @@ def _needs_you_comment(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence, reas
         ]
         args["further_round"] = body.findings_earlier_rounds
     ctx.comment("ready-blocked", **args)
+
+
+def _h_base_pushed(ctx: _Ctx, body: ev.BasePushed) -> None:
+    """The default branch moved: re-read the parcel's open PR, whose mergeability GitHub
+    recomputes against the new base. Only a Building or Ready card with a recorded PR
+    and build_ready; a build that has not submitted yet is read when it does."""
+    _ = body
+    r = ctx.p.readiness
+    if (
+        r is None
+        or _completed(ctx)
+        or ctx.p.stage not in (Stage.BUILDING, Stage.READY)
+        or Hold.PR_CLOSED in ctx.p.holds
+    ):
+        return
+    _fetch_evidence(ctx, r)
+
+
+def _conflict_note(base: str) -> str:
+    return f"Merge conflict with {base}"
+
+
+def _merge_conflict(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
+    """GitHub reports the PR cannot merge into its base (the base moved under it).
+
+    The review that covered the PR so far never carries past this point as a base sync.
+    Once per (PR head, base head): a finished build run waiting on checks (or idle) is
+    woken to merge the base in; a card whose build run closed (Ready, or Building with
+    the build ended) goes back to Building with a conflict rework, admitted like any
+    build (queued while no slot is free). A run mid-turn is not interrupted: the next
+    read after its turn ends decides. After the wake for this pair, a run that ended
+    without resolving it (or a conflict nothing may act on) is Needs you, with one
+    comment.
+    """
+    base = body.base_ref or "main"
+    key = f"{r.head_sha}:{body.base_head}"
+    reason = f"merge conflict with {base}"
+    ctx.update(
+        conflict_reviewed_head=r.reviewed_head or r.head_sha,
+        readiness=replace(r, verified=False, sync_red=False, red_checks=""),
+    )
+    r = ctx.p.readiness or r
+    s = _open_run(ctx, r)
+    if ctx.p.stage == Stage.READY and s is not None:
+        # The owner moved the card to Ready while its build run was still open.
+        _move(ctx, Stage.BUILDING)
+    in_ready = ctx.p.stage == Stage.READY
+    if ctx.p.conflict_wake != key:
+        if (
+            not in_ready
+            and s is not None
+            and s.kind == SessionKind.BUILD
+            and not s.fences
+            and (
+                (
+                    s.lifecycle == Lifecycle.WAITING
+                    and s.wait_reason == WaitReason.CHECKS
+                    and s.quiescent
+                )
+                or _idle_run(s)
+            )
+        ):
+            if (
+                ctx.p.open_decisions
+                or not approval_ok(ctx.p)
+                or not dispatchable(ctx.p)
+                or not work_allowed(ctx.p, s)
+                or board_pending(ctx.p)
+            ):
+                return  # recorded; a later read wakes it once the gate is open
+            ctx.update(conflict_wake=key)
+            ctx.unhold(Hold.READINESS_FAILED)
+            # Not quiescent until a scan sees this new turn end (as for a comment relay).
+            s = ctx.put_session(
+                replace(s, lifecycle=Lifecycle.ACTIVE, wait_reason=None, quiescent=False)
+            )
+            _ensure_issuance(ctx, s)
+            ctx.emit(
+                EffectKind.SEND_MESSAGE,
+                session=s,
+                args={
+                    "purpose": MessagePurpose.READINESS_WAKE.value,
+                    "wake": "conflict",
+                    "reason": reason,
+                    "pr_number": r.pr_number,
+                    "head_sha": r.head_sha,
+                    "base_ref": base,
+                },
+            )
+            ctx.note(_conflict_note(base))
+            return
+        if _conflict_run_live(ctx, s):
+            return  # recorded: the run mid-turn merges the base itself or is read after
+        if (
+            (in_ready or _build_ended(ctx))
+            and not ctx.p.holds
+            & (_NOT_CHECKS_WITHDRAWN | BLOCKING_HOLDS | {Hold.REWORK_CONTROL_REQUIRED})
+            and not ctx.p.open_decisions
+            and not _rework_queued(ctx)
+            and eligible(ctx.p)
+            and _rework_refusal(ctx) is None
+        ):
+            ctx.update(conflict_wake=key)
+            _rework(ctx, None, conflict=base)
+            return
+    elif _conflict_run_live(ctx, s):
+        return  # woken for this pair: still working on it
+    if in_ready:
+        _invalidate_ready(ctx, reason)
+    if Hold.READINESS_FAILED not in ctx.p.holds:
+        ctx.hold(Hold.READINESS_FAILED)
+        _needs_you_comment(ctx, r, body, reason)
+        ctx.note(f"Needs you: PR #{r.pr_number} on {r.head_sha[:7]}: {reason}")
+
+
+def _conflict_run_live(ctx: _Ctx, s: StageSession | None) -> bool:
+    """The build episode is still running (mid-turn, queued, at a checkpoint, ...): it
+    is not interrupted for a merge conflict."""
+    if s is None:
+        return _approval_active(ctx) or _rework_queued(ctx)
+    if s.kind != SessionKind.BUILD or s.lifecycle == Lifecycle.RETIRED or s.execution_closed:
+        return False
+    return not _idle_run(s) and not (
+        s.lifecycle == Lifecycle.WAITING and s.wait_reason == WaitReason.CHECKS and s.quiescent
+    )
 
 
 def _check_gap(body: ev.ReadinessEvidence) -> bool:
@@ -4073,7 +4219,10 @@ def _awaiting_evidence(ctx: _Ctx) -> bool:
     return (
         r is not None
         and (
-            not r.verified or (not r.ready and _in_review_grace(r)) or _report_line_pending(ctx, r)
+            not r.verified
+            or (not r.ready and _in_review_grace(r))
+            or _report_line_pending(ctx, r)
+            or r.merge_unknown  # GitHub had not computed mergeability: ask again
         )
         and not _completed(ctx)
         and Hold.PR_CLOSED not in ctx.p.holds
@@ -4139,6 +4288,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.CHECKS_CHANGED: _h_checks_changed,
     EventKind.REVIEW_CHANGED: _h_review_changed,
     EventKind.READINESS_EVIDENCE: _h_readiness,
+    EventKind.BASE_PUSHED: _h_base_pushed,
     EventKind.OPERATOR_RESUME: _h_operator_resume,
     EventKind.AUTO_TRIAGE: _h_auto_triage,
     EventKind.RELATED_MARKED: _h_related_marked,

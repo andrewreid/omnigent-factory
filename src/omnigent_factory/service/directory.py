@@ -106,7 +106,8 @@ class ServiceDispatchDirectory:
             template_name = _RETRIAGE_TEMPLATE  # a re-run on owner feedback
         auth = parcel.authorization(session.authorization_id)
         if session.kind == SessionKind.BUILD and auth is not None and auth.rework:
-            template_name = _REWORK_TEMPLATE  # owner feedback on the built work
+            # Owner feedback on the built work, or a merge conflict with the base branch.
+            template_name = _CONFLICT_TEMPLATE if auth.conflict else _REWORK_TEMPLATE
         template = _template(template_name)
         evidence = await self.issue_evidence(parcel)
         return {
@@ -197,6 +198,13 @@ class ServiceDispatchDirectory:
                 return _template("triage-comment-v1.txt").format(run_id=sid)
             return _template("feedback-v3.txt").format(revision=parcel.revision, run_id=sid)
         if purpose == "readiness_wake":
+            if effect.args.get("wake") == "conflict":
+                return _template(_CONFLICT_WAKE_TEMPLATE).format(
+                    pr_number=int(str(effect.args.get("pr_number") or 0)),
+                    head_sha=str(effect.args.get("head_sha") or ""),
+                    base_ref=str(effect.args.get("base_ref") or self.config.default_branch),
+                    run_id=sid,
+                )
             # Findings only (the check wake spent or not needed): ask for an outcome each.
             findings = effect.args.get("wake") == "findings"
             name = "readiness-findings-wake-v1.txt" if findings else "readiness-wake-v8.txt"
@@ -237,6 +245,7 @@ class ServiceDispatchDirectory:
                 capability_file=self.config.capability_dir / f"{_safe(sid)}.cap",
                 plan_hash=authority_hash,
                 pr_number=parcel.pr_number or 0,
+                base_ref=self.config.default_branch,
             )
         return template.format(**common)
 
@@ -1083,6 +1092,9 @@ _FIRST_TEMPLATES = {
 }
 _RETRIAGE_TEMPLATE = "triage-feedback-v4.txt"
 _REWORK_TEMPLATE = "build-rework-v5.txt"
+#: A rework run, or a wake of the waiting build run, for a merge conflict with the base.
+_CONFLICT_TEMPLATE = "build-conflict-v1.txt"
+_CONFLICT_WAKE_TEMPLATE = "readiness-conflict-wake-v1.txt"
 
 
 def _template(name: str) -> str:

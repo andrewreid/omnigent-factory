@@ -80,6 +80,7 @@ class EventKind(enum.StrEnum):
     CHECKS_CHANGED = "ChecksChanged"
     REVIEW_CHANGED = "ReviewChanged"
     READINESS_EVIDENCE = "ReadinessEvidence"
+    BASE_PUSHED = "BasePushed"
     CONTRACT_PUBLISHED = "ContractPublished"
     PUBLICATION_ACKED = "PublicationAcked"
     # observation: Omnigent / effects
@@ -489,6 +490,28 @@ class ReadinessEvidence(_Body):
     #: The review bot also opened threads on earlier commits of the PR: open findings are
     #: a further review round after a fix.
     findings_earlier_rounds: bool = False
+    #: Whether the PR merges into its base: "clean", "conflict" or "unknown" (GitHub was
+    #: still computing it after the read's bounded re-reads); "" = not told (older reads).
+    mergeable: str = ""
+    #: The base branch head GitHub's mergeability was computed against, and its name.
+    base_head: str = ""
+    base_ref: str = ""
+
+
+#: ``ReadinessEvidence.mergeable`` values.
+MERGE_CLEAN = "clean"
+MERGE_CONFLICT = "conflict"
+MERGE_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class BasePushed(_Body):
+    """A push to the repository's default branch: open PRs may now conflict with it."""
+
+    KIND: ClassVar[EventKind] = EventKind.BASE_PUSHED
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    ref: str = ""
+    head_sha: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -877,6 +900,7 @@ EventBody = (
     | ChecksChanged
     | ReviewChanged
     | ReadinessEvidence
+    | BasePushed
     | ContractPublished
     | PublicationAcked
     | SessionCreated
@@ -946,6 +970,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         ChecksChanged,
         ReviewChanged,
         ReadinessEvidence,
+        BasePushed,
         ContractPublished,
         PublicationAcked,
         SessionCreated,
@@ -1024,6 +1049,9 @@ __all__ = [
     "BODY_TYPES",
     "CONTROL_PROVENANCES",
     "GLOBAL_KINDS",
+    "MERGE_CLEAN",
+    "MERGE_CONFLICT",
+    "MERGE_UNKNOWN",
     "ActiveLimitReached",
     "ActiveTimeSample",
     "AdoptionResult",
@@ -1031,6 +1059,7 @@ __all__ = [
     "ApprovePlan",
     "AssignedHuman",
     "AutoTriage",
+    "BasePushed",
     "BotEyes",
     "CapacityAvailable",
     "ChecksChanged",
