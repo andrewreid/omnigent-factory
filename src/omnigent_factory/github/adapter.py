@@ -8,7 +8,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -109,6 +109,10 @@ class BoardSchema:
     bot_options: Mapping[str, str]
     #: The "Factory note" text field ("" when not configured: notes are not written).
     note_field_id: str = ""
+    #: The "Auto-build" single-select field and its option IDs by name (Queued, Started);
+    #: "" when not configured: the field is neither read nor written.
+    auto_build_field_id: str = ""
+    auto_build_options: Mapping[str, str] = field(default_factory=dict)
 
 
 class GitHubAPIAdapter:
@@ -194,7 +198,7 @@ class GitHubAPIAdapter:
             )
             if not isinstance(issue, dict) or issue.get("node_id") != ref.parcel_id:
                 return RetryableReadFailure("issue identity did not match requested parcel")
-            stage, in_project, bot, note = await self._project_stage(ref.parcel_id)
+            stage, in_project, bot, note, auto_build = await self._project_stage(ref.parcel_id)
             assignees = issue.get("assignees")
             human_assigned = not isinstance(assignees, list) or any(
                 not isinstance(user, dict) or user.get("type") != "Bot" for user in assignees
@@ -211,6 +215,7 @@ class GitHubAPIAdapter:
                 read_at_us=self._now_us(),
                 bot=bot,
                 note=note,
+                auto_build=auto_build,
             )
         except RateLimited as exc:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
@@ -279,6 +284,9 @@ class GitHubAPIAdapter:
                 ... on ProjectV2ItemFieldSingleSelectValue { optionId }
               }
               bot: fieldValueByName(name: "Bot") {
+                ... on ProjectV2ItemFieldSingleSelectValue { optionId }
+              }
+              autoBuild: fieldValueByName(name: "Auto-build") {
                 ... on ProjectV2ItemFieldSingleSelectValue { optionId }
               }
               content { __typename ... on Issue {
@@ -356,6 +364,7 @@ class GitHubAPIAdapter:
             open=content.get("state") == "OPEN",
             status_option=option(item.get("status")),
             bot_option=option(item.get("bot")),
+            auto_build_option=option(item.get("autoBuild")) if self._auto_build_configured else "",
             assignees=names(content.get("assignees"), "id"),
             labels=names(content.get("labels"), "name"),
             title=str(content.get("title") or ""),
@@ -400,9 +409,10 @@ class GitHubAPIAdapter:
 
     async def _project_stage(
         self, parcel_id: str
-    ) -> tuple[Stage | None, bool, str | None, str | None]:
+    ) -> tuple[Stage | None, bool, str | None, str | None, str | None]:
         """(stage by Status option ID, in project, current Bot display value or None,
-        current Factory note text or None when not read)."""
+        current Factory note text or None when not read, current Auto-build option name
+        ("" = empty) or None when not configured)."""
         query = """
         query($id: ID!, $after: String) {
           node(id: $id) { ... on Issue {
@@ -419,6 +429,11 @@ class GitHubAPIAdapter:
               }
               note: fieldValueByName(name: "Factory note") {
                 ... on ProjectV2ItemFieldTextValue { text field { ... on ProjectV2Field { id } } }
+              }
+              autoBuild: fieldValueByName(name: "Auto-build") {
+                ... on ProjectV2ItemFieldSingleSelectValue {
+                  optionId field { ... on ProjectV2SingleSelectField { id } }
+                }
               } }
               pageInfo { hasNextPage endCursor }
             }
@@ -443,9 +458,10 @@ class GitHubAPIAdapter:
                     continue
                 bot = self._bot_name(item.get("bot"))
                 note = self._note_text(item.get("note"))
+                auto_build = self._auto_build_name(item.get("autoBuild"))
                 value = item.get("fieldValueByName")
                 if value is None:
-                    return None, True, bot, note
+                    return None, True, bot, note, auto_build
                 if not isinstance(value, dict):
                     raise GitHubAPIError("Status field value was malformed")
                 field = value.get("field")
@@ -453,10 +469,10 @@ class GitHubAPIAdapter:
                     raise GitHubAPIError("Status field identity changed")
                 # Read by option ID only: a renamed option must not change the stage.
                 stage = stage_for_option(value.get("optionId"), self.status_options)
-                return stage, True, bot, note
+                return stage, True, bot, note, auto_build
             page = items.get("pageInfo")
             if not isinstance(page, dict) or not page.get("hasNextPage"):
-                return None, False, None, None
+                return None, False, None, None, None
             after_value = page.get("endCursor")
             if not isinstance(after_value, str):
                 raise GitHubAPIError("projectItems pagination cursor was missing")
@@ -469,6 +485,31 @@ class GitHubAPIAdapter:
         option = value.get("optionId")
         names = [n for n, o in self.board_schema.bot_options.items() if o == option]
         return names[0] if len(names) == 1 else None
+
+    @property
+    def _auto_build_configured(self) -> bool:
+        return self.board_schema is not None and bool(self.board_schema.auto_build_field_id)
+
+    def _auto_build_name(self, value: object) -> str | None:
+        """Auto-build option name by the persisted IDs ("" = empty, "?" = an unknown
+        option or field); None when the field is not configured or the value unreadable."""
+        if self.board_schema is None or not self.board_schema.auto_build_field_id:
+            return None
+        if value is None:
+            return ""
+        if not isinstance(value, dict):
+            return None
+        if not value:
+            return ""  # another field type answered the name: nothing selected here
+        field_ref = value.get("field")
+        if isinstance(field_ref, dict) and field_ref.get("id") not in (
+            None,
+            self.board_schema.auto_build_field_id,
+        ):
+            return "?"
+        option = value.get("optionId")
+        names = [n for n, o in self.board_schema.auto_build_options.items() if o == option]
+        return names[0] if len(names) == 1 else "?"
 
     def _note_text(self, value: object) -> str | None:
         """Factory note text ("" when empty), by the persisted field ID; None if unread."""
@@ -1151,7 +1192,11 @@ class GitHubAPIAdapter:
                 return await self._edit_report(effect)
             if effect.kind in {EffectKind.MOVE_CARD, EffectKind.SET_BOT}:
                 return await self._write_board(effect)
-            if effect.kind in {EffectKind.SET_NOTE, EffectKind.REACT_COMMENT}:
+            if effect.kind in {
+                EffectKind.SET_NOTE,
+                EffectKind.SET_AUTO_BUILD,
+                EffectKind.REACT_COMMENT,
+            }:
                 return await self._display_write(effect)
             if effect.kind == EffectKind.ENSURE_PROJECT_ITEM:
                 return await self._ensure_project_item(effect)
@@ -1587,6 +1632,8 @@ class GitHubAPIAdapter:
         try:
             if effect.kind == EffectKind.SET_NOTE:
                 return await self._write_note(effect)
+            if effect.kind == EffectKind.SET_AUTO_BUILD:
+                return await self._write_auto_build(effect)
             return await self._react(effect)
         except AmbiguousRequest as exc:
             return RetryableReadFailure(f"display write uncertain: {exc}")
@@ -1638,6 +1685,46 @@ class GitHubAPIAdapter:
             """
         await self.client.graphql(mutation, variables)
         return Ack(item_id, {"note": note})
+
+    async def _write_auto_build(self, effect: EffectIntent) -> AdapterOutcome:
+        """Set the "Auto-build" field to ``args.value`` (an option name, "" clears it)."""
+        schema = self.board_schema
+        value = effect.args.get("value")
+        if schema is None or not schema.auto_build_field_id:
+            return DefinitiveFailure("no Auto-build field is configured")
+        if not isinstance(value, str):
+            return DefinitiveFailure("SET_AUTO_BUILD requires a value")
+        option_id = schema.auto_build_options.get(value) if value else None
+        if value and option_id is None:
+            return DefinitiveFailure(f"no Auto-build option id is configured for {value}")
+        binding = await self._binding(effect)
+        item_id = binding.project_item_id if binding is not None else None
+        if item_id is None and effect.parcel_id is not None:
+            item_id = await self._project_item_id(effect.parcel_id)
+        if item_id is None:
+            return DefinitiveFailure("the parcel has no project item")
+        field_id = schema.auto_build_field_id
+        current = await self._field_option(item_id, field_id, "Auto-build")
+        if (current or None) == option_id:
+            return Ack(item_id, {"adopted": True, "value": value})
+        if option_id is not None:
+            await self._set_single_select(item_id, field_id, option_id)
+        else:
+            await self.client.graphql(
+                """
+                mutation($input: ClearProjectV2ItemFieldValueInput!) {
+                  clearProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
+                }
+                """,
+                {
+                    "input": {
+                        "projectId": self.project_node_id,
+                        "itemId": item_id,
+                        "fieldId": field_id,
+                    }
+                },
+            )
+        return Ack(item_id, {"value": value})
 
     async def _react(self, effect: EffectIntent) -> AdapterOutcome:
         comment_id = effect.args.get("comment_id")

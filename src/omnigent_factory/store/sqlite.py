@@ -139,6 +139,7 @@ _PRUNABLE_EFFECT_KINDS = frozenset(
         EffectKind.SCAN_TREE.value,
         EffectKind.SET_BOT.value,
         EffectKind.SET_NOTE.value,
+        EffectKind.SET_AUTO_BUILD.value,
     }
 )
 _AUTO_VACUUM_INCREMENTAL = 2
@@ -455,12 +456,25 @@ class SqliteStore:
         row = conn.execute("SELECT * FROM repositories WHERE repo_id = ?", (repo_id,)).fetchone()
         if row is None:
             raise StoreError(f"unknown repository {repo_id}; call ensure_repository first")
+        # ``auto`` is derived, never written back: the entry the parcel's auto-build mark
+        # started (same approval and queue sequence; a later rework is no auto-build).
         queue = tuple(
             QueueEntry(
-                r["parcel_id"], r["approval_id"], r["approval_sequence"], QueueStatus(r["status"])
+                r["parcel_id"],
+                r["approval_id"],
+                r["approval_sequence"],
+                QueueStatus(r["status"]),
+                auto=bool(r["auto"]),
             )
             for r in conn.execute(
-                "SELECT * FROM queue WHERE repo_id = ? ORDER BY approval_sequence", (repo_id,)
+                "SELECT q.*, COALESCE(("
+                "json_extract(p.aggregate_json, '$.parcel.auto_build.approval_id') "
+                "= q.approval_id AND "
+                "json_extract(p.aggregate_json, '$.parcel.auto_build.sequence') "
+                "= q.approval_sequence), 0) AS auto "
+                "FROM queue q LEFT JOIN parcels p ON p.parcel_id = q.parcel_id "
+                "WHERE q.repo_id = ? ORDER BY q.approval_sequence",
+                (repo_id,),
             )
         )
         reservations = tuple(
@@ -498,12 +512,44 @@ class SqliteStore:
             triage_runs=triage_runs,
         )
 
-    # ---------------------------------------------------------- auto-triage
+    # ---------------------------------------------------------- auto-triage / build
+
+    #: Tables holding an operator switch + daily grant (same shape; see migrations).
+    _SWITCH_TABLES = frozenset({"auto_triage", "auto_build"})
 
     def auto_triage_state(self, repo_id: str) -> AutoTriageState:
+        return self._switch_state("auto_triage", repo_id)
+
+    def set_auto_triage_override(self, repo_id: str, enabled: bool, config_value: bool) -> None:
+        """The operator turned auto-triage on/off, against the current config value."""
+        self._set_switch_override("auto_triage", repo_id, enabled, config_value)
+
+    def clear_auto_triage_override(self, repo_id: str) -> None:
+        self._clear_switch_override("auto_triage", repo_id)
+
+    def grant_auto_triage(self, repo_id: str, day: str, count: int) -> int:
+        """Add ``count`` auto-triages to ``day``'s budget; returns that day's total grant."""
+        return self._grant_switch("auto_triage", repo_id, day, count)
+
+    def auto_build_state(self, repo_id: str) -> AutoTriageState:
+        """Operator state of auto-build (same shape and rules as auto-triage's)."""
+        return self._switch_state("auto_build", repo_id)
+
+    def set_auto_build_override(self, repo_id: str, enabled: bool, config_value: bool) -> None:
+        self._set_switch_override("auto_build", repo_id, enabled, config_value)
+
+    def grant_auto_build(self, repo_id: str, day: str, count: int) -> int:
+        return self._grant_switch("auto_build", repo_id, day, count)
+
+    def _switch_table(self, table: str) -> str:
+        if table not in self._SWITCH_TABLES:
+            raise StoreError(f"unknown switch table {table}")
+        return table
+
+    def _switch_state(self, table: str, repo_id: str) -> AutoTriageState:
         row = self._conn.execute(
-            "SELECT enabled_override, override_config, grant_day, granted FROM auto_triage "
-            "WHERE repo_id = ?",
+            "SELECT enabled_override, override_config, grant_day, granted FROM "
+            f"{self._switch_table(table)} WHERE repo_id = ?",
             (repo_id,),
         ).fetchone()
         if row is None:
@@ -515,31 +561,33 @@ class SqliteStore:
             granted=int(row[3]),
         )
 
-    def set_auto_triage_override(self, repo_id: str, enabled: bool, config_value: bool) -> None:
-        """The operator turned auto-triage on/off, against the current config value."""
+    def _set_switch_override(
+        self, table: str, repo_id: str, enabled: bool, config_value: bool
+    ) -> None:
         with self._txn() as conn:
             conn.execute(
-                "INSERT INTO auto_triage (repo_id, enabled_override, override_config, granted, "
-                "updated_at_us) VALUES (?, ?, ?, 0, ?) ON CONFLICT(repo_id) DO UPDATE SET "
+                f"INSERT INTO {self._switch_table(table)} (repo_id, enabled_override, "
+                "override_config, granted, updated_at_us) VALUES (?, ?, ?, 0, ?) "
+                "ON CONFLICT(repo_id) DO UPDATE SET "
                 "enabled_override = excluded.enabled_override, "
                 "override_config = excluded.override_config, "
                 "updated_at_us = excluded.updated_at_us",
                 (repo_id, int(enabled), int(config_value), self._clock.now_utc_us()),
             )
 
-    def clear_auto_triage_override(self, repo_id: str) -> None:
+    def _clear_switch_override(self, table: str, repo_id: str) -> None:
         with self._txn() as conn:
             conn.execute(
-                "UPDATE auto_triage SET enabled_override = NULL, override_config = NULL, "
-                "updated_at_us = ? WHERE repo_id = ?",
+                f"UPDATE {self._switch_table(table)} SET enabled_override = NULL, "
+                "override_config = NULL, updated_at_us = ? WHERE repo_id = ?",
                 (self._clock.now_utc_us(), repo_id),
             )
 
-    def grant_auto_triage(self, repo_id: str, day: str, count: int) -> int:
-        """Add ``count`` auto-triages to ``day``'s budget; returns that day's total grant."""
+    def _grant_switch(self, table: str, repo_id: str, day: str, count: int) -> int:
+        name = self._switch_table(table)
         with self._txn() as conn:
             conn.execute(
-                "INSERT INTO auto_triage (repo_id, grant_day, granted, updated_at_us) "
+                f"INSERT INTO {name} (repo_id, grant_day, granted, updated_at_us) "
                 "VALUES (?, ?, ?, ?) ON CONFLICT(repo_id) DO UPDATE SET "
                 "granted = CASE WHEN grant_day IS excluded.grant_day "
                 "THEN granted + excluded.granted ELSE excluded.granted END, "
@@ -547,7 +595,7 @@ class SqliteStore:
                 (repo_id, day, count, self._clock.now_utc_us()),
             )
             row = conn.execute(
-                "SELECT granted FROM auto_triage WHERE repo_id = ?", (repo_id,)
+                f"SELECT granted FROM {name} WHERE repo_id = ?", (repo_id,)
             ).fetchone()
         return int(row[0])
 

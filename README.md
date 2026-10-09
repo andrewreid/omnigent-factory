@@ -55,6 +55,9 @@ including labels applied when the issue is opened (GitHub sends a `labeled` even
 | `factory:plan` | `/plan` |
 | `factory:build` | Build without a plan: approves the issue's current title and body as written (default block M), from any column. Refused while a question is open, a revision is pending or a build is live. Editing the title or body later voids that approval. |
 
+The board's `Auto-build` field is a control too: `Queued` set by you approves the posted
+plan for [auto-build](#auto-build).
+
 `factory:skip` is not a control: it only keeps the issue out of
 [idle-time auto-triage](#idle-time-auto-triage) (anyone may add it; the factory never
 starts anything because of it).
@@ -159,15 +162,59 @@ hold, no parked delivery). It is checked about every `reconcile_interval_seconds
 audit records each start as an `AutoTriage` event from the trusted clock (the operator's
 standing authorisation), never as an owner control.
 
+### Auto-build
+
+Off by default (`auto_build = true` or `auto-build on`). The project's `Auto-build`
+single-select field lets you approve a posted plan now and have the factory start the
+build when it has room, without dragging the card yourself.
+
+Setting a card's `Auto-build` to `Queued` is your approval of the plan posted on it at
+that moment, exactly like `/approve <hash>`: only your own board edit counts (its
+`projects_v2_item` webhook, from an owner's numeric ID, like a card drag). Anyone else's
+`Queued`, and the factory's own writes, approve nothing. It is accepted only on a card in
+Planning with a posted plan; anywhere else (no plan yet, Inbox, Triage, a plan being
+revised, a build already approved) the factory clears the field and the `Factory note`
+says why (`Auto-build cleared: ...`). An accepted mark notes `Auto-build queued: ...`.
+
+| Situation | What happens |
+|---|---|
+| A question on the plan is open | The mark waits (`eligible: false` in `auto-build status`); once you answer, it can start if the plan is unchanged (a plan the run re-posts after your answer must have the same hash). |
+| The plan is revised after the mark (plain comment, `/plan`, a replan, a changed plan re-posted) | The mark lapses: the field is cleared, note `Plan revised: re-queue to approve`. A build never runs a plan you have not seen. |
+| A stop, a leftward drag or the card leaving Planning | The mark lapses (field cleared, with the reason). |
+| You clear the field before the build starts | It leaves the queue. |
+| You clear the field after the build started | Nothing: stop a build with `/stop` or a leftward drag. |
+| A board read shows `Queued` but no owner webhook was seen | Not acted on: note `Auto-build mark not confirmed: re-select it` (once). Clear and select it again. |
+| You select `Started` | Not an approval (it is the factory's own option): the field is cleared. |
+
+Whenever a build slot is free (this does not wait for the factory to be idle, unlike
+auto-triage), the factory starts the first startable mark by `Rank` (lowest first, unranked
+last), then the oldest issue. Manually approved builds (drag, `/approve`,
+`factory:build`) always go first: no auto-build starts while one waits for a slot, and an
+approved manual build is admitted before a queued auto-build. Auto-builds count towards
+`max_building`; at most `auto_build_concurrency` (1) of them hold a build slot at once.
+Optionally `auto_build_daily_limit` caps starts per local day (0, the default, is
+unlimited; `auto-build grant <n>` adds more for today). The audit records each start as
+an `AutoBuild` event from the trusted clock carrying your mark's approval (owner, event,
+plan hash).
+
+Once started, the factory sets the field to `Started` and it is a normal build: the card
+moves to Building, with the usual checkpoints, fix budget and Ready rules. When the card
+is Done or the issue closes (or its PR merges), the factory clears the field. Marks,
+approvals and starts are stored with the parcel, so a restart never starts a mark twice or
+repeats a note.
+
 ### Triage ranking
 
 Off by default (`ranking = true` or `ranking on`). When the factory is idle by the
 auto-triage rule and no triage is running, and either `ranking_min_new_triages` (5)
 triage results are new or changed since the last ranking or 24 hours have passed with a
-change in the Triage column, one read-only Omnigent session (`Factory ranking · <date>`)
-orders the Triage column. It weighs priority, size, dependencies and blockers from each
-triage's related list, overlaps, clashes with Building or Ready work, stale or likely-done
-findings and age; it reads with `factory_list_issues` and `factory_get_issue` and submits
+change in the Triage or Planning column, one read-only Omnigent session (`Factory ranking ·
+<date>`) ranks the Triage and Planning columns together on one scale: a single `Rank`
+1..N across both columns (no two cards share a rank), so planned cards and triaged ones
+are weighed against each other and auto-build starts queued plans in that order. It weighs
+priority, size, dependencies and blockers from each triage's related list, overlaps,
+clashes with Building or Ready work, stale or likely-done findings, how ready an issue is
+and age; it reads with `factory_list_issues` and `factory_get_issue` and submits
 once with `factory_submit_ranking`. It never moves cards, starts stages or closes issues,
 and a ranking and auto-triage never run at the same time. `ranking now` skips the idle rule: it
 starts as soon as no triage and no other ranking is running, even while builds, plans or
@@ -176,7 +223,7 @@ reworks run.
 What it writes: the project's `Rank` number field (1 = next), only where the value
 changes; a `Priority` change only when the run found the triage priority wrong, each with
 one short comment on the issue (reason, old -> new); and one short project status update
-(top 5 and any priority changes; `ranking_status_update = false` turns it off; without
+(top 5 of the combined Triage and Planning ranking and any priority changes; `ranking_status_update = false` turns it off; without
 access the run posts none and logs it).
 
 Your choices win. Set a card's Rank yourself and it is pinned there: later rankings order
@@ -234,24 +281,33 @@ waits up to 90 s for it instead of failing.
 | `auto-triage status` | Idle-time auto-triage: enabled (and whether config or the CLI decides), today's used/limit/granted, idle or what keeps it busy, triage slots, the next candidate. |
 | `auto-triage on` / `off` | Turn auto-triage on/off at runtime. Stored in the state database, so it survives restarts, until `auto_triage` in the config file changes: then the config value applies again (the newer intent wins). |
 | `auto-triage grant <n>` | Add `<n>` (1-1000) auto-triages to today's budget (local day; it does not carry over). |
+| `auto-build status` | Auto-build: enabled (and whether config or the CLI decides), the concurrency cap, auto-builds running and waiting for a slot, today's used/limit/granted, what the next start waits on (`waiting_on`), and the queue in start order with each card's rank, `eligible` and `blocker`. |
+| `auto-build on` / `off` | Turn auto-build on/off at runtime; stored like `auto-triage on`/`off` (the newer intent wins). Marks stay queued while it is off. |
+| `auto-build grant <n>` | Add `<n>` (1-1000) auto-builds to today's limit (only matters with `auto_build_daily_limit` > 0). |
 | `ranking status` | Triage ranking: enabled (and whether config or the CLI decides), idle or what keeps it busy, new triage results since the last ranking, failures/backoff, recent runs. |
 | `ranking on` / `off` | Turn triage ranking on/off at runtime; stored like `auto-triage on`/`off` (the newer intent wins). |
 | `ranking now` | Run one ranking as soon as no triage or other ranking is running (it does not wait for builds, plans, reworks, queued builds or stage requests), whatever changed (also when ranking is off, or backing off; not while paused). `ranking status` then shows only what it still waits on. |
 | `sessions prune [--dry-run]` | Delete (or list) the factory sessions session retention would remove now (through the daemon). |
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id` and `session_retention_days`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id` and `session_retention_days`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.
-Auto-triage keys (under `[service]`, all hot-reloadable):
+Auto-triage, auto-build and ranking keys (under `[service]`; hot-reloadable unless marked
+"restart"):
 
 ```toml
 auto_triage = false              # idle-time auto-triage of Inbox issues
 auto_triage_daily_limit = 20     # auto-started triages per local day
 auto_triage_min_age_hours = 24   # grace before a new issue is taken
 triage_concurrency = 1           # triage runs at once, however started
-ranking = false                  # idle-time ranking of the Triage column
+auto_build = false               # start builds you queued with the Auto-build field
+auto_build_concurrency = 1       # auto-builds holding a build slot at once
+auto_build_daily_limit = 0       # auto-builds started per local day (0 = unlimited)
+auto_build_field_node_id = ""    # the project's "Auto-build" SINGLE_SELECT field (restart)
+auto_build_options = { Queued = "", Started = "" }  # its option IDs (restart)
+ranking = false                  # idle-time ranking of the Triage and Planning columns
 ranking_min_new_triages = 5      # new/changed triage results that start a ranking
 ranking_status_update = true     # short project status update per ranking
 rank_field_node_id = ""          # the project's "Rank" NUMBER field (doctor checks it)
@@ -260,6 +316,14 @@ session_retention_days = 30      # delete factory sessions archived this long; 0
 
 Create the `Rank` field with the board migration (`setup render` lists it) and record its
 node ID as `rank_field_node_id`; ranking does not start without it.
+
+Create the `Auto-build` field the same way: `setup render` lists it under `create_fields`
+(a SINGLE_SELECT with options `Queued` and `Started`). Apply that one `createProjectV2Field`
+input, then record the returned field node ID as `auto_build_field_node_id` and its two
+option IDs as `auto_build_options = { Queued = "...", Started = "..." }` and restart the
+daemon (these two keys are not hot-reloadable). While `auto_build` is on or the field
+is configured, `doctor` fails when the field is missing (naming its ID and options when
+the board already has one) or its IDs differ.
 
 A triage/report/status publication that failed definitively leaves the card at
 `Bot: Blocked`. Fix the cause, then run `recovery` and `retry-effect <effect_id>`.

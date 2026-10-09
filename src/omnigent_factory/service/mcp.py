@@ -1265,9 +1265,10 @@ def build_mcp_server(tools: FactoryTools, config: ServiceConfig) -> FastMCP:
 
     @server.tool(
         name="factory_submit_ranking",
-        description="Ranking sessions only: submit the Triage column's order once. run_id "
-        "is your ranking run (start message). ranking: every unpinned Triage issue in "
-        "order, each {issue, reason} with a one-line reason; owner-pinned issues may be "
+        description="Ranking sessions only: submit the order of the Triage and Planning "
+        "columns once, on one scale. run_id is your ranking run (start message). ranking: "
+        "every unpinned Triage and Planning issue in one order, each {issue, reason} with a "
+        "one-line reason; owner-pinned issues may be "
         "left out. priority_changes (optional): {issue, new_priority P0-P3, reason} only "
         "when you found the triage priority wrong. summary: at most 600 characters. "
         "Errors list exactly what to fix; an exact retry returns the original receipt. "

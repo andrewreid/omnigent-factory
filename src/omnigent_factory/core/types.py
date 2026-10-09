@@ -123,6 +123,20 @@ class Via(enum.StrEnum):
     LABEL = "label"
 
 
+class AutoBuildStatus(enum.StrEnum):
+    """An owner's auto-build mark (the board's "Auto-build" field)."""
+
+    #: Set to Queued by an owner: approval of the posted plan, waiting to be started.
+    QUEUED = "queued"
+    #: The factory started the build from the mark (it wrote "Started" on the board).
+    STARTED = "started"
+
+
+#: The board's "Auto-build" single-select option names (``auto_build_options`` keys).
+AUTO_BUILD_QUEUED = "Queued"
+AUTO_BUILD_STARTED = "Started"
+
+
 class Size(enum.StrEnum):
     S = "S"
     M = "M"
@@ -314,6 +328,9 @@ class IssueSnapshot:
     #: sha256 of ``body`` when a stored read was superseded by a newer one and its body
     #: dropped (only the newest read's text is ever read back); None otherwise.
     body_sha256: str | None = None
+    #: The board's "Auto-build" option name when read ("" = empty, "?" = an option the
+    #: config does not know); None when not read (no field configured).
+    auto_build: str | None = None
 
     @property
     def eligible(self) -> bool:
@@ -591,6 +608,36 @@ class QueueEntry:
     approval_id: str
     sequence: int
     status: QueueStatus
+    #: Started from an owner's auto-build mark: admitted after every manually approved
+    #: build and within ``auto_build_concurrency``. Derived on load from the parcel's
+    #: mark (``AutoBuildMark.approval_id``/``sequence``), never stored in the queue table.
+    auto: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class AutoBuildMark:
+    """An owner set the card's "Auto-build" field to Queued: approval of one posted plan.
+
+    Accepted only from the owner's own ``projects_v2_item`` webhook. It approves exactly
+    the plan posted when it was set (``full_hash``); a later plan revision, a barrier or
+    the card leaving Planning lapses it before it starts. Once the factory starts the
+    build (``STARTED``) it is an ordinary approved build.
+    """
+
+    status: AutoBuildStatus
+    full_hash: str
+    contract_id: str
+    owner_id: int
+    source_event_id: str
+    marked_at_us: int
+    #: The plan revision the mark approved; an owner answer to the plan's question moves
+    #: it on (the re-posted plan must then carry the same hash), any other revision
+    #: lapses the mark.
+    revision: int = 0
+    #: The approval the started build runs under ("" while queued) and the sequence of
+    #: its queue entry (a later rework under the same approval is no auto-build).
+    approval_id: str = ""
+    sequence: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -707,6 +754,13 @@ class Parcel:
     #: The latest column change observed without an owner control (None once a control
     #: explains it or the card moves on).
     observed_move: ObservedMove | None = None
+    #: The owner's auto-build mark (None: none, or it lapsed or finished).
+    auto_build: AutoBuildMark | None = None
+    #: The "Auto-build" option the factory believes the board shows ("" = empty): the
+    #: factory's own last write, or the owner's change as seen by a webhook or a read.
+    auto_build_field: str = ""
+    #: When ``auto_build_field`` last changed: a read taken before then is stale.
+    auto_build_field_at_us: int = 0
     applied_event_ids: frozenset[str] = frozenset()
 
     def session(self, session_id: str | None) -> StageSession | None:
@@ -793,6 +847,11 @@ class AdmissionSnapshot:
     #: (``predicates.holds_triage_slot``), shared by every triage start in the repository.
     triage_runs: frozenset[str] = frozenset()
 
+    @property
+    def auto_build_count(self) -> int:
+        """Builds started from an auto-build mark that hold their building slot."""
+        return sum(1 for q in self.queue if q.auto and q.status == QueueStatus.RESERVED)
+
     def queue_entry(self, parcel_id: str) -> QueueEntry | None:
         for q in self.queue:
             if q.parcel_id == parcel_id:
@@ -840,6 +899,9 @@ class TrustedConfig:
     #: Triage runs that may hold a slot at once, repository-wide (owner and auto-triage
     #: starts alike); a triage request beyond it waits for a slot.
     triage_concurrency: int = 1
+    #: Builds started from an owner's auto-build mark that may run at once (within
+    #: ``max_building``; manually approved builds are always admitted first).
+    auto_build_concurrency: int = 1
 
     def block_us(self, size: Size) -> int:
         return self.block_hours[size] * MICROS_PER_HOUR

@@ -269,12 +269,23 @@ def triage_queued_note() -> str:
     return "Queued: triage starts when a triage slot is free"
 
 
+def admission_key(q: QueueEntry) -> tuple[bool, int, str]:
+    """Admission order: every manually approved build before any auto-build, then the
+    persisted approval sequence, then parcel ID."""
+    return (q.auto, q.sequence, q.parcel_id)
+
+
 def queue_head(admission: AdmissionSnapshot) -> QueueEntry | None:
-    """Oldest valid queued entry by persisted approval sequence, then parcel ID."""
+    """The next queued entry to admit (``admission_key``)."""
     queued = [q for q in admission.queue if q.status == QueueStatus.QUEUED]
     if not queued:
         return None
-    return min(queued, key=lambda q: (q.sequence, q.parcel_id))
+    return min(queued, key=admission_key)
+
+
+def auto_build_capacity_available(admission: AdmissionSnapshot, config: TrustedConfig) -> bool:
+    """Another auto-build may hold a building slot (``auto_build_concurrency``)."""
+    return admission.auto_build_count < config.auto_build_concurrency
 
 
 def building_capacity_available(admission: AdmissionSnapshot, config: TrustedConfig) -> bool:
@@ -288,12 +299,14 @@ def pr_capacity_available(admission: AdmissionSnapshot, config: TrustedConfig) -
 def startable_build(admission: AdmissionSnapshot, config: TrustedConfig) -> QueueEntry | None:
     """The queued build that capacity would admit right now, if any.
 
-    Not paused, the queue head, a building slot free and an open-PR slot free unless the
-    head already holds one: the repository-wide checks of ``CapacityAvailable`` (its
-    per-parcel preconditions are the parcel's own).
+    Not paused, the queue head, a building slot free (for an auto-build also an auto-build
+    slot) and an open-PR slot free unless the head already holds one: the repository-wide
+    checks of ``CapacityAvailable`` (its per-parcel preconditions are the parcel's own).
     """
     head = queue_head(admission)
     if head is None or admission.paused or not building_capacity_available(admission, config):
+        return None
+    if head.auto and not auto_build_capacity_available(admission, config):
         return None
     holds_pr = any(
         r.parcel_id == head.parcel_id for r in admission.live_reservations(ReservationKind.OPEN_PR)

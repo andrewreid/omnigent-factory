@@ -40,6 +40,7 @@ def snapshot(
     identity_resolved: bool = True,
     bot: str | None = None,
     note: str | None = None,
+    auto_build: str | None = None,
 ) -> IssueSnapshot:
     return IssueSnapshot(
         open=open,
@@ -53,6 +54,7 @@ def snapshot(
         read_at_us=read_at_us,
         bot=bot,
         note=note,
+        auto_build=auto_build,
     )
 
 
@@ -139,7 +141,8 @@ class EventFactory:
                 | ev.CapacityAvailable
                 | ev.RetryDue
                 | ev.ReconcileDue
-                | ev.AutoTriage,
+                | ev.AutoTriage
+                | ev.AutoBuild,
             ):
                 provenance = Provenance.SCHEDULER
             if isinstance(body, ev.InboxHoldSet | ev.InboxHoldReleased):

@@ -15,6 +15,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any
 
 from omnigent_factory.core import events as ev
@@ -64,6 +65,9 @@ class DeliveryIdentity:
     automation_user_ids: frozenset[int] = frozenset()
     #: Status option IDs per stage; columns are identified by option ID, never by name.
     status_option_ids: Mapping[Stage, str] = STATUS_OPTION_IDS
+    #: The "Auto-build" single-select field and its option IDs by name ("" = none).
+    auto_build_field_node_id: str = ""
+    auto_build_option_ids: Mapping[str, str] = MappingProxyType({})
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,6 +441,9 @@ class DeliveryNormalizer:
         field = changes.get("field_value") if isinstance(changes, dict) else None
         if not isinstance(field, dict):
             return ()
+        auto_build_field = self.identity.auto_build_field_node_id
+        if auto_build_field and field.get("field_node_id") == auto_build_field:
+            return self._auto_build_change(field, actor_id)
         if field.get("field_node_id") != self.identity.status_field_node_id:
             return ()
         old = field.get("from")
@@ -469,6 +476,30 @@ class DeliveryNormalizer:
                 return (ev.RequestRework(),)
             return (ev.ApprovePlan(via=Via.DRAG, board_from=from_stage),)
         return (ev.ColumnObserved(stage=to_stage),)
+
+    def _auto_build_change(
+        self, field: Mapping[str, Any], actor_id: int
+    ) -> tuple[ev.EventBody, ...]:
+        """The "Auto-build" field changed: an owner control only from an owner's own edit.
+
+        The factory's own writes (its bot user) are ignored, as is anyone who is not an
+        owner (or is an automation account): a non-owner's Queued approves nothing. The
+        option is identified by ID only; an unknown option is ``"?"``.
+        """
+        if (
+            actor_id == self.identity.bot_user_id
+            or actor_id not in self.identity.owner_ids
+            or actor_id in self.identity.automation_user_ids
+        ):
+            return ()
+        if "to" not in field:
+            return ()  # the new value is not in the payload: a read sees it (unconfirmed)
+        new = field.get("to")
+        option_id = new.get("id") if isinstance(new, dict) else None
+        if option_id is None:
+            return (ev.AutoBuildMarked(option=""),)
+        names = [n for n, o in self.identity.auto_build_option_ids.items() if o == option_id]
+        return (ev.AutoBuildMarked(option=names[0] if len(names) == 1 else "?"),)
 
     def _pull_request(self, payload: dict[str, Any]) -> tuple[ev.EventBody, ...]:
         pr = payload.get("pull_request")

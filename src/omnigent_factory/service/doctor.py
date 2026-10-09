@@ -332,11 +332,53 @@ async def _check_project(config: ServiceConfig, client: GitHubClient, report: Do
         report.fail("github_project", "Factory note text field ID does not match")
         return
     report.pass_check("github_project", "project and live field/option IDs match")
+    if config.auto_build or config.auto_build_field_node_id:
+        _check_auto_build_field(config, by_id, report)
     ranking_set_up = config.ranking or bool(config.rank_field_node_id)
     if ranking_set_up:
         _check_rank_field(config, by_id, report)
     if ranking_set_up and config.ranking_status_update:
         await _check_status_updates(config, client, report)
+
+
+def _check_auto_build_field(
+    config: ServiceConfig, by_id: dict[Any, Any], report: DoctorReport
+) -> None:
+    """The owner's "Auto-build" SINGLE_SELECT field (``auto_build_field_node_id`` with
+    ``auto_build_options`` Queued/Started), when auto-build is on or the field is set."""
+    if not config.auto_build_field_node_id:
+        found = [
+            row
+            for row in by_id.values()
+            if isinstance(row, dict) and row.get("name") == "Auto-build"
+        ]
+        hint = " (create it, see `setup render`)"
+        if found:
+            options = {
+                str(o.get("name")): str(o.get("id"))
+                for o in found[0].get("options") or []
+                if isinstance(o, dict)
+            }
+            hint = f" (the board has one: id {found[0].get('id')}, options {options})"
+        report.fail(
+            "github_auto_build_field",
+            "auto_build is on but auto_build_field_node_id is not set: the Auto-build field "
+            "is missing, so no card can be queued for auto-build" + hint,
+        )
+        return
+    field = by_id.get(config.auto_build_field_node_id)
+    if not isinstance(field, dict) or field.get("name") != "Auto-build":
+        report.fail("github_auto_build_field", "Auto-build field ID does not match")
+        return
+    live = {
+        str(option.get("name")): str(option.get("id"))
+        for option in field.get("options") or []
+        if isinstance(option, dict)
+    }
+    if any(live.get(name) != option for name, option in config.auto_build_options.items()):
+        report.fail("github_auto_build_field", "Auto-build option IDs differ from configuration")
+        return
+    report.pass_check("github_auto_build_field", "Auto-build field and option IDs match")
 
 
 def _check_rank_field(config: ServiceConfig, by_id: dict[Any, Any], report: DoctorReport) -> None:

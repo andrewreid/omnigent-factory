@@ -61,6 +61,8 @@ from omnigent_factory.core.predicates import (
 )
 from omnigent_factory.core.projection import (
     NOTE_MAX,
+    admission_key,
+    auto_build_capacity_available,
     building_capacity_available,
     pr_capacity_available,
     project_bot,
@@ -73,6 +75,8 @@ from omnigent_factory.core.projection import (
     work_live,
 )
 from omnigent_factory.core.types import (
+    AUTO_BUILD_QUEUED,
+    AUTO_BUILD_STARTED,
     BLOCKING_HOLDS,
     CONTROL_CLEARED_HOLDS,
     RELATIONS,
@@ -80,6 +84,8 @@ from omnigent_factory.core.types import (
     AdmissionSnapshot,
     Approval,
     ApprovalKind,
+    AutoBuildMark,
+    AutoBuildStatus,
     BotState,
     Contract,
     Decision,
@@ -166,6 +172,7 @@ _DEFAULT_RETRY: dict[EffectKind, RetryClass] = {
     EffectKind.MOVE_CARD: RetryClass.ADOPTABLE_WRITE,
     EffectKind.SET_BOT: RetryClass.ADOPTABLE_WRITE,
     EffectKind.SET_NOTE: RetryClass.ADOPTABLE_WRITE,
+    EffectKind.SET_AUTO_BUILD: RetryClass.ADOPTABLE_WRITE,
     EffectKind.REACT_COMMENT: RetryClass.ADOPTABLE_WRITE,
     EffectKind.POST_COMMENT: RetryClass.ADOPTABLE_WRITE,
     EffectKind.PUBLISH_CONTRACT: RetryClass.ADOPTABLE_WRITE,
@@ -794,6 +801,7 @@ def _apply_evidence(ctx: _Ctx) -> None:
     was_in_project = ctx.p.in_project
     ctx.update(eligible=snap.eligible, in_project=snap.in_project)
     _sync_session_title(ctx, snap)
+    _observe_auto_build(ctx, snap)
     if snap.in_project:
         ctx.unhold(Hold.NO_PROJECT_ITEM)
     if was_eligible and not snap.eligible:
@@ -1224,15 +1232,19 @@ def _new_approval(
     *,
     contract_id: str | None = None,
     snapshot: str | None = None,
+    mark: AutoBuildMark | None = None,
 ) -> Approval:
-    assert ctx.event.actor_id is not None  # noqa: S101 - guarded by _control
+    """A new current approval: the event's owner's, or (``mark``) the owner's auto-build
+    mark the trusted clock starts (its owner, event and time are the approval's source)."""
+    owner_id = ctx.event.actor_id if mark is None else mark.owner_id
+    assert owner_id is not None  # noqa: S101 - guarded by _control or the mark
     a = Approval(
         approval_id=ctx.new_id("ap"),
         kind=kind,
         full_hash=full_hash,
-        owner_id=ctx.event.actor_id,
-        source_event_id=ctx.event.event_id,
-        source_time_us=ctx.now,
+        owner_id=owner_id,
+        source_event_id=ctx.event.event_id if mark is None else mark.source_event_id,
+        source_time_us=ctx.now if mark is None else mark.marked_at_us,
         sequence=ctx.admission.next_sequence,
         eligibility_epoch=ctx.p.eligibility_epoch,
         contract_id=contract_id,
@@ -1273,7 +1285,7 @@ def _build_blocked_by_live(ctx: _Ctx) -> bool:
     return cur is not None and cur.kind == SessionKind.BUILD and gate_open(ctx.p, cur)
 
 
-def _after_approval(ctx: _Ctx, approval: Approval, duration_us: int, via: Via) -> None:
+def _after_approval(ctx: _Ctx, approval: Approval, duration_us: int, via: Via | None) -> None:
     ctx.unhold(*CONTROL_CLEARED_HOLDS)
     ctx.update(readiness_wakes=0, findings_wakes=0)  # a new approved deliverable: own wakes
     _cancel_pending(ctx)
@@ -1423,6 +1435,247 @@ def _h_related_marked(ctx: _Ctx, body: ev.RelatedMarked) -> None:
     ctx.update(related_marks=(*rest, mark)[-_MAX_RELATED_MARKS:])
 
 
+# ------------------------------------------------------------------ auto-build
+
+
+def _write_auto_build(ctx: _Ctx, value: str) -> None:
+    """Write the board's "Auto-build" field (display; the owner's webhook is the control)."""
+    if ctx.p.auto_build_field == value:
+        return
+    ctx.update(
+        auto_build_field=value, auto_build_field_at_us=max(ctx.p.auto_build_field_at_us, ctx.now)
+    )
+    ctx.emit(EffectKind.SET_AUTO_BUILD, args={"value": value})
+
+
+def _auto_build_live(p: Parcel) -> bool:
+    """The build an auto-build mark started still runs under its approval."""
+    mark = p.auto_build
+    a = p.current_approval
+    return (
+        mark is not None
+        and mark.status == AutoBuildStatus.STARTED
+        and a is not None
+        and a.valid
+        and a.approval_id == mark.approval_id
+    )
+
+
+def _plan_revised(p: Parcel, mark: AutoBuildMark) -> bool:
+    """The plan the mark approved is no longer the posted, current one.
+
+    Any revision but the one an owner answer to the plan's question starts (owner
+    feedback, ``/plan``, a replan) revises it. While that answer is folded into the
+    plan, the mark waits; the re-posted plan must carry the same hash.
+    """
+    c = p.current_contract
+    if p.revision != mark.revision or (c is not None and not c.intact):
+        return True
+    if p.revision_pending:
+        return False  # an answer is being folded in: judged once the plan is posted
+    return c is None or not c.published or c.superseded or c.full_hash != mark.full_hash
+
+
+PLAN_REVISED_NOTE = "Plan revised: re-queue to approve"
+AUTO_BUILD_UNCONFIRMED_NOTE = "Auto-build mark not confirmed: re-select it"
+
+
+def _mark_refusal(ctx: _Ctx) -> str | None:
+    """Why an owner's Queued cannot approve the plan posted now (None: it can)."""
+    p = ctx.p
+    if ctx.now <= p.barrier_time_us:
+        return "Auto-build cleared: set before the latest stop; re-select Queued"
+    if not eligible(p):
+        return "Auto-build cleared: the issue is closed, assigned or unverified"
+    if ctx.origin_stage != Stage.SCOPED or p.stage != Stage.SCOPED:
+        return "Auto-build cleared: only a card in Planning with a posted plan can be queued"
+    c = p.current_contract
+    if c is None or not c.published or not c.intact or c.superseded:
+        return "Auto-build cleared: there is no posted plan to approve"
+    if p.revision_pending or c.posted_at_us is None or not c.posted_at_us < ctx.now:
+        return PLAN_REVISED_NOTE
+    if _build_blocked_by_live(ctx) or _approval_active(ctx):
+        return "Auto-build cleared: a build is already approved"
+    return None
+
+
+def _h_auto_build_marked(ctx: _Ctx, body: ev.AutoBuildMarked) -> None:
+    """The owner changed the card's "Auto-build" field (their own webhook; the factory's
+    writes never arrive here).
+
+    Queued approves the plan posted now, like ``/approve <hash>``: it is recorded as a
+    mark bound to that plan's hash and started later by the trusted clock (``AutoBuild``)
+    when a build slot is free. Anywhere a plan cannot be approved the factory clears the
+    field and says why. An open owner question does not refuse it: the build waits for
+    the answer. Clearing the field before the start drops the mark; after the start it
+    changes nothing (``/stop`` or a leftward drag stops a build). "Started" is the
+    factory's own option: the owner selecting it approves nothing.
+    """
+    option = body.option
+    mark = ctx.p.auto_build
+    ctx.update(
+        auto_build_field=option,
+        auto_build_field_at_us=max(ctx.p.auto_build_field_at_us, ctx.now),
+    )
+    if option == AUTO_BUILD_QUEUED:
+        if _auto_build_live(ctx.p):
+            _write_auto_build(ctx, AUTO_BUILD_STARTED)  # already started: nothing new
+            return
+        refusal = _mark_refusal(ctx)
+        if refusal is not None:
+            ctx.update(auto_build=None)
+            _write_auto_build(ctx, "")
+            ctx.note(refusal)
+            return
+        c = ctx.p.current_contract
+        assert c is not None and ctx.event.actor_id is not None  # noqa: S101 - checked above
+        ctx.update(
+            auto_build=AutoBuildMark(
+                status=AutoBuildStatus.QUEUED,
+                full_hash=c.full_hash,
+                contract_id=c.contract_id,
+                owner_id=ctx.event.actor_id,
+                source_event_id=ctx.event.event_id,
+                marked_at_us=ctx.now,
+                revision=ctx.p.revision,
+            )
+        )
+        ctx.note(
+            "Auto-build queued: starts once your open question is answered"
+            if ctx.p.open_decisions
+            else "Auto-build queued: starts when a build slot is free"
+        )
+        return
+    queued = mark is not None and mark.status == AutoBuildStatus.QUEUED
+    if option == "":
+        if queued:
+            ctx.update(auto_build=None)
+            ctx.note("Auto-build mark cleared")
+        return  # after the start: nothing (stop a build with /stop or a leftward drag)
+    if option == AUTO_BUILD_STARTED and not _auto_build_live(ctx.p):
+        # The factory's own option: never an approval.
+        ctx.update(auto_build=None if queued else mark)
+        _write_auto_build(ctx, "")
+        ctx.note("Auto-build cleared: Started is set by the factory; select Queued to approve")
+
+
+def _h_auto_build(ctx: _Ctx, body: ev.AutoBuild) -> None:
+    """Start the build an owner's auto-build mark approved (the trusted clock).
+
+    The mark is the owner's approval of exactly one posted plan; this re-checks
+    everything that could have changed since: a fresh read, no barrier after the mark,
+    the card still in Planning with that plan posted and approvable (no open question,
+    no revision), no build live, and admission: not paused, no queued build waiting (a
+    manual approval always goes first), a building slot, an auto-build slot and an
+    open-PR slot free. Then it is an ordinary approval: the build is queued (as the queue's
+    auto-build entry) and the card moves to Building; the field shows "Started".
+    """
+    _ = body
+    p = ctx.p
+    mark = p.auto_build
+    if mark is None or mark.status != AutoBuildStatus.QUEUED:
+        raise Rejected("no-auto-build-mark")
+    if ctx.event.evidence is None:
+        raise Rejected("auto-build-without-fresh-read")
+    if ctx.now <= p.barrier_time_us or mark.marked_at_us <= p.barrier_time_us:
+        raise Rejected("auto-build-not-fresh-after-barrier")
+    if ctx.admission.paused:
+        raise Rejected("paused")
+    if not dispatchable(p):
+        raise Rejected("parcel-not-dispatchable")
+    if ctx.origin_stage != Stage.SCOPED or p.stage != Stage.SCOPED:
+        raise Rejected("auto-build-not-in-planning")
+    if p.open_decisions:
+        raise Rejected("open-decisions")
+    if not plan_ok(p) or _plan_revised(p, mark):
+        raise Rejected("auto-build-plan-changed")
+    if _build_blocked_by_live(ctx) or _approval_active(ctx):
+        raise Rejected("auto-build-build-live")
+    if queue_head(ctx.admission) is not None:
+        raise Rejected("auto-build-behind-queued-build")
+    if not building_capacity_available(ctx.admission, ctx.config):
+        raise Rejected("building-cap")
+    if not auto_build_capacity_available(ctx.admission, ctx.config):
+        raise Rejected("auto-build-cap")
+    if not pr_capacity_available(ctx.admission, ctx.config):
+        raise Rejected("open-pr-cap")
+    latest = p.current_contract
+    assert latest is not None  # noqa: S101 - plan_ok checks it
+    approval = _new_approval(
+        ctx, ApprovalKind.PLAN, latest.full_hash, contract_id=latest.contract_id, mark=mark
+    )
+    _after_approval(ctx, approval, ctx.config.block_us(latest.size), None)
+    entry = ctx.admission.queue_entry(ctx.p.parcel_id)
+    assert entry is not None  # noqa: S101 - _enqueue_build queued it
+    _set_queue(ctx, replace(entry, auto=True), ctx.p.parcel_id)
+    ctx.update(
+        auto_build=replace(
+            mark,
+            status=AutoBuildStatus.STARTED,
+            approval_id=approval.approval_id,
+            sequence=entry.sequence,
+        )
+    )
+    _write_auto_build(ctx, AUTO_BUILD_STARTED)
+
+
+def _observe_auto_build(ctx: _Ctx, snap: IssueSnapshot) -> None:
+    """A fresh read's "Auto-build" value (the webhook may have been lost).
+
+    A read proves no actor: Queued seen without the owner's webhook is never acted on
+    (the note asks the owner to select it again, once per value seen); an empty field
+    while a mark waits is the owner clearing it (that only restricts: the mark drops).
+    """
+    value = snap.auto_build
+    p = ctx.p
+    if (
+        value is None
+        or snap.read_at_us <= p.auto_build_field_at_us
+        or value == p.auto_build_field
+        or ctx.event.kind == EventKind.AUTO_BUILD_MARKED
+    ):
+        return
+    ctx.update(auto_build_field=value, auto_build_field_at_us=snap.read_at_us)
+    mark = p.auto_build
+    if value == AUTO_BUILD_QUEUED:
+        if mark is None or mark.status != AutoBuildStatus.QUEUED:
+            ctx.note(AUTO_BUILD_UNCONFIRMED_NOTE)
+    elif mark is not None and mark.status == AutoBuildStatus.QUEUED:
+        ctx.update(auto_build=None)
+        ctx.note("Auto-build mark cleared")
+
+
+def _settle_auto_build(ctx: _Ctx) -> None:
+    """After every event: a queued mark lapses as soon as it no longer approves the
+    plan on the card (a revision, a barrier, the card leaving Planning); a finished
+    parcel (Done, closed or merged) clears the field (a started mark stays as the record
+    of its build)."""
+    p = ctx.p
+    mark = p.auto_build
+    if Hold.COMPLETED in p.holds or p.stage == Stage.DONE:
+        if mark is not None and mark.status == AutoBuildStatus.QUEUED:
+            ctx.update(auto_build=None)
+        if p.auto_build_field:
+            _write_auto_build(ctx, "")
+        return
+    if mark is None or mark.status != AutoBuildStatus.QUEUED:
+        return
+    if p.stage != Stage.SCOPED:
+        why = "Auto-build cleared: the card left Planning"
+    elif not eligible(p):
+        why = "Auto-build cleared: the issue is closed, assigned or unverified"
+    elif mark.marked_at_us <= p.barrier_time_us:
+        why = "Auto-build cleared: stopped after it was queued; re-select Queued"
+    elif _plan_revised(p, mark):
+        why = PLAN_REVISED_NOTE
+    else:
+        return
+    ctx.update(auto_build=None)
+    _write_auto_build(ctx, "")
+    if not ctx.note_set:
+        ctx.note(why)
+
+
 def _replan(ctx: _Ctx, via: Via | None) -> None:
     cur = ctx.p.current_session
     if cur is not None and cur.kind == SessionKind.BUILD and cur.lifecycle != Lifecycle.RETIRED:
@@ -1520,6 +1773,10 @@ def _deliver_answer(ctx: _Ctx, s: StageSession) -> None:
     """Relay recorded answers to ``s``; a plan answer is a plan revision."""
     if s.kind == SessionKind.PLAN:
         ctx.update(revision=ctx.p.revision + 1, revision_pending=True)
+        mark = ctx.p.auto_build
+        if mark is not None and mark.status == AutoBuildStatus.QUEUED:
+            # The owner's own answer: the mark waits for the re-posted plan (same hash).
+            ctx.update(auto_build=replace(mark, revision=ctx.p.revision))
         _void_approval(ctx, "plan-decision")
         s = ctx.put_session(replace(s, revision=ctx.p.revision))
     _relay_answers(ctx, s)
@@ -4127,6 +4384,8 @@ def _h_capacity(ctx: _Ctx, body: ev.CapacityAvailable) -> None:
         raise Rejected("not-queue-head")
     if not building_capacity_available(ctx.admission, ctx.config):
         raise Rejected("building-cap")
+    if entry.auto and not auto_build_capacity_available(ctx.admission, ctx.config):
+        raise Rejected("auto-build-cap")
     has_pr = ctx.p.pr_number is not None and ctx.p.pr_number in ctx.admission.open_bot_prs
     has_pr_reservation = any(
         r.parcel_id == ctx.p.parcel_id and r.kind == ReservationKind.OPEN_PR and r.live
@@ -4315,6 +4574,8 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.BASE_PUSHED: _h_base_pushed,
     EventKind.OPERATOR_RESUME: _h_operator_resume,
     EventKind.AUTO_TRIAGE: _h_auto_triage,
+    EventKind.AUTO_BUILD_MARKED: _h_auto_build_marked,
+    EventKind.AUTO_BUILD: _h_auto_build,
     EventKind.RELATED_MARKED: _h_related_marked,
     EventKind.CONTRACT_PUBLISHED: _h_contract_published,
     EventKind.PUBLICATION_ACKED: _h_publication_acked,
@@ -4400,11 +4661,9 @@ def _queued_note(ctx: _Ctx) -> str:
     entry = ctx.admission.queue_entry(ctx.p.parcel_id)
     if entry is None or entry.status != QueueStatus.QUEUED:
         return ""
-    key = (entry.sequence, entry.parcel_id)
+    key = admission_key(entry)
     ahead = sum(
-        1
-        for q in ctx.admission.queue
-        if q.status == QueueStatus.QUEUED and (q.sequence, q.parcel_id) < key
+        1 for q in ctx.admission.queue if q.status == QueueStatus.QUEUED and admission_key(q) < key
     )
     return f"Queued: {_ordinal(ahead + 1)} in line"
 
@@ -4542,6 +4801,7 @@ def transition(state: State, event: Event) -> TransitionResult:
     new_parcel = ctx.maybe_parcel
     if new_parcel is not None:
         _settle_observed_move(ctx, accepted)
+        _settle_auto_build(ctx)
         _project_board(ctx)
         new_parcel = ctx.p
         kept: list[EffectIntent] = []

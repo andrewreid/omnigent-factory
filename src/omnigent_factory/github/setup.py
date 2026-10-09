@@ -135,6 +135,16 @@ def render_project_migration(
         },
         # Triage ranking order (1 = next); record its node ID as rank_field_node_id.
         {"name": "Rank", "dataType": "NUMBER"},
+        # Owner approval of the posted plan for auto-build; record its node ID as
+        # auto_build_field_node_id and the option IDs as auto_build_options.
+        {
+            "name": "Auto-build",
+            "dataType": "SINGLE_SELECT",
+            "singleSelectOptions": [
+                _option("Queued", "PURPLE", "Owner: build the posted plan when a slot is free"),
+                _option("Started", "BLUE", "Factory: the auto-build was started"),
+            ],
+        },
     ]
     create_fields = [{"input": {"projectId": PROJECT_NODE_ID, **field}} for field in fields]
     views: list[dict[str, Any]] = []
@@ -190,7 +200,8 @@ def render_project_migration(
         "create_fields": create_fields,
         "create_views": views,
         "post_apply_verification": [
-            "persist every returned node and database id (Rank: rank_field_node_id)",
+            "persist every returned node and database id (Rank: rank_field_node_id; "
+            "Auto-build: auto_build_field_node_id and auto_build_options Queued/Started)",
             "verify every preserved option id and existing item value",
             f"keep item-added to {status_names[Stage.INBOX]} and disable PR-driven moves",
             "retire Agent/Audit and old views only after new views verify",

@@ -1,4 +1,6 @@
-"""Triage ranking: an idle-time pass that orders the Triage column (the board's Rank field).
+"""Triage ranking: an idle-time pass that orders the Triage and Planning columns on one
+scale (the board's Rank field: a single 1..N across both columns; auto-build starts
+queued builds in this order).
 
 The standing authorisation is the operator's (host config ``ranking``, or the
 ``ranking on|off`` CLI override; ``ranking now`` asks for one run). An automatic run starts
@@ -70,6 +72,8 @@ PRIORITY_REASON_MAX = 300
 MAX_PRIORITY_CHANGES = 20
 #: Issues listed in the project status update.
 STATUS_TOP = 5
+#: The columns one ranking orders, together on one Rank scale.
+RANKED_STAGES = frozenset({Stage.TRIAGED, Stage.SCOPED})
 
 
 class RankingToolError(RuntimeError):
@@ -106,8 +110,8 @@ def rank_text(value: float | None) -> str | None:
 
 
 def triage_digest(cards: Iterable[RankingCard]) -> str:
-    """The Triage column's membership (a change starts the time-based trigger)."""
-    nodes = sorted(c.node_id for c in cards if c.stage == Stage.TRIAGED)
+    """The ranked columns' membership (a change starts the time-based trigger)."""
+    nodes = sorted(c.node_id for c in cards if c.stage in RANKED_STAGES)
     return hashlib.sha256("\n".join(nodes).encode()).hexdigest()
 
 
@@ -134,11 +138,12 @@ def validate_submission(
     pinned: Mapping[int, float],
     owner_priority: Iterable[int],
 ) -> Submission:
-    """Check a submission against the current Triage column; raises with every problem.
+    """Check a submission against the current Triage and Planning columns (``triage``:
+    every ranked issue); raises with every problem.
 
-    Every unpinned Triage issue exactly once; a pinned issue may be left out or listed at
-    its pinned position; only Triage issues; priorities from P0-P3, never on an issue
-    whose Priority the owner chose.
+    Every unpinned ranked issue exactly once, on one scale across both columns; a pinned
+    issue may be left out or listed at its pinned position; only ranked issues;
+    priorities from P0-P3, never on an issue whose Priority the owner chose.
     """
     errors: list[str] = []
     sticky = set(owner_priority)
@@ -158,7 +163,7 @@ def validate_submission(
             continue
         seen.add(issue)
         if issue not in triage:
-            errors.append(f"#{issue} is not in the Triage column")
+            errors.append(f"#{issue} is not in the Triage or Planning column")
             continue
         if issue in pinned:
             if float(position) != pinned[issue]:
@@ -173,7 +178,7 @@ def validate_submission(
         order.append((issue, reason))
     missing = sorted(set(triage) - set(pinned) - seen)
     if missing:
-        errors.append("missing Triage issues: " + ", ".join(f"#{n}" for n in missing))
+        errors.append("missing Triage/Planning issues: " + ", ".join(f"#{n}" for n in missing))
     summary = str(raw.get("summary") or "").strip()
     if not summary:
         errors.append("summary: required (at most 600 characters)")
@@ -194,7 +199,7 @@ def validate_submission(
         reason = one_line(item.get("reason"), PRIORITY_REASON_MAX)
         card = triage.get(issue)
         if card is None:
-            errors.append(f"priority_changes: #{issue} is not in the Triage column")
+            errors.append(f"priority_changes: #{issue} is not in the Triage or Planning column")
         elif issue in changed:
             errors.append(f"priority_changes: #{issue} is listed twice")
         elif new not in PRIORITIES:
@@ -489,6 +494,8 @@ class Ranker:
         if edit is None:
             return
         node_id, field_id, change = edit
+        if field_id is not None and field_id == config.auto_build_field_node_id:
+            return  # the Auto-build field: an approval control, not a ranking choice
         now = self._now()
         if config.rank_field_node_id and field_id == config.rank_field_node_id:
             await self._owner_rank(node_id, change, now)
@@ -593,15 +600,15 @@ class Ranker:
         except RankingToolError as exc:
             LOG.warning("ranking board read failed reason=%s", exc)
             return "board unavailable"
-        triage = [c for c in cards if c.stage == Stage.TRIAGED]
+        triage = [c for c in cards if c.stage in RANKED_STAGES]
         if not triage:
-            return "no issue in Triage"
+            return "no issue in Triage or Planning"
         pinned, _sticky = await self.owner_choices(cards)
         due = await self._due(state, triage_digest(cards), forced)
         if due is None:
             return "nothing new to rank"
         if all(c.node_id in pinned for c in triage):
-            return "every Triage issue is owner-pinned"
+            return "every Triage/Planning issue is owner-pinned"
         return await self._start(cards, forced=forced, why=due)
 
     async def _due(self, state: rs.RankingState, digest: str, forced: bool) -> str | None:
@@ -613,7 +620,7 @@ class Ranker:
             return f"{new} new triage results"
         changed = new > 0 or digest != state.last_triage_digest
         if changed and self._now() - last >= MAX_AGE_US:
-            return "24 hours and the Triage column changed"
+            return "24 hours and the Triage/Planning columns changed"
         return None
 
     async def _start(self, cards: list[RankingCard], *, forced: bool, why: str) -> str:
@@ -704,18 +711,21 @@ class Ranker:
         config = self.service.config
         cards = await self.cards()
         pinned, _sticky = await self.owner_choices(cards)
-        triage = sorted((c for c in cards if c.stage == Stage.TRIAGED), key=lambda c: c.number)
+        ranked = sorted((c for c in cards if c.stage in RANKED_STAGES), key=lambda c: c.number)
         pins = ", ".join(
-            f"#{c.number} at {rank_text(pinned[c.node_id])}" for c in triage if c.node_id in pinned
+            f"#{c.number} at {rank_text(pinned[c.node_id])}" for c in ranked if c.node_id in pinned
         )
         return (
-            _template("ranking-v1.txt")
+            _template("ranking-v2.txt")
             .format(
                 run_id=run.run_id,
                 repository=config.repository,
                 session_id=run.root_id,
                 triage_column=config.status_names.get(Stage.TRIAGED.value, Stage.TRIAGED.value),
-                count=len(triage),
+                planning_column=config.status_names.get(Stage.SCOPED.value, Stage.SCOPED.value),
+                triage_count=sum(c.stage == Stage.TRIAGED for c in ranked),
+                planning_count=sum(c.stage == Stage.SCOPED for c in ranked),
+                count=len(ranked),
                 pinned=f"pinned: {pins}" if pins else "none are pinned now",
             )
             .strip()
@@ -804,7 +814,7 @@ class Ranker:
                 raise RankingToolError(problem)
             cards = await self.cards()
             pinned_nodes, sticky_nodes = await self.owner_choices(cards)
-            triage = {c.number: c for c in cards if c.stage == Stage.TRIAGED}
+            triage = {c.number: c for c in cards if c.stage in RANKED_STAGES}
             by_node = {c.node_id: c for c in cards}
             pinned = {by_node[n].number: v for n, v in pinned_nodes.items() if n in by_node}
             sticky = {by_node[n].number for n in sticky_nodes if n in by_node}
@@ -1117,7 +1127,7 @@ def _status_text(submission: Submission, triage: Mapping[int, RankingCard], now_
         reason = reasons.get(number) or "owner-pinned"
         lines.append(f"{rank_text(rank)}. #{number} {title}: {reason}")
     if len(ordered) > STATUS_TOP:
-        lines.append(f"…and {len(ordered) - STATUS_TOP} more in Triage.")
+        lines.append(f"…and {len(ordered) - STATUS_TOP} more in Triage and Planning.")
     if submission.priority_changes:
         lines += ["", "**Priority changes:**"]
         lines += [

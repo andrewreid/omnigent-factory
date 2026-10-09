@@ -113,6 +113,17 @@ def build_parser() -> argparse.ArgumentParser:
     grant = auto_sub.add_parser("grant", help="add <n> auto-triages to today's budget")
     grant.add_argument("count", type=int)
     _config_arg(grant)
+    build = sub.add_parser(
+        "auto-build",
+        help="owner-marked auto-builds: status, on/off (overrides the config until it "
+        "changes), grant <n> more for today",
+    )
+    build_sub = build.add_subparsers(dest="build_command", required=True)
+    for name in ("status", "on", "off"):
+        _config_arg(build_sub.add_parser(name))
+    build_grant = build_sub.add_parser("grant", help="add <n> auto-builds to today's limit")
+    build_grant.add_argument("count", type=int)
+    _config_arg(build_grant)
     ranking = sub.add_parser(
         "ranking",
         help="triage ranking: status, on/off (overrides the config until it changes), "
@@ -175,6 +186,7 @@ def _operator(
         "cleanup": 60.0,
         "prune": 900.0,
         "auto-triage": 60.0,  # status reads the board
+        "auto-build": 60.0,
         "ranking": 60.0,
         "sessions-prune": 600.0,  # snapshot, tree scan and delete per session
     }.get(command, 5.0)
@@ -244,6 +256,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.auto_command == "grant":
             request["count"] = args.count
         return _operator(config, "auto-triage", request)
+    if args.command == "auto-build":
+        build_request: dict[str, object] = {"action": args.build_command}
+        if args.build_command == "grant":
+            build_request["count"] = args.count
+        return _operator(config, "auto-build", build_request)
     if args.command == "ranking":
         return _operator(config, "ranking", {"action": args.ranking_command})
     if args.command == "sessions" and args.sessions_command == "prune":

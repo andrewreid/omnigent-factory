@@ -664,6 +664,23 @@ CREATE TABLE board_digests (
 );
 """
 
+# Auto-build (an owner's "Auto-build" field mark, started when a build slot is free).
+#
+# * auto_build: the operator's runtime override of host config ``auto_build`` (same rule
+#   as auto_triage) and today's extra budget from ``auto-build grant``. Auto-started
+#   builds are counted from their accepted ``AutoBuild`` events (retention never deletes
+#   them). The marks themselves live in the parcel aggregate.
+V14_SQL = """
+CREATE TABLE auto_build (
+    repo_id TEXT PRIMARY KEY REFERENCES repositories (repo_id),
+    enabled_override INTEGER CHECK (enabled_override IN (0, 1)),
+    override_config INTEGER CHECK (override_config IN (0, 1)),
+    grant_day TEXT,
+    granted INTEGER NOT NULL DEFAULT 0 CHECK (granted >= 0),
+    updated_at_us INTEGER NOT NULL
+);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -678,4 +695,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(11, "triage-ranking-and-session-retention", V11_SQL),
     Migration(12, "owner-choice-evidence", V12_SQL),
     Migration(13, "board-diff-digests", V13_SQL),
+    Migration(14, "auto-build", V14_SQL),
 )

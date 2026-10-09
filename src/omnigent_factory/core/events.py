@@ -61,6 +61,8 @@ class EventKind(enum.StrEnum):
     UNPAUSE = "Unpause"
     OPERATOR_RESUME = "OperatorResume"
     AUTO_TRIAGE = "AutoTriage"
+    AUTO_BUILD_MARKED = "AutoBuildMarked"
+    AUTO_BUILD = "AutoBuild"
     # safety
     LEFTWARD_MOVE = "LeftwardMove"
     ASSIGNED_HUMAN = "AssignedHuman"
@@ -297,6 +299,35 @@ class AutoTriage(_Body):
     """
 
     KIND: ClassVar[EventKind] = EventKind.AUTO_TRIAGE
+    CLASS: ClassVar[EventClass] = EventClass.CONTROL
+
+
+@dataclass(frozen=True, slots=True)
+class AutoBuildMarked(_Body):
+    """An owner changed the card's "Auto-build" field (their ``projects_v2_item`` webhook).
+
+    ``option`` is the option now selected: ``"Queued"`` approves the plan posted now (an
+    owner approval like ``/approve <hash>``), ``""`` cleared it, ``"Started"`` (the
+    factory's own option) or ``"?"`` (unknown) approve nothing. The factory's own
+    writes never become this event.
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.AUTO_BUILD_MARKED
+    CLASS: ClassVar[EventClass] = EventClass.CONTROL
+    option: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class AutoBuild(_Body):
+    """Start the build an owner's auto-build mark approved (the trusted clock).
+
+    The owner's approval is the mark itself; the operator's standing authorisation
+    (``auto_build``, its daily budget) decides only when. The service picks the mark when
+    a build slot is free and attaches a fresh read; the reducer re-checks the mark against
+    the parcel, the posted plan and admission, then queues the build like an approval.
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.AUTO_BUILD
     CLASS: ClassVar[EventClass] = EventClass.CONTROL
 
 
@@ -883,6 +914,8 @@ EventBody = (
     | OperatorResume
     | Unpause
     | AutoTriage
+    | AutoBuildMarked
+    | AutoBuild
     | LeftwardMove
     | AssignedHuman
     | Closed
@@ -953,6 +986,8 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         OperatorResume,
         Unpause,
         AutoTriage,
+        AutoBuildMarked,
+        AutoBuild,
         LeftwardMove,
         AssignedHuman,
         Closed,
@@ -1058,6 +1093,8 @@ __all__ = [
     "ApprovalInvalidated",
     "ApprovePlan",
     "AssignedHuman",
+    "AutoBuild",
+    "AutoBuildMarked",
     "AutoTriage",
     "BasePushed",
     "BotEyes",

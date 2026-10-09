@@ -88,9 +88,9 @@ def test_validation_lists_every_problem():
     text = str(caught.value)
     for expected in (
         "#1 is listed twice",
-        "#99 is not in the Triage column",
+        "#99 is not in the Triage or Planning column",
         "#2: reason is required",
-        "missing Triage issues: #3, #4",
+        "missing Triage/Planning issues: #3, #4",
         "summary: 601 characters",
         "#3 new_priority must be one of P0-P3",
         "the owner set the Priority of #4",
@@ -641,7 +641,7 @@ async def test_an_owner_rank_webhook_pins_until_the_owner_clears_it(
         await r.ranker.command({"action": "now"})
         assert await r.ranker.run_once() == "started"
         assert not (await r.field("I_3", "rank")).owner_choice  # type: ignore[union-attr]
-        with pytest.raises(RankingToolError, match="missing Triage issues: #3"):
+        with pytest.raises(RankingToolError, match="missing Triage/Planning issues: #3"):
             await r.submit({"ranking": [item(2), item(1)], "summary": "s"})
 
 
@@ -1039,3 +1039,76 @@ async def test_a_run_failing_before_its_create_is_known_still_archives_its_sessi
         assert (await r.ranker.run_once()).startswith("failed")
         newest = (await r.runs())[0]
         assert newest.root_id is None and newest.archived_at_us is not None
+
+
+# ------------------------------------------------------------------ one scale
+
+
+@pytest.mark.asyncio
+async def test_triage_and_planning_are_ranked_together_on_one_scale(
+    service_config: ServiceConfig,
+):
+    names = {"Triaged": "Triage", "Scoped": "Planning"}
+    async with rig(ranking_config(service_config, status_names=names)) as r:
+        cards = [
+            card(1),
+            card(2, stage=Stage.SCOPED),
+            card(3),
+            card(4, stage=Stage.SCOPED),
+            card(5, stage=Stage.BUILDING),
+        ]
+        run = await started(r, *cards)
+        text = " ".join((await r.ranker._start_message(run)).split())
+        assert "Triage and Planning columns together, on one scale" in text
+        assert "4 open issues (2 in Triage, 2 in Planning)" in text
+        # Planning issues must be ranked too; a Building one is not ranked.
+        with pytest.raises(RankingToolError, match="missing Triage/Planning issues: #4"):
+            await r.submit({"ranking": [item(2), item(1), item(3)], "summary": "s"})
+        with pytest.raises(RankingToolError, match="#5 is not in the Triage or Planning column"):
+            await r.submit({"ranking": [item(n) for n in (2, 1, 4, 3, 5)], "summary": "s"})
+        await r.submit({"ranking": [item(n) for n in (2, 1, 4, 3)], "summary": "s"})
+        assert await r.ranker.run_once() == "completed"
+        # One 1..N across both columns: no two issues share a rank.
+        assert sorted(r.board.ranks, key=lambda w: w[1]) == [
+            ("PVTI_2", 1),
+            ("PVTI_1", 2),
+            ("PVTI_4", 3),
+            ("PVTI_3", 4),
+        ]
+        [update] = r.board.updates.values()
+        assert [line.split(" ")[:2] for line in update.splitlines()[2:6]] == [
+            ["1.", "#2"],
+            ["2.", "#1"],
+            ["3.", "#4"],
+            ["4.", "#3"],
+        ]
+
+
+@pytest.mark.asyncio
+async def test_a_planning_only_board_is_ranked_and_owner_pins_hold_across_columns(
+    service_config: ServiceConfig,
+):
+    async with rig(ranking_config(service_config)) as r:
+        pinned = card(2, stage=Stage.SCOPED)
+        r.board.cards_ = [card(1, stage=Stage.SCOPED), pinned]
+        # The owner pins the Planning issue #2 at rank 1 (their own webhook).
+        await r.ranker.note_owner_field(
+            json.dumps(
+                {
+                    "action": "edited",
+                    "sender": {"id": OWNER_ID},
+                    "projects_v2_item": {
+                        "project_node_id": service_config.project_node_id,
+                        "content_node_id": pinned.node_id,
+                    },
+                    "changes": {"field_value": {"field_node_id": RANK_FIELD, "to": 1}},
+                }
+            ).encode()
+        )
+        r.board._set("PVTI_2", rank=1.0)
+        await r.ranker.command({"action": "now"})
+        assert await r.ranker.run_once() == "started"
+        r.board.cards_.append(card(3))  # a Triage issue arrives mid-run
+        await r.submit({"ranking": [item(3), item(1)], "summary": "s"})
+        assert await r.ranker.run_once() == "completed"
+        assert sorted(r.board.ranks) == [("PVTI_1", 3), ("PVTI_3", 2)]

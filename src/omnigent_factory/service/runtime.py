@@ -27,6 +27,7 @@ from omnigent_factory.core.effects import (
 )
 from omnigent_factory.core.events import Event, Provenance
 from omnigent_factory.core.predicates import board_pending, run_closed, settled
+from omnigent_factory.core.projection import admission_key, auto_build_capacity_available
 from omnigent_factory.core.reducer import awaiting_evidence
 from omnigent_factory.core.types import (
     MICROS_PER_MINUTE,
@@ -92,6 +93,9 @@ RERENDERABLE_KINDS = frozenset(
 
 #: Delivery-loop cadence while a delivery is due now but left pending by its pass.
 DELIVERY_BUSY_POLL_SECONDS = 0.05
+#: Longest wait between auto-build passes (a pass with nothing startable reads nothing
+#: remote, so a free build slot is taken within this).
+AUTO_BUILD_POLL_SECONDS = 30.0
 #: How often the clock loop runs the history retention sweep (delivery bodies, old
 #: observation events).
 RETENTION_SWEEP_INTERVAL_SECONDS = 900.0
@@ -155,6 +159,9 @@ class FactoryService:
         #: Idle-time auto-triage and its ``auto-triage`` operator command (composition;
         #: ``service.auto_triage.AutoTriager``). None: not wired.
         self.auto_triager: Any = None
+        #: Owner-marked auto-builds and the ``auto-build`` operator command (composition;
+        #: ``service.auto_build.AutoBuilder``). None: not wired.
+        self.auto_builder: Any = None
         #: Idle-time triage ranking and its ``ranking`` operator command (composition;
         #: ``service.ranking.Ranker``). None: not wired.
         self.ranker: Any = None
@@ -260,6 +267,8 @@ class FactoryService:
                 self._tasks.append(
                     asyncio.create_task(self._auto_triage_loop(), name="auto-triage")
                 )
+            if self.auto_builder is not None:
+                self._tasks.append(asyncio.create_task(self._auto_build_loop(), name="auto-build"))
             if self.ranker is not None:
                 self._tasks.append(asyncio.create_task(self._ranking_loop(), name="ranking"))
             for task in self._tasks:
@@ -640,8 +649,7 @@ class FactoryService:
     async def _admit_once(self) -> None:
         admission = await self.db.call(lambda store: store.load_admission(self.config.repo_id))
         queued = sorted(
-            (q for q in admission.queue if q.status == QueueStatus.QUEUED),
-            key=lambda q: (q.sequence, q.parcel_id),
+            (q for q in admission.queue if q.status == QueueStatus.QUEUED), key=admission_key
         )
         if not queued:
             return
@@ -658,6 +666,7 @@ class FactoryService:
         if not (
             not admission.paused
             and admission.building_count < self.config.max_building
+            and (not head.auto or auto_build_capacity_available(admission, self.config.trusted))
             and (
                 _has_own_pr(parcel, admission)  # e.g. a rework: its PR is already open
                 or admission.prospective_pr_count < self.config.max_open_bot_prs
@@ -824,6 +833,22 @@ class FactoryService:
                 raise
             except Exception:
                 LOG.warning("auto-triage pass failed")
+
+    async def _auto_build_loop(self) -> None:
+        """Auto-build passes (each starts at most one build), every reconcile interval and
+        at least every ``AUTO_BUILD_POLL_SECONDS``: a build slot is taken as soon as it is free.
+        Housekeeping, not a safety loop: a failed pass is logged and retried."""
+        while not self._stop.is_set():
+            await self._wait(min(self.config.reconcile_interval_seconds, AUTO_BUILD_POLL_SECONDS))
+            if self._stop.is_set() or not self.accepting_admission:
+                continue
+            try:
+                outcome = await self.auto_builder.run_once()
+                LOG.debug("auto-build pass outcome=%s", outcome)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.warning("auto-build pass failed")
 
     async def _ranking_loop(self) -> None:
         """Triage ranking passes: every few seconds while a run is open, else every
@@ -1048,6 +1073,11 @@ class FactoryService:
                 raise ValueError("auto-triage is not wired")
             report: dict[str, object] = await self.auto_triager.command(args)
             return report
+        if command == "auto-build":
+            if self.auto_builder is None:
+                raise ValueError("auto-build is not wired")
+            built: dict[str, object] = await self.auto_builder.command(args)
+            return built
         if command == "ranking":
             if self.ranker is None:
                 raise ValueError("ranking is not wired")

@@ -56,6 +56,7 @@ GITHUB_EFFECT_KINDS = frozenset(
         EffectKind.MOVE_CARD,
         EffectKind.SET_BOT,
         EffectKind.SET_NOTE,
+        EffectKind.SET_AUTO_BUILD,
         EffectKind.REACT_COMMENT,
         EffectKind.POST_COMMENT,
         EffectKind.PUBLISH_CONTRACT,
@@ -132,8 +133,8 @@ class BoardCard:
     """One repository issue on the project board, open or closed (a board-diff read).
 
     Everything a missed webhook can change that the factory acts on: column, Bot,
-    open/closed, assignees, labels, title, and the issue's ``updatedAt`` (an edit, label,
-    assignment or close moves it; a column or field change does not).
+    Auto-build, open/closed, assignees, labels, title, and the issue's ``updatedAt`` (an
+    edit, label, assignment or close moves it; a column or field change does not).
     """
 
     node_id: str
@@ -147,11 +148,13 @@ class BoardCard:
     labels: tuple[str, ...]
     title: str
     updated_at: str
+    #: "Auto-build" option ID ("" = none, or the field is not configured).
+    auto_build_option: str = ""
 
     @property
     def digest(self) -> str:
         """Change key of the card's values (stable across reads of an unchanged card)."""
-        values = [
+        values: list[object] = [
             self.open,
             self.status_option,
             self.bot_option,
@@ -160,6 +163,9 @@ class BoardCard:
             self.title,
             self.updated_at,
         ]
+        if self.auto_build_option:
+            # Only when set: a card without one keeps the digest stored before the field.
+            values.append(self.auto_build_option)
         text = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 

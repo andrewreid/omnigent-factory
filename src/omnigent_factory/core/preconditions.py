@@ -39,6 +39,12 @@ def effect_still_valid(parcel: Parcel | None, effect: EffectIntent) -> str | Non
         and effect.args.get("note") != parcel.board_note
     ):
         return "note-superseded"  # a newer note write is queued; latest wins
+    if (
+        effect.kind == EffectKind.SET_AUTO_BUILD
+        and parcel is not None
+        and effect.args.get("value") != parcel.auto_build_field
+    ):
+        return "auto-build-superseded"  # the field changed since: latest wins
     if parcel is not None and Hold.COMPLETED in parcel.holds:
         completed = _completed_invalid(effect)
         if completed is not None:

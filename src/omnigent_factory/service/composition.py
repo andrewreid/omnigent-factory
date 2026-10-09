@@ -35,6 +35,7 @@ from omnigent_factory.omnigent.ranking import RankingSessions
 from omnigent_factory.omnigent.rest import OmnigentReadError, OmnigentRest
 from omnigent_factory.ports.clock import SystemClock
 from omnigent_factory.ports.github import IssueRef
+from omnigent_factory.service.auto_build import AutoBuilder
 from omnigent_factory.service.auto_triage import AutoTriager
 from omnigent_factory.service.board_diff import BoardDiff
 from omnigent_factory.service.board_index import BoardIndex
@@ -280,6 +281,8 @@ async def build_production(
             config.bot_field_node_id,
             config.bot_options,
             config.note_field_node_id,
+            config.auto_build_field_node_id,
+            config.auto_build_options,
         ),
         publication_renderer=publications,
         independent_reviewer_ids=config.independent_reviewer_ids,
@@ -302,6 +305,8 @@ async def build_production(
         owner_ids=config.owners,
         bot_user_id=config.github_bot_user_id,
         status_option_ids=github.status_options,
+        auto_build_field_node_id=config.auto_build_field_node_id,
+        auto_build_option_ids=config.auto_build_options,
     )
     normalizer = DeliveryNormalizer(identity)
 
@@ -389,9 +394,15 @@ async def build_production(
     board = BoardIndex(github.board_issues, clock)
     github.related_marker = RelatedMarker(service, board, directory).schedule
     service.auto_triager = AutoTriager(service, board, github.issue_snapshot)
+    ranking_board = RankingBoard(github)
+    service.auto_builder = AutoBuilder(
+        service,
+        github.issue_snapshot,
+        lambda: ranking_board.cards(service.config.rank_field_node_id),
+    )
     ranker = Ranker(
         service,
-        board=RankingBoard(github),
+        board=ranking_board,
         # Read-only: no git worktree or credential capability, only the factory tools.
         sessions=RankingSessions(omnigent_adapter, str(config.source_clone)),
         policy_barrier_us=omnigent_adapter.config.policy_barrier_us,

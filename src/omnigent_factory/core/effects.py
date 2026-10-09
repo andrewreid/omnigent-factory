@@ -29,6 +29,9 @@ class EffectKind(enum.StrEnum):
     SET_BOT = "set_bot"
     #: Write the board's "Factory note" text field (display only, never authority).
     SET_NOTE = "set_note"
+    #: Write the board's "Auto-build" field (``args.value``: "Queued", "Started" or ""
+    #: to clear; display only, the owner's own webhook is the control).
+    SET_AUTO_BUILD = "set_auto_build"
     #: React to an owner command comment (+1 accepted, confused refused).
     REACT_COMMENT = "react_comment"
     POST_COMMENT = "post_comment"

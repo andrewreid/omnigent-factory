@@ -49,6 +49,9 @@ HOT_RELOAD_KEYS = frozenset(
         "auto_triage_daily_limit",
         "auto_triage_min_age_hours",
         "triage_concurrency",
+        "auto_build",
+        "auto_build_concurrency",
+        "auto_build_daily_limit",
         "ranking",
         "ranking_min_new_triages",
         "ranking_status_update",
@@ -178,9 +181,23 @@ class ServiceConfig(BaseModel):
     #: Triage runs at once, repository-wide (owner drags, labels, commands and comments
     #: included); further triage requests wait for a free slot.
     triage_concurrency: int = Field(default=1, ge=1, le=20)
+    #: Auto-build: start the build of a card whose "Auto-build" field the owner set to
+    #: Queued (their approval of the posted plan) whenever a build slot is free, by Rank.
+    #: ``omnigent-factory auto-build on|off`` overrides it until it changes here.
+    auto_build: bool = False
+    #: Auto-builds that may run at once, within ``max_building`` (manually approved
+    #: builds are always admitted first).
+    auto_build_concurrency: int = Field(default=1, ge=1, le=20)
+    #: Auto-builds started per local day; 0 = unlimited (``auto-build grant <n>`` adds
+    #: more today when limited).
+    auto_build_daily_limit: int = Field(default=0, ge=0, le=1000)
+    #: Projects v2 SINGLE_SELECT field "Auto-build" and its option IDs (``Queued``,
+    #: ``Started``); "" = not set up: the field is neither read nor written.
+    auto_build_field_node_id: str = ""
+    auto_build_options: dict[str, str] = Field(default_factory=dict)
     #: Triage ranking: while the factory is idle, one read-only session orders the Triage
-    #: column (the ``Rank`` field). ``omnigent-factory ranking on|off`` overrides it until
-    #: it changes here.
+    #: and Planning columns on one scale (the ``Rank`` field). ``omnigent-factory ranking
+    #: on|off`` overrides it until it changes here.
     ranking: bool = False
     #: New or changed triage results since the last ranking that start a new one (else a
     #: change in the Triage column and 24 hours).
@@ -292,6 +309,11 @@ class ServiceConfig(BaseModel):
             self.bot_options
         ):
             raise ValueError("bot_options must map every unique Bot option id")
+        if self.auto_build_field_node_id and (
+            set(self.auto_build_options) != {"Queued", "Started"}
+            or len(set(self.auto_build_options.values())) != 2
+        ):
+            raise ValueError("auto_build_options must map Queued and Started to unique option ids")
         if set(self.checkpoint_block_hours) != {"S", "M", "L"}:
             raise ValueError("checkpoint_block_hours must contain S, M and L")
         blocks = [self.checkpoint_block_hours[key] for key in ("S", "M", "L")]
@@ -349,6 +371,7 @@ class ServiceConfig(BaseModel):
             review_ack_us=self.review_bot_ack_minutes * MICROS_PER_MINUTE,
             review_cap_us=self.review_bot_max_wait_minutes * MICROS_PER_MINUTE,
             triage_concurrency=self.triage_concurrency,
+            auto_build_concurrency=self.auto_build_concurrency,
         )
 
     def prepare_private_directories(self) -> None:

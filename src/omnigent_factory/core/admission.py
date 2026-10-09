@@ -14,7 +14,9 @@ Trust classes:
 * ``SCHEDULER`` is the trusted clock; ``OPERATOR`` the local protected CLI socket. The
   clock alone carries ``AutoTriage``: the operator's standing authorisation (host config
   or the ``auto-triage`` CLI, with a daily budget) acted on when the factory is idle. It
-  only ever starts triage of an Inbox issue the factory never worked on.
+  only ever starts triage of an Inbox issue the factory never worked on. It also carries
+  ``AutoBuild``: the start of a build an owner already approved with the board's
+  "Auto-build" field (``AutoBuildMarked``, an owner control).
 * ``MCP`` is a factory tool call over the loopback MCP endpoint, already resolved by the
   service to the calling issue session's current run. It can only report that run's own
   result or ask the owner a question; it never carries authority.
@@ -65,12 +67,17 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.CONTINUE: _OWNER_CONTROL,
     EventKind.STOP: _OWNER_CONTROL,
     EventKind.REQUEST_REWORK: _OWNER_CONTROL,
+    # the owner's "Auto-build" field change (their own project-item webhook)
+    EventKind.AUTO_BUILD_MARKED: _OWNER_CONTROL,
     # operator
     EventKind.PAUSE: Admission(_OPERATOR),
     EventKind.UNPAUSE: Admission(_OPERATOR),
     EventKind.OPERATOR_RESUME: Admission(_OPERATOR),
     # standing operator authorisation, acted on by the trusted clock (no actor)
     EventKind.AUTO_TRIAGE: Admission(_SCHEDULER),
+    # an owner's auto-build mark started when a build slot is free (the mark is the
+    # owner's approval; the clock only picks the time)
+    EventKind.AUTO_BUILD: Admission(_SCHEDULER),
     # safety facts: any actor, GitHub input or a daemon read (they only restrict)
     EventKind.LEFTWARD_MOVE: Admission(_GITHUB_OR_READ),
     EventKind.ASSIGNED_HUMAN: Admission(_GITHUB_OR_READ),
