@@ -10,6 +10,11 @@ left the board) gets a per-issue read. A parcel never compared before is *unknow
 is read once (the service spreads those reads) and then compared like the others.
 
 A failed or partial board read reports nothing, never "no change".
+
+A changed or unknown card that shows a ``factory:*`` command label also gets a label
+check (``service.label_recovery``): the per-issue read carries no label actor, so a label
+whose webhook was lost is recovered from the issue's timeline before the card's digest is
+stored.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from typing import TYPE_CHECKING
 
 from omnigent_factory.core.effects import RetryableReadFailure
 from omnigent_factory.ports.github import BoardCard
+from omnigent_factory.service.label_recovery import LabelCheck, label_check
 
 if TYPE_CHECKING:
     from omnigent_factory.service.runtime import FactoryService
@@ -39,6 +45,8 @@ class DiffResult:
     changed: Mapping[str, str] = field(default_factory=dict)
     #: Parcels never compared before, with their current digest.
     unknown: Mapping[str, str] = field(default_factory=dict)
+    #: Changed or unknown parcels whose card shows a command label.
+    label_checks: Mapping[str, LabelCheck] = field(default_factory=dict)
 
 
 class BoardDiff:
@@ -64,6 +72,7 @@ class BoardDiff:
         by_id = {card.node_id: card for card in cards}
         changed: dict[str, str] = {}
         unknown: dict[str, str] = {}
+        checks: dict[str, LabelCheck] = {}
         for row in rows:
             parcel_id = str(row[0])
             card = by_id.get(parcel_id)
@@ -73,6 +82,11 @@ class BoardDiff:
                 unknown[parcel_id] = digest
             elif previous != digest:
                 changed[parcel_id] = digest
+            else:
+                continue
+            check = label_check(card.labels, card.updated_at) if card is not None else None
+            if check is not None:
+                checks[parcel_id] = check
         LOG.log(
             logging.INFO if changed else logging.DEBUG,
             "board diff cards=%s parcels=%s changed=%s unknown=%s",
@@ -81,4 +95,4 @@ class BoardDiff:
             len(changed),
             len(unknown),
         )
-        return DiffResult(changed=changed, unknown=unknown)
+        return DiffResult(changed=changed, unknown=unknown, label_checks=checks)

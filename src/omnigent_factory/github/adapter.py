@@ -47,6 +47,7 @@ from omnigent_factory.ports.github import (
     BoardIssue,
     ContractPublication,
     IssueRef,
+    LabelEvent,
     PullRequestEvidence,
     stage_for_option,
 )
@@ -55,6 +56,8 @@ LOG = logging.getLogger(__name__)
 
 #: Project fields a triage result may fill (design §B: only while the owner left them unset).
 TRIAGE_FIELDS = ("Priority", "Size")
+#: Label events (newest) one ``label_events`` read returns.
+_LABEL_EVENTS_READ = 50
 #: Board pages (100 items each) one ``board_issues`` read takes at most.
 _BOARD_MAX_PAGES = 20
 #: Seconds between re-reads of a PR whose ``mergeable`` GitHub has not computed yet
@@ -221,6 +224,82 @@ class GitHubAPIAdapter:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
         except GitHubAPIError as exc:
             return RetryableReadFailure(str(exc))
+
+    async def label_events(self, ref: IssueRef) -> tuple[LabelEvent, ...] | RetryableReadFailure:
+        """The issue's latest ``labeled``/``unlabeled`` events, oldest first (one request).
+
+        Only the last ``_LABEL_EVENTS_READ`` label events are read: label recovery needs
+        just the newest event of a label still on the issue.
+        """
+        query = """
+        query($id: ID!, $last: Int!) { node(id: $id) { __typename ... on Issue {
+          id number
+          timelineItems(last: $last, itemTypes: [LABELED_EVENT, UNLABELED_EVENT]) {
+            nodes {
+              __typename
+              ... on LabeledEvent {
+                id createdAt label { name }
+                actor { __typename ... on User { databaseId } ... on Bot { databaseId } }
+              }
+              ... on UnlabeledEvent {
+                id createdAt label { name }
+                actor { __typename ... on User { databaseId } ... on Bot { databaseId } }
+              }
+            }
+          }
+        } } }
+        """
+        try:
+            data = await self.client.graphql(
+                query, {"id": ref.parcel_id, "last": _LABEL_EVENTS_READ}
+            )
+        except RateLimited as exc:
+            return RetryableReadFailure(str(exc), exc.retry_after_us)
+        except GitHubAPIError as exc:
+            return RetryableReadFailure(str(exc))
+        node = data.get("node")
+        if (
+            not isinstance(node, dict)
+            or node.get("id") != ref.parcel_id
+            or node.get("number") != ref.issue_number
+        ):
+            return RetryableReadFailure("issue identity did not match requested parcel")
+        timeline = node.get("timelineItems")
+        nodes = timeline.get("nodes") if isinstance(timeline, dict) else None
+        if not isinstance(nodes, list):
+            return RetryableReadFailure("issue timeline was unavailable")
+        events: list[LabelEvent] = []
+        for item in nodes:
+            if not isinstance(item, dict):
+                continue
+            kind = item.get("__typename")
+            label = item.get("label")
+            name = label.get("name") if isinstance(label, dict) else None
+            event_id = item.get("id")
+            created = self._parse_time_us(item.get("createdAt"))
+            if (
+                kind not in ("LabeledEvent", "UnlabeledEvent")
+                or not isinstance(name, str)
+                or not isinstance(event_id, str)
+                or not created
+            ):
+                continue
+            actor = item.get("actor")
+            actor_id = actor.get("databaseId") if isinstance(actor, dict) else None
+            events.append(
+                LabelEvent(
+                    event_id=event_id,
+                    label=name,
+                    labeled=kind == "LabeledEvent",
+                    actor_id=(
+                        actor_id
+                        if isinstance(actor_id, int) and not isinstance(actor_id, bool)
+                        else None
+                    ),
+                    created_at_us=created,
+                )
+            )
+        return tuple(events)
 
     async def board_issues(self) -> list[BoardIssue] | RetryableReadFailure:
         """Open issues of the repository on the project board, by Status option ID."""

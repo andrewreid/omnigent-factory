@@ -14,6 +14,7 @@ from omnigent_factory.core.effects import (
     EffectKind,
     ExecutionContext,
     Preconditions,
+    RetryableReadFailure,
 )
 from omnigent_factory.core.events import ChecksState
 from omnigent_factory.core.types import Stage
@@ -505,3 +506,63 @@ async def test_review_comments_reads_one_reviews_inline_comments_oldest_first():
         ("a.py", None, "first"),
         ("b.py", 3, "second"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_label_events_read_the_label_timeline_in_one_request():
+    """Label recovery: actor numeric IDs, add/remove, oldest first, identity-checked."""
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        assert body["variables"] == {"id": "I_1", "last": 50}
+        assert "LABELED_EVENT, UNLABELED_EVENT" in body["query"]
+        nodes = [
+            {
+                "__typename": "LabeledEvent",
+                "id": "LE_1",
+                "createdAt": "2026-10-09T01:00:00Z",
+                "label": {"name": "factory:triage"},
+                "actor": {"__typename": "User", "databaseId": 114979},
+            },
+            {
+                "__typename": "UnlabeledEvent",
+                "id": "UE_2",
+                "createdAt": "2026-10-09T01:00:05Z",
+                "label": {"name": "factory:triage"},
+                "actor": {"__typename": "Bot", "databaseId": 334191208},
+            },
+            {  # a deleted account: no actor
+                "__typename": "LabeledEvent",
+                "id": "LE_3",
+                "createdAt": "2026-10-09T01:00:09Z",
+                "label": {"name": "factory:plan"},
+                "actor": None,
+            },
+            {"__typename": "LabeledEvent", "id": "LE_bad", "label": {"name": "x"}},
+        ]
+        issue = {"__typename": "Issue", "id": "I_1", "number": 12}
+        issue["timelineItems"] = {"nodes": nodes}
+        return httpx.Response(200, json={"data": {"node": issue}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        events = await adapter(http).label_events(PARCEL_REF)
+    assert len(requests) == 1
+    assert [(e.event_id, e.label, e.labeled, e.actor_id) for e in events] == [
+        ("LE_1", "factory:triage", True, 114979),
+        ("UE_2", "factory:triage", False, 334191208),
+        ("LE_3", "factory:plan", True, None),
+    ]
+    assert events[0].created_at_us == 1_791_507_600_000_000
+
+
+@pytest.mark.asyncio
+async def test_label_events_refuse_another_issue():
+    def handler(request: httpx.Request) -> httpx.Response:
+        issue = {"__typename": "Issue", "id": "I_1", "number": 13, "timelineItems": {"nodes": []}}
+        return httpx.Response(200, json={"data": {"node": issue}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await adapter(http).label_events(PARCEL_REF)
+    assert isinstance(result, RetryableReadFailure)

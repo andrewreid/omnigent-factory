@@ -38,7 +38,16 @@ from pathlib import Path
 
 from omnigent_factory.core import codec
 from omnigent_factory.core.effects import READ_ONLY_KINDS, EffectIntent, EffectKind
-from omnigent_factory.core.events import EffectReconciled, Event, EventKind, MessageAck
+from omnigent_factory.core.events import (
+    AdoptionResult,
+    CreateRejected,
+    EffectReconciled,
+    Event,
+    EventKind,
+    MessageAck,
+    PublicationAcked,
+    SessionCreated,
+)
 from omnigent_factory.core.predicates import RUNNING_LIFECYCLES
 from omnigent_factory.core.reducer import TransitionResult, transition
 from omnigent_factory.core.types import (
@@ -324,6 +333,27 @@ def _resolution(event: Event) -> tuple[str, bool, str] | None:
         return body.effect_id, body.delivered, body.item_id
     if isinstance(body, MessageAck) and body.effect_id:
         return body.effect_id, True, body.item_id
+    if isinstance(body, PublicationAcked) and body.effect_id:
+        return body.effect_id, True, body.comment_id
+    return None
+
+
+def _create_resolution(event: Event) -> tuple[str, bool, str] | None:
+    """``(session_id, exists, root_id)`` when ``event`` settles whether a session exists.
+
+    A create whose write timed out is resolved by a separate event (the adoption search's
+    ``AdoptionResult``, or a later ``SessionCreated`` / ``CreateRejected``), never by the
+    create effect's own outcome. Zero or several adoption matches prove nothing.
+    """
+    body = event.body
+    if isinstance(body, SessionCreated) and body.session_id and body.root_id:
+        return body.session_id, True, body.root_id
+    if isinstance(body, AdoptionResult) and body.session_id:
+        if body.matches == 1 and body.root_id:
+            return body.session_id, True, body.root_id
+        return None
+    if isinstance(body, CreateRejected) and body.session_id:
+        return body.session_id, False, ""
     return None
 
 
@@ -1238,6 +1268,9 @@ class SqliteStore:
             resolution = _resolution(event)
             if resolution is not None:
                 self._close_unknown(conn, *resolution)
+            created = _create_resolution(event)
+            if created is not None and event.parcel_id is not None:
+                self._close_unknown_create(conn, event.parcel_id, *created)
         if new.parcel is not None:
             self._project(conn, old_parcel, new.parcel, event, now)
         self._write_admission(conn, new.admission, now)
@@ -1835,27 +1868,77 @@ class SqliteStore:
             reason="reconciled: not delivered",
         )
 
+    def _close_unknown_create(
+        self, conn: sqlite3.Connection, parcel_id: str, session_id: str, exists: bool, root: str
+    ) -> bool:
+        """Close the ``unknown`` create of ``session_id`` once adoption settled it.
+
+        ``done`` (with the adopted root) when the session exists, ``failed`` when it
+        provably does not; never ``pending``, so the create is never sent again.
+        """
+        row = conn.execute(
+            "SELECT effect_id FROM effects WHERE parcel_id = ? AND kind = ? AND target = ? "
+            "AND state = 'unknown'",
+            (parcel_id, EffectKind.CREATE_SESSION.value, session_id),
+        ).fetchone()
+        if row is None:
+            return False
+        return self._close_unknown(conn, str(row["effect_id"]), exists, root)
+
     def close_reconciled_unknown(self, effect_id: str) -> bool:
         """Startup: close an ``unknown`` row whose resolution event is already persisted.
 
         Repairs rows left ``unknown`` before resolutions closed them in the same
-        transaction. Reads accepted ``EffectReconciled`` / ``MessageAck`` events only.
+        transaction. Reads accepted ``EffectReconciled`` / ``MessageAck`` /
+        ``PublicationAcked`` events for the effect, and for a ``create_session`` the
+        accepted ``SessionCreated`` / single-match ``AdoptionResult`` / ``CreateRejected``
+        of its session.
         """
         row = self._conn.execute(
-            "SELECT kind, payload_json FROM events WHERE accepted = 1 AND kind IN (?, ?) "
+            "SELECT kind, payload_json FROM events WHERE accepted = 1 AND kind IN (?, ?, ?) "
             "AND json_extract(payload_json, '$.body.effect_id') = ? "
             "ORDER BY sequence DESC LIMIT 1",
-            (EventKind.EFFECT_RECONCILED.value, EventKind.MESSAGE_ACK.value, effect_id),
+            (
+                EventKind.EFFECT_RECONCILED.value,
+                EventKind.MESSAGE_ACK.value,
+                EventKind.PUBLICATION_ACKED.value,
+                effect_id,
+            ),
         ).fetchone()
         if row is None:
+            return self._close_adopted_create(effect_id)
+        resolution = _resolution(codec.event_from_json(row["payload_json"]))
+        if resolution is None:
             return False
-        body = json.loads(row["payload_json"]).get("body") or {}
-        delivered = row["kind"] == EventKind.MESSAGE_ACK.value or body.get("delivered") is True
-        item_id = body.get("item_id")
         with self._txn() as conn:
-            return self._close_unknown(
-                conn, effect_id, delivered, item_id if isinstance(item_id, str) else ""
-            )
+            return self._close_unknown(conn, *resolution)
+
+    def _close_adopted_create(self, effect_id: str) -> bool:
+        effect = self._conn.execute(
+            "SELECT parcel_id, target FROM effects WHERE effect_id = ? AND kind = ? "
+            "AND state = 'unknown'",
+            (effect_id, EffectKind.CREATE_SESSION.value),
+        ).fetchone()
+        if effect is None or effect["parcel_id"] is None:
+            return False
+        parcel_id, session_id = str(effect["parcel_id"]), str(effect["target"])
+        for (payload,) in self._conn.execute(
+            "SELECT payload_json FROM events WHERE accepted = 1 AND parcel_id = ? "
+            "AND kind IN (?, ?, ?) AND json_extract(payload_json, '$.body.session_id') = ? "
+            "ORDER BY sequence DESC",
+            (
+                parcel_id,
+                EventKind.SESSION_CREATED.value,
+                EventKind.ADOPTION_RESULT.value,
+                EventKind.CREATE_REJECTED.value,
+                session_id,
+            ),
+        ).fetchall():
+            created = _create_resolution(codec.event_from_json(payload))
+            if created is not None:
+                with self._txn() as conn:
+                    return self._close_unknown_create(conn, parcel_id, *created)
+        return False
 
     def mark_effect_unknown(self, effect_id: str, reason: str) -> bool:
         """Ambiguous write: never returns to ``pending`` automatically."""

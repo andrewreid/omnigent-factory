@@ -476,7 +476,8 @@ async def test_session_create_crash_is_adopted_by_nonce_without_a_second_create(
 
         await until(adopted)
         assert rig.omnigent_wire.count(_path("POST", "/v1/sessions")) == 1
-        assert await effect_state(second, effect.effect_id) == "unknown"  # never re-sent
+        # Adoption settles the ambiguous create: closed as done, never re-sent (#822).
+        assert await effect_state(second, effect.effect_id) == "done"
         [adoption] = await bodies(second, ev.AdoptionResult)
         assert (adoption.matches, adoption.root_id) == (1, created.id)
     finally:

@@ -58,6 +58,7 @@ from omnigent_factory.service.github_delivery import (
     GitHubDeliveryProcessor,
     GitHubWebhookVerifier,
 )
+from omnigent_factory.service.label_recovery import LabelRecovery
 from omnigent_factory.service.locking import ProcessLock
 from omnigent_factory.service.mcp import McpEndpoint, build_endpoint
 from omnigent_factory.service.observer import OmnigentObserver
@@ -391,6 +392,7 @@ async def build_production(
         omnigent_adapter=omnigent_adapter,
     )
     service.board_diff = BoardDiff(service, github.board_cards)
+    service.label_recovery = LabelRecovery(service, github.label_events, github.issue_snapshot)
     board = BoardIndex(github.board_issues, clock)
     github.related_marker = RelatedMarker(service, board, directory).schedule
     service.auto_triager = AutoTriager(service, board, github.issue_snapshot)

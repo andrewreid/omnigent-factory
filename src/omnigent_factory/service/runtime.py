@@ -178,6 +178,13 @@ class FactoryService:
         self._next_board_diff_at: float | None = None
         #: Board digests to store once the read they scheduled has been applied.
         self._digests_after_read: dict[str, str] = {}
+        #: Lost owner label commands, recovered from the issue timeline for cards the
+        #: board diff shows changed (composition; ``service.label_recovery``). None: not
+        #: wired.
+        self.label_recovery: Any = None
+        #: Command labels a changed or unknown card showed, checked by ``label_recovery``
+        #: before that card's digest is stored.
+        self._label_checks: dict[str, Any] = {}
         self._fatal_exit = fatal_exit
         self._fatal_reason: str | None = None
         self._delivery_failures: dict[str, int] = {}
@@ -756,6 +763,9 @@ class FactoryService:
             # change".
             return
         self._next_board_diff_at = loop_now + self.config.board_diff_interval_minutes * 60
+        # Checked with the read each changed or unknown card gets, before its digest is
+        # stored: a label whose webhook was lost is never compared away unchecked.
+        self._label_checks.update(diff.label_checks)
         for parcel_id, digest in sorted(diff.changed.items()):
             # A card the board shows changed is read now, live or not.
             await self._reconcile(parcel_id, digest=digest)
@@ -772,6 +782,15 @@ class FactoryService:
         await self.apply_event(
             self._event(parcel_id, ev.ReconcileDue(), f"reconcile:{parcel_id}:{now}")
         )
+        check = self._label_checks.pop(parcel_id, None)
+        if (
+            check is not None
+            and self.label_recovery is not None
+            and not await self.label_recovery.check(parcel_id, check)
+        ):
+            # A failed label read: keep the old digest, so the next diff checks again.
+            self._digests_after_read.pop(parcel_id, None)
+            return
         # The read is durable in the outbox now: the card's values may be recorded.
         stored = self._digests_after_read.pop(parcel_id, None)
         if digest is not None or stored is not None:

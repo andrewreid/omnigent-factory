@@ -28,6 +28,24 @@ _COMMAND = re.compile(r"^/(?P<name>[a-z-]+)(?:\s+(?P<args>.*))?$", re.DOTALL)
 _DURATION = re.compile(r"(?:^|\s)for\s+(?P<hours>\d+)h(?:\s|$)", re.IGNORECASE)
 
 
+#: Owner labels that are commands (any other label is no transition). The board diff's
+#: label recovery (``service.label_recovery``) maps a lost label webhook the same way.
+LABEL_CONTROLS: Mapping[str, ev.EventBody] = MappingProxyType(
+    {
+        "factory:triage": ev.RequestTriage(via=Via.LABEL),
+        "factory:plan": ev.RequestPlan(via=Via.LABEL),
+        "factory:build": ev.WaivePlan(via=Via.LABEL),
+    }
+)
+
+
+def label_name(payload: Mapping[str, Any]) -> str | None:
+    """The label an ``issues`` labeled/unlabeled payload names."""
+    label = payload.get("label")
+    name = label.get("name") if isinstance(label, dict) else None
+    return name if isinstance(name, str) else None
+
+
 class WebhookError(ValueError):
     """A delivery cannot be trusted or safely interpreted."""
 
@@ -418,14 +436,7 @@ class DeliveryNormalizer:
     def _label(self, payload: dict[str, Any], actor_id: int) -> tuple[ev.EventBody, ...]:
         if actor_id not in self.identity.owner_ids:
             return ()
-        label = payload.get("label")
-        name = label.get("name") if isinstance(label, dict) else None
-        mapping: dict[str, ev.EventBody] = {
-            "factory:triage": ev.RequestTriage(via=Via.LABEL),
-            "factory:plan": ev.RequestPlan(via=Via.LABEL),
-            "factory:build": ev.WaivePlan(via=Via.LABEL),
-        }
-        body: ev.EventBody | None = mapping.get(str(name))
+        body = LABEL_CONTROLS.get(str(label_name(payload)))
         if body is None:
             return ()
         return (body,)

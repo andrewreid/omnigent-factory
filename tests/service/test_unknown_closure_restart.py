@@ -1,4 +1,5 @@
-"""Startup closes ``unknown`` rows already resolved by a persisted reconciliation (#694)."""
+"""Startup closes ``unknown`` rows already resolved by a persisted reconciliation (#694)
+or adoption (#822)."""
 
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from omnigent_factory.testing.fakes import (
     FakeGitHub,
     FakeOmnigent,
 )
+from tests.test_unknown_create_closure import _adopted, unknown_create
 from tests.test_unknown_effect_closure import _reconciled, unknown_send
 
 
@@ -48,5 +50,40 @@ async def test_restart_closes_a_reconciled_unknown_send_without_resending(
         await asyncio.sleep(0.1)  # let the outbox run: the send must never be repeated
         sent = omnigent.executed(EffectKind.SEND_MESSAGE)
         assert effect_id not in {e.effect_id for e in sent}
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_restart_closes_an_adopted_unknown_create_and_status_drops_it(
+    service_config: ServiceConfig,
+) -> None:
+    """Live #822: the run was adopted by nonce and is WAITING; the create stayed unknown."""
+    clock = FakeClock()
+    store = SqliteStore.open(service_config.database_path, clock)
+    h, session_id, nonce, effect_id = unknown_create(store)
+    assert store.apply_event(_adopted(session_id, nonce), h.cfg).accepted
+    store.close()
+    with sqlite3.connect(service_config.database_path) as raw:
+        raw.execute(
+            "UPDATE effects SET state = 'unknown', remote_id = NULL WHERE effect_id = ?",
+            (effect_id,),
+        )
+
+    omnigent = FakeOmnigent()
+    service = FactoryService(
+        service_config,
+        adapters=(FakeGitHub(), omnigent, FakeCredentialBroker()),
+        clock=clock,
+    )
+    await service.start()
+    try:
+        row = await service.db.call(lambda db: db.get_effect(effect_id))
+        assert row is not None and row.state == "done"
+        status = await service._status()
+        assert status["unknown_effects"] == 0
+        await asyncio.sleep(0.1)  # let the outbox run: the create must never be repeated
+        created = omnigent.executed(EffectKind.CREATE_SESSION)
+        assert effect_id not in {e.effect_id for e in created}
     finally:
         await service.stop()

@@ -110,6 +110,22 @@ class IssueRef:
 
 
 @dataclass(frozen=True, slots=True)
+class LabelEvent:
+    """One ``labeled`` / ``unlabeled`` event of an issue's timeline (a fresh read).
+
+    ``event_id`` is GitHub's node ID of the timeline event: stable, so a recovered label
+    command is applied at most once. ``actor_id`` is the actor's numeric ID (None: the
+    actor is unknown, deleted, or not a user or bot).
+    """
+
+    event_id: str
+    label: str
+    labeled: bool
+    actor_id: int | None
+    created_at_us: int
+
+
+@dataclass(frozen=True, slots=True)
 class BoardIssue:
     """One open issue of the configured repository on the project board (a fresh read).
 

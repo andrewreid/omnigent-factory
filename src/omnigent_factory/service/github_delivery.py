@@ -9,8 +9,9 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 
+from omnigent_factory.core.effects import RetryableReadFailure
 from omnigent_factory.core.events import Event, EventKind, Provenance
-from omnigent_factory.core.types import IssueSnapshot, Stage
+from omnigent_factory.core.types import IssueSnapshot, Stage, Via
 from omnigent_factory.github.adapter import GitHubAPIAdapter
 from omnigent_factory.github.client import GitHubAPIError, RateLimited
 from omnigent_factory.github.webhook import (
@@ -19,11 +20,13 @@ from omnigent_factory.github.webhook import (
     IdentityError,
     SignatureError,
     WebhookError,
+    label_name,
     resolve_project_delivery,
 )
 from omnigent_factory.ports.clock import Clock
 from omnigent_factory.ports.github import IssueRef
 from omnigent_factory.service.interfaces import NonRetryableDelivery, WebhookRejected
+from omnigent_factory.service.label_recovery import label_event_id, newest_label_event
 from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.store.sqlite import DeliveryRecord
 
@@ -265,6 +268,10 @@ class GitHubDeliveryProcessor:
         if event is None:
             await self._ignore(delivery, "PR/check event for no known parcel")
             return
+        if getattr(event.body, "via", None) == Via.LABEL:
+            event = await self._label_identity(event, delivery)
+            if event is None:
+                return
         if delivery.event_name == "pull_request_review" and event.kind == EventKind.PLAN_FEEDBACK:
             await self._record_review_comments(delivery, event)
         await self.service.apply_event(event, delivery_status="processed")
@@ -304,6 +311,43 @@ class GitHubDeliveryProcessor:
         await self.service.db.call(
             lambda store: store.mark_delivery(delivery.delivery_guid, "processed")
         )
+
+    async def _label_identity(self, event: Event, delivery: DeliveryRecord) -> Event | None:
+        """Key an owner label command by its timeline event (``label_recovery``).
+
+        The webhook names no timeline event: its sender's newest ``labeled`` event of that
+        label is the one it reports. Keyed alike, a command the board diff's label
+        recovery already applied is not applied again (None: the delivery is retired).
+        A failed read retries the delivery; no matching event keeps the delivery's ID.
+        """
+        name = label_name(json.loads(delivery.body))
+        if name is None or event.parcel_id is None or event.issue_number is None:
+            return event
+        ref = IssueRef(self.github.repository_node_id, event.issue_number, event.parcel_id)
+        events = await self.github.label_events(ref)
+        if isinstance(events, RetryableReadFailure):
+            raise RuntimeError(f"issue label timeline temporarily unavailable: {events.reason}")
+        newest = newest_label_event(events, name, actor_id=event.actor_id)
+        if newest is None:
+            LOG.warning(
+                "label webhook has no timeline event delivery_guid=%s issue=%s label=%s",
+                delivery.delivery_guid,
+                event.issue_number,
+                name,
+            )
+            return event
+        event = replace(event, event_id=label_event_id(newest))
+        if await self.service.db.call(lambda store: store.has_event(event.event_id)):
+            LOG.info(
+                "label webhook already applied by recovery delivery_guid=%s issue=%s label=%s",
+                delivery.delivery_guid,
+                event.issue_number,
+                name,
+            )
+            guid = delivery.delivery_guid
+            await self.service.db.call(lambda store: store.mark_delivery(guid, "processed"))
+            return None
+        return event
 
     async def _record_review_comments(self, delivery: DeliveryRecord, event: Event) -> None:
         """Store the inline comments of an owner review for ``factory_get_feedback``.
