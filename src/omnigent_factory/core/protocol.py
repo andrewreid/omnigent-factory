@@ -13,6 +13,7 @@ The daemon computes hashes/timestamps itself; model-provided values never overri
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -110,8 +111,47 @@ class EpicCoverage(_Strict):
     overlaps: Texts
 
 
+GateKey = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9-]{0,39}$")]
+PartText = Annotated[str, StringConstraints(min_length=1, max_length=1000)]
+GateTitle = Annotated[str, StringConstraints(min_length=1, max_length=120)]
+
+
+class EpicPart(_Strict):
+    """One sub-issue's part of the epic: what its plan may cover."""
+
+    issue: Annotated[int, Field(ge=1)]
+    scope: PartText
+
+
+class EpicGate(_Strict):
+    """A step the factory cannot do (tenant, cloud, identity, secrets, DNS, ...): it
+    becomes a sub-issue assigned to the owner, blocking the sub-issues in ``blocks``."""
+
+    key: GateKey
+    title: GateTitle
+    steps: PartText
+    blocks: Annotated[list[Annotated[int, Field(ge=1)]], Field(min_length=1, max_length=50)]
+
+
+class EpicExternal(_Strict):
+    """An issue outside the epic that sub-issues wait on (autopilot never starts it)."""
+
+    issue: Annotated[int, Field(ge=1)]
+    note: RelatedNote
+
+
+class EpicPlanSection(_Strict):
+    """The epic plan autopilot follows (required when the epic is on autopilot)."""
+
+    parts: Annotated[list[EpicPart], Field(max_length=100)]
+    coordination: Texts
+    human_gates: Annotated[list[EpicGate], Field(max_length=20)] = []
+    external_blockers: Annotated[list[EpicExternal], Field(max_length=50)] = []
+
+
 class EpicTriageResult(_Strict):
-    """The triage of an epic (an issue with sub-issues): no priority or size."""
+    """The triage of an epic (an issue with sub-issues): no priority or size. With
+    ``plan``, the epic plan autopilot follows once the owner approves it."""
 
     kind: Literal["epic_triage"]
     summary: Text
@@ -120,6 +160,14 @@ class EpicTriageResult(_Strict):
     links: Annotated[list[EpicLink], Field(max_length=100)] = []
     missing_information: Texts = []
     related: Annotated[list[Related], Field(max_length=20)] = []
+    plan: EpicPlanSection | None = None
+
+
+class EpicFit(_Strict):
+    """A sub-issue plan of an autopilot epic: does it stay within its part of the epic?"""
+
+    within: bool
+    note: RelatedNote
 
 
 class PlanResult(_Strict):
@@ -130,6 +178,7 @@ class PlanResult(_Strict):
     contract: ContractModel
     open_decision_ids: Texts
     related: Annotated[list[Related], Field(max_length=20)] = []
+    epic_fit: EpicFit | None = None
 
 
 class Verification(_Strict):
@@ -235,12 +284,16 @@ RESULT_SHAPES: dict[str, str] = {
     '"relation":"duplicate|overlaps|conflicts|depends_on|blocks|supersedes","note":str}]}',
     "epic_triage": '{"kind":"epic_triage","summary":str,"coverage":{"gaps":[str],'
     '"overlaps":[str]},"build_order":[{"issue":int,"reason":str}],"links"?:[{"issue":int,'
-    '"blocked_by":int,"reason":str}],"missing_information"?:[str],"related"?:[...]}',
+    '"blocked_by":int,"reason":str}],"missing_information"?:[str],"related"?:[...],'
+    '"plan"?:{"parts":[{"issue":int,"scope":str}],"coordination":[str],"human_gates"?:'
+    '[{"key":"slug","title":str,"steps":str,"blocks":[int]}],"external_blockers"?:'
+    '[{"issue":int,"note":str}]}}',
     "plan": '{"kind":"plan","publication_kind":"contract|info","approach":str,"risks":[str],'
     '"contract":{"goal":str,"acceptance_criteria":[{"id":str,"criterion":str,'
     '"verification":str}],"non_goals":[str],"size":"S|M|L","resolved_decisions":'
     '[{"decision_id":str,"answer":str,"source_event_id":str}]},"open_decision_ids":[str],"related"?:[{"issue":int,'
-    '"relation":"depends_on|blocks|duplicate|overlaps|conflicts|supersedes","note":str}]}',
+    '"relation":"depends_on|blocks|duplicate|overlaps|conflicts|supersedes","note":str}],'
+    '"epic_fit"?:{"within":bool,"note":str}}',
     "build_ready": '{"kind":"build_ready","pr_number":int>=1,"branch":str,"head_sha":sha40,'
     '"summary":str,"verification":[{"command":str,"file_set":[str],'
     '"outcome":"passed|failed|not_run","evidence":str}],"review":{"implementation_vendor":str,'
@@ -286,6 +339,10 @@ class Correlation:
     #: The issue is an epic: its sub-issue numbers (empty when not all could be read).
     #: None: not an epic (an epic is triaged with ``epic_triage``, never ``triage``).
     sub_issues: frozenset[int] | None = None
+    #: The epic is on autopilot: its epic triage must carry the epic ``plan``.
+    epic_plan: bool = False
+    #: The issue is a sub-issue epic autopilot drives: its plan must say ``epic_fit``.
+    epic_part: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,13 +371,35 @@ def _check_epic_triage(r: EpicTriageResult, expected: Correlation) -> None:
     if any(a == b for a, b in pairs):
         raise ResultError("links: an issue cannot block itself")
     named = set(order) | {n for pair in pairs for n in pair}
+    plan = r.plan
+    if plan is not None:
+        parts = [item.issue for item in plan.parts]
+        if len(set(parts)) != len(parts):
+            raise ResultError("plan.parts: each sub-issue at most once")
+        keys = [gate.key for gate in plan.human_gates]
+        if len(set(keys)) != len(keys):
+            raise ResultError("plan.human_gates: each key at most once")
+        named |= set(parts) | {n for gate in plan.human_gates for n in gate.blocks}
+        if known and any(item.issue in known for item in plan.external_blockers):
+            raise ResultError("plan.external_blockers: only issues outside this epic")
+    elif expected.epic_plan:
+        raise ResultError(
+            "this epic is on autopilot: include plan (parts, coordination, human_gates, "
+            "external_blockers)"
+        )
     outside = sorted(named - known) if known else []
     if outside:
         raise ResultError(
-            "build_order/links: only this epic's sub-issues ("
+            "build_order/links/plan: only this epic's sub-issues ("
             + ", ".join(f"#{n}" for n in outside[:10])
             + " are not)"
         )
+
+
+def epic_plan_hash(result: Mapping[str, object]) -> str:
+    """sha256 of an epic plan (a validated ``epic_triage`` result as JSON): binds approval."""
+    text = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def validate_result(result: Mapping[str, object], expected: Correlation) -> ParsedResult:
@@ -386,6 +465,11 @@ def validate_result(result: Mapping[str, object], expected: Correlation) -> Pars
         if expected.stage == "triage":
             raise ResultError("plan result from triage stage")
         _check_ids(r.open_decision_ids, "open decision")
+        if expected.stage == "plan" and expected.epic_part and r.epic_fit is None:
+            raise ResultError(
+                "this issue is part of an autopilot epic: include epic_fit (within: does the "
+                "plan stay within its part of the epic plan; note: why)"
+            )
         try:
             contract_bytes = canonical_contract(r.contract.model_dump(mode="json"))
         except CanonicalizationError as exc:

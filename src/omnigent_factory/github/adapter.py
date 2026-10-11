@@ -117,6 +117,10 @@ class BoardSchema:
     #: "" when not configured: the field is neither read nor written.
     auto_build_field_id: str = ""
     auto_build_options: Mapping[str, str] = field(default_factory=dict)
+    #: The epic "Autopilot" single-select field and its option IDs by name (Full,
+    #: Delayed, Plan only); "" when not configured: neither read nor written.
+    autopilot_field_id: str = ""
+    autopilot_options: Mapping[str, str] = field(default_factory=dict)
 
 
 class GitHubAPIAdapter:
@@ -202,7 +206,7 @@ class GitHubAPIAdapter:
             )
             if not isinstance(issue, dict) or issue.get("node_id") != ref.parcel_id:
                 return RetryableReadFailure("issue identity did not match requested parcel")
-            stage, in_project, bot, note, auto_build, links = await self._project_stage(
+            stage, in_project, bot, note, auto_build, links, autopilot = await self._project_stage(
                 ref.parcel_id
             )
             assignees = issue.get("assignees")
@@ -222,6 +226,7 @@ class GitHubAPIAdapter:
                 bot=bot,
                 note=note,
                 auto_build=auto_build,
+                autopilot=autopilot,
                 links=links,
             )
         except RateLimited as exc:
@@ -373,6 +378,9 @@ class GitHubAPIAdapter:
               autoBuild: fieldValueByName(name: "Auto-build") {
                 ... on ProjectV2ItemFieldSingleSelectValue { optionId }
               }
+              autopilot: fieldValueByName(name: "Autopilot") {
+                ... on ProjectV2ItemFieldSingleSelectValue { optionId }
+              }
               content { __typename ... on Issue {
                 id number title state updatedAt repository { id }
                 assignees(first: 20) { totalCount nodes { id } }
@@ -450,6 +458,7 @@ class GitHubAPIAdapter:
             status_option=option(item.get("status")),
             bot_option=option(item.get("bot")),
             auto_build_option=option(item.get("autoBuild")) if self._auto_build_configured else "",
+            autopilot_option=option(item.get("autopilot")) if self._autopilot_configured else "",
             assignees=names(content.get("assignees"), "id"),
             labels=names(content.get("labels"), "name"),
             title=str(content.get("title") or ""),
@@ -496,11 +505,13 @@ class GitHubAPIAdapter:
 
     async def _project_stage(
         self, parcel_id: str
-    ) -> tuple[Stage | None, bool, str | None, str | None, str | None, IssueLinks | None]:
+    ) -> tuple[
+        Stage | None, bool, str | None, str | None, str | None, IssueLinks | None, str | None
+    ]:
         """(stage by Status option ID, in project, current Bot display value or None,
         current Factory note text or None when not read, current Auto-build option name
         ("" = empty) or None when not configured, the issue's native links or None when
-        unreadable)."""
+        unreadable, current Autopilot option name like Auto-build's)."""
         query = """
         query($id: ID!, $after: String) {
           node(id: $id) { ... on Issue {
@@ -520,6 +531,11 @@ class GitHubAPIAdapter:
                 ... on ProjectV2ItemFieldTextValue { text field { ... on ProjectV2Field { id } } }
               }
               autoBuild: fieldValueByName(name: "Auto-build") {
+                ... on ProjectV2ItemFieldSingleSelectValue {
+                  optionId field { ... on ProjectV2SingleSelectField { id } }
+                }
+              }
+              autopilot: fieldValueByName(name: "Autopilot") {
                 ... on ProjectV2ItemFieldSingleSelectValue {
                   optionId field { ... on ProjectV2SingleSelectField { id } }
                 }
@@ -551,9 +567,10 @@ class GitHubAPIAdapter:
                 bot = self._bot_name(item.get("bot"))
                 note = self._note_text(item.get("note"))
                 auto_build = self._auto_build_name(item.get("autoBuild"))
+                autopilot = self._autopilot_name(item.get("autopilot"))
                 value = item.get("fieldValueByName")
                 if value is None:
-                    return None, True, bot, note, auto_build, links
+                    return None, True, bot, note, auto_build, links, autopilot
                 if not isinstance(value, dict):
                     raise GitHubAPIError("Status field value was malformed")
                 field = value.get("field")
@@ -561,10 +578,10 @@ class GitHubAPIAdapter:
                     raise GitHubAPIError("Status field identity changed")
                 # Read by option ID only: a renamed option must not change the stage.
                 stage = stage_for_option(value.get("optionId"), self.status_options)
-                return stage, True, bot, note, auto_build, links
+                return stage, True, bot, note, auto_build, links, autopilot
             page = items.get("pageInfo")
             if not isinstance(page, dict) or not page.get("hasNextPage"):
-                return None, False, None, None, None, links
+                return None, False, None, None, None, links, None
             after_value = page.get("endCursor")
             if not isinstance(after_value, str):
                 raise GitHubAPIError("projectItems pagination cursor was missing")
@@ -582,11 +599,29 @@ class GitHubAPIAdapter:
     def _auto_build_configured(self) -> bool:
         return self.board_schema is not None and bool(self.board_schema.auto_build_field_id)
 
+    @property
+    def _autopilot_configured(self) -> bool:
+        return self.board_schema is not None and bool(self.board_schema.autopilot_field_id)
+
     def _auto_build_name(self, value: object) -> str | None:
         """Auto-build option name by the persisted IDs ("" = empty, "?" = an unknown
         option or field); None when the field is not configured or the value unreadable."""
         if self.board_schema is None or not self.board_schema.auto_build_field_id:
             return None
+        return self._option_name(
+            value, self.board_schema.auto_build_field_id, self.board_schema.auto_build_options
+        )
+
+    def _autopilot_name(self, value: object) -> str | None:
+        """Autopilot option name, like :meth:`_auto_build_name`."""
+        if self.board_schema is None or not self.board_schema.autopilot_field_id:
+            return None
+        return self._option_name(
+            value, self.board_schema.autopilot_field_id, self.board_schema.autopilot_options
+        )
+
+    @staticmethod
+    def _option_name(value: object, field_id: str, options: Mapping[str, str]) -> str | None:
         if value is None:
             return ""
         if not isinstance(value, dict):
@@ -594,13 +629,10 @@ class GitHubAPIAdapter:
         if not value:
             return ""  # another field type answered the name: nothing selected here
         field_ref = value.get("field")
-        if isinstance(field_ref, dict) and field_ref.get("id") not in (
-            None,
-            self.board_schema.auto_build_field_id,
-        ):
+        if isinstance(field_ref, dict) and field_ref.get("id") not in (None, field_id):
             return "?"
         option = value.get("optionId")
-        names = [n for n, o in self.board_schema.auto_build_options.items() if o == option]
+        names = [n for n, o in options.items() if o == option]
         return names[0] if len(names) == 1 else "?"
 
     def _note_text(self, value: object) -> str | None:
@@ -1287,6 +1319,7 @@ class GitHubAPIAdapter:
             if effect.kind in {
                 EffectKind.SET_NOTE,
                 EffectKind.SET_AUTO_BUILD,
+                EffectKind.SET_AUTOPILOT,
                 EffectKind.REACT_COMMENT,
             }:
                 return await self._display_write(effect)
@@ -1726,6 +1759,8 @@ class GitHubAPIAdapter:
                 return await self._write_note(effect)
             if effect.kind == EffectKind.SET_AUTO_BUILD:
                 return await self._write_auto_build(effect)
+            if effect.kind == EffectKind.SET_AUTOPILOT:
+                return await self._write_autopilot(effect)
             return await self._react(effect)
         except AmbiguousRequest as exc:
             return RetryableReadFailure(f"display write uncertain: {exc}")
@@ -1781,22 +1816,38 @@ class GitHubAPIAdapter:
     async def _write_auto_build(self, effect: EffectIntent) -> AdapterOutcome:
         """Set the "Auto-build" field to ``args.value`` (an option name, "" clears it)."""
         schema = self.board_schema
-        value = effect.args.get("value")
         if schema is None or not schema.auto_build_field_id:
             return DefinitiveFailure("no Auto-build field is configured")
+        return await self._write_select(
+            effect, schema.auto_build_field_id, schema.auto_build_options, "Auto-build"
+        )
+
+    async def _write_autopilot(self, effect: EffectIntent) -> AdapterOutcome:
+        """Set (in practice: clear) the epic's "Autopilot" field to ``args.value``."""
+        schema = self.board_schema
+        if schema is None or not schema.autopilot_field_id:
+            return DefinitiveFailure("no Autopilot field is configured")
+        return await self._write_select(
+            effect, schema.autopilot_field_id, schema.autopilot_options, "Autopilot"
+        )
+
+    async def _write_select(
+        self, effect: EffectIntent, field_id: str, options: Mapping[str, str], name: str
+    ) -> AdapterOutcome:
+        """Set the single-select ``name`` to ``args.value`` (an option name, "" clears it)."""
+        value = effect.args.get("value")
         if not isinstance(value, str):
-            return DefinitiveFailure("SET_AUTO_BUILD requires a value")
-        option_id = schema.auto_build_options.get(value) if value else None
+            return DefinitiveFailure(f"{effect.kind.value} requires a value")
+        option_id = options.get(value) if value else None
         if value and option_id is None:
-            return DefinitiveFailure(f"no Auto-build option id is configured for {value}")
+            return DefinitiveFailure(f"no {name} option id is configured for {value}")
         binding = await self._binding(effect)
         item_id = binding.project_item_id if binding is not None else None
         if item_id is None and effect.parcel_id is not None:
             item_id = await self._project_item_id(effect.parcel_id)
         if item_id is None:
             return DefinitiveFailure("the parcel has no project item")
-        field_id = schema.auto_build_field_id
-        current = await self._field_option(item_id, field_id, "Auto-build")
+        current = await self._field_option(item_id, field_id, name)
         if (current or None) == option_id:
             return Ack(item_id, {"adopted": True, "value": value})
         if option_id is not None:

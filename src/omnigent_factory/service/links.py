@@ -35,9 +35,13 @@ from omnigent_factory.core.types import Parcel
 from omnigent_factory.github.client import GitHubAPIError, GitHubClient
 from omnigent_factory.github.links import (
     add_blocked_by,
+    create_sub_issue,
+    epic_gate_issues,
     epic_issue_type,
+    gate_marker,
     read_target,
     set_issue_type,
+    user_node_id,
 )
 from omnigent_factory.ports.github import RankingCard
 from omnigent_factory.service.runtime import FactoryService
@@ -246,6 +250,8 @@ class NativeLinks:
         by_node = {c.node_id: c for c in cards}
         applied = 0
         for parcel in parcels.values():
+            if parcel.autopilot is not None:
+                continue  # epic autopilot keeps this epic's note (``service.autopilot``)
             card = by_node.get(parcel.parcel_id)
             if card is None and parcel.epic_note and parcel.issue_number is not None:
                 continue  # off the board or closed: the note goes with the card
@@ -365,8 +371,59 @@ class NativeLinks:
         return count
 
 
+class GitHubGates:
+    """Epic autopilot's human gates on GitHub (``service.autopilot.GateWriter``): a gate
+    is a sub-issue of the epic assigned to the owner, created in one mutation and found
+    again by its hidden marker, so a retry or restart never creates a second one; its
+    blocked-by links go through :meth:`NativeLinks.link` (skipped when they exist)."""
+
+    def __init__(self, links: NativeLinks, publish: Callable[[str], str]) -> None:
+        self.links = links
+        #: Makes agent text safe to post as the bot (mentions, HTML comments, credentials).
+        self.publish = publish
+
+    async def find(self, epic: int) -> dict[str, int]:
+        owner, name = self.links._owner_name
+        return await epic_gate_issues(self.links.client, owner, name, epic)
+
+    async def create(
+        self,
+        epic: int,
+        *,
+        key: str,
+        title: str,
+        steps: str,
+        blocks: Iterable[int],
+        owner_id: int,
+    ) -> int:
+        owner, name = self.links._owner_name
+        client = self.links.client
+        repo_node = self.links.service.config.repo_id
+        target = await read_target(client, owner, name, epic, repo_node)
+        if target is None:
+            raise GitHubAPIError(f"epic #{epic} is not an issue of this repository")
+        before = ", ".join(f"#{n}" for n in blocks)
+        body = (
+            f"{self.publish(steps)}\n\n"
+            f"This is a step of epic #{epic} the factory can't take itself"
+            + (f"; autopilot goes on with {before} once this issue is closed." if before else ".")
+            + f"\n\n{gate_marker(epic, key)}"
+        )
+        return await create_sub_issue(
+            client,
+            repository_node_id=repo_node,
+            parent_node_id=target.node_id,
+            title=" ".join(title.split())[:120] or key,
+            body=body,
+            assignee_node_id=await user_node_id(client, owner_id),
+        )
+
+    async def link(self, blocked: int, blocking: int, *, source: int) -> bool:
+        return await self.links.link(blocked, blocking, source=source)
+
+
 def _load(store: SqliteStore, *, parcel_id: str) -> Parcel | None:
     return store.load_parcel(parcel_id)
 
 
-__all__ = ["LINK_EVENTS", "NativeLinks", "epic_note", "requested_links"]
+__all__ = ["LINK_EVENTS", "GitHubGates", "NativeLinks", "epic_note", "requested_links"]

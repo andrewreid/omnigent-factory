@@ -342,6 +342,104 @@
           "items": {
             "$ref": "#/$defs/related"
           }
+        },
+        "plan": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "parts",
+            "coordination"
+          ],
+          "properties": {
+            "parts": {
+              "type": "array",
+              "maxItems": 100,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "issue",
+                  "scope"
+                ],
+                "properties": {
+                  "issue": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "scope": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000
+                  }
+                }
+              }
+            },
+            "coordination": {
+              "$ref": "#/$defs/texts"
+            },
+            "human_gates": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "key",
+                  "title",
+                  "steps",
+                  "blocks"
+                ],
+                "properties": {
+                  "key": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9-]{0,39}$"
+                  },
+                  "title": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 120
+                  },
+                  "steps": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000
+                  },
+                  "blocks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "items": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
+                  }
+                }
+              }
+            },
+            "external_blockers": {
+              "type": "array",
+              "maxItems": 50,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "issue",
+                  "note"
+                ],
+                "properties": {
+                  "issue": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "note": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 300
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -383,6 +481,24 @@
           "maxItems": 20,
           "items": {
             "$ref": "#/$defs/related"
+          }
+        },
+        "epic_fit": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "within",
+            "note"
+          ],
+          "properties": {
+            "within": {
+              "type": "boolean"
+            },
+            "note": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 300
+            }
           }
         }
       }

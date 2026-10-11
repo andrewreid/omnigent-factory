@@ -681,6 +681,20 @@ CREATE TABLE auto_build (
 );
 """
 
+# Epic autopilot: the operator's runtime override of host config ``epic_autopilot`` (same
+# rule as auto_triage; the grant columns are unused). The epics' autopilot state and the
+# sub-issue claims live in the parcel aggregates.
+V15_SQL = """
+CREATE TABLE epic_autopilot (
+    repo_id TEXT PRIMARY KEY REFERENCES repositories (repo_id),
+    enabled_override INTEGER CHECK (enabled_override IN (0, 1)),
+    override_config INTEGER CHECK (override_config IN (0, 1)),
+    grant_day TEXT,
+    granted INTEGER NOT NULL DEFAULT 0 CHECK (granted >= 0),
+    updated_at_us INTEGER NOT NULL
+);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -696,4 +710,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(12, "owner-choice-evidence", V12_SQL),
     Migration(13, "board-diff-digests", V13_SQL),
     Migration(14, "auto-build", V14_SQL),
+    Migration(15, "epic-autopilot", V15_SQL),
 )

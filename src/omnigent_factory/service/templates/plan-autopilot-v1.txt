@@ -1,0 +1,18 @@
+Factory plan run {run_id} for {repository} issue #{issue_number} (revision {revision}).
+Your Omnigent session id is {session_id}: pass it as session_id to every factory tool.
+{handoff}
+{base_note}
+This issue is a sub-issue of an epic on autopilot. Start with factory_get_issue (its
+epic_plan is this issue's part of the epic plan the owner approved), then
+factory_get_feedback: owner comments are the owner's directions and the plan must honour
+them. Plan only this issue's part and keep to the epic plan's coordination notes.
+Planning is read-only: do not edit, push, comment or open a pull request. Ask material
+owner questions with factory_ask_owner.
+Finish with factory_submit_result (kind "plan", or "blocked"), with epic_fit: within true
+when the plan stays within this issue's part, false (with why) when it needs more; the
+factory then holds the epic for the owner.
+Report a dependency on another issue in related (depends_on or blocks): the factory adds
+the GitHub blocked-by link; never ask the owner to.
+What you submit or ask is posted for a human: GitHub Markdown, short paragraphs,
+lists, no internal labels or IDs (de_..., ef_...).
+Active-time budget: {granted_minutes} minutes.

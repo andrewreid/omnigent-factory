@@ -413,6 +413,8 @@ async def _check_project(config: ServiceConfig, client: GitHubClient, report: Do
     report.pass_check("github_project", "project and live field/option IDs match")
     if config.auto_build or config.auto_build_field_node_id:
         _check_auto_build_field(config, by_id, report)
+    if config.epic_autopilot or config.autopilot_field_node_id or config.parallel_field_node_id:
+        _check_autopilot_fields(config, by_id, report)
     ranking_set_up = config.ranking or bool(config.rank_field_node_id)
     if ranking_set_up:
         _check_rank_field(config, by_id, report)
@@ -458,6 +460,56 @@ def _check_auto_build_field(
         report.fail("github_auto_build_field", "Auto-build option IDs differ from configuration")
         return
     report.pass_check("github_auto_build_field", "Auto-build field and option IDs match")
+
+
+def _check_autopilot_fields(
+    config: ServiceConfig, by_id: dict[Any, Any], report: DoctorReport
+) -> None:
+    """Epic autopilot's "Autopilot" SINGLE_SELECT field (``autopilot_field_node_id`` with
+    ``autopilot_options`` Full/Delayed/Plan only) and the optional "Parallel" NUMBER field
+    (``parallel_field_node_id``), when autopilot is on or either is set."""
+    if not config.autopilot_field_node_id:
+        found = [
+            row
+            for row in by_id.values()
+            if isinstance(row, dict) and row.get("name") == "Autopilot"
+        ]
+        hint = " (create it, see `setup render`)"
+        if found:
+            options = {
+                str(o.get("name")): str(o.get("id"))
+                for o in found[0].get("options") or []
+                if isinstance(o, dict)
+            }
+            hint = f" (the board has one: id {found[0].get('id')}, options {options})"
+        report.fail(
+            "github_autopilot_field",
+            "epic autopilot is set up but autopilot_field_node_id is not set: the Autopilot "
+            "field is missing, so no epic can be put on autopilot" + hint,
+        )
+        return
+    field = by_id.get(config.autopilot_field_node_id)
+    if not isinstance(field, dict) or field.get("name") != "Autopilot":
+        report.fail("github_autopilot_field", "Autopilot field ID does not match")
+        return
+    live = {
+        str(option.get("name")): str(option.get("id"))
+        for option in field.get("options") or []
+        if isinstance(option, dict)
+    }
+    if any(live.get(name) != option for name, option in config.autopilot_options.items()):
+        report.fail("github_autopilot_field", "Autopilot option IDs differ from configuration")
+        return
+    if config.parallel_field_node_id:
+        parallel = by_id.get(config.parallel_field_node_id)
+        if (
+            not isinstance(parallel, dict)
+            or parallel.get("name") != "Parallel"
+            or parallel.get("dataType") != "NUMBER"
+        ):
+            report.fail("github_autopilot_field", "Parallel NUMBER field ID does not match")
+            return
+    report.pass_check("github_autopilot_field", "Autopilot field and option IDs match")
 
 
 def _check_rank_field(config: ServiceConfig, by_id: dict[Any, Any], report: DoctorReport) -> None:

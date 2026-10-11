@@ -37,6 +37,7 @@ from omnigent_factory.ports.clock import SystemClock
 from omnigent_factory.ports.github import IssueRef
 from omnigent_factory.service.auto_build import AutoBuilder
 from omnigent_factory.service.auto_triage import AutoTriager
+from omnigent_factory.service.autopilot import EpicAutopilotService
 from omnigent_factory.service.board_diff import BoardDiff
 from omnigent_factory.service.board_index import BoardIndex
 from omnigent_factory.service.cleanup import CleanupAdapter, WorkspaceCleaner
@@ -47,6 +48,8 @@ from omnigent_factory.service.directory import (
     RecordingOmnigentAdapter,
     ServiceDispatchDirectory,
     ServiceParcelResolver,
+    approved_epic_plan,
+    safe_publication,
 )
 from omnigent_factory.service.durable import (
     StoreCapabilityStore,
@@ -59,7 +62,7 @@ from omnigent_factory.service.github_delivery import (
     GitHubWebhookVerifier,
 )
 from omnigent_factory.service.label_recovery import LabelRecovery
-from omnigent_factory.service.links import NativeLinks
+from omnigent_factory.service.links import GitHubGates, NativeLinks
 from omnigent_factory.service.locking import ProcessLock
 from omnigent_factory.service.mcp import McpEndpoint, build_endpoint
 from omnigent_factory.service.observer import OmnigentObserver
@@ -285,6 +288,8 @@ async def build_production(
             config.note_field_node_id,
             config.auto_build_field_node_id,
             config.auto_build_options,
+            config.autopilot_field_node_id,
+            config.autopilot_options,
         ),
         publication_renderer=publications,
         independent_reviewer_ids=config.independent_reviewer_ids,
@@ -309,6 +314,8 @@ async def build_production(
         status_option_ids=github.status_options,
         auto_build_field_node_id=config.auto_build_field_node_id,
         auto_build_option_ids=config.auto_build_options,
+        autopilot_field_node_id=config.autopilot_field_node_id,
+        autopilot_option_ids=config.autopilot_options,
     )
     normalizer = DeliveryNormalizer(identity)
 
@@ -408,10 +415,21 @@ async def build_production(
     service.native_links = native_links
 
     github.related_marker = marker.schedule
+    service.epic_autopilot = EpicAutopilotService(
+        service,
+        github.issue_snapshot,
+        lambda: ranking_board.cards(
+            service.config.rank_field_node_id, service.config.parallel_field_node_id
+        ),
+        labels=directory.issue_labels,
+        plans=lambda autopilot: approved_epic_plan(directory, autopilot),
+        gates=GitHubGates(native_links, lambda text: safe_publication(text, service.config)),
+    )
     service.auto_builder = AutoBuilder(
         service,
         github.issue_snapshot,
         lambda: ranking_board.cards(service.config.rank_field_node_id),
+        autopilot=service.epic_autopilot,
     )
     ranker = Ranker(
         service,

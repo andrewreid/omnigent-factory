@@ -151,6 +151,7 @@ _PRUNABLE_EFFECT_KINDS = frozenset(
         EffectKind.SET_BOT.value,
         EffectKind.SET_NOTE.value,
         EffectKind.SET_AUTO_BUILD.value,
+        EffectKind.SET_AUTOPILOT.value,
     }
 )
 _AUTO_VACUUM_INCREMENTAL = 2
@@ -563,7 +564,7 @@ class SqliteStore:
     # ---------------------------------------------------------- auto-triage / build
 
     #: Tables holding an operator switch + daily grant (same shape; see migrations).
-    _SWITCH_TABLES = frozenset({"auto_triage", "auto_build"})
+    _SWITCH_TABLES = frozenset({"auto_triage", "auto_build", "epic_autopilot"})
 
     def auto_triage_state(self, repo_id: str) -> AutoTriageState:
         return self._switch_state("auto_triage", repo_id)
@@ -588,6 +589,13 @@ class SqliteStore:
 
     def grant_auto_build(self, repo_id: str, day: str, count: int) -> int:
         return self._grant_switch("auto_build", repo_id, day, count)
+
+    def epic_autopilot_state(self, repo_id: str) -> AutoTriageState:
+        """Operator state of epic autopilot (same shape and rules as auto-triage's)."""
+        return self._switch_state("epic_autopilot", repo_id)
+
+    def set_epic_autopilot_override(self, repo_id: str, enabled: bool, config_value: bool) -> None:
+        self._set_switch_override("epic_autopilot", repo_id, enabled, config_value)
 
     def _switch_table(self, table: str) -> str:
         if table not in self._SWITCH_TABLES:

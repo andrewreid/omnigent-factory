@@ -80,8 +80,10 @@ from omnigent_factory.core.projection import (
 from omnigent_factory.core.types import (
     AUTO_BUILD_QUEUED,
     AUTO_BUILD_STARTED,
+    AUTOPILOT_LEVELS,
     BLOCKING_HOLDS,
     CONTROL_CLEARED_HOLDS,
+    MICROS_PER_MINUTE,
     RELATIONS,
     STAGE_ORDER,
     AdmissionSnapshot,
@@ -89,12 +91,16 @@ from omnigent_factory.core.types import (
     ApprovalKind,
     AutoBuildMark,
     AutoBuildStatus,
+    AutopilotClaim,
+    AutopilotGate,
     BotState,
     Contract,
     Decision,
     DecisionImpact,
     DecisionSource,
     DecisionStatus,
+    EpicAutopilot,
+    EpicPlan,
     FenceKind,
     Grant,
     HeldWake,
@@ -185,6 +191,7 @@ _DEFAULT_RETRY: dict[EffectKind, RetryClass] = {
     EffectKind.SET_BOT: RetryClass.ADOPTABLE_WRITE,
     EffectKind.SET_NOTE: RetryClass.ADOPTABLE_WRITE,
     EffectKind.SET_AUTO_BUILD: RetryClass.ADOPTABLE_WRITE,
+    EffectKind.SET_AUTOPILOT: RetryClass.ADOPTABLE_WRITE,
     EffectKind.REACT_COMMENT: RetryClass.ADOPTABLE_WRITE,
     EffectKind.POST_COMMENT: RetryClass.ADOPTABLE_WRITE,
     EffectKind.PUBLISH_CONTRACT: RetryClass.ADOPTABLE_WRITE,
@@ -821,6 +828,7 @@ def _apply_evidence(ctx: _Ctx) -> None:
         ctx.update(links=snap.links)
     _sync_session_title(ctx, snap)
     _observe_auto_build(ctx, snap)
+    _observe_autopilot(ctx, snap)
     if snap.in_project:
         ctx.unhold(Hold.NO_PROJECT_ITEM)
     if was_eligible and not snap.eligible:
@@ -1630,6 +1638,8 @@ def _h_auto_build(ctx: _Ctx, body: ev.AutoBuild) -> None:
     mark = p.auto_build
     if mark is None or mark.status != AutoBuildStatus.QUEUED:
         raise Rejected("no-auto-build-mark")
+    if mark.not_before_us > ctx.now:
+        raise Rejected("auto-build-not-due")
     if ctx.event.evidence is None:
         raise Rejected("auto-build-without-fresh-read")
     if ctx.now <= p.barrier_time_us or mark.marked_at_us <= p.barrier_time_us:
@@ -1679,7 +1689,8 @@ def _h_auto_build(ctx: _Ctx, body: ev.AutoBuild) -> None:
             sequence=entry.sequence,
         )
     )
-    _write_auto_build(ctx, AUTO_BUILD_STARTED)
+    if not mark.autopilot_epic or ctx.p.auto_build_field:
+        _write_auto_build(ctx, AUTO_BUILD_STARTED)  # an autopilot mark: only if shown
 
 
 def _observe_auto_build(ctx: _Ctx, snap: IssueSnapshot) -> None:
@@ -1745,6 +1756,431 @@ def _settle_auto_build(ctx: _Ctx) -> None:
         ctx.note(why)
 
 
+# ------------------------------------------------------------------ epic autopilot
+
+
+AUTOPILOT_UNCONFIRMED_NOTE = "Autopilot mark not confirmed: re-select it"
+#: What each human step reads as on the epic's question comment template.
+_AUTOPILOT_QUESTIONS = frozenset({"order"})
+
+
+def _is_epic(p: Parcel) -> bool:
+    return p.links is not None and p.links.epic
+
+
+def _write_autopilot(ctx: _Ctx, value: str) -> None:
+    """Write the epic's "Autopilot" field (the factory only clears it: display)."""
+    if ctx.p.autopilot_field == value:
+        return
+    ctx.update(
+        autopilot_field=value, autopilot_field_at_us=max(ctx.p.autopilot_field_at_us, ctx.now)
+    )
+    ctx.emit(EffectKind.SET_AUTOPILOT, args={"value": value})
+
+
+def _autopilot_refusal(ctx: _Ctx) -> str | None:
+    """Why an owner's Autopilot level cannot put this issue on autopilot (None: it can)."""
+    p = ctx.p
+    if not eligible(p):
+        return "Autopilot cleared: the issue is closed, assigned or unverified"
+    if p.links is None:
+        return "Autopilot cleared: the issue's links could not be read; re-select it"
+    if not p.links.epic:
+        return "Autopilot cleared: only an epic (an issue with sub-issues) can run on autopilot"
+    if ctx.origin_stage not in (None, Stage.INBOX, Stage.TRIAGED):
+        return "Autopilot cleared: move the epic to Inbox or Triage first"
+    return None
+
+
+def _start_epic_plan(ctx: _Ctx) -> None:
+    """The epic planning pass: the epic triage run, asked for the epic plan (the template
+    follows ``Parcel.autopilot``). The card goes to Triage like an owner ``/triage``."""
+    ctx.unhold(*CONTROL_CLEARED_HOLDS)
+    _cancel_queue(ctx)
+    _move(ctx, Stage.TRIAGED)
+    _start_stage(ctx, SessionKind.TRIAGE, ctx.config.block_us(ctx.p.size or Size.S))
+
+
+def _h_autopilot_marked(ctx: _Ctx, body: ev.AutopilotMarked) -> None:
+    """The owner changed the epic's "Autopilot" field (their own webhook only).
+
+    A level on an epic starts the epic planning pass; nothing advances until the owner
+    approves the epic plan with ``/approve``. Changing the level keeps the plan and its
+    approval. Clearing the field turns autopilot off: running builds continue, queued
+    autopilot starts are withdrawn by the autopilot pass.
+    """
+    _control(ctx)
+    option = body.option
+    ctx.update(
+        autopilot_field=option, autopilot_field_at_us=max(ctx.p.autopilot_field_at_us, ctx.now)
+    )
+    current = ctx.p.autopilot
+    if option == "":
+        if current is not None:
+            ctx.update(autopilot=None)
+            ctx.note("Autopilot off")
+        return
+    refusal = (
+        "Autopilot cleared: unknown option; select Full, Delayed or Plan only"
+        if option not in AUTOPILOT_LEVELS
+        else _autopilot_refusal(ctx)
+    )
+    if refusal is not None:
+        ctx.update(autopilot=None)
+        _write_autopilot(ctx, "")
+        ctx.note(refusal)
+        return
+    assert ctx.event.actor_id is not None  # noqa: S101 - _control
+    if current is not None:
+        ctx.update(autopilot=replace(current, level=option))
+        ctx.note(f"Autopilot: {option}")
+        return
+    ctx.update(
+        autopilot=EpicAutopilot(
+            level=option,
+            owner_id=ctx.event.actor_id,
+            source_event_id=ctx.event.event_id,
+            set_at_us=ctx.now,
+        )
+    )
+    _start_epic_plan(ctx)
+    ctx.note(f"Autopilot ({option}): writing the epic plan")
+
+
+def _observe_autopilot(ctx: _Ctx, snap: IssueSnapshot) -> None:
+    """A fresh read's "Autopilot" value (the webhook may have been lost).
+
+    A read proves no actor: a level seen without the owner's webhook never enables or
+    changes autopilot (the note asks the owner to select it again, once per value); an
+    empty field while autopilot is on is the owner clearing it (that only restricts).
+    """
+    value = snap.autopilot
+    p = ctx.p
+    if (
+        value is None
+        or snap.read_at_us <= p.autopilot_field_at_us
+        or value == p.autopilot_field
+        or ctx.event.kind == EventKind.AUTOPILOT_MARKED
+    ):
+        return
+    ctx.update(autopilot_field=value, autopilot_field_at_us=snap.read_at_us)
+    if value == "":
+        if p.autopilot is not None:
+            ctx.update(autopilot=None)
+            ctx.note("Autopilot off")
+        return
+    if p.autopilot is None or p.autopilot.level != value:
+        ctx.note(AUTOPILOT_UNCONFIRMED_NOTE)
+
+
+def _record_epic_plan(ctx: _Ctx, body: ev.ResultCandidate, s: StageSession, effect_id: str) -> None:
+    """An epic triage with a plan on an autopilot epic: the epic plan to approve (posted
+    once its comment is acknowledged)."""
+    ap = ctx.p.autopilot
+    if ap is None or not body.epic_plan_hash:
+        return
+    ctx.update(
+        autopilot=replace(
+            ap,
+            plan=EpicPlan(body.epic_plan_hash, s.session_id, effect_id),
+            revision_pending=False,
+        )
+    )
+
+
+def _epic_plan_revision(ctx: _Ctx) -> None:
+    """An owner comment on an autopilot epic with a plan: it revises the epic plan. The
+    approval is void until the revised plan is approved; running builds continue."""
+    ap = ctx.p.autopilot
+    if ap is None or ap.plan is None:
+        return
+    ctx.update(
+        autopilot=replace(
+            ap,
+            revision_pending=True,
+            approved_hash="",
+            approved_by=0,
+            approval_event_id="",
+            approved_at_us=0,
+        )
+    )
+
+
+def _approve_epic_plan(ctx: _Ctx, body: ev.ApprovePlan) -> None:
+    """``/approve [hash]`` on an autopilot epic approves its posted epic plan (hash-bound
+    like a sub-issue plan). The approval event is the autopilot epoch."""
+    ap = ctx.p.autopilot
+    assert ap is not None  # noqa: S101 - checked by the caller
+    plan = ap.plan
+    if plan is None or plan.posted_at_us is None:
+        raise Rejected("epic-plan-not-posted", explain=True)
+    if ap.revision_pending:
+        raise Rejected("epic-plan-revision-pending", explain=True)
+    if ctx.p.open_decisions:
+        raise Rejected("open-decisions", explain=True)
+    if body.hash_text is not None:
+        if resolve_hash(body.hash_text, [plan.full_hash]) != plan.full_hash:
+            raise Rejected("hash-does-not-identify-latest", explain=True)
+    elif not plan.posted_at_us < ctx.now:
+        raise Rejected("epic-plan-not-posted-before-control", explain=True)
+    if ap.approved:
+        ctx.note("Epic plan already approved: autopilot is on")
+        return
+    assert ctx.event.actor_id is not None  # noqa: S101 - _control
+    ctx.update(
+        autopilot=replace(
+            ap,
+            approved_hash=plan.full_hash,
+            approved_by=ctx.event.actor_id,
+            approval_event_id=ctx.event.event_id,
+            approved_at_us=ctx.now,
+            paused="",
+            asked=(),
+        )
+    )
+    ctx.note(f"Epic plan approved: autopilot ({ap.level}) starts")
+
+
+def _judge_epic_fit(ctx: _Ctx, body: ev.ResultCandidate, full_hash: str) -> None:
+    """A plan of a sub-issue autopilot drives: keep the epic plan's word on its part."""
+    claim = ctx.p.autopilot_claim
+    if claim is None or not claim.active:
+        return
+    if body.epic_fit == "within":
+        drift = ""
+    elif body.epic_fit == "exceeds":
+        drift = "its plan goes beyond its part of the epic plan"
+    else:
+        drift = "its plan does not say whether it stays within the epic plan"
+    ctx.update(autopilot_claim=replace(claim, drift=drift, drift_hash=full_hash))
+
+
+def _autopilot_fresh(ctx: _Ctx, what: str) -> None:
+    """Shared checks of the trusted clock's autopilot steps."""
+    p = ctx.p
+    if ctx.event.evidence is None:
+        raise Rejected(f"{what}-without-fresh-read")
+    if ctx.now <= p.barrier_time_us:
+        raise Rejected(f"{what}-not-fresh-after-barrier")
+    if ctx.admission.paused:
+        raise Rejected("paused")
+    if not dispatchable(p):
+        raise Rejected("parcel-not-dispatchable")
+
+
+def _h_autopilot_plan(ctx: _Ctx, body: ev.AutopilotPlan) -> None:
+    """Epic autopilot starts the plan of an unblocked sub-issue (the trusted clock).
+
+    The service picked it (the epic's next sub-issue, its plan approved by the owner);
+    this re-checks what the parcel and a fresh read can tell: a sub-issue of that epic,
+    not an epic itself, every blocker closed, not claimed in this epoch (never twice), no
+    run or build live. Unplanned issues go straight to planning (no triage); a plan the
+    owner already has posted is taken as it is.
+    """
+    _autopilot_fresh(ctx, "autopilot")
+    p = ctx.p
+    if not body.epoch or body.epic <= 0:
+        raise Rejected("autopilot-without-epoch")
+    claim = p.autopilot_claim
+    if claim is not None and claim.epoch == body.epoch:
+        raise Rejected("autopilot-already-claimed")
+    snap = ctx.event.evidence
+    assert snap is not None  # noqa: S101 - _autopilot_fresh
+    links = snap.links
+    if links is None:
+        raise Rejected("autopilot-links-unreadable")  # fail closed: a blocker may hide
+    if links.parent is None or links.parent.repo or links.parent.number != body.epic:
+        raise Rejected("autopilot-not-a-sub-issue")
+    if links.epic:
+        raise Rejected("autopilot-nested-epic")  # a blocker only, never recursed into
+    if links.open_blockers:
+        raise Rejected("autopilot-blocked")
+    if _build_blocked_by_live(ctx) or _approval_active(ctx):
+        raise Rejected("autopilot-build-live")
+    if ctx.origin_stage not in (None, Stage.INBOX, Stage.TRIAGED, Stage.SCOPED):
+        raise Rejected("autopilot-stage")
+    cur = p.current_session
+    if p.pending_authorization_id is not None or (cur is not None and not settled(cur)):
+        raise Rejected("autopilot-run-live")
+    if ctx.origin_stage == Stage.SCOPED and plan_ok(p):
+        ctx.note("Autopilot: taking the posted plan")
+    else:
+        _start_plan(ctx, None)
+        ctx.note(f"Autopilot: planning (epic #{body.epic})")
+    ctx.update(
+        autopilot_claim=AutopilotClaim(
+            epic=body.epic, epoch=body.epoch, claimed_at_us=ctx.now, revision=ctx.p.revision
+        )
+    )
+
+
+def _h_autopilot_queue(ctx: _Ctx, body: ev.AutopilotQueue) -> None:
+    """Epic autopilot queues the build of a claimed sub-issue's posted plan.
+
+    An auto-build mark bound to that plan's hash, carrying the owner's epic plan approval
+    (``owner_id``, ``epoch``) and started by the auto-build queue (capacity, manual builds
+    first) no earlier than ``delay_us`` after the plan was posted. Each plan is queued at
+    most once; a plan that goes beyond its part of the epic is never queued.
+    """
+    _autopilot_fresh(ctx, "autopilot")
+    p = ctx.p
+    claim = p.autopilot_claim
+    if claim is None or claim.epoch != body.epoch or claim.epic != body.epic:
+        raise Rejected("autopilot-not-claimed")
+    if not claim.active:
+        raise Rejected("autopilot-released")
+    if body.owner_id not in ctx.config.owners:
+        raise Rejected("autopilot-owner-unknown")
+    if ctx.origin_stage != Stage.SCOPED or p.stage != Stage.SCOPED:
+        raise Rejected("autopilot-not-in-planning")
+    if p.open_decisions:
+        raise Rejected("open-decisions")
+    if not plan_ok(p):
+        raise Rejected("autopilot-no-posted-plan")
+    c = p.current_contract
+    assert c is not None  # noqa: S101 - plan_ok
+    if c.posted_at_us is None or claim.marked_hash == c.full_hash:
+        raise Rejected("autopilot-already-queued")
+    if claim.drift and claim.drift_hash == c.full_hash:
+        raise Rejected("autopilot-plan-drift")
+    if claim.drift_hash != c.full_hash:
+        raise Rejected("autopilot-plan-not-judged")
+    if p.auto_build is not None or _build_blocked_by_live(ctx) or _approval_active(ctx):
+        raise Rejected("autopilot-build-approved")
+    if p.links is not None and (p.links.epic or p.links.open_blockers):
+        raise Rejected("autopilot-blocked")
+    due = max(ctx.now, c.posted_at_us + max(0, body.delay_us))
+    ctx.update(
+        auto_build=AutoBuildMark(
+            status=AutoBuildStatus.QUEUED,
+            full_hash=c.full_hash,
+            contract_id=c.contract_id,
+            owner_id=body.owner_id,
+            source_event_id=body.approval_event_id or body.epoch,
+            marked_at_us=ctx.now,
+            revision=p.revision,
+            autopilot_epic=body.epic,
+            not_before_us=due if due > ctx.now else 0,
+        ),
+        autopilot_claim=replace(claim, marked_hash=c.full_hash),
+    )
+    if body.show_auto_build:
+        _write_auto_build(ctx, AUTO_BUILD_QUEUED)
+    if due > ctx.now:
+        minutes = max(1, -(-(due - ctx.now) // MICROS_PER_MINUTE))
+        ctx.note(f"Autopilot: build starts in {minutes} min unless you object")
+    else:
+        ctx.note("Autopilot: build queued")
+
+
+def _h_autopilot_withdraw(ctx: _Ctx, body: ev.AutopilotWithdraw) -> None:
+    """The epic no longer authorises autopilot here: drop its queued build mark and
+    release the claim (a running build is never touched)."""
+    p = ctx.p
+    claim = p.autopilot_claim
+    mark = p.auto_build
+    queued = (
+        mark is not None
+        and mark.status == AutoBuildStatus.QUEUED
+        and mark.autopilot_epic == body.epic
+    )
+    if not queued and (claim is None or claim.epic != body.epic or not claim.active):
+        raise Rejected("autopilot-nothing-to-withdraw")
+    reason = " ".join(body.reason.split())[:120] or "autopilot was turned off"
+    if queued:
+        ctx.update(auto_build=None)
+        _write_auto_build(ctx, "")
+    if claim is not None and claim.epic == body.epic and claim.active:
+        ctx.update(autopilot_claim=replace(claim, released=reason))
+    ctx.note(f"Autopilot stood down: {reason}")
+
+
+def _h_autopilot_status(ctx: _Ctx, body: ev.AutopilotStatus) -> None:
+    """The autopilot pass's note and pause state for this epic (display; a pause holds
+    new starts)."""
+    ap = ctx.p.autopilot
+    if ap is None:
+        raise Rejected("autopilot-off")
+    text = " ".join(body.text.split())[:NOTE_MAX]
+    paused = " ".join(body.paused.split())[:NOTE_MAX]
+    if text == ctx.p.epic_note and paused == ap.paused:
+        raise Rejected("autopilot-status-unchanged")
+    ctx.update(epic_note=text, autopilot=replace(ap, paused=paused))
+    if ctx.p.note.startswith(("Autopilot", "Epic plan")) and not ctx.note_set:
+        ctx.update(note="")  # the pass's current status supersedes the acknowledgement
+
+
+def _h_autopilot_gate_created(ctx: _Ctx, body: ev.AutopilotGateCreated) -> None:
+    """A human gate of the epic plan exists as a sub-issue (recorded once per key)."""
+    key = body.key.strip()
+    if not key or body.number <= 0:
+        raise Rejected("invalid-autopilot-gate")
+    known = next((g for g in ctx.p.autopilot_gates if g.key == key), None)
+    if known is not None:
+        if known.number != body.number or known.linked or not body.linked:
+            raise Rejected("autopilot-gate-known")
+        gates = tuple(replace(g, linked=True) if g.key == key else g for g in ctx.p.autopilot_gates)
+        ctx.update(autopilot_gates=gates)
+        return
+    gate = AutopilotGate(key, body.number, linked=body.linked)
+    ctx.update(autopilot_gates=(*ctx.p.autopilot_gates, gate))
+
+
+def _h_autopilot_question(ctx: _Ctx, body: ev.AutopilotQuestion) -> None:
+    """Autopilot cannot go on without the owner: one comment per epoch and question."""
+    ap = ctx.p.autopilot
+    if ap is None or not ap.approved:
+        raise Rejected("autopilot-off")
+    if body.key not in _AUTOPILOT_QUESTIONS:
+        raise Rejected("unknown-autopilot-question")
+    if body.key in ap.asked:
+        raise Rejected("autopilot-already-asked")
+    ctx.update(autopilot=replace(ap, asked=(*ap.asked, body.key)))
+    ctx.comment(f"autopilot-{body.key}")
+
+
+def _settle_autopilot(ctx: _Ctx) -> None:
+    """After every event: an epic's autopilot ends with the epic (closed, assigned,
+    stopped, no longer an epic); a sub-issue's claim is released once the owner takes it
+    over (a stop or leftward move, an assignment, a revision of the plan that is not an
+    answer, or the autopilot build mark cleared without a build)."""
+    p = ctx.p
+    ap = p.autopilot
+    if ap is not None:
+        why = ""
+        if Hold.COMPLETED in p.holds or p.stage == Stage.DONE:
+            why = "Autopilot off: the epic is closed"
+        elif not eligible(p):
+            why = "Autopilot cleared: the epic is closed, assigned or unverified"
+        elif p.barrier_time_us >= ap.set_at_us:
+            why = "Autopilot cleared: stopped after it was set; re-select it"
+        elif p.links is not None and not p.links.epic:
+            why = "Autopilot cleared: the issue has no sub-issues"
+        if why:
+            ctx.update(autopilot=None)
+            _write_autopilot(ctx, "")
+            if not ctx.note_set:
+                ctx.note(why)
+    claim = p.autopilot_claim
+    if claim is None or not claim.active or Hold.COMPLETED in p.holds:
+        return
+    released = ""
+    if p.barrier_time_us >= claim.claimed_at_us:
+        released = "stopped or moved back by the owner"
+    elif not eligible(p):
+        released = "assigned to a person"
+    elif p.revision > claim.revision:
+        released = "the owner revised the plan"
+    elif claim.marked_hash:
+        mark = p.auto_build
+        kept = mark is not None and mark.full_hash == claim.marked_hash
+        built = any(a.full_hash == claim.marked_hash for a in p.approvals)
+        if not kept and not built:
+            released = "the owner cleared the autopilot build"
+    if released:
+        ctx.update(autopilot_claim=replace(claim, released=released))
+
+
 def _replan(ctx: _Ctx, via: Via | None) -> None:
     cur = ctx.p.current_session
     if cur is not None and cur.kind == SessionKind.BUILD and cur.lifecycle != Lifecycle.RETIRED:
@@ -1800,6 +2236,8 @@ def _h_plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
     _require_eligible(ctx)
     stage = ctx.origin_stage
     answered = _answer_questions(ctx)
+    if not answered:
+        _epic_plan_revision(ctx)
     if stage == Stage.BUILDING:
         _build_feedback(ctx, body, answered=answered)
     elif stage == Stage.READY and _feedback_rework(ctx):
@@ -1846,6 +2284,10 @@ def _deliver_answer(ctx: _Ctx, s: StageSession) -> None:
         if mark is not None and mark.status == AutoBuildStatus.QUEUED:
             # The owner's own answer: the mark waits for the re-posted plan (same hash).
             ctx.update(auto_build=replace(mark, revision=ctx.p.revision))
+        claim = ctx.p.autopilot_claim
+        if claim is not None and claim.active and claim.revision == ctx.p.revision - 1:
+            # The owner's answer to autopilot's plan run is no revision of theirs.
+            ctx.update(autopilot_claim=replace(claim, revision=ctx.p.revision))
         _void_approval(ctx, "plan-decision")
         s = ctx.put_session(replace(s, revision=ctx.p.revision))
     _relay_answers(ctx, s)
@@ -2133,6 +2575,9 @@ def _h_approve_plan(ctx: _Ctx, body: ev.ApprovePlan) -> None:
     _control(ctx)
     if not eligible(ctx.p):
         raise Rejected("parcel-not-eligible", explain=True, rollback_to=rollback)
+    if body.via == Via.COMMAND and ctx.p.autopilot is not None and _is_epic(ctx.p):
+        _approve_epic_plan(ctx, body)
+        return
     latest = ctx.p.current_contract
     if latest is None:
         raise Rejected("no-published-contract", explain=True, rollback_to=rollback)
@@ -3591,6 +4036,15 @@ def _h_publication_acked(ctx: _Ctx, body: ev.PublicationAcked) -> None:
         )
     if body.effect_kind in _PUBLICATION_KINDS:
         ctx.unhold(Hold.PUBLICATION_FAILED)
+    ap = ctx.p.autopilot
+    if (
+        ap is not None
+        and ap.plan is not None
+        and ap.plan.effect_id == body.effect_id
+        and ap.plan.posted_at_us is None
+    ):
+        ctx.update(autopilot=replace(ap, plan=replace(ap.plan, posted_at_us=ctx.now)))
+        ctx.note("Epic plan posted: approve it with /approve to start autopilot")
     if (
         body.effect_kind == EffectKind.PUBLISH_TRIAGE.value
         and Hold.PUBLICATION_PENDING in ctx.p.holds
@@ -4174,7 +4628,8 @@ def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
     if body.result_kind == ev.ResultKind.TRIAGE:
         if body.size is not None:
             ctx.update(size=body.size)
-        ctx.emit(EffectKind.PUBLISH_TRIAGE, session=s, args={"session_id": s.session_id})
+        publish = ctx.emit(EffectKind.PUBLISH_TRIAGE, session=s, args={"session_id": s.session_id})
+        _record_epic_plan(ctx, body, s, publish.effect_id)
         # Needs you only once the owner can see the outcome (PublicationAcked).
         ctx.hold(Hold.PUBLICATION_PENDING)
         _begin_drain(ctx, s, interrupt=False)
@@ -4192,6 +4647,7 @@ def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
             size=body.size,
         )
         ctx.update(contracts=(*ctx.p.contracts, contract), size=body.size)
+        _judge_epic_fit(ctx, body, full_hash)
         ctx.put_session(
             replace(s, lifecycle=Lifecycle.WAITING, wait_reason=WaitReason.PLAN_APPROVAL)
         )
@@ -4675,6 +5131,13 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.AUTO_TRIAGE: _h_auto_triage,
     EventKind.AUTO_BUILD_MARKED: _h_auto_build_marked,
     EventKind.AUTO_BUILD: _h_auto_build,
+    EventKind.AUTOPILOT_MARKED: _h_autopilot_marked,
+    EventKind.AUTOPILOT_PLAN: _h_autopilot_plan,
+    EventKind.AUTOPILOT_QUEUE: _h_autopilot_queue,
+    EventKind.AUTOPILOT_WITHDRAW: _h_autopilot_withdraw,
+    EventKind.AUTOPILOT_STATUS: _h_autopilot_status,
+    EventKind.AUTOPILOT_GATE_CREATED: _h_autopilot_gate_created,
+    EventKind.AUTOPILOT_QUESTION: _h_autopilot_question,
     EventKind.RELATED_MARKED: _h_related_marked,
     EventKind.EPIC_PROGRESS: _h_epic_progress,
     EventKind.CONTRACT_PUBLISHED: _h_contract_published,
@@ -5100,6 +5563,7 @@ def transition(state: State, event: Event) -> TransitionResult:
     if new_parcel is not None:
         _settle_observed_move(ctx, accepted)
         _settle_auto_build(ctx)
+        _settle_autopilot(ctx)
         _settle_build_slot(ctx)
         _project_board(ctx)
         new_parcel = ctx.p

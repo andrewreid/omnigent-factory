@@ -16,7 +16,9 @@ Trust classes:
   or the ``auto-triage`` CLI, with a daily budget) acted on when the factory is idle. It
   only ever starts triage of an Inbox issue the factory never worked on. It also carries
   ``AutoBuild``: the start of a build an owner already approved with the board's
-  "Auto-build" field (``AutoBuildMarked``, an owner control).
+  "Auto-build" field (``AutoBuildMarked``, an owner control), and epic autopilot's
+  ``AutopilotPlan``/``AutopilotQueue``: steps of an epic plan the owner approved with the
+  epic's "Autopilot" field (``AutopilotMarked``, an owner control) and ``/approve``.
 * ``MCP`` is a factory tool call over the loopback MCP endpoint, already resolved by the
   service to the calling issue session's current run. It can only report that run's own
   result or ask the owner a question; it never carries authority.
@@ -69,6 +71,8 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.REQUEST_REWORK: _OWNER_CONTROL,
     # the owner's "Auto-build" field change (their own project-item webhook)
     EventKind.AUTO_BUILD_MARKED: _OWNER_CONTROL,
+    # the owner's "Autopilot" field change on an epic (their own project-item webhook)
+    EventKind.AUTOPILOT_MARKED: _OWNER_CONTROL,
     # operator
     EventKind.PAUSE: Admission(_OPERATOR),
     EventKind.UNPAUSE: Admission(_OPERATOR),
@@ -78,6 +82,11 @@ ADMISSION: dict[EventKind, Admission] = {
     # an owner's auto-build mark started when a build slot is free (the mark is the
     # owner's approval; the clock only picks the time)
     EventKind.AUTO_BUILD: Admission(_SCHEDULER),
+    # epic autopilot acting on an owner-approved epic plan (the approval is the owner's;
+    # the clock only picks the sub-issue and the time); withdrawal only restricts
+    EventKind.AUTOPILOT_PLAN: Admission(_SCHEDULER),
+    EventKind.AUTOPILOT_QUEUE: Admission(_SCHEDULER),
+    EventKind.AUTOPILOT_WITHDRAW: Admission(_SCHEDULER),
     # safety facts: any actor, GitHub input or a daemon read (they only restrict)
     EventKind.LEFTWARD_MOVE: Admission(_GITHUB_OR_READ),
     EventKind.ASSIGNED_HUMAN: Admission(_GITHUB_OR_READ),
@@ -123,6 +132,9 @@ ADMISSION: dict[EventKind, Admission] = {
     # display only: another issue's accepted triage named this one
     EventKind.RELATED_MARKED: Admission(_ADAPTER),
     EventKind.EPIC_PROGRESS: Admission(_ADAPTER),
+    EventKind.AUTOPILOT_STATUS: Admission(_ADAPTER),
+    EventKind.AUTOPILOT_GATE_CREATED: Admission(_ADAPTER),
+    EventKind.AUTOPILOT_QUESTION: Admission(_ADAPTER),
     EventKind.POLICIES_VERIFIED: Admission(_ADAPTER),
     EventKind.POLICY_GUARD_FAILED: Admission(_ADAPTER),
     EventKind.TREE_QUIESCENT: Admission(_ADAPTER),

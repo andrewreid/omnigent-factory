@@ -57,8 +57,11 @@ class RankingBoard:
     def project_node_id(self) -> str:
         return self.adapter.project_node_id
 
-    async def cards(self, rank_field_id: str) -> list[RankingCard] | RetryableReadFailure:
-        """Open repository issues on the board with Status, Rank and Priority values."""
+    async def cards(
+        self, rank_field_id: str, parallel_field_id: str = ""
+    ) -> list[RankingCard] | RetryableReadFailure:
+        """Open repository issues on the board with Status, Rank and Priority values (and
+        an epic's "Parallel" number when ``parallel_field_id`` is set)."""
         query = """
         query($id: ID!, $after: String) { node(id: $id) { ... on ProjectV2 {
           items(first: 100, after: $after) {
@@ -97,7 +100,7 @@ class RankingBoard:
                 if not isinstance(items, dict) or not isinstance(nodes, list):
                     return RetryableReadFailure("project items were unavailable")
                 for item in nodes:
-                    card = self._card(item, rank_field_id)
+                    card = self._card(item, rank_field_id, parallel_field_id)
                     if card is not None:
                         cards.append(card)
                 page = items.get("pageInfo")
@@ -113,7 +116,9 @@ class RankingBoard:
             return RetryableReadFailure(str(exc))
         return cards
 
-    def _card(self, item: object, rank_field_id: str) -> RankingCard | None:
+    def _card(
+        self, item: object, rank_field_id: str, parallel_field_id: str = ""
+    ) -> RankingCard | None:
         if not isinstance(item, dict) or not isinstance(item.get("id"), str):
             return None
         content = item.get("content")
@@ -135,6 +140,7 @@ class RankingBoard:
             self.adapter.status_options,
         )
         rank: float | None = None
+        parallel: int | None = None
         priority: str | None = None
         values = item.get("fieldValues")
         for value in values.get("nodes", []) if isinstance(values, dict) else []:
@@ -146,6 +152,13 @@ class RankingBoard:
             number_value = value.get("number")
             if field.get("id") == rank_field_id and isinstance(number_value, int | float):
                 rank = float(number_value)
+            elif (
+                parallel_field_id
+                and field.get("id") == parallel_field_id
+                and isinstance(number_value, int | float)
+                and not isinstance(number_value, bool)
+            ):
+                parallel = int(number_value)
             elif field.get("name") == PRIORITY_FIELD and value.get("name") in PRIORITIES:
                 priority = str(value["name"])
         return RankingCard(
@@ -158,6 +171,7 @@ class RankingBoard:
             rank=rank,
             priority=priority,
             links=parse_links(content, self.adapter.repository_node_id),
+            parallel=parallel,
         )
 
     # ------------------------------------------------------------------ writes

@@ -46,7 +46,7 @@ def test_v7_database_with_inbox_rows_upgrades_and_uses_the_partial_index(db: Pat
     old.close()
 
     store = SqliteStore.open(db, clock)
-    assert store.schema_version() == 14
+    assert store.schema_version() == 15
     assert [d.delivery_guid for d in store.pending_deliveries()] == before == ["d-1"]
     assert store.inbox_due() == [("d-1", None), ("d-4", clock.now_utc_us() + 10)]
     assert store.has_pending_delivery()

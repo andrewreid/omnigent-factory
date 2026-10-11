@@ -63,6 +63,10 @@ class EventKind(enum.StrEnum):
     AUTO_TRIAGE = "AutoTriage"
     AUTO_BUILD_MARKED = "AutoBuildMarked"
     AUTO_BUILD = "AutoBuild"
+    AUTOPILOT_MARKED = "AutopilotMarked"
+    AUTOPILOT_PLAN = "AutopilotPlan"
+    AUTOPILOT_QUEUE = "AutopilotQueue"
+    AUTOPILOT_WITHDRAW = "AutopilotWithdraw"
     # safety
     LEFTWARD_MOVE = "LeftwardMove"
     ASSIGNED_HUMAN = "AssignedHuman"
@@ -106,6 +110,9 @@ class EventKind(enum.StrEnum):
     ISSUE_SESSION_CLOSED = "IssueSessionClosed"
     RELATED_MARKED = "RelatedMarked"
     EPIC_PROGRESS = "EpicProgress"
+    AUTOPILOT_STATUS = "AutopilotStatus"
+    AUTOPILOT_GATE_CREATED = "AutopilotGateCreated"
+    AUTOPILOT_QUESTION = "AutopilotQuestion"
     TREE_QUIESCENT = "TreeQuiescent"
     STOP_TIMEOUT = "StopTimeout"
     SESSION_CRASHED = "SessionCrashed"
@@ -330,6 +337,63 @@ class AutoBuild(_Body):
 
     KIND: ClassVar[EventKind] = EventKind.AUTO_BUILD
     CLASS: ClassVar[EventClass] = EventClass.CONTROL
+
+
+@dataclass(frozen=True, slots=True)
+class AutopilotMarked(_Body):
+    """An owner changed the epic card's "Autopilot" field (their own webhook only).
+
+    ``option`` is "Full", "Delayed" or "Plan only", ``""`` (cleared: autopilot off) or
+    ``"?"`` (unknown). The factory's own writes and anyone else's never become this.
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.AUTOPILOT_MARKED
+    CLASS: ClassVar[EventClass] = EventClass.CONTROL
+    option: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class AutopilotPlan(_Body):
+    """Epic autopilot starts the plan of this unblocked sub-issue of ``epic`` (the
+    trusted clock, with a fresh read). The authority is the owner's approval of the epic
+    plan; ``epoch`` is the epic's autopilot (the owner's field event). The reducer
+    re-checks the parcel and its links."""
+
+    KIND: ClassVar[EventKind] = EventKind.AUTOPILOT_PLAN
+    CLASS: ClassVar[EventClass] = EventClass.CONTROL
+    epic: int = 0
+    epoch: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class AutopilotQueue(_Body):
+    """Epic autopilot queues the build of this claimed sub-issue's posted plan (an
+    auto-build mark carrying the owner's epic plan approval: ``owner_id`` and
+    ``approval_event_id``), started by the auto-build queue no earlier than ``delay_us``
+    after the plan was posted. ``epoch`` is the epic's autopilot (its field event)."""
+
+    KIND: ClassVar[EventKind] = EventKind.AUTOPILOT_QUEUE
+    CLASS: ClassVar[EventClass] = EventClass.CONTROL
+    epic: int = 0
+    epoch: str = ""
+    owner_id: int = 0
+    approval_event_id: str = ""
+    delay_us: int = 0
+    #: The board has an "Auto-build" field: show the queued mark there (the owner may
+    #: clear it to object).
+    show_auto_build: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class AutopilotWithdraw(_Body):
+    """The epic no longer authorises autopilot (turned off, re-approved, cleared): drop
+    the queued autopilot build mark of this sub-issue and release the claim. Only ever
+    restricts."""
+
+    KIND: ClassVar[EventKind] = EventKind.AUTOPILOT_WITHDRAW
+    CLASS: ClassVar[EventClass] = EventClass.CONTROL
+    epic: int = 0
+    reason: str = ""
 
 
 # ----------------------------------------------------------------- safety bodies
@@ -801,6 +865,41 @@ class EpicProgress(_Body):
 
 
 @dataclass(frozen=True, slots=True)
+class AutopilotStatus(_Body):
+    """The autopilot pass's view of this epic: its card note (``Epic · 3/9 done ·
+    autopilot: planning #882, next #883``) and why it is paused ("" = not paused).
+    Display and a hold on new starts only; never authority."""
+
+    KIND: ClassVar[EventKind] = EventKind.AUTOPILOT_STATUS
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    text: str = ""
+    paused: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class AutopilotGateCreated(_Body):
+    """A human gate of the approved epic plan exists as sub-issue ``number`` (created, or
+    found by its marker after a restart)."""
+
+    KIND: ClassVar[EventKind] = EventKind.AUTOPILOT_GATE_CREATED
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    key: str = ""
+    number: int = 0
+    #: Its blocked-by links to the sub-issues it comes before exist now.
+    linked: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class AutopilotQuestion(_Body):
+    """Autopilot cannot go on without the owner (``key``: e.g. "order", no build order):
+    one comment on the epic per epoch and key."""
+
+    KIND: ClassVar[EventKind] = EventKind.AUTOPILOT_QUESTION
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    key: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class ResultCandidate(_Body):
     """A stage result accepted from ``factory_submit_result``, already validated.
 
@@ -821,6 +920,11 @@ class ResultCandidate(_Body):
     pr_number: int | None = None
     head_sha: str | None = None
     open_decision_ids: tuple[str, ...] = ()
+    #: An epic plan (an epic triage with a ``plan``): sha256 of its canonical result.
+    epic_plan_hash: str | None = None
+    #: A plan of an autopilot sub-issue: "within" its part of the epic plan, "exceeds",
+    #: or None (not given).
+    epic_fit: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -930,6 +1034,10 @@ EventBody = (
     | AutoTriage
     | AutoBuildMarked
     | AutoBuild
+    | AutopilotMarked
+    | AutopilotPlan
+    | AutopilotQueue
+    | AutopilotWithdraw
     | LeftwardMove
     | AssignedHuman
     | Closed
@@ -970,6 +1078,9 @@ EventBody = (
     | IssueSessionClosed
     | RelatedMarked
     | EpicProgress
+    | AutopilotStatus
+    | AutopilotGateCreated
+    | AutopilotQuestion
     | TreeQuiescent
     | StopTimeout
     | SessionCrashed
@@ -1003,6 +1114,10 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         AutoTriage,
         AutoBuildMarked,
         AutoBuild,
+        AutopilotMarked,
+        AutopilotPlan,
+        AutopilotQueue,
+        AutopilotWithdraw,
         LeftwardMove,
         AssignedHuman,
         Closed,
@@ -1043,6 +1158,9 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         IssueSessionClosed,
         RelatedMarked,
         EpicProgress,
+        AutopilotStatus,
+        AutopilotGateCreated,
+        AutopilotQuestion,
         TreeQuiescent,
         StopTimeout,
         SessionCrashed,
@@ -1112,6 +1230,13 @@ __all__ = [
     "AutoBuild",
     "AutoBuildMarked",
     "AutoTriage",
+    "AutopilotGateCreated",
+    "AutopilotMarked",
+    "AutopilotPlan",
+    "AutopilotQuestion",
+    "AutopilotQueue",
+    "AutopilotStatus",
+    "AutopilotWithdraw",
     "BasePushed",
     "BotEyes",
     "CapacityAvailable",

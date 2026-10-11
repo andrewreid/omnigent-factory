@@ -113,7 +113,7 @@ def test_v8_aggregates_lose_their_event_id_sets_on_upgrade(db: Path):
     old.close()
 
     store = SqliteStore.open(db, clock)
-    assert store.schema_version() == 14
+    assert store.schema_version() == 15
     loaded = store.load_parcel(P)
     assert loaded is not None and loaded.applied_event_ids == frozenset()
     assert replace(loaded, applied_event_ids=bloated.applied_event_ids) == bloated

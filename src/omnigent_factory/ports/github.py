@@ -57,6 +57,7 @@ GITHUB_EFFECT_KINDS = frozenset(
         EffectKind.SET_BOT,
         EffectKind.SET_NOTE,
         EffectKind.SET_AUTO_BUILD,
+        EffectKind.SET_AUTOPILOT,
         EffectKind.REACT_COMMENT,
         EffectKind.POST_COMMENT,
         EffectKind.PUBLISH_CONTRACT,
@@ -182,6 +183,8 @@ class BoardCard:
     updated_at: str
     #: "Auto-build" option ID ("" = none, or the field is not configured).
     auto_build_option: str = ""
+    #: "Autopilot" option ID ("" = none, or the field is not configured).
+    autopilot_option: str = ""
     #: Native links (parent, sub-issue counts, blocked-by with states, blocking): GitHub
     #: does not move ``updatedAt`` for every link change, and a blocker closing changes
     #: only the blocker. None when unreadable.
@@ -202,6 +205,8 @@ class BoardCard:
         if self.auto_build_option:
             # Only when set: a card without one keeps the digest stored before the field.
             values.append(self.auto_build_option)
+        if self.autopilot_option:
+            values.append(f"autopilot:{self.autopilot_option}")  # likewise only when set
         links = links_digest(self.links)
         if links:
             # Likewise only with links: an unlinked card keeps its earlier digest.
@@ -228,6 +233,8 @@ class RankingCard:
     priority: str | None
     #: Native links (parent, blocked-by, blocking; no titles); None when unreadable.
     links: IssueLinks | None = None
+    #: The epic's "Parallel" NUMBER field (None: empty or not configured).
+    parallel: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

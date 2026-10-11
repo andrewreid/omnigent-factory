@@ -124,6 +124,13 @@ def build_parser() -> argparse.ArgumentParser:
     build_grant = build_sub.add_parser("grant", help="add <n> auto-builds to today's limit")
     build_grant.add_argument("count", type=int)
     _config_arg(build_grant)
+    autopilot = sub.add_parser(
+        "epic-autopilot",
+        help="epic autopilot: status, on/off (overrides the config until it changes)",
+    )
+    autopilot_sub = autopilot.add_subparsers(dest="autopilot_command", required=True)
+    for name in ("status", "on", "off"):
+        _config_arg(autopilot_sub.add_parser(name))
     ranking = sub.add_parser(
         "ranking",
         help="triage ranking: status, on/off (overrides the config until it changes), "
@@ -187,6 +194,7 @@ def _operator(
         "prune": 900.0,
         "auto-triage": 60.0,  # status reads the board
         "auto-build": 60.0,
+        "epic-autopilot": 60.0,
         "ranking": 60.0,
         "sessions-prune": 600.0,  # snapshot, tree scan and delete per session
     }.get(command, 5.0)
@@ -261,6 +269,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.build_command == "grant":
             build_request["count"] = args.count
         return _operator(config, "auto-build", build_request)
+    if args.command == "epic-autopilot":
+        return _operator(config, "epic-autopilot", {"action": args.autopilot_command})
     if args.command == "ranking":
         return _operator(config, "ranking", {"action": args.ranking_command})
     if args.command == "sessions" and args.sessions_command == "prune":

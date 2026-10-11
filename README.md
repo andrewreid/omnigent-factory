@@ -256,6 +256,47 @@ is Done or the issue closes (or its PR merges), the factory clears the field. Ma
 approvals and starts are stored with the parcel, so a restart never starts a mark twice or
 repeats a note.
 
+### Epic autopilot
+
+Off by default (`epic_autopilot = true` or `epic-autopilot on`). It moves an epic's
+sub-issues through plan and build one after another, in dependency order, with you
+approving the epic plan once and merging each PR.
+
+Set the epic card's `Autopilot` field (only your own board edit counts, as for
+`Auto-build`; a read that shows a level without your webhook notes `Autopilot mark not
+confirmed: re-select it`): the epic moves to Triage and the epic triage writes the
+**epic plan**: build order, each sub-issue's part, coordination between them, gaps,
+steps only you can take (tenant, Azure, Entra, secrets, DNS ...) and blockers outside the
+epic, posted as one comment headed by its hash. Nothing advances until you `/approve` it
+on the epic (hash-bound like a plan). A comment on the epic revises the plan: running
+builds go on, nothing new starts until you approve the revision. On approval each human
+step becomes a sub-issue of the epic assigned to you, with blocked-by links from the
+sub-issues it comes before (never created twice); closing it unblocks them.
+
+| Level | After a sub-issue's plan is posted |
+|---|---|
+| `Full` | Its build is queued at once. |
+| `Delayed` | Its build starts `epic_autopilot_delay_minutes` (60) after the plan was posted, unless you object first: a comment (a plan revision), a leftward drag, `/stop`, clearing its `Auto-build` field, assigning a person, or clearing the epic's `Autopilot` field. |
+| `Plan only` | Nothing: approve it as usual (drag, `/approve`, `Auto-build` = Queued). |
+
+Next sub-issue: open, assigned to nobody, not `factory:skip`, not an epic itself (a
+nested epic only blocks), every blocker closed (a merged PR closes it; blockers outside
+the epic are waited on, never started), by the plan's build order, then `Rank`, then
+age. It goes straight to planning (no triage), its worktree synced with the base. Its
+plan must say whether it stays within its part of the epic; one that does not is never
+built. At most `epic_autopilot_concurrency` (1) sub-issues per epic are in progress (the
+epic's `Parallel` number overrides it). Builds are ordinary auto-builds: they count
+against `auto_build_concurrency`, `max_building`, the daily limit and the parked-slot
+rules, and your own builds go first (`auto_build` itself may stay off).
+
+Autopilot pauses (starts nothing new) while a sub-issue it drives is `Needs you` or
+`Blocked` or its plan goes beyond its part, and stops to ask once (one comment) when
+neither the plan nor blocked-by links give an order. Its state is the epic card's note,
+e.g. `Epic · 3/9 done · autopilot: planning #882, next #883` or `Autopilot paused: #881
+needs you`; no status comments. Clearing the epic's field turns it off and drops queued
+starts. Delayed starts and every step are stored with the issues, so a restart never
+repeats one.
+
 ### Triage ranking
 
 Off by default (`ranking = true` or `ranking on`). When the factory is idle by the
@@ -337,13 +378,15 @@ waits up to 90 s for it instead of failing.
 | `auto-build status` | Auto-build: enabled (and whether config or the CLI decides), the concurrency cap, auto-builds running and waiting for a slot, today's used/limit/granted, what the next start waits on (`waiting_on`), and the queue in start order with each card's rank, `eligible` and `blocker`. |
 | `auto-build on` / `off` | Turn auto-build on/off at runtime; stored like `auto-triage on`/`off` (the newer intent wins). Marks stay queued while it is off. |
 | `auto-build grant <n>` | Add `<n>` (1-1000) auto-builds to today's limit (only matters with `auto_build_daily_limit` > 0). |
+| `epic-autopilot status` | Epic autopilot: enabled (and whether config or the CLI decides), delay, concurrency, and each epic on autopilot with its level, plan state, pause, note and human gates. |
+| `epic-autopilot on` / `off` | Turn epic autopilot on/off at runtime; stored like `auto-build on`/`off` (the newer intent wins). Queued autopilot starts wait while it is off. |
 | `ranking status` | Triage ranking: enabled (and whether config or the CLI decides), idle or what keeps it busy, new triage results since the last ranking, failures/backoff, recent runs. |
 | `ranking on` / `off` | Turn triage ranking on/off at runtime; stored like `auto-triage on`/`off` (the newer intent wins). |
 | `ranking now` | Run one ranking as soon as no triage or other ranking is running (it does not wait for builds, plans, reworks, queued builds or stage requests), whatever changed (also when ranking is off, or backing off; not while paused). `ranking status` then shows only what it still waits on. |
 | `sessions prune [--dry-run]` | Delete (or list) the factory sessions session retention would remove now (through the daemon). |
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id` and `session_retention_days`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id` and `session_retention_days`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.
@@ -360,6 +403,12 @@ auto_build_concurrency = 1       # auto-builds holding a build slot at once
 auto_build_daily_limit = 0       # auto-builds started per local day (0 = unlimited)
 auto_build_field_node_id = ""    # the project's "Auto-build" SINGLE_SELECT field (restart)
 auto_build_options = { Queued = "", Started = "" }  # its option IDs (restart)
+epic_autopilot = false           # advance epics whose Autopilot field you set
+epic_autopilot_delay_minutes = 60  # Delayed: build starts this long after the plan
+epic_autopilot_concurrency = 1   # sub-issues per epic in progress (Parallel overrides)
+autopilot_field_node_id = ""     # the epic "Autopilot" SINGLE_SELECT field (restart)
+autopilot_options = { Full = "", Delayed = "", "Plan only" = "" }  # its options (restart)
+parallel_field_node_id = ""      # the epic "Parallel" NUMBER field (restart)
 ranking = false                  # idle-time ranking of the Triage and Planning columns
 ranking_min_new_triages = 5      # new/changed triage results that start a ranking
 ranking_status_update = true     # short project status update per ranking
@@ -377,6 +426,12 @@ option IDs as `auto_build_options = { Queued = "...", Started = "..." }` and res
 daemon (these two keys are not hot-reloadable). While `auto_build` is on or the field
 is configured, `doctor` fails when the field is missing (naming its ID and options when
 the board already has one) or its IDs differ.
+
+Create the `Autopilot` (SINGLE_SELECT: `Full`, `Delayed`, `Plan only`) and `Parallel`
+(NUMBER) fields the same way (`setup render` lists both), record their IDs as
+`autopilot_field_node_id`, `autopilot_options` and `parallel_field_node_id`, and restart.
+While `epic_autopilot` is on or either field is configured, `doctor` fails when the
+Autopilot field is missing or its IDs differ (naming the board's IDs when it has one).
 
 A triage/report/status publication that failed definitively leaves the card at
 `Bot: Blocked`. Fix the cause, then run `recovery` and `retry-effect <effect_id>`.

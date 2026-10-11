@@ -136,6 +136,15 @@ class AutoBuildStatus(enum.StrEnum):
 AUTO_BUILD_QUEUED = "Queued"
 AUTO_BUILD_STARTED = "Started"
 
+#: The board's "Autopilot" single-select option names on an epic (``autopilot_options``
+#: keys): Full plans and builds each next sub-issue, Delayed starts a build only after
+#: ``epic_autopilot_delay_minutes`` without an owner objection, Plan only plans and
+#: waits for the owner's approval. Empty = autopilot off.
+AUTOPILOT_FULL = "Full"
+AUTOPILOT_DELAYED = "Delayed"
+AUTOPILOT_PLAN_ONLY = "Plan only"
+AUTOPILOT_LEVELS = (AUTOPILOT_FULL, AUTOPILOT_DELAYED, AUTOPILOT_PLAN_ONLY)
+
 
 class Size(enum.StrEnum):
     S = "S"
@@ -385,6 +394,9 @@ class IssueSnapshot:
     #: The board's "Auto-build" option name when read ("" = empty, "?" = an option the
     #: config does not know); None when not read (no field configured).
     auto_build: str | None = None
+    #: The board's "Autopilot" option name when read ("" = empty, "?" = unknown); None
+    #: when not read (no field configured).
+    autopilot: str | None = None
     #: GitHub-native links (parent, sub-issues, blocked-by, blocking); None when not read
     #: or unreadable (e.g. more blockers than one read returns).
     links: IssueLinks | None = None
@@ -715,6 +727,109 @@ class AutoBuildMark:
     #: its queue entry (a later rework under the same approval is no auto-build).
     approval_id: str = ""
     sequence: int = 0
+    #: Queued by epic autopilot for the sub-issue of this epic (0 = the owner's own mark):
+    #: the owner's approval is their approval of the epic plan (``owner_id`` and
+    #: ``source_event_id`` are that approval's), and it holds only while the epic's
+    #: autopilot still authorises it.
+    autopilot_epic: int = 0
+    #: Not started before this time (a Delayed autopilot start; 0 = at once).
+    not_before_us: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class EpicPlan:
+    """An epic plan (an ``epic_triage`` result with a ``plan``) posted on the epic.
+
+    ``full_hash`` binds the owner's ``/approve`` like a sub-issue plan's contract hash.
+    """
+
+    full_hash: str
+    session_id: str
+    #: The PUBLISH_TRIAGE effect that posts it; its acknowledgement sets ``posted_at_us``.
+    effect_id: str
+    posted_at_us: int | None = None
+
+    @property
+    def prefix(self) -> str:
+        return self.full_hash[:12]
+
+
+@dataclass(frozen=True, slots=True)
+class EpicAutopilot:
+    """An owner set the epic card's "Autopilot" field (their own webhook only).
+
+    Nothing advances until the owner approves the epic plan (``approved_hash``); an
+    owner comment on the epic asks for a revision and voids that approval until the
+    revised plan is approved.
+    """
+
+    level: str
+    owner_id: int
+    source_event_id: str
+    set_at_us: int
+    plan: EpicPlan | None = None
+    #: The approved plan hash ("" = none) and the owner, event and time of the approval
+    #: (the source of every autopilot build approval). ``source_event_id`` (the owner's
+    #: field event) is the autopilot epoch sub-issue claims carry.
+    approved_hash: str = ""
+    approved_by: int = 0
+    approval_event_id: str = ""
+    approved_at_us: int = 0
+    #: An owner comment on the epic asked for a revised plan (nothing new starts).
+    revision_pending: bool = False
+    #: Why the last autopilot pass paused this epic ("" = not paused).
+    paused: str = ""
+    #: Questions already asked on the epic in this epoch (no repeats).
+    asked: tuple[str, ...] = ()
+
+    @property
+    def approved(self) -> bool:
+        return (
+            bool(self.approved_hash)
+            and self.plan is not None
+            and self.plan.full_hash == self.approved_hash
+            and not self.revision_pending
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AutopilotGate:
+    """A human gate of an approved epic plan, created as a sub-issue of the epic
+    (assigned to the owner). ``key`` is the plan's gate key: never created twice."""
+
+    key: str
+    number: int
+    #: Its blocked-by links to the sub-issues it comes before were written.
+    linked: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class AutopilotClaim:
+    """Epic autopilot drives this sub-issue (it started its plan or took its posted one).
+
+    ``epoch`` is the epic's autopilot (the owner's field event): a claim from another
+    epoch is void.
+    The owner taking over (a stop, a leftward drag, a plan revision, an assignment, or
+    clearing the autopilot build mark) sets ``released``: autopilot leaves it alone.
+    """
+
+    epic: int
+    epoch: str
+    claimed_at_us: int
+    #: The parcel's plan revision autopilot started (or found); a later revision that is
+    #: not an owner answer is the owner revising the plan.
+    revision: int
+    released: str = ""
+    #: The sub-issue plan goes beyond its part of the epic plan ("" = it fits), and the
+    #: contract hash that was judged.
+    drift: str = ""
+    drift_hash: str = ""
+    #: The plan hash autopilot queued for build (each plan at most once).
+    marked_hash: str = ""
+
+    @property
+    def active(self) -> bool:
+        return not self.released
 
 
 @dataclass(frozen=True, slots=True)
@@ -848,6 +963,16 @@ class Parcel:
     #: An epic's progress note (``Epic · 1/8 done · next: #823``), set by the factory's
     #: board pass only when it changes ("" = none).
     epic_note: str = ""
+    #: Epic autopilot on this epic (None: off).
+    autopilot: EpicAutopilot | None = None
+    #: The "Autopilot" option the factory believes the board shows ("" = empty) and when
+    #: that last changed (a read taken before then is stale).
+    autopilot_field: str = ""
+    autopilot_field_at_us: int = 0
+    #: Human gates created for this epic (kept when autopilot is turned off: never twice).
+    autopilot_gates: tuple[AutopilotGate, ...] = ()
+    #: Epic autopilot drives this sub-issue (None: never claimed).
+    autopilot_claim: AutopilotClaim | None = None
     applied_event_ids: frozenset[str] = frozenset()
 
     def session(self, session_id: str | None) -> StageSession | None:

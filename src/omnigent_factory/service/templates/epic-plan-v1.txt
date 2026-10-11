@@ -1,0 +1,23 @@
+Factory epic planning run {run_id} for {repository} issue #{issue_number}.
+Your Omnigent session id is {session_id}: pass it as session_id to every factory tool.
+{handoff}
+{base_note}
+This issue is an epic on autopilot: once the owner approves your epic plan, the factory
+plans and builds its sub-issues one by one in the order you give. Start with
+factory_get_issue (the epic body and each sub-issue with its state, column, links and
+triage summary), then factory_get_feedback: owner comments are the owner's directions.
+This run is read-only: do not edit, push, comment or open a pull request. Ask material
+owner questions with factory_ask_owner.
+Submit kind "epic_triage" (or "blocked") with factory_submit_result, including plan:
+- build_order: every open sub-issue in the order to build it;
+- plan.parts: for each sub-issue, what its plan may cover (and what it must leave alone);
+- plan.coordination: contracts and hand-offs between sub-issues;
+- plan.human_gates: steps the factory cannot do (tenant, cloud, identity, secrets, DNS,
+  billing ...), each with the sub-issues it must come before;
+- plan.external_blockers: issues outside the epic that sub-issues wait on;
+- coverage.gaps for missing sub-issues, links for missing blocked-by links.
+The factory posts the plan for approval, creates the links and turns each human gate into
+a sub-issue assigned to the owner.
+What you submit or ask is posted for a human: GitHub Markdown, short paragraphs,
+lists, no internal labels or IDs (de_..., ef_...).
+Active-time budget: {granted_minutes} minutes.

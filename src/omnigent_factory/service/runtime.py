@@ -162,6 +162,10 @@ class FactoryService:
         #: Owner-marked auto-builds and the ``auto-build`` operator command (composition;
         #: ``service.auto_build.AutoBuilder``). None: not wired.
         self.auto_builder: Any = None
+        #: Epic autopilot and its ``epic-autopilot`` operator command (composition;
+        #: ``service.autopilot.EpicAutopilotService``). None: not wired. Its pass runs in
+        #: the auto-build loop, just before each auto-build pass.
+        self.epic_autopilot: Any = None
         #: Idle-time triage ranking and its ``ranking`` operator command (composition;
         #: ``service.ranking.Ranker``). None: not wired.
         self.ranker: Any = None
@@ -882,6 +886,14 @@ class FactoryService:
             await self._wait(min(self.config.reconcile_interval_seconds, AUTO_BUILD_POLL_SECONDS))
             if self._stop.is_set() or not self.accepting_admission:
                 continue
+            if self.epic_autopilot is not None:
+                try:
+                    advanced = await self.epic_autopilot.run_once()
+                    LOG.debug("epic autopilot pass outcome=%s", advanced)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOG.warning("epic autopilot pass failed")
             try:
                 outcome = await self.auto_builder.run_once()
                 LOG.debug("auto-build pass outcome=%s", outcome)
@@ -1150,6 +1162,11 @@ class FactoryService:
                 raise ValueError("auto-build is not wired")
             built: dict[str, object] = await self.auto_builder.command(args)
             return built
+        if command == "epic-autopilot":
+            if self.epic_autopilot is None:
+                raise ValueError("epic autopilot is not wired")
+            piloted: dict[str, object] = await self.epic_autopilot.command(args)
+            return piloted
         if command == "ranking":
             if self.ranker is None:
                 raise ValueError("ranking is not wired")

@@ -12,6 +12,12 @@ The reducer re-checks the mark against the posted plan and starts it like an app
 
 Started auto-builds are counted from their accepted ``AutoBuild`` events (durable, never
 pruned) per local calendar day of the host.
+
+Epic autopilot (``service.autopilot``) queues marks of its own on the sub-issues it drives
+(``AutoBuildMark.autopilot_epic``): they carry the owner's epic plan approval, start under
+the ``epic_autopilot`` switch (not ``auto_build``), never before ``not_before_us`` (a
+Delayed start), and only while the epic's autopilot still authorises them (checked just
+before each start). They share every capacity rule and the daily limit with the others.
 """
 
 from __future__ import annotations
@@ -19,7 +25,9 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import partial
+from typing import Any
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.codec import parcel_from_json
@@ -109,8 +117,12 @@ def order_candidates(
     )
 
 
-def mark_blocker(parcel: Parcel, *, parked: bool = False) -> str | None:
+def mark_blocker(parcel: Parcel, *, parked: bool = False, now_us: int = 0) -> str | None:
     """Why this queued mark cannot start now, from the parcel alone (None: it can)."""
+    mark = parcel.auto_build
+    if mark is not None and mark.not_before_us > now_us:
+        due = datetime.fromtimestamp(mark.not_before_us / 1_000_000, tz=UTC)
+        return f"autopilot start at {due:%H:%M} UTC unless the owner objects"
     if parcel.open_decisions:
         return "waiting for the answer to an open question"
     if parcel.revision_pending:
@@ -166,11 +178,17 @@ class AutoBuilder:
     """Starts owner-marked auto-builds; also the ``auto-build`` operator command."""
 
     def __init__(
-        self, service: FactoryService, snapshot: SnapshotReader, cards: CardReader
+        self,
+        service: FactoryService,
+        snapshot: SnapshotReader,
+        cards: CardReader,
+        autopilot: Any = None,  # noqa: ANN401 - service.autopilot.EpicAutopilotService
     ) -> None:
         self.service = service
         self.snapshot = snapshot
         self.cards = cards
+        #: Epic autopilot: its switch and its per-start authorisation of autopilot marks.
+        self.autopilot = autopilot
 
     # --------------------------------------------------------------- state
 
@@ -207,15 +225,29 @@ class AutoBuilder:
         )
         return AutoBuildBudget(day, int(used), config.auto_build_daily_limit, state.granted_on(day))
 
-    async def marked(self) -> list[Parcel]:
-        """Parcels whose owner auto-build mark waits to be started."""
+    async def switches(self) -> tuple[bool, bool]:
+        """(auto-build on, epic autopilot on): which marks may start at all."""
+        auto, _source = await self.enabled()
+        autopilot = self.autopilot is not None and (await self.autopilot.enabled())[0]
+        return auto, bool(autopilot)
+
+    async def marked(self, switches: tuple[bool, bool] | None = None) -> list[Parcel]:
+        """Parcels whose owner auto-build mark waits to be started (with ``switches``: only
+        the marks a switch that is on covers)."""
         repo_id = self.service.config.repo_id
         parcels: list[Parcel] = await self.service.db.call(partial(_marked, repo_id=repo_id))
-        return parcels
+        if switches is None:
+            return parcels
+        auto, autopilot = switches
+        return [
+            p
+            for p in parcels
+            if p.auto_build is not None and (autopilot if p.auto_build.autopilot_epic else auto)
+        ]
 
-    async def queue(self) -> list[Candidate]:
+    async def queue(self, switches: tuple[bool, bool] | None = None) -> list[Candidate]:
         """Waiting marks in start order (unranked by issue age when the board is unread)."""
-        parcels = await self.marked()
+        parcels = await self.marked(switches)
         if not parcels:
             return []
         found = await self.cards()
@@ -239,10 +271,10 @@ class AutoBuilder:
 
     async def run_once(self) -> str:
         """One decision: start at most one auto-build. Returns what happened (for logs)."""
-        enabled, _source = await self.enabled()
-        if not enabled:
+        switches = await self.switches()
+        if not any(switches):
             return "disabled"
-        if not await self.marked():
+        if not await self.marked(switches):
             return "no auto-build queued"
         budget = await self.budget()
         if budget.remaining == 0:
@@ -253,9 +285,12 @@ class AutoBuilder:
         if blocker is not None:
             return f"waiting: {blocker}"
         attempts = 0
-        for candidate in await self.queue():
+        now = self.service.clock.now_utc_us()
+        for candidate in await self.queue(switches):
             parked = self.service.parked.blocks(candidate.parcel.parcel_id)
-            if mark_blocker(candidate.parcel, parked=parked) is not None:
+            if mark_blocker(candidate.parcel, parked=parked, now_us=now) is not None:
+                continue
+            if self.autopilot is not None and await self.autopilot.blocker(candidate.parcel):
                 continue
             outcome = await self._start(candidate.parcel)
             if outcome is not None:
@@ -299,9 +334,12 @@ class AutoBuilder:
         mark = parcel.auto_build
         LOG.info(
             "auto-build started issue=#%s parcel=%s source=scheduler "
-            "authority=owner-auto-build-mark owner=%s mark_event=%s",
+            "authority=%s owner=%s mark_event=%s",
             number,
             parcel.parcel_id,
+            "owner-epic-plan-approval"
+            if mark is not None and mark.autopilot_epic
+            else "owner-auto-build-mark",
             mark.owner_id if mark is not None else "?",
             mark.source_event_id if mark is not None else "?",
         )
@@ -344,10 +382,13 @@ class AutoBuilder:
         elif budget.remaining == 0:
             blocker = "today's auto-build limit is used"
         queue = await self.queue()
+        now = self.service.clock.now_utc_us()
         entries: list[dict[str, object]] = []
         for candidate in queue:
             parked = self.service.parked.blocks(candidate.parcel.parcel_id)
-            why = mark_blocker(candidate.parcel, parked=parked)
+            why = mark_blocker(candidate.parcel, parked=parked, now_us=now)
+            if why is None and self.autopilot is not None:
+                why = await self.autopilot.blocker(candidate.parcel)
             entries.append(
                 {
                     "issue": candidate.number,

@@ -45,6 +45,12 @@ def effect_still_valid(parcel: Parcel | None, effect: EffectIntent) -> str | Non
         and effect.args.get("value") != parcel.auto_build_field
     ):
         return "auto-build-superseded"  # the field changed since: latest wins
+    if (
+        effect.kind == EffectKind.SET_AUTOPILOT
+        and parcel is not None
+        and effect.args.get("value") != parcel.autopilot_field
+    ):
+        return "autopilot-superseded"  # the owner set it again since: latest wins
     if parcel is not None and Hold.COMPLETED in parcel.holds:
         completed = _completed_invalid(effect)
         if completed is not None:

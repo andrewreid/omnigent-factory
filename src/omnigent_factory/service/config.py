@@ -52,6 +52,9 @@ HOT_RELOAD_KEYS = frozenset(
         "auto_build",
         "auto_build_concurrency",
         "auto_build_daily_limit",
+        "epic_autopilot",
+        "epic_autopilot_delay_minutes",
+        "epic_autopilot_concurrency",
         "ranking",
         "ranking_min_new_triages",
         "ranking_status_update",
@@ -197,6 +200,22 @@ class ServiceConfig(BaseModel):
     #: ``Started``); "" = not set up: the field is neither read nor written.
     auto_build_field_node_id: str = ""
     auto_build_options: dict[str, str] = Field(default_factory=dict)
+    #: Epic autopilot: advance the sub-issues of an epic whose "Autopilot" field the owner
+    #: set (and whose epic plan they approved) through plan and build in dependency order.
+    #: ``omnigent-factory epic-autopilot on|off`` overrides it until it changes here.
+    epic_autopilot: bool = False
+    #: Delayed level: a posted sub-issue plan's build starts this long after posting
+    #: unless the owner objects.
+    epic_autopilot_delay_minutes: int = Field(default=60, ge=0, le=7 * 24 * 60)
+    #: Sub-issues of one epic autopilot has in progress at once (the epic's "Parallel"
+    #: field overrides it); always capped by the dependency graph and build capacity.
+    epic_autopilot_concurrency: int = Field(default=1, ge=1, le=20)
+    #: Projects v2 SINGLE_SELECT field "Autopilot" and its option IDs (``Full``,
+    #: ``Delayed``, ``Plan only``); "" = not set up: the field is neither read nor written.
+    autopilot_field_node_id: str = ""
+    autopilot_options: dict[str, str] = Field(default_factory=dict)
+    #: Projects v2 NUMBER field "Parallel" ("" = not set up: the concurrency applies).
+    parallel_field_node_id: str = ""
     #: Triage ranking: while the factory is idle, one read-only session orders the Triage
     #: and Planning columns on one scale (the ``Rank`` field). ``omnigent-factory ranking
     #: on|off`` overrides it until it changes here.
@@ -327,6 +346,13 @@ class ServiceConfig(BaseModel):
             or len(set(self.auto_build_options.values())) != 2
         ):
             raise ValueError("auto_build_options must map Queued and Started to unique option ids")
+        if self.autopilot_field_node_id and (
+            set(self.autopilot_options) != {"Full", "Delayed", "Plan only"}
+            or len(set(self.autopilot_options.values())) != 3
+        ):
+            raise ValueError(
+                "autopilot_options must map Full, Delayed and Plan only to unique option ids"
+            )
         if set(self.checkpoint_block_hours) != {"S", "M", "L"}:
             raise ValueError("checkpoint_block_hours must contain S, M and L")
         blocks = [self.checkpoint_block_hours[key] for key in ("S", "M", "L")]

@@ -44,6 +44,7 @@ def snapshot(
     bot: str | None = None,
     note: str | None = None,
     auto_build: str | None = None,
+    autopilot: str | None = None,
     links: IssueLinks | None = _NO_LINKS,
 ) -> IssueSnapshot:
     return IssueSnapshot(
@@ -59,6 +60,7 @@ def snapshot(
         bot=bot,
         note=note,
         auto_build=auto_build,
+        autopilot=autopilot,
         links=links,
     )
 
@@ -147,7 +149,10 @@ class EventFactory:
                 | ev.RetryDue
                 | ev.ReconcileDue
                 | ev.AutoTriage
-                | ev.AutoBuild,
+                | ev.AutoBuild
+                | ev.AutopilotPlan
+                | ev.AutopilotQueue
+                | ev.AutopilotWithdraw,
             ):
                 provenance = Provenance.SCHEDULER
             if isinstance(body, ev.InboxHoldSet | ev.InboxHoldReleased):

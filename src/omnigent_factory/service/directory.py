@@ -26,12 +26,13 @@ from omnigent_factory.core.effects import (
     ExecutionContext,
 )
 from omnigent_factory.core.events import EventKind
-from omnigent_factory.core.protocol import ParsedResult
+from omnigent_factory.core.protocol import ParsedResult, epic_plan_hash
 from omnigent_factory.core.types import (
     MICROS_PER_MINUTE,
     ApprovalKind,
     Contract,
     Decision,
+    EpicAutopilot,
     IssueSnapshot,
     Parcel,
     SessionKind,
@@ -105,8 +106,13 @@ class ServiceDispatchDirectory:
         template_name = _FIRST_TEMPLATES[session.kind]
         if session.kind == SessionKind.TRIAGE and parcel.links is not None and parcel.links.epic:
             template_name = _EPIC_TRIAGE_TEMPLATE  # an epic: coverage, order and links
+            if parcel.autopilot is not None:
+                template_name = _EPIC_PLAN_TEMPLATE  # on autopilot: also the epic plan
         elif session.kind == SessionKind.TRIAGE and self.latest_triage(parcel) is not None:
             template_name = _RETRIAGE_TEMPLATE  # a re-run on owner feedback
+        claim = parcel.autopilot_claim
+        if session.kind == SessionKind.PLAN and claim is not None and claim.active:
+            template_name = _AUTOPILOT_PLAN_TEMPLATE  # a sub-issue epic autopilot drives
         auth = parcel.authorization(session.authorization_id)
         if session.kind == SessionKind.BUILD and auth is not None and auth.rework:
             # Owner feedback on the built work, or a merge conflict with the base branch.
@@ -870,6 +876,9 @@ _STATUS_TEXT = {
     "confirmed idle.",
     "restart-exhausted": "The session stopped and couldn't be restarted automatically, so this "
     "is blocked.",
+    "autopilot-order": "I've paused autopilot on this epic: I can't tell which sub-issue goes "
+    "next, because neither the epic plan's build order nor blocked-by links between the "
+    "sub-issues say. Which order should they go in?",
 }
 
 
@@ -975,8 +984,15 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
 
 
 def _epic_triage_text(result: Mapping[str, Any]) -> str:
-    """One short epic comment: the summary, the build order and the coverage gaps."""
-    lines = ["### Epic triage", "", " ".join(str(result.get("summary", "")).split())]
+    """One short epic comment: the summary, the build order and the coverage gaps (with a
+    ``plan``: the epic plan, headed by its hash like a sub-issue plan)."""
+    plan = result.get("plan")
+    heading = (
+        f"### Epic plan · hash `{epic_plan_hash(result)[:12]}`"
+        if isinstance(plan, dict)
+        else "### Epic triage"
+    )
+    lines = [heading, "", " ".join(str(result.get("summary", "")).split())]
     order = [
         item
         for item in (result.get("build_order") or [])
@@ -1009,7 +1025,67 @@ def _epic_triage_text(result: Mapping[str, Any]) -> str:
     missing = _bullets(result.get("missing_information"))
     if missing:
         lines += ["", "**Missing information:**", missing]
+    if isinstance(plan, dict):
+        lines += _epic_plan_lines(plan)
     return "\n".join(lines)
+
+
+def _epic_plan_lines(plan: Mapping[str, Any]) -> list[str]:
+    """The epic plan's own sections: each sub-issue's part, coordination, the steps only
+    the owner can do, and what the epic waits on outside it."""
+    lines: list[str] = []
+    parts = [
+        item
+        for item in plan.get("parts") or []
+        if isinstance(item, dict) and isinstance(item.get("issue"), int)
+    ]
+    if parts:
+        lines += ["", "**Parts:**"]
+        lines += [
+            f"- #{item['issue']}: {' '.join(str(item.get('scope')).split())}" for item in parts
+        ]
+    coordination = _bullets(plan.get("coordination"))
+    if coordination:
+        lines += ["", "**Coordination:**", coordination]
+    gates = [item for item in plan.get("human_gates") or [] if isinstance(item, dict)]
+    if gates:
+        lines += ["", "**Steps for you** (each becomes a sub-issue assigned to you):"]
+        for gate in gates:
+            blocks = ", ".join(f"#{n}" for n in gate.get("blocks") or [] if isinstance(n, int))
+            steps = " ".join(str(gate.get("steps") or "").split())
+            lines.append(
+                f"- {' '.join(str(gate.get('title')).split())}: {steps}"
+                + (f" (before {blocks})" if blocks else "")
+            )
+    outside = [
+        item
+        for item in plan.get("external_blockers") or []
+        if isinstance(item, dict) and isinstance(item.get("issue"), int)
+    ]
+    if outside:
+        lines += ["", "**Waiting on outside this epic:**"]
+        lines += [
+            f"- #{item['issue']}: {' '.join(str(item.get('note') or '').split())}"
+            for item in outside
+        ]
+    return lines
+
+
+def approved_epic_plan(
+    directory: ServiceDispatchDirectory, autopilot: EpicAutopilot
+) -> dict[str, Any] | None:
+    """The stored epic plan (the ``epic_triage`` result) whose hash the owner approved."""
+    plan = autopilot.plan
+    if plan is None or not autopilot.approved_hash:
+        return None
+    stored = directory.latest_result(plan.session_id)
+    record = stored.get("factory_result") if stored is not None else None
+    body = record.get("result") if isinstance(record, dict) else None
+    if not isinstance(body, dict) or body.get("kind") != "epic_triage":
+        return None
+    if epic_plan_hash(body) != autopilot.approved_hash:
+        return None
+    return body
 
 
 #: How each related issue reads in the triage comment: "- Overlaps #12: note".
@@ -1050,6 +1126,12 @@ def _safe_publication(text: str, config: ServiceConfig) -> str:
     if len(text) > limit:
         text = text[: limit - 30].rstrip() + "\n\n[truncated]"
     return text
+
+
+def safe_publication(text: str, config: ServiceConfig) -> str:
+    """Agent text the factory posts itself outside a stage publication (e.g. a human-gate
+    issue of an epic plan): credentials blocked, mentions neutralised, length bounded."""
+    return _safe_publication(text, config)
 
 
 def _credential_block(text: str, config: ServiceConfig) -> str | None:
@@ -1165,6 +1247,10 @@ _FIRST_TEMPLATES = {
 _RETRIAGE_TEMPLATE = "triage-feedback-v5.txt"
 #: The triage of an epic (an issue with sub-issues), first run and re-runs alike.
 _EPIC_TRIAGE_TEMPLATE = "epic-triage-v2.txt"
+#: The epic planning pass of an epic on autopilot (the epic triage plus the epic plan).
+_EPIC_PLAN_TEMPLATE = "epic-plan-v1.txt"
+#: A plan run of a sub-issue epic autopilot drives (keeps to its part of the epic plan).
+_AUTOPILOT_PLAN_TEMPLATE = "plan-autopilot-v1.txt"
 _REWORK_TEMPLATE = "build-rework-v7.txt"
 #: A rework run, or a wake of the waiting build run, for a merge conflict with the base.
 _CONFLICT_TEMPLATE = "build-conflict-v2.txt"

@@ -159,6 +159,19 @@ def render_project_migration(
                 _option("Started", "BLUE", "Factory: the auto-build was started"),
             ],
         },
+        # Epic autopilot, set by the owner on an epic card; record its node ID as
+        # autopilot_field_node_id and the option IDs as autopilot_options.
+        {
+            "name": "Autopilot",
+            "dataType": "SINGLE_SELECT",
+            "singleSelectOptions": [
+                _option("Full", "GREEN", "Owner: plan and build each next sub-issue"),
+                _option("Delayed", "YELLOW", "Owner: build after a delay unless I object"),
+                _option("Plan only", "GRAY", "Owner: plan each next sub-issue, I approve"),
+            ],
+        },
+        # Sub-issues of an epic autopilot runs at once; record as parallel_field_node_id.
+        {"name": "Parallel", "dataType": "NUMBER"},
     ]
     create_fields = [{"input": {"projectId": PROJECT_NODE_ID, **field}} for field in fields]
     views: list[dict[str, Any]] = []
@@ -216,7 +229,9 @@ def render_project_migration(
         "create_epics_view": render_epics_view(),
         "post_apply_verification": [
             "persist every returned node and database id (Rank: rank_field_node_id; "
-            "Auto-build: auto_build_field_node_id and auto_build_options Queued/Started)",
+            "Auto-build: auto_build_field_node_id and auto_build_options Queued/Started; "
+            "Autopilot: autopilot_field_node_id and autopilot_options Full/Delayed/Plan only; "
+            "Parallel: parallel_field_node_id)",
             "verify every preserved option id and existing item value",
             f"keep item-added to {status_names[Stage.INBOX]} and disable PR-driven moves",
             "retire Agent/Audit and old views only after new views verify",

@@ -68,6 +68,9 @@ note_field_node_id = "PVTF_lADOEanNes4BkJhbzhjww0c"
 # rank_field_node_id = ""      # the "Rank" NUMBER field (setup render creates it)
 # auto_build_field_node_id = "" # the "Auto-build" SINGLE_SELECT field (setup render)
 # auto_build_options = {{ Queued = "", Started = "" }}  # its option IDs
+# autopilot_field_node_id = ""  # the epic "Autopilot" SINGLE_SELECT field (setup render)
+# autopilot_options = {{ Full = "", Delayed = "", "Plan only" = "" }}  # its option IDs
+# parallel_field_node_id = ""   # the epic "Parallel" NUMBER field (setup render)
 github_app_id = 5085812
 github_installation_id = 165144097
 github_bot_login = "molly-omnigent-factory[bot]"
@@ -105,6 +108,9 @@ review_bot_grace_minutes = 10     # the wait when the bot's 👀 cannot be told
 auto_build = false             # start owner-queued (Auto-build = Queued) plans
 auto_build_concurrency = 1     # auto-builds at once, within max_building
 auto_build_daily_limit = 0     # auto-builds per local day (0 = unlimited)
+epic_autopilot = false         # advance epics whose Autopilot field you set
+epic_autopilot_delay_minutes = 60  # Delayed: build starts this long after the plan
+epic_autopilot_concurrency = 1 # sub-issues per epic in progress at once (Parallel overrides)
 ranking = false                # idle-time ranking of the Triage and Planning columns
 ranking_min_new_triages = 5    # new/changed triages that start a ranking
 ranking_status_update = true   # short project status update per ranking

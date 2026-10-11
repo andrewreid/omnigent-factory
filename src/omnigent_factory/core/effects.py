@@ -32,6 +32,9 @@ class EffectKind(enum.StrEnum):
     #: Write the board's "Auto-build" field (``args.value``: "Queued", "Started" or ""
     #: to clear; display only, the owner's own webhook is the control).
     SET_AUTO_BUILD = "set_auto_build"
+    #: Clear the epic's "Autopilot" field (``args.value`` ""; the factory only ever clears
+    #: it, the owner's own webhook is the control).
+    SET_AUTOPILOT = "set_autopilot"
     #: React to an owner command comment (+1 accepted, confused refused).
     REACT_COMMENT = "react_comment"
     POST_COMMENT = "post_comment"

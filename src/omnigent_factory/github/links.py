@@ -15,6 +15,7 @@ Schema checked read-only (``gh api graphql`` introspection, 2026-10-09): ``Issue
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -222,13 +223,97 @@ async def set_issue_type(client: GitHubClient, issue_id: str, type_id: str) -> N
     await client.graphql(mutation, {"issue": issue_id, "type": type_id})
 
 
+#: The hidden marker of a human-gate sub-issue the factory created for an epic plan: a
+#: restart finds the issue by it among the epic's sub-issues instead of creating another.
+_GATE_MARKER = re.compile(r"<!-- factory-gate epic=(\d+) key=([a-z0-9][a-z0-9-]{0,39}) -->")
+
+
+def gate_marker(epic: int, key: str) -> str:
+    return f"<!-- factory-gate epic={epic} key={key} -->"
+
+
+async def epic_gate_issues(
+    client: GitHubClient, owner: str, name: str, epic: int
+) -> dict[str, int]:
+    """Human-gate sub-issues of ``epic`` found by their marker: gate key -> issue number."""
+    query = """
+    query($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) { issue(number: $number) {
+        subIssues(first: 100) { nodes { number body } }
+      } }
+    }
+    """
+    data = await client.graphql(query, {"owner": owner, "name": name, "number": epic})
+    repo = data.get("repository")
+    issue = repo.get("issue") if isinstance(repo, dict) else None
+    subs = issue.get("subIssues") if isinstance(issue, dict) else None
+    nodes = subs.get("nodes") if isinstance(subs, dict) else None
+    if not isinstance(nodes, list):
+        raise GitHubAPIError("epic sub-issues were unavailable")
+    found: dict[str, int] = {}
+    for node in nodes:
+        if not isinstance(node, dict) or not isinstance(node.get("number"), int):
+            continue
+        for epic_ref, key in _GATE_MARKER.findall(str(node.get("body") or "")):
+            if int(epic_ref) == epic:
+                found.setdefault(key, int(node["number"]))
+    return found
+
+
+async def create_sub_issue(
+    client: GitHubClient,
+    *,
+    repository_node_id: str,
+    parent_node_id: str,
+    title: str,
+    body: str,
+    assignee_node_id: str,
+) -> int:
+    """Create an issue as a sub-issue of ``parent_node_id``, assigned in the same call
+    (one mutation: no half-made gate). Returns its number."""
+    mutation = """
+    mutation($input: CreateIssueInput!) { createIssue(input: $input) { issue { number } } }
+    """
+    data = await client.graphql(
+        mutation,
+        {
+            "input": {
+                "repositoryId": repository_node_id,
+                "title": title,
+                "body": body,
+                "parentIssueId": parent_node_id,
+                "assigneeIds": [assignee_node_id],
+            }
+        },
+    )
+    created = data.get("createIssue")
+    issue = created.get("issue") if isinstance(created, dict) else None
+    number = issue.get("number") if isinstance(issue, dict) else None
+    if not isinstance(number, int):
+        raise GitHubAPIError("createIssue returned no issue number")
+    return number
+
+
+async def user_node_id(client: GitHubClient, user_id: int) -> str:
+    """The GraphQL node ID of the GitHub user with numeric ``user_id``."""
+    user = await client.get_json(f"/user/{user_id}")
+    node = user.get("node_id") if isinstance(user, dict) else None
+    if not isinstance(node, str) or not node:
+        raise GitHubAPIError(f"user {user_id} has no node id")
+    return node
+
+
 __all__ = [
     "BOARD_LINK_FIELDS",
     "ISSUE_LINK_FIELDS",
     "LinkTarget",
     "add_blocked_by",
+    "create_sub_issue",
+    "epic_gate_issues",
     "epic_issue_type",
+    "gate_marker",
     "parse_links",
     "read_target",
     "set_issue_type",
+    "user_node_id",
 ]
