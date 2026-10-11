@@ -476,7 +476,10 @@ card back to its run with the one check wake only while that wake is unused and 
 head has the bot's own commits; once it is spent (the agent re-submits when the red check
 is outside the change, or ends that woken turn without a new result), or the head only
 syncs the base branch, the card goes to Ready, `Blocked`. A run woken by an owner comment
-that ends its turn without re-submitting is `Needs you`, never left `Working`. Review-bot
+that ends its turn without re-submitting is `Needs you`, never left `Working`. A run that
+had submitted build_ready and is reopened by `/continue` may re-submit (the same head
+included); if it ends the continued turn without a new result, its build_ready stands for
+the head it attested and the card goes to Ready on the usual terms. Review-bot
 findings without an outcome get a wake of their own (once per build or rework, separate
 from the check wake, so findings that arrive after the check wake still reach the run);
 findings still without an outcome after it are `Needs you`. Findings that arrive on the

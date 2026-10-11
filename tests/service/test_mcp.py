@@ -436,6 +436,47 @@ async def test_build_ready_after_the_findings_wake_opens_its_own_slot(
         assert receipt["accepted"] is True and receipt["slot"] == f"build-{SHA}-w2"
 
 
+async def test_build_ready_for_the_same_head_after_continue_is_accepted(
+    service_config: ServiceConfig,
+):
+    """#913: build_ready accepted, then the active-time checkpoint and the owner's
+    /continue reopened the run; its re-submission of the same head opens a fresh slot
+    instead of being refused as "a different submission was already accepted for this
+    slot", and is applied (the run waits on checks again)."""
+    async with started(service_config) as rig:
+        root, plan_hash = await building(rig)
+        await rig.tools.get_plan(root)
+        first = await rig.submit(root, "build_ready", build_ready(), plan_hash=plan_hash)
+        assert first["slot"] == f"build-{SHA}"
+        run = await rig.run()
+        await rig.send(
+            ev.ActiveLimitReached(session_id=run.session_id, grant_id=run.grant.grant_id),
+            provenance=Provenance.SCHEDULER,
+        )
+        await rig.send(
+            ev.GraceExpired(session_id=run.session_id, grant_id=run.grant.grant_id),
+            provenance=Provenance.SCHEDULER,
+        )
+        await rig.quiesce()
+        assert (await rig.run()).lifecycle == Lifecycle.FENCED
+        assert (await rig.send(ev.Continue())).accepted
+
+        async def resumed() -> bool:
+            return (await rig.run()).lifecycle == Lifecycle.ACTIVE
+
+        await eventually(resumed)
+        grant = (await rig.run()).grant
+        assert grant.grant_id != run.grant.grant_id
+        # The identical submission (as #913's re-submission was in substance) is applied.
+        receipt = await rig.submit(root, "build_ready", build_ready(), plan_hash=plan_hash)
+        assert receipt["accepted"] is True and "replayed" not in receipt
+        assert receipt["slot"] == f"build-{SHA}-g{grant.policy_generation}"
+        assert (await rig.run()).lifecycle == Lifecycle.WAITING
+        # An exact retry replays that receipt.
+        retry = await rig.submit(root, "build_ready", build_ready(), plan_hash=plan_hash)
+        assert retry == {**receipt, "replayed": True}
+
+
 async def test_submission_after_stop_is_rejected_but_exact_retry_replays(
     service_config: ServiceConfig,
 ):

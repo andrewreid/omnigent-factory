@@ -618,3 +618,106 @@ def test_comment_relay_answered_without_a_result_needs_you_not_working():
     h.quiesce(P, h.cur().session_id)
     h.send(P, evidence(h, BUILT, verified=True, checks=ev.ChecksState.GREEN))
     assert h.p().stage == Stage.READY and h.p().bot == BotState.IDLE
+
+
+# --------------------------- 8. a run reopened by /continue after its build_ready (#913)
+
+#: #913 / PR #929: Rosie's head, submitted as build_ready before the checkpoint.
+CONTINUED = "4ac552963bfb5d241e45f82e6b577c6e4a748aa1"
+
+
+def continued_after_build_ready(h: Harness) -> None:
+    """#913 up to 19:00 ACDT: build_ready accepted while the tree is still busy, a green
+    read, the active-time checkpoint, grace expiry and drain, the owner's /continue and
+    its resume (the continuation message reopens the run)."""
+    h.to_building()
+    submit_ready(h, CONTINUED)
+    h.send(
+        P, ev.PRObserved(pr_number=PR, head_sha=CONTINUED, bot_authored=True, parcel_branch=True)
+    )
+    run = h.cur()
+    h.send(P, ev.RuntimeActivity(session_id=run.session_id, busy=True))
+    h.send(P, evidence(h, CONTINUED, verified=True, checks=ev.ChecksState.GREEN))
+    assert h.p().stage == Stage.BUILDING and h.cur().lifecycle == Lifecycle.WAITING
+    h.send(P, ev.ActiveLimitReached(session_id=run.session_id, grant_id=run.grant.grant_id))
+    h.send(P, ev.GraceExpired(session_id=run.session_id, grant_id=run.grant.grant_id))
+    h.quiesce(P, run.session_id)
+    assert h.cur().lifecycle == Lifecycle.FENCED
+    assert h.send(P, ev.Continue(), actor=OWNER_ID, provenance=Provenance.WEBHOOK).audit.accepted
+    grant = h.cur().grant
+    r = h.send(P, ev.PolicyReady(session_id=run.session_id, grant_id=grant.grant_id))
+    assert [e.args["purpose"] for e in r.effects if e.kind == EffectKind.SEND_MESSAGE] == [
+        "continuation"
+    ]
+    s = h.cur()
+    assert s.lifecycle == Lifecycle.ACTIVE and not s.fences and s.grant.ready
+    assert h.p().stage == Stage.BUILDING and h.p().bot == BotState.WORKING
+
+
+def test_913_continued_run_that_ends_idle_lands_in_ready():
+    """Live #913: after /continue, Rosie's same-head build_ready was refused (spent slot)
+    and her turn ended. Base: Building, Bot Working forever (readiness verified, no gaps).
+    Now: its accepted build_ready stands: Ready, one report, no new run or comment."""
+    h = Harness()
+    continued_after_build_ready(h)
+    run = h.cur()
+    sessions = len(h.p().sessions)
+    # The continuation turn has not run yet: never taken as finished on a stale scan.
+    assert not run.quiescent
+    r = h.send(P, evidence(h, CONTINUED, verified=True, checks=ev.ChecksState.GREEN))
+    assert h.p().stage == Stage.BUILDING and not ready_reports(r)  # turn not over yet
+    h.send(P, ev.RuntimeActivity(session_id=run.session_id, busy=True))
+    r = h.quiesce(P, run.session_id)  # turn over, no result: the green read stands
+    assert len(ready_reports(r)) == 1
+    assert EffectKind.POST_COMMENT not in kinds(r) and EffectKind.SEND_MESSAGE not in kinds(r)
+    for _ in range(3):  # later reconcile reads: quiet, still one report
+        r = h.send(P, evidence(h, CONTINUED, verified=True, checks=ev.ChecksState.GREEN))
+        assert_quiet(r) and not ready_reports(r)
+    p = h.p()
+    assert p.stage == Stage.READY and p.readiness.ready and p.bot == BotState.IDLE
+    assert not p.holds
+    assert h.cur().session_id == run.session_id and h.cur().lifecycle == Lifecycle.RETIRED
+    assert len(h.p().sessions) == sessions
+
+
+def test_913_stuck_state_reaches_ready_on_the_next_reconcile():
+    """Recovery of the live card: stored before this fix, the continued run is ACTIVE and
+    quiescent with its verified green readiness (the resume left the stale quiescent flag;
+    the turn has since ended). The next reconcile lands it in Ready, no new run or comment."""
+    h = Harness()
+    continued_after_build_ready(h)
+    run = h.cur()
+    h.parcels[P] = replace(
+        h.p(), sessions=tuple(replace(s, quiescent=True) for s in h.p().sessions)
+    )
+    sessions = len(h.p().sessions)
+    r = h.send(P, ev.ReconcileDue())
+    assert h.p().stage == Stage.READY and len(ready_reports(r)) == 1
+    assert EffectKind.POST_COMMENT not in kinds(r) and EffectKind.CREATE_SESSION not in kinds(r)
+    assert h.cur().session_id == run.session_id and h.cur().lifecycle == Lifecycle.RETIRED
+    assert len(h.p().sessions) == sessions
+
+
+def test_913_continued_run_then_red_names_the_check_not_endless_working():
+    """A red required check read after the continued run finished is named (Ready, Bot
+    Blocked, as for any finished run), never Working with no reason. Base: Needs you
+    blaming the run for not re-submitting."""
+    h = Harness()
+    continued_after_build_ready(h)
+    run = h.cur()
+    h.send(P, ev.RuntimeActivity(session_id=run.session_id, busy=True))
+    h.quiesce(P, run.session_id)
+    h.send(P, red(h, CONTINUED))
+    assert_ready_blocked(h)
+
+
+def test_913_resubmission_after_continue_is_reapplied():
+    """The continued run re-submits build_ready for the same head: accepted and applied
+    (waits on checks again), then green lands in Ready."""
+    h = Harness()
+    continued_after_build_ready(h)
+    submit_ready(h, CONTINUED)
+    assert h.cur().lifecycle == Lifecycle.WAITING
+    h.quiesce(P, h.cur().session_id)
+    h.send(P, evidence(h, CONTINUED, verified=True, checks=ev.ChecksState.GREEN))
+    assert h.p().stage == Stage.READY and h.p().bot == BotState.IDLE

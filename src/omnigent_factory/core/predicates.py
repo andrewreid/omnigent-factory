@@ -148,6 +148,13 @@ def only_checkpoint_fenced(s: StageSession) -> bool:
     return s.fences <= frozenset({FenceKind.CHECKPOINT})
 
 
+def continued(p: Parcel, s: StageSession) -> bool:
+    """The run carries on under an owner /continue grant: its grant is not the one its
+    authorization opened it with (a crash restart copies that grant's source)."""
+    auth = p.authorization(s.authorization_id)
+    return auth is not None and s.grant.source_event_id != auth.source_event_id
+
+
 def plan_ok(p: Parcel, approval: Approval | None = None) -> bool:
     """PlanOK for ``approval`` (or for the latest contract when checking a candidate)."""
     if not (eligible(p) and no_open_decisions(p)) or p.revision_pending:

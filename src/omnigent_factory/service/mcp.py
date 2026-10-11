@@ -42,7 +42,7 @@ from starlette.types import Receive, Scope, Send
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.codec import event_from_json, parcel_from_json
 from omnigent_factory.core.events import Event, EventKind, Provenance
-from omnigent_factory.core.predicates import work_allowed
+from omnigent_factory.core.predicates import continued, work_allowed
 from omnigent_factory.core.protocol import (
     RESULT_SHAPES,
     BuildResult,
@@ -784,7 +784,9 @@ class FactoryTools:
         if result.get("kind", kind) != kind:
             raise FactoryToolError("result.kind differs from kind")
         payload: dict[str, Any] = {**result, "kind": kind}
-        request = {"kind": kind, "result": payload, "plan_hash": plan_hash}
+        # A copy: the defaults filled in below must not change the digest an exact retry
+        # is compared against (#913: an identical build_ready was refused as different).
+        request = {"kind": kind, "result": dict(payload), "plan_hash": plan_hash}
         slot = _slot(run, kind, payload, parcel)
         receipt_key = f"{run.session_id}:{slot}"
         # An exact retry of an accepted submission returns its receipt, even after a stop
@@ -1183,6 +1185,10 @@ def _slot(run: StageSession, kind: str, payload: Mapping[str, Any], parcel: Parc
         wakes = parcel.readiness_wakes + parcel.findings_wakes
         if wakes and r is not None and r.session_id == run.session_id:
             slot = f"{slot}-w{wakes}"
+        # And each owner /continue of the run (a new grant): a run that had submitted before
+        # its checkpoint re-submits, often the same head (#913).
+        if continued(parcel, run):
+            slot = f"{slot}-g{run.grant.policy_generation}"
         return slot
     return "blocked"
 

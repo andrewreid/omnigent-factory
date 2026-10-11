@@ -49,6 +49,7 @@ from omnigent_factory.core.predicates import (
     approval_ok,
     authority_ok,
     board_pending,
+    continued,
     dispatchable,
     eligible,
     executable,
@@ -2444,7 +2445,8 @@ def _idle_run(s: StageSession) -> bool:
 
 def _ended_without_result(ctx: _Ctx, s: StageSession) -> bool:
     """The build run submitted build_ready (the readiness record is its own), was woken
-    again (readiness wake or owner comment) and ended that turn idle with no new result.
+    again (readiness wake, owner comment or /continue) and ended that turn idle with no
+    new result.
     A run that reported blocked (or whose result was refused) is Bot Blocked already."""
     r = ctx.p.readiness
     return (
@@ -2457,15 +2459,23 @@ def _ended_without_result(ctx: _Ctx, s: StageSession) -> bool:
 
 
 def _wake_answered(ctx: _Ctx, s: StageSession) -> bool:
-    """The run's last wake was a readiness wake (check or findings; no owner comment relayed
-    to it) and its turn ended with no new result: its build_ready stands and it has nothing
-    left to do (#675: it named a red check outside the change on the PR; a re-submission of
-    the same head was refused)."""
+    """The run's last wake was a readiness wake (check or findings) or an owner /continue,
+    with no owner comment relayed to it, and its turn ended with no new result: its
+    build_ready stands and it has nothing left to do (#675: it named a red check outside
+    the change on the PR; #913; a re-submission of the same head was refused)."""
     return (
         _ended_without_result(ctx, s)
-        and (ctx.p.readiness_wakes >= 1 or ctx.p.findings_wakes >= 1)
+        and (ctx.p.readiness_wakes >= 1 or ctx.p.findings_wakes >= 1 or _continue_answered(ctx, s))
         and not s.feedback_wakes
     )
+
+
+def _continue_answered(ctx: _Ctx, s: StageSession) -> bool:
+    """The run was reopened by an owner /continue (#913: its build_ready was accepted, the
+    checkpoint came while it waited on checks). Its build_ready stands for the head it
+    attested when the continued turn ends without a new result."""
+    r = ctx.p.readiness
+    return continued(ctx.p, s) and r is not None and r.reviewed_head in ("", r.head_sha)
 
 
 def _relay_comment(ctx: _Ctx, s: StageSession, digest: str = "") -> None:
@@ -4838,6 +4848,8 @@ def _resume_checkpoint(ctx: _Ctx, s: StageSession) -> None:
             fences=s.fences - {FenceKind.CHECKPOINT},
             lifecycle=Lifecycle.ACTIVE,
             wait_reason=None,
+            # Not quiescent until a scan sees the continued turn end (#913).
+            quiescent=False,
         )
     )
     ctx.emit(EffectKind.ENABLE_ISSUANCE, session=s, args={"profile": profile_for(s.kind).value})
