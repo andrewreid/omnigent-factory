@@ -21,6 +21,10 @@ Each pass, per approved epic (one decision per sub-issue; the reducer re-checks 
 * while fewer than the epic's concurrency (its "Parallel" field, else
   ``epic_autopilot_concurrency``) are in progress, the next open sub-issue with every
   blocker closed (epic plan order, then Rank, then oldest) gets ``AutopilotPlan``.
+  Blockers come from the pass's board read when it saw every one (else the stored read);
+  a waiting sub-issue whose stored blockers that read contradicts, or cannot confirm, is
+  re-read (bounded per epic and pass, at most every ``REREAD_INTERVAL_US`` per issue), and the
+  reducer starts nothing without a fresh per-issue read showing every blocker closed.
 
 The epic card's note (``Epic · 3/9 done · autopilot: planning #882, next #883``) is the
 only status output: no comments except the epic plan and genuine questions.
@@ -48,6 +52,7 @@ from omnigent_factory.core.types import (
     AutoBuildStatus,
     BotState,
     EpicAutopilot,
+    IssueLinks,
     IssueSnapshot,
     Parcel,
     Stage,
@@ -63,6 +68,9 @@ MAX_STARTS_PER_PASS = 3
 #: Columns of a sub-issue autopilot counts as in progress (Ready waits only for merge).
 _IN_PROGRESS = frozenset({Stage.TRIAGED, Stage.SCOPED, Stage.BUILDING})
 SKIP_LABEL = "factory:skip"
+#: Stale waiting sub-issues re-read per epic per pass, and how often one issue is re-read.
+MAX_REREADS_PER_PASS = 5
+REREAD_INTERVAL_US = 5 * MICROS_PER_MINUTE
 
 SnapshotReader = Callable[[IssueRef], Awaitable[IssueSnapshot | RetryableReadFailure]]
 #: Open board issues with Rank and the epic's Parallel value.
@@ -126,6 +134,8 @@ class EpicAutopilotService:
         self.labels = labels
         self.plans = plans
         self.gates = gates
+        #: When each parcel was last re-read for stale blockers (this process only).
+        self._reread_at: dict[str, int] = {}
 
     # --------------------------------------------------------------- state
 
@@ -318,6 +328,7 @@ class EpicAutopilotService:
             return await self._pause(epic, "no build order for its sub-issues")
         candidates: list[Sub] = []
         waiting: list[str] = []
+        stale: list[Sub] = []
         for sub in unstarted:
             why = await self._candidate_blocker(
                 sub, open_gates & gate_blocks.get(sub.number, set())
@@ -326,6 +337,9 @@ class EpicAutopilotService:
                 candidates.append(sub)
             elif why:
                 waiting.append(why)
+            if why != "" and _stale_blockers(sub):  # waiting (or startable) on blockers
+                stale.append(sub)
+        await self._reread_stale(stale)
         card = cards.get(number)
         limit = (
             card.parallel
@@ -382,7 +396,7 @@ class EpicAutopilotService:
             return ""  # a nested epic only blocks; autopilot never recurses into it
         if SKIP_LABEL in (await self.labels(p) or []):
             return ""
-        blockers = [b.ref for b in p.links.open_blockers] + [f"#{n}" for n in sorted(gates)]
+        blockers = [b.ref for b in _links(sub).open_blockers] + [f"#{n}" for n in sorted(gates)]
         if blockers:
             return f"#{sub.number} waits on {', '.join(dict.fromkeys(blockers))}"
         if p.stage in (Stage.BUILDING, Stage.READY, Stage.DONE):
@@ -391,6 +405,24 @@ class EpicAutopilotService:
         if p.pending_authorization_id is not None or (cur is not None and not settled(cur)):
             return ""  # a run the owner started
         return None
+
+    async def _reread_stale(self, stale: Sequence[Sub]) -> None:
+        """Re-read sub-issues whose stored blockers the board read contradicts or cannot
+        confirm (a closed blocker whose close never reached them), so their stored state
+        catches up; bounded per pass and per issue."""
+        now = self.service.clock.now_utc_us()
+        done = 0
+        for sub in stale:
+            if done >= MAX_REREADS_PER_PASS:
+                break
+            assert sub.parcel is not None  # noqa: S101 - _stale_blockers checked
+            pid = sub.parcel.parcel_id
+            if now - self._reread_at.get(pid, -REREAD_INTERVAL_US) < REREAD_INTERVAL_US:
+                continue
+            self._reread_at[pid] = now
+            done += 1
+            LOG.info("epic autopilot re-reading blockers issue=#%s", sub.number)
+            await self.service.reread(pid)
 
     async def _start(self, sub: Sub, epic: int, epoch: str) -> bool:
         assert sub.parcel is not None  # noqa: S101 - candidates have one
@@ -617,6 +649,30 @@ def _pause_reason(claimed: Sequence[Sub]) -> str:
         if claim.drift and c is not None and claim.drift_hash == c.full_hash:
             return f"#{sub.number}: {claim.drift}"
     return ""
+
+
+def _links(sub: Sub) -> IssueLinks:
+    """The sub-issue's links from this pass's board read when it saw every blocker,
+    else its stored read (the caller checked that one exists)."""
+    fresh = sub.card.links if sub.card is not None else None
+    if fresh is not None:
+        return fresh
+    assert sub.parcel is not None and sub.parcel.links is not None  # noqa: S101
+    return sub.parcel.links
+
+
+def _blocker_state(links: IssueLinks) -> frozenset[tuple[str, int, bool]]:
+    return frozenset((b.repo, b.number, b.open) for b in links.blocked_by)
+
+
+def _stale_blockers(sub: Sub) -> bool:
+    """The stored read shows an open blocker that the board read contradicts, or the
+    board read could not see the blockers to confirm it."""
+    stored = sub.parcel.links if sub.parcel is not None else None
+    if stored is None or not stored.open_blockers:
+        return False
+    fresh = sub.card.links if sub.card is not None else None
+    return fresh is None or _blocker_state(fresh) != _blocker_state(stored)
 
 
 def _linked_among(subs: Sequence[Sub]) -> bool:

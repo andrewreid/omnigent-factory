@@ -12,11 +12,11 @@ from dataclasses import asdict
 from functools import cache
 from typing import Any, cast
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from omnigent_factory.core.effects import EffectIntent, EffectKind, Preconditions, RetryClass
 from omnigent_factory.core.events import BODY_TYPES, Event, EventBody, EventKind, Provenance
-from omnigent_factory.core.types import AdmissionSnapshot, IssueSnapshot, Parcel
+from omnigent_factory.core.types import AdmissionSnapshot, IssueLinks, IssueSnapshot, Parcel
 
 SCHEMA_VERSION = 1
 
@@ -57,6 +57,17 @@ def admission_to_data(admission: AdmissionSnapshot) -> Any:
 
 def admission_from_data(data: object) -> AdmissionSnapshot:
     return cast(AdmissionSnapshot, _load(AdmissionSnapshot, data))
+
+
+def issue_links_from_data(data: object) -> IssueLinks | None:
+    """An issue read's native links from an effect ack's detail (None: not read, or not
+    decodable, which the reducer treats as unreadable and never as "no blockers")."""
+    if data is None:
+        return None
+    try:
+        return cast(IssueLinks, _load(IssueLinks, data))
+    except ValidationError:
+        return None
 
 
 # -------------------------------------------------------------------- events

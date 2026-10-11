@@ -10,6 +10,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable
 
 from omnigent_factory.core import events as ev
+from omnigent_factory.core.codec import issue_links_from_data
 from omnigent_factory.core.effects import (
     READ_ONLY_KINDS,
     Ack,
@@ -615,6 +616,9 @@ class EffectExecutor:
                     body=(str(detail["body"]) if isinstance(detail.get("body"), str) else None),
                     read_at_us=_json_int(detail.get("read_at_us"), 0),
                     bot=str(detail["bot"]) if isinstance(detail.get("bot"), str) else None,
+                    # The blockers a reconcile read sees: without them a dependent's
+                    # stored blocked-by state never learns that its blocker closed.
+                    links=issue_links_from_data(detail.get("links")),
                 ),
             )
         elif effect.kind == EffectKind.RECONCILE_SESSION:
