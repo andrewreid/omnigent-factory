@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import stat
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -123,11 +124,14 @@ class ProductionRuntime:
         await _in_thread(self.workspaces.ensure_source_clone)
         # Molly/Rosie scratch state never shows up as untracked work (never .gitignore).
         await asyncio.to_thread(self.workspaces.ensure_excluded, "/.molly/")
+        began = time.monotonic()
         await self.broker.restore()
         await self.broker_server.restore()
         github_observed = await self._github_reconcile()
+        github_done = time.monotonic()
         # Only open runs are scanned (the observer skips closed ones): live parcels.
         omnigent_observed = await self.observer.observe_once()
+        omnigent_done = time.monotonic()
         parcels = [
             parcel
             for parcel in await _load_parcels(self.service)
@@ -143,6 +147,13 @@ class ProductionRuntime:
         # (once) only after reconciliation, the propagation barrier and verification.
         await reenable_issuance_after_boot(
             self.broker, [p for p in parcels if p.current_session_id not in held]
+        )
+        LOG.info(
+            "startup reconcile github_reads=%d github_s=%.1f omnigent_s=%.1f policies_s=%.1f",
+            len(github_observed),
+            github_done - began,
+            omnigent_done - github_done,
+            time.monotonic() - omnigent_done,
         )
         await self.broker_server.start()
         await self.observer.start()

@@ -36,9 +36,12 @@ def create_app(
         async with AsyncExitStack() as stack:
             if mcp is not None:
                 # Tool calls are refused until the service reports ready (after store
-                # migration and startup recovery), see McpGate.
+                # migration, startup recovery and reconciliation), see McpGate.
                 await stack.enter_async_context(mcp.manager.run())
-            await service.start()
+            # The listener comes up once the store is open: webhooks are stored durably
+            # while the slow startup reconciliation (GitHub, Omnigent) finishes behind it.
+            await service.open()
+            service.finish_start_in_background()
             try:
                 yield
             finally:

@@ -226,6 +226,10 @@ class FactoryService:
         )
         self.ready = False
         self.accepting_admission = False
+        #: The store is open (:meth:`open`) and not yet closed.
+        self._opened = False
+        #: The startup reconciliation run after the HTTP listener is up (:meth:`finish_start`).
+        self._starting: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
         self._managed: list[ManagedRuntime] = []
@@ -253,10 +257,20 @@ class FactoryService:
         self._managed.extend(managed)
 
     async def start(self) -> None:
+        """Open the store (:meth:`open`), then the startup reconciliation (:meth:`finish_start`)."""
+        await self.open()
+        await self.finish_start()
+
+    async def open(self) -> None:
+        """What the HTTP listener needs, and nothing slow: the process lock, the migrated
+        store and its own crash recovery (store only). From here webhooks are stored
+        durably; nothing is admitted, sent or issued, and MCP tool calls are refused as
+        retryable (not ``ready``), until :meth:`finish_start` has reconciled."""
         self.config.prepare_private_directories()
         demote_routine_library_logs()
         install_redaction_filter()
         self.process_lock.acquire()
+        self._opened = True
         try:
             await self.db.start()
             await self.db.call(lambda store: store.ensure_repository(self.config.trusted))
@@ -266,6 +280,36 @@ class FactoryService:
             unknown = await self.db.call(lambda store: store.effects_in_state("unknown"))
             unknown = await self._requeue_unknown_reads(unknown)
             await self._recover_outbox(unknown)
+        except BaseException:
+            await self._cleanup_start_failure()
+            raise
+
+    def finish_start_in_background(self) -> None:
+        """Run :meth:`finish_start` after the listener is up (GitHub and Omnigent reads can
+        take minutes); a failure is fatal, like a failed start."""
+        self._starting = asyncio.create_task(self._finish_start_or_exit(), name="startup")
+
+    async def _finish_start_or_exit(self) -> None:
+        began = asyncio.get_running_loop().time()
+        try:
+            await self.finish_start()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._fatal_reason = "startup-failed"
+            LOG.exception("startup reconciliation failed")
+            if self._fatal_exit is not None:
+                self._fatal_exit(1)
+            return
+        LOG.info(
+            "startup reconciliation complete seconds=%.1f",
+            asyncio.get_running_loop().time() - began,
+        )
+
+    async def finish_start(self) -> None:
+        """Startup reconciliation (integrations: GitHub and Omnigent reads, credential
+        restore), then admission, the operator socket and the background loops."""
+        try:
             for managed in self._managed:
                 await managed.start()
             await self.operator.start()
@@ -295,7 +339,13 @@ class FactoryService:
             raise
 
     async def stop(self) -> None:
+        starting = self._starting
+        if starting is not None and not starting.done():
+            starting.cancel()
+            await asyncio.gather(starting, return_exceptions=True)
         if not self.ready and not self._tasks:
+            if self._opened:  # opened, reconciliation not finished: nothing else runs
+                await self._cleanup_start_failure()
             return
         self.ready = False
         self.accepting_admission = False
@@ -322,10 +372,14 @@ class FactoryService:
         for managed in reversed(self._managed):
             with contextlib.suppress(Exception):
                 await managed.close()
+        self._opened = False
         await self.db.close()
         self.process_lock.close()
 
     async def _cleanup_start_failure(self) -> None:
+        if not self._opened:
+            return
+        self._opened = False
         with contextlib.suppress(Exception):
             await self.operator.close()
         for managed in reversed(self._managed):

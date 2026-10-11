@@ -101,6 +101,7 @@ from omnigent_factory.core.effects import (
 from omnigent_factory.core.types import SessionKind
 from omnigent_factory.credentials.worktree import (
     BotIdentity,
+    GitLockBusy,
     OffBranchError,
     StageWiring,
     VerifiedWorktree,
@@ -142,6 +143,8 @@ LOG = logging.getLogger(__name__)
 
 ELICITATION_NOT_PENDING = "elicitation-not-pending"
 NONCE_LABEL = "factory.dispatch"
+#: Retry delay after a Git lock of the shared clone outlasted the short in-process retry.
+GIT_LOCK_RETRY_US = 5_000_000
 #: Message purposes sent within a running stage: they never sync the worktree.
 _MID_STAGE = frozenset({"feedback", "readiness_wake"})
 _TURN_ITEM_TYPES = frozenset(
@@ -438,6 +441,8 @@ class OmnigentExecutionAdapter:
                     return RetryableReadFailure(f"source fetch failed: {exc}")
                 workspace = str(self.workspaces.source_clone)
                 git = {"branch_name": spec.branch, "base_branch": f"origin/{base}"}
+        except GitLockBusy as exc:  # another Git process held a clone lock (#888)
+            return RetryableReadFailure(f"workspace busy: {exc}", GIT_LOCK_RETRY_US)
         except WorktreeError as exc:
             return DefinitiveFailure(f"workspace-rejected: {exc}")
         body: dict[str, Any] = {
@@ -661,6 +666,8 @@ class OmnigentExecutionAdapter:
                 return self._prepared(root, ok=False, reason="bound workspace differs")
             capability = await self.provisioner.provision(spec.session_id)
             await asyncio.to_thread(self._wire, verified, spec, capability.path)
+        except GitLockBusy as exc:
+            return RetryableReadFailure(f"workspace busy: {exc}", GIT_LOCK_RETRY_US)
         except OffBranchError as exc:
             return self._prepared(root, ok=False, reason=f"workspace: {exc}", note=str(exc))
         except WorktreeError as exc:

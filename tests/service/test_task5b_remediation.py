@@ -319,11 +319,13 @@ def test_cli_serve_builds_runs_and_stops_on_one_loop(
             self._tasks: list[object] = []
             self.process_lock = Lock()
 
-        async def start(self) -> None:
+        async def open(self) -> None:
             loops.append(asyncio.get_running_loop())
+
+        def finish_start_in_background(self) -> None:
             self.ready = True
 
-        async def stop(self) -> None:
+        async def stop(self) -> None:  # the lifespan's, then serve's (a no-op) safety net
             loops.append(asyncio.get_running_loop())
             self.ready = False
 
@@ -349,7 +351,7 @@ def test_cli_serve_builds_runs_and_stops_on_one_loop(
     monkeypatch.setattr(cli.uvicorn, "Server", Server)
     monkeypatch.setattr(cli, "listener_sockets", lambda _config: [])
     assert cli.main(["serve"]) == 0
-    assert len(loops) == 4
+    assert len(loops) == 5
     assert len({id(loop) for loop in loops}) == 1
 
 

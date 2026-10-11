@@ -34,8 +34,11 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping, Sequence
+import threading
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 
 GITHUB_HTTPS = "https://github.com/"
@@ -62,6 +65,11 @@ HARNESS_ALLOW_RULES = (
 
 class WorktreeError(RuntimeError):
     """A workspace failed verification or could not be wired. Fail closed."""
+
+
+class GitLockBusy(WorktreeError):
+    """Another Git process held a lock of the clone (``index.lock``, ``config.lock``, a ref
+    lock) for longer than the short retry. Transient: retry later, never a rejection."""
 
 
 class OffBranchError(WorktreeError):
@@ -165,6 +173,31 @@ def inspection_env(runner_config_env: Mapping[str, str]) -> dict[str, str]:
     return env
 
 
+#: Every write to the dedicated clone's shared ``.git`` (config, refs, worktree
+#: registrations, ``info/exclude``) in this process holds this lock (#888: two sessions
+#: created at once collided on ``.git/config.lock``). Re-entrant: writers nest.
+CLONE_LOCK = threading.RLock()
+#: Waits before each retry of a Git command that found a lock held (bounded, ~3 s).
+LOCK_RETRY_DELAYS_S: tuple[float, ...] = (0.1, 0.2, 0.4, 0.8, 1.6)
+
+
+def _clone_write[**P, R](method: Callable[P, R]) -> Callable[P, R]:
+    """Run a method that writes the clone's shared ``.git`` under :data:`CLONE_LOCK`."""
+
+    @wraps(method)
+    def locked(*args: P.args, **kwargs: P.kwargs) -> R:
+        with CLONE_LOCK:
+            return method(*args, **kwargs)
+
+    return locked
+
+
+def git_lock_busy(stderr: str) -> bool:
+    """Git refused because another process holds one of its lock files."""
+    text = stderr.lower()
+    return "could not lock" in text or (".lock" in text and "file exists" in text)
+
+
 def _run(
     args: Sequence[str],
     cwd: Path,
@@ -173,17 +206,22 @@ def _run(
     git: str = "git",
     env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        [git, *args],
-        cwd=cwd,
-        env=dict(env) if env is not None else git_env(),
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
+    for delay in (*LOCK_RETRY_DELAYS_S, None):
+        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [git, *args],
+            cwd=cwd,
+            env=dict(env) if env is not None else git_env(),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if proc.returncode == 0 or delay is None or not git_lock_busy(proc.stderr):
+            break
+        time.sleep(delay)  # another Git process (Omnigent, a stage) holds a lock
     if check and proc.returncode != 0:
-        raise WorktreeError(f"git {' '.join(args[:3])} failed: {proc.stderr.strip()[:500]}")
+        error = GitLockBusy if git_lock_busy(proc.stderr) else WorktreeError
+        raise error(f"git {' '.join(args[:3])} failed: {proc.stderr.strip()[:500]}")
     return proc
 
 
@@ -242,8 +280,10 @@ class Workspaces:
         out = self._git(["rev-parse", "--path-format=absolute", "--git-common-dir"], path)
         return Path(out).resolve()
 
+    @_clone_write
     def ensure_source_clone(self) -> None:
-        """Verify the dedicated clone and enable per-worktree config in it only."""
+        """Verify the dedicated clone and enable per-worktree config in it only (written
+        only when not already on, so a ready clone needs no config lock)."""
         if not (self.source_clone / ".git").is_dir():
             raise WorktreeError("source clone is not an ordinary non-bare clone")
         urls = self._git(["config", "--get-all", "remote.origin.url"], self.source_clone)
@@ -258,8 +298,17 @@ class Workspaces:
         ).stdout.split()
         if push and push != [self.remote_url]:
             raise WorktreeError("source clone push URL differs from the expected HTTPS URL")
-        self._git(["config", "--local", "extensions.worktreeConfig", "true"], self.source_clone)
+        enabled = _run(
+            ["config", "--local", "--get", "extensions.worktreeConfig"],
+            self.source_clone,
+            check=False,
+            git=self.git,
+            env=self.inspection_env,
+        ).stdout.strip()
+        if enabled != "true":
+            self._git(["config", "--local", "extensions.worktreeConfig", "true"], self.source_clone)
 
+    @_clone_write
     def ensure_excluded(self, pattern: str) -> bool:
         """Add ``pattern`` to the clone's effective ``info/exclude`` once (idempotent).
 
@@ -281,6 +330,7 @@ class Workspaces:
             stream.write(f"{prefix}{pattern}\n")
         return True
 
+    @_clone_write
     def fetch_base(self, base_branch: str = "main") -> str:
         """Fetch ``origin/<base>`` explicitly and return its OID (§5.1)."""
         ref = f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}"
@@ -365,6 +415,7 @@ class Workspaces:
 
     # ------------------------------------------------------------ worktrees
 
+    @_clone_write
     def recreate_worktree(
         self, workspace: str | Path, branch: str, base_branch: str = "main"
     ) -> str | None:
@@ -723,13 +774,14 @@ class Workspaces:
         rel = ".claude/settings.local.json"
         if not self._ignored(path, rel):
             exclude = self.common_dir(path) / "info" / "exclude"
-            exclude.parent.mkdir(parents=True, exist_ok=True)
-            existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-            if f"/{rel}" not in existing.splitlines():
-                with exclude.open("a", encoding="utf-8") as handle:
-                    handle.write(
-                        ("" if existing.endswith("\n") or not existing else "\n") + f"/{rel}\n"
-                    )
+            with CLONE_LOCK:  # the clone's shared exclude file
+                exclude.parent.mkdir(parents=True, exist_ok=True)
+                existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+                if f"/{rel}" not in existing.splitlines():
+                    with exclude.open("a", encoding="utf-8") as handle:
+                        handle.write(
+                            ("" if existing.endswith("\n") or not existing else "\n") + f"/{rel}\n"
+                        )
             if not self._ignored(path, rel):
                 return False
         target = path / rel
@@ -797,6 +849,7 @@ class Workspaces:
         )
         return proc.stdout.strip() or None
 
+    @_clone_write
     def remove_worktree(self, path: Path, *, force: bool) -> None:
         """Remove one linked worktree of the dedicated clone (never the clone itself)."""
         resolved = path.resolve()
@@ -805,6 +858,7 @@ class Workspaces:
         args = ["worktree", "remove", *(["--force"] if force else []), str(resolved)]
         self._git(args, self.source_clone)
 
+    @_clone_write
     def delete_branch(self, branch: str) -> None:
         """Delete a local factory branch of the dedicated clone that no worktree uses."""
         if not branch.startswith("factory/"):

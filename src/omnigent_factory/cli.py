@@ -327,8 +327,7 @@ async def _serve(config: ServiceConfig, config_path: Path | None = None) -> None
     finally:
         # Lifespan normally owns shutdown; this also releases a pre-acquired lock if
         # uvicorn fails before entering lifespan.
-        if production.service.ready or production.service._tasks:
-            await production.service.stop()
+        await production.service.stop()  # a no-op once the lifespan stopped it
         production.service.process_lock.close()
 
 
