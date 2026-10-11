@@ -4086,6 +4086,8 @@ def _adopt(ctx: _Ctx, s: StageSession, root_id: str, nonce: str) -> None:
         raise Rejected("session-not-awaiting-create")
     s = replace(s, root_id=root_id)
     _bind_issue_session(ctx, s, root_id)
+    if ctx.p.create_rejected_reason:
+        ctx.update(create_rejected_reason="")
     if s.fences or s.lifecycle == Lifecycle.DRAINING or s.session_id != ctx.p.current_session_id:
         s = ctx.put_session(
             replace(
@@ -4161,8 +4163,13 @@ def _h_create_rejected(ctx: _Ctx, body: ev.CreateRejected) -> None:
         raise Rejected("session-not-awaiting-create")
     if not s.fences:
         ctx.hold(Hold.CREATE_REJECTED)
-        ctx.comment("create-rejected", reason=body.reason)
-        ctx.note("Blocked: Omnigent refused to create the session")
+        if body.reason and body.reason == ctx.p.create_rejected_reason:
+            # Already commented with this exact reason: no second identical comment.
+            ctx.note("Blocked again: Omnigent refused to create the session (same reason)")
+        else:
+            ctx.comment("create-rejected", reason=body.reason)
+            ctx.update(create_rejected_reason=body.reason)
+            ctx.note("Blocked: Omnigent refused to create the session")
     _finish_drain(ctx, replace(s, drain_target=Lifecycle.FENCED if s.fences else Lifecycle.RETIRED))
 
 

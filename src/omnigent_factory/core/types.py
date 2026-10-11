@@ -963,6 +963,9 @@ class Parcel:
     #: An epic's progress note (``Epic · 1/8 done · next: #823``), set by the factory's
     #: board pass only when it changes ("" = none).
     epic_note: str = ""
+    #: Reason of the last create rejection already commented on ("" = none since the
+    #: last created session): the same reason again updates the note only.
+    create_rejected_reason: str = ""
     #: Epic autopilot on this epic (None: off).
     autopilot: EpicAutopilot | None = None
     #: The "Autopilot" option the factory believes the board shows ("" = empty) and when

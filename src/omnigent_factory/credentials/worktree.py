@@ -365,6 +365,64 @@ class Workspaces:
 
     # ------------------------------------------------------------ worktrees
 
+    def recreate_worktree(
+        self, workspace: str | Path, branch: str, base_branch: str = "main"
+    ) -> str | None:
+        """Re-add a recorded issue worktree that is gone (#821); None when it exists.
+
+        Finished-parcel cleanup removes the worktree (and keeps an unmerged branch); a
+        reopened issue's next run binds the recorded path again. Stale registrations are
+        pruned first. An existing ``branch`` with no commits of its own is fast-forwarded
+        to the last fetched ``origin/<base>``; one with its own commits is checked out as
+        it is (never rewritten); a missing branch is created from ``origin/<base>``. The
+        branch never tracks the base. Raises :class:`WorktreeError` when the path is not
+        a safe owned location or the branch is checked out elsewhere. Callers fetch the
+        base first and verify the result with :meth:`verify_worktree`.
+        """
+        raw = Path(workspace)
+        if not raw.is_absolute():
+            raise WorktreeError("workspace path is not absolute")
+        if raw.exists() or raw.is_symlink():
+            return None
+        parent = raw.parent
+        if not parent.is_dir() or parent.resolve() != parent.absolute():
+            raise WorktreeError("workspace parent is missing or traverses a symlink")
+        if not _within(raw.absolute(), self.owned_roots):
+            raise WorktreeError("workspace is outside the approved owned roots")
+        self._git(["worktree", "prune"], self.source_clone)
+        other = self.find_branch_worktree(branch)
+        if other is not None:
+            raise WorktreeError(f"branch {branch} is checked out in another worktree ({other})")
+        base = f"refs/remotes/origin/{base_branch}"
+        if self.branch_exists(branch):
+            ahead = int(
+                self._git(
+                    ["rev-list", "--count", f"{base}..refs/heads/{branch}"], self.source_clone
+                )
+                or 0
+            )
+            if ahead:
+                how = f"from {branch} as is ({ahead} commits of its own)"
+            else:
+                # Nothing of its own: the move to the base is a fast-forward (no loss).
+                self._git(["branch", "--force", "--no-track", branch, base], self.source_clone)
+                how = f"from {branch} fast-forwarded to origin/{base_branch}"
+            self._git(["worktree", "add", str(raw), branch], self.source_clone)
+        else:
+            self._git(
+                ["worktree", "add", "--no-track", "-b", branch, str(raw), base],
+                self.source_clone,
+            )
+            how = f"with new branch {branch} from origin/{base_branch}"
+        _run(
+            ["branch", "--unset-upstream", branch],
+            self.source_clone,
+            check=False,
+            git=self.git,
+            env=self.inspection_env,
+        )
+        return how
+
     def verify_worktree(self, workspace: str | Path, branch: str) -> VerifiedWorktree:
         """Verify ``workspace`` is our clone's worktree on ``branch`` inside owned roots."""
         resolved = self._owned_worktree(workspace)

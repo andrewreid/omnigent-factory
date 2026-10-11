@@ -414,6 +414,9 @@ class OmnigentExecutionAdapter:
         base_oid: str | None = None
         try:
             if spec.bind_worktree is not None:
+                repair = await self._repair_worktree(spec.bind_worktree, spec)
+                if repair is not None:
+                    return repair
                 verified = await asyncio.to_thread(
                     self.workspaces.verify_worktree, spec.bind_worktree, spec.branch
                 )
@@ -474,6 +477,35 @@ class OmnigentExecutionAdapter:
                 "base_oid": base_oid,
             },
         )
+
+    async def _repair_worktree(
+        self, workspace: str | Path, spec: StageSpec
+    ) -> AdapterOutcome | None:
+        """Re-add the recorded issue worktree when it is gone (#821), before it is bound.
+
+        Finished-parcel cleanup removed it; a reopened issue's next run needs it back.
+        A failed base fetch is retryable; anything else unsafe raises
+        :class:`WorktreeError` (the caller's definitive rejection).
+        """
+        if Path(workspace).exists():
+            return None
+        base = spec.default_branch
+        try:
+            await asyncio.to_thread(self.workspaces.ensure_source_clone)
+            await asyncio.to_thread(self.workspaces.fetch_base, base)
+        except WorktreeError as exc:
+            return RetryableReadFailure(f"source fetch failed: {exc}")
+        how = await asyncio.to_thread(
+            self.workspaces.recreate_worktree, workspace, spec.branch, base
+        )
+        if how is not None:
+            LOG.warning(
+                "issue worktree was missing: recreated session=%s path=%s %s",
+                spec.session_id,
+                workspace,
+                how,
+            )
+        return None
 
     def _identity_problem(self, row: Mapping[str, Any], spec: StageSpec) -> str | None:
         """Agent/host/project/branch of a listed or snapshotted root vs the recorded tuple."""
@@ -598,6 +630,13 @@ class OmnigentExecutionAdapter:
             return self._prepared(root, ok=True, unexpected=True, reason=turn)
         workspace = str(snap.get("workspace") or "")
         try:
+            if workspace and (
+                spec.bind_worktree is None
+                or Path(workspace).resolve() == spec.bind_worktree.resolve()
+            ):
+                repair = await self._repair_worktree(workspace, spec)
+                if repair is not None:
+                    return repair
             # A stage may have left the worktree off its branch (#761): switch back when
             # nothing can be lost, else refuse with an owner-facing note.
             if (
