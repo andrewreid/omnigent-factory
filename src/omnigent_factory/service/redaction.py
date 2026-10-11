@@ -33,7 +33,19 @@ class SecretRedactionFilter(logging.Filter):
             record.args = redact_fields(record.args)
         record.msg = redact_text(record.getMessage())
         record.args = ()
+        # A logged traceback carries exception messages: redact it as text too (handlers
+        # print ``exc_text`` as is once ``exc_info`` is consumed here).
+        if record.exc_info and record.exc_info[0] is not None:
+            record.exc_text = _FORMATTER.formatException(record.exc_info)
+            record.exc_info = None
+        if record.exc_text:
+            record.exc_text = redact_text(record.exc_text)
+        if record.stack_info:
+            record.stack_info = redact_text(record.stack_info)
         return True
+
+
+_FORMATTER = logging.Formatter()
 
 
 _FILTER = SecretRedactionFilter()

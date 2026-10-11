@@ -729,8 +729,9 @@ class AutoBuildMark:
     sequence: int = 0
     #: Queued by epic autopilot for the sub-issue of this epic (0 = the owner's own mark):
     #: the owner's approval is their approval of the epic plan (``owner_id`` and
-    #: ``source_event_id`` are that approval's), and it holds only while the epic's
-    #: autopilot still authorises it.
+    #: ``source_event_id`` are that approval's; the build approval it starts is sourced
+    #: from its ``AutoBuild`` event, as one epic approval backs many builds), and it holds
+    #: only while the epic's autopilot still authorises it.
     autopilot_epic: int = 0
     #: Not started before this time (a Delayed autopilot start; 0 = at once).
     not_before_us: int = 0
@@ -769,7 +770,7 @@ class EpicAutopilot:
     set_at_us: int
     plan: EpicPlan | None = None
     #: The approved plan hash ("" = none) and the owner, event and time of the approval
-    #: (the source of every autopilot build approval). ``source_event_id`` (the owner's
+    #: (the authority of every autopilot build approval). ``source_event_id`` (the owner's
     #: field event) is the autopilot epoch sub-issue claims carry.
     approved_hash: str = ""
     approved_by: int = 0

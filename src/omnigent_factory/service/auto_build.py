@@ -22,6 +22,7 @@ before each start). They share every capacity rule and the daily limit with the 
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -290,9 +291,21 @@ class AutoBuilder:
             parked = self.service.parked.blocks(candidate.parcel.parcel_id)
             if mark_blocker(candidate.parcel, parked=parked, now_us=now) is not None:
                 continue
-            if self.autopilot is not None and await self.autopilot.blocker(candidate.parcel):
-                continue
-            outcome = await self._start(candidate.parcel)
+            try:
+                if self.autopilot is not None and await self.autopilot.blocker(candidate.parcel):
+                    continue
+                outcome = await self._start(candidate.parcel)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # One failing mark must not starve the marks behind it: logged, counted as
+                # an attempt, and retried next pass.
+                LOG.exception(
+                    "auto-build start failed issue=#%s parcel=%s",
+                    candidate.number,
+                    candidate.parcel.parcel_id,
+                )
+                outcome = None
             if outcome is not None:
                 return outcome
             attempts += 1

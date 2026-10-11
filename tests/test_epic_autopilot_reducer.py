@@ -409,7 +409,10 @@ def test_full_queues_at_once_and_the_build_carries_the_epic_plan_approval():
     ap = h.p(EPIC).autopilot
     assert approval is not None and ap is not None
     assert approval.owner_id == ap.approved_by == OWNER_ID
-    assert approval.source_event_id == ap.approval_event_id
+    # The epic approval backs every sub-issue build: each approval is sourced from its
+    # own AutoBuild event (approvals.source_event_id is unique in the store).
+    assert approval.source_event_id == r.audit.event_id
+    assert h.p(S1).auto_build.source_event_id == ap.approval_event_id  # type: ignore[union-attr]
     assert h.p(S1).stage == Stage.BUILDING
     h.quiesce(S1, plan.session_id)
     assert h.admit(S1).kind == SessionKind.BUILD

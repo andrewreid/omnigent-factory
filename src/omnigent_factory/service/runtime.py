@@ -513,6 +513,7 @@ class FactoryService:
                 "delivery processor failed delivery_guid=%s attempt=%s",
                 delivery.delivery_guid,
                 attempts,
+                exc_info=True,
             )
             delay = min(
                 self.config.delivery_retry_max_backoff_seconds,
@@ -795,7 +796,7 @@ class FactoryService:
             try:
                 await self.native_links.epic_pass()
             except Exception:
-                LOG.warning("epic pass failed")
+                LOG.warning("epic pass failed", exc_info=True)
 
     async def reread(self, parcel_id: str) -> None:
         """A per-issue read now (e.g. a native link of the issue changed)."""
@@ -876,7 +877,7 @@ class FactoryService:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                LOG.warning("auto-triage pass failed")
+                LOG.warning("auto-triage pass failed", exc_info=True)
 
     async def _auto_build_loop(self) -> None:
         """Auto-build passes (each starts at most one build), every reconcile interval and
@@ -893,14 +894,14 @@ class FactoryService:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    LOG.warning("epic autopilot pass failed")
+                    LOG.warning("epic autopilot pass failed", exc_info=True)
             try:
                 outcome = await self.auto_builder.run_once()
                 LOG.debug("auto-build pass outcome=%s", outcome)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                LOG.warning("auto-build pass failed")
+                LOG.warning("auto-build pass failed", exc_info=True)
 
     async def _ranking_loop(self) -> None:
         """Triage ranking passes: every few seconds while a run is open, else every
@@ -920,7 +921,7 @@ class FactoryService:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                LOG.warning("ranking pass failed")
+                LOG.warning("ranking pass failed", exc_info=True)
                 wait = self.config.reconcile_interval_seconds
 
     async def _clock_loop(self) -> None:
@@ -946,7 +947,7 @@ class FactoryService:
                         await self.prune_history(max_batches=RETENTION_SWEEP_MAX_BATCHES)
                     except Exception:
                         # Housekeeping only: retried next sweep, never a clock-loop failure.
-                        LOG.warning("history retention sweep failed")
+                        LOG.warning("history retention sweep failed", exc_info=True)
                     await self._session_housekeeping()
                 failures = 0
                 next_sweep = self._next_retention_at or loop_now
@@ -972,7 +973,7 @@ class FactoryService:
                 )
             )
         except Exception:
-            LOG.warning("session retention sweep failed")
+            LOG.warning("session retention sweep failed", exc_info=True)
 
     async def prune_delivery_bodies(self) -> int:
         """Empty bodies of processed deliveries past retention, in short batches."""
@@ -1415,7 +1416,7 @@ class FactoryService:
 
     async def _background_error(self, task: str, failures: int) -> int:
         failures += 1
-        LOG.warning("background task failed task=%s attempt=%s", task, failures)
+        LOG.warning("background task failed task=%s attempt=%s", task, failures, exc_info=True)
         if failures >= self.config.background_failure_limit:
             raise RuntimeError(f"{task} failure limit reached") from None
         await self._wait(self.config.background_error_backoff_seconds * failures)
@@ -1427,7 +1428,8 @@ class FactoryService:
         self.ready = False
         self.accepting_admission = False
         self._fatal_reason = f"{task.get_name()}-stopped"
-        LOG.error("background task stopped task=%s", task.get_name())
+        error = None if task.cancelled() else task.exception()
+        LOG.error("background task stopped task=%s", task.get_name(), exc_info=error)
         if self._fatal_exit is not None:
             self._fatal_exit(1)
 

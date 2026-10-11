@@ -1270,15 +1270,24 @@ def _new_approval(
     mark: AutoBuildMark | None = None,
 ) -> Approval:
     """A new current approval: the event's owner's, or (``mark``) the owner's auto-build
-    mark the trusted clock starts (its owner, event and time are the approval's source)."""
+    mark the trusted clock starts (its owner, event and time are the approval's source).
+
+    An epic autopilot mark carries the owner's epic plan approval, which authorises every
+    sub-issue build of that epic: its approvals are sourced from the starting
+    ``AutoBuild`` event instead, since one source event backs at most one approval (the
+    store keeps ``approvals.source_event_id`` unique)."""
     owner_id = ctx.event.actor_id if mark is None else mark.owner_id
     assert owner_id is not None  # noqa: S101 - guarded by _control or the mark
+    if mark is None or mark.autopilot_epic:
+        source_event_id = ctx.event.event_id
+    else:
+        source_event_id = mark.source_event_id
     a = Approval(
         approval_id=ctx.new_id("ap"),
         kind=kind,
         full_hash=full_hash,
         owner_id=owner_id,
-        source_event_id=ctx.event.event_id if mark is None else mark.source_event_id,
+        source_event_id=source_event_id,
         source_time_us=ctx.now if mark is None else mark.marked_at_us,
         sequence=ctx.admission.next_sequence,
         eligibility_epoch=ctx.p.eligibility_epoch,
