@@ -173,6 +173,10 @@ class GitHubDeliveryProcessor:
         #: ``sub_issues``/``issue_dependencies`` delivery names, and those a closed or
         #: reopened issue blocks. None: not wired.
         self.native_links: Any = None
+        #: Follow-ups (``service.follow_ups.FollowUps``): issues the bot opened during a
+        #: run, and ``follow-up`` / ``factory:build-follow-ups`` label changes. None: not
+        #: wired.
+        self.follow_ups: Any = None
 
     async def process(self, delivery: DeliveryRecord) -> None:
         try:
@@ -198,6 +202,13 @@ class GitHubDeliveryProcessor:
                 await self.native_links.on_link_delivery(delivery.event_name, delivery.body)
             except Exception:
                 LOG.warning("native link re-read failed delivery_guid=%s", delivery.delivery_guid)
+
+        if self.follow_ups is not None and delivery.event_name == "issues":
+            try:
+                # Authenticated (normalized above); its own durable state, no transition.
+                await self.follow_ups.on_issues_delivery(delivery.body)
+            except Exception:
+                LOG.warning("follow-up handling failed delivery_guid=%s", delivery.delivery_guid)
 
         if self.field_observer is not None and delivery.event_name == "projects_v2_item":
             try:

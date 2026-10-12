@@ -7,10 +7,10 @@ import logging
 import os
 import stat
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import httpx
 
@@ -58,6 +58,7 @@ from omnigent_factory.service.durable import (
     StoreWorkerGrantStore,
     reenable_issuance_after_boot,
 )
+from omnigent_factory.service.follow_ups import FollowUps
 from omnigent_factory.service.github_delivery import (
     GitHubDeliveryProcessor,
     GitHubWebhookVerifier,
@@ -424,6 +425,12 @@ async def build_production(
         lambda: ranking_board.cards(service.config.rank_field_node_id),
     )
     service.native_links = native_links
+    follow_ups = FollowUps(service, native_links, github.label_events)
+    service.follow_ups = follow_ups
+
+    def write_links(issue: int, result: Mapping[str, Any]) -> None:
+        native_links.schedule_result(issue, result)
+        follow_ups.schedule_result(issue, result)
 
     github.related_marker = marker.schedule
     service.epic_autopilot = EpicAutopilotService(
@@ -470,6 +477,7 @@ async def build_production(
     processor = GitHubDeliveryProcessor(service, normalizer, github, clock)
     processor.field_observer = ranker.note_owner_field
     processor.native_links = native_links
+    processor.follow_ups = follow_ups
     service.bind_integrations(
         adapters=(github, recording_omnigent, broker, CleanupAdapter(cleaner)),
         delivery_processor=processor,
@@ -484,7 +492,7 @@ async def build_production(
             config,
             board=board,
             ranker=ranker,
-            link_writer=native_links.schedule_result,
+            link_writer=write_links,
         ),
     )
 

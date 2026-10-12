@@ -25,6 +25,9 @@ Each pass, per approved epic (one decision per sub-issue; the reducer re-checks 
   a waiting sub-issue whose stored blockers that read contradicts, or cannot confirm, is
   re-read (bounded per epic and pass, at most every ``REREAD_INTERVAL_US`` per issue), and the
   reducer starts nothing without a fresh per-issue read showing every blocker closed.
+* a sub-issue labelled ``follow-up`` (``service.follow_ups``) is held, not started, unless
+  it natively blocks another open sub-issue of the epic, the owner removed its label, or
+  the owner put ``factory:build-follow-ups`` on the epic; the note counts held ones.
 
 The epic card's note (``Epic · 3/9 done · autopilot: planning #882, next #883``) is the
 only status output: no comments except the epic plan and genuine questions.
@@ -58,8 +61,9 @@ from omnigent_factory.core.types import (
     Stage,
 )
 from omnigent_factory.ports.github import IssueRef, RankingCard
+from omnigent_factory.service.follow_ups import is_held
 from omnigent_factory.service.runtime import FactoryService
-from omnigent_factory.store.sqlite import AutoTriageState, SqliteStore
+from omnigent_factory.store.sqlite import AutoTriageState, FollowUpRow, SqliteStore
 
 LOG = logging.getLogger(__name__)
 
@@ -329,10 +333,18 @@ class EpicAutopilotService:
         candidates: list[Sub] = []
         waiting: list[str] = []
         stale: list[Sub] = []
+        held: list[int] = []
+        build_all, _changed = await self.service.db.call(
+            lambda store: store.epic_follow_up_builds(self.service.config.repo_id, number)
+        )
+        open_subs = {s.number for s in links.sub_issues if s.open and not s.repo}
         for sub in unstarted:
             why = await self._candidate_blocker(
                 sub, open_gates & gate_blocks.get(sub.number, set())
             )
+            if why != "" and not build_all and await self._held_follow_up(sub, open_subs):
+                held.append(sub.number)
+                continue
             if why is None:
                 candidates.append(sub)
             elif why:
@@ -362,6 +374,7 @@ class EpicAutopilotService:
             started=started,
             candidates=candidates,
             waiting=waiting,
+            held=len(held),
         )
         await self._status(epic, text, "")
         return f"started {', '.join(f'#{n}' for n in started)}" if started else "nothing to start"
@@ -405,6 +418,26 @@ class EpicAutopilotService:
         if p.pending_authorization_id is not None or (cur is not None and not settled(cur)):
             return ""  # a run the owner started
         return None
+
+    async def _held_follow_up(self, sub: Sub, open_subs: set[int]) -> bool:
+        """A follow-up autopilot leaves for the owner: labelled ``follow-up`` (and not
+        released by the owner) and blocking no other open sub-issue of the epic."""
+        p = sub.parcel
+        if p is None:
+            return False
+        repo_id = self.service.config.repo_id
+        row: FollowUpRow | None = await self.service.db.call(
+            lambda store: store.follow_up(repo_id, sub.number)
+        )
+        if not is_held(row, await self.labels(p) if row is None else None):
+            return False
+        links = sub.card.links if sub.card is not None and sub.card.links is not None else p.links
+        blocks = {
+            b.number
+            for b in (links.blocking if links is not None else ())
+            if b.open and not b.repo and b.number != sub.number
+        }
+        return not blocks & open_subs
 
     async def _reread_stale(self, stale: Sequence[Sub]) -> None:
         """Re-read sub-issues whose stored blockers the board read contradicts or cannot
@@ -695,6 +728,7 @@ def _status_text(
     started: Sequence[int],
     candidates: Sequence[Sub],
     waiting: Sequence[str],
+    held: int = 0,
 ) -> str:
     """``Epic · 3/9 done · autopilot: planning #882, next #883``."""
     planning: list[int] = []
@@ -732,6 +766,8 @@ def _status_text(
         parts.append(f"next #{nxt[0]}")
     elif not parts and waiting:
         parts.append(waiting[0])
+    if held:
+        parts.append(f"{held} follow-up{'s' if held != 1 else ''} held")
     if not subs:
         parts.append("every sub-issue done")
     return f"{progress} · autopilot: {', '.join(parts) or 'nothing to start'}"

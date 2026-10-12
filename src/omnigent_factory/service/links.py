@@ -197,6 +197,11 @@ class NativeLinks:
 
     async def link(self, blocked: int, blocking: int, *, source: int) -> bool:
         """``blocked`` is blocked by ``blocking`` (both in the configured repository)."""
+        return await self.link_status(blocked, blocking, source=source) == "created"
+
+    async def link_status(self, blocked: int, blocking: int, *, source: int) -> str:
+        """As :meth:`link`: ``created``, ``exists``, ``skipped`` (not both issues of this
+        repository) or ``failed`` (GitHub refused or failed: worth retrying)."""
         owner, name = self._owner_name
         repo_node = self.service.config.repo_id
         try:
@@ -210,7 +215,7 @@ class NativeLinks:
                     blocked,
                     blocking,
                 )
-                return False
+                return "skipped"
             if blocking in target.blocked_by:
                 LOG.info(
                     "native link exists source=#%s issue=#%s blocked_by=#%s",
@@ -218,7 +223,7 @@ class NativeLinks:
                     blocked,
                     blocking,
                 )
-                return False
+                return "exists"
             await add_blocked_by(self.client, target.node_id, other.node_id)
         except GitHubAPIError as exc:
             LOG.warning(
@@ -228,11 +233,11 @@ class NativeLinks:
                 blocking,
                 exc,
             )
-            return False
+            return "failed"
         LOG.info(
             "native link created source=#%s issue=#%s blocked_by=#%s", source, blocked, blocking
         )
-        return True
+        return "created"
 
     # ------------------------------------------------------------------ epics
 

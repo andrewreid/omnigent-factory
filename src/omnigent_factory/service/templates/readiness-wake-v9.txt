@@ -20,6 +20,8 @@ never push an empty commit); if it stays red, name the check and the cause in a 
 and in the build_ready summary, and submit build_ready; the factory parks the card for the
 owner with that check named. Submit kind "blocked" only if a required defect in this change
 cannot be fixed within scope.
+Every issue you open goes in follow_ups, with blocks naming the issues it must come
+before; the factory labels it and links it to the epic and those issues.
 The build_ready summary says what changed, the decisions you made and any follow-ups. Leave
 out CI and review-bot status (pending, passed, reacted): the factory reports those from its
 own reads.

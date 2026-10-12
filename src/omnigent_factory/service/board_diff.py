@@ -47,6 +47,8 @@ class DiffResult:
     unknown: Mapping[str, str] = field(default_factory=dict)
     #: Changed or unknown parcels whose card shows a command label.
     label_checks: Mapping[str, LabelCheck] = field(default_factory=dict)
+    #: Labels of each changed or unknown card (``service.follow_ups`` checks its holds).
+    labels: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 class BoardDiff:
@@ -73,6 +75,7 @@ class BoardDiff:
         changed: dict[str, str] = {}
         unknown: dict[str, str] = {}
         checks: dict[str, LabelCheck] = {}
+        labels: dict[str, tuple[str, ...]] = {}
         for row in rows:
             parcel_id = str(row[0])
             card = by_id.get(parcel_id)
@@ -84,6 +87,8 @@ class BoardDiff:
                 changed[parcel_id] = digest
             else:
                 continue
+            if card is not None:
+                labels[parcel_id] = tuple(card.labels)
             check = label_check(card.labels, card.updated_at) if card is not None else None
             if check is not None:
                 checks[parcel_id] = check
@@ -95,4 +100,4 @@ class BoardDiff:
             len(changed),
             len(unknown),
         )
-        return DiffResult(changed=changed, unknown=unknown, label_checks=checks)
+        return DiffResult(changed=changed, unknown=unknown, label_checks=checks, labels=labels)

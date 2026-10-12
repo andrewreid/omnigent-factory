@@ -286,8 +286,8 @@ def test_build_summaries_carry_no_live_status():
     for name in (
         "build-v8.txt",
         "build-rework-v5.txt",
-        "readiness-wake-v8.txt",
-        "readiness-findings-wake-v1.txt",
+        "readiness-wake-v9.txt",
+        "readiness-findings-wake-v2.txt",
     ):
         text = " ".join((root / name).read_text("utf-8").split())
         assert "no CI or review-bot status" in text or "Leave out CI and review-bot" in text, name
@@ -300,6 +300,8 @@ def test_build_summaries_carry_no_live_status():
         "build-rework-v4.txt",
         "readiness-wake-v6.txt",
         "readiness-wake-v7.txt",
+        "readiness-wake-v8.txt",
+        "readiness-findings-wake-v1.txt",
     ):
         assert not (root / gone).is_file()
 

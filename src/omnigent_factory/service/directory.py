@@ -241,7 +241,7 @@ class ServiceDispatchDirectory:
                 )
             # Findings only (the check wake spent or not needed): ask for an outcome each.
             findings = effect.args.get("wake") == "findings"
-            name = "readiness-findings-wake-v1.txt" if findings else "readiness-wake-v8.txt"
+            name = "readiness-findings-wake-v2.txt" if findings else "readiness-wake-v9.txt"
             return _template(name).format(
                 pr_number=int(str(effect.args.get("pr_number") or 0)),
                 head_sha=str(effect.args.get("head_sha") or ""),
@@ -1246,7 +1246,7 @@ def _new_boundary() -> str:
 _FIRST_TEMPLATES = {
     SessionKind.TRIAGE: "triage-v8.txt",
     SessionKind.PLAN: "plan-v8.txt",
-    SessionKind.BUILD: "build-v10.txt",
+    SessionKind.BUILD: "build-v11.txt",
 }
 _RETRIAGE_TEMPLATE = "triage-feedback-v5.txt"
 #: The triage of an epic (an issue with sub-issues), first run and re-runs alike.
@@ -1255,7 +1255,7 @@ _EPIC_TRIAGE_TEMPLATE = "epic-triage-v2.txt"
 _EPIC_PLAN_TEMPLATE = "epic-plan-v1.txt"
 #: A plan run of a sub-issue epic autopilot drives (keeps to its part of the epic plan).
 _AUTOPILOT_PLAN_TEMPLATE = "plan-autopilot-v1.txt"
-_REWORK_TEMPLATE = "build-rework-v7.txt"
+_REWORK_TEMPLATE = "build-rework-v8.txt"
 #: A rework run, or a wake of the waiting build run, for a merge conflict with the base.
 _CONFLICT_TEMPLATE = "build-conflict-v2.txt"
 _CONFLICT_WAKE_TEMPLATE = "readiness-conflict-wake-v1.txt"

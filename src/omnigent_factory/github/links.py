@@ -4,7 +4,9 @@ Reads are GraphQL fragments folded into reads the factory already makes (the per
 read and the board reads), so links cost no extra request. Writes only ever add: a
 blocked-by link between two issues of the configured repository (``addBlockedBy``) and
 GitHub's "Epic" issue type on an issue that has sub-issues (``updateIssueIssueType``),
-never on an issue whose type the owner set to something else. Nothing is removed.
+never on an issue whose type the owner set to something else; for follow-ups
+(``service.follow_ups``) a sub-issue link (``addSubIssue``) and the ``follow-up`` label.
+Nothing is removed.
 
 Schema checked read-only (``gh api graphql`` introspection, 2026-10-09): ``Issue.parent``,
 ``subIssues``, ``subIssuesSummary {total completed}``, ``blockedBy``, ``blocking``,
@@ -19,6 +21,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 from omnigent_factory.core.types import (
     LINK_TITLE_MAX,
@@ -26,7 +29,7 @@ from omnigent_factory.core.types import (
     IssueLinks,
     LinkedIssue,
 )
-from omnigent_factory.github.client import GitHubAPIError, GitHubClient
+from omnigent_factory.github.client import GitHubAPIError, GitHubClient, GitHubRejected
 
 LOG = logging.getLogger(__name__)
 
@@ -136,6 +139,12 @@ class LinkTarget:
     #: Blockers of this issue were more than one read returned (cannot tell "exists").
     blocked_by_truncated: bool
     issue_type: str | None
+    #: The parent issue's number when it is in this repository (None: none or elsewhere).
+    parent: int | None = None
+    #: The issue has a parent (in any repository).
+    has_parent: bool = False
+    #: Its label names (the first 100).
+    labels: frozenset[str] = frozenset()
 
 
 async def read_target(
@@ -146,6 +155,8 @@ async def read_target(
     query($owner: String!, $name: String!, $number: Int!) {
       repository(owner: $owner, name: $name) { issue(number: $number) {
         id number repository { id } issueType { name }
+        parent { number repository { id } }
+        labels(first: 100) { nodes { name } }
         blockedBy(first: 100) { totalCount nodes { number repository { id } } }
       } }
     }
@@ -170,6 +181,11 @@ async def read_target(
     )
     total = connection.get("totalCount") if isinstance(connection, dict) else None
     kind = issue.get("issueType")
+    parent = issue.get("parent")
+    parent_number = parent.get("number") if isinstance(parent, dict) else None
+    parent_home = parent.get("repository") if isinstance(parent, dict) else None
+    labels = issue.get("labels")
+    label_nodes = labels.get("nodes") if isinstance(labels, dict) else None
     return LinkTarget(
         node_id=issue["id"],
         number=number,
@@ -178,6 +194,17 @@ async def read_target(
         or not isinstance(total, int)
         or total > len(nodes),
         issue_type=str(kind["name"]) if isinstance(kind, dict) and kind.get("name") else None,
+        parent=parent_number
+        if isinstance(parent_number, int)
+        and isinstance(parent_home, dict)
+        and parent_home.get("id") == repository_node_id
+        else None,
+        has_parent=isinstance(parent, dict),
+        labels=frozenset(
+            str(n["name"])
+            for n in (label_nodes if isinstance(label_nodes, list) else [])
+            if isinstance(n, dict) and isinstance(n.get("name"), str)
+        ),
     )
 
 
@@ -191,6 +218,47 @@ async def add_blocked_by(client: GitHubClient, issue_id: str, blocking_issue_id:
     }
     """
     await client.graphql(mutation, {"issue": issue_id, "blocking": blocking_issue_id})
+
+
+async def add_sub_issue(client: GitHubClient, parent_id: str, sub_issue_id: str) -> None:
+    """``sub_issue_id`` becomes a sub-issue of ``parent_id`` (raises ``GitHubAPIError``)."""
+    mutation = """
+    mutation($parent: ID!, $sub: ID!) {
+      addSubIssue(input: {issueId: $parent, subIssueId: $sub}) { issue { id } }
+    }
+    """
+    await client.graphql(mutation, {"parent": parent_id, "sub": sub_issue_id})
+
+
+#: Colour of a repository label the factory creates (GitHub's default grey).
+_LABEL_COLOR = "ededed"
+
+
+async def ensure_label(client: GitHubClient, repository: str, name: str, description: str) -> bool:
+    """Create the repository label ``name`` when it is absent; True when created."""
+    try:
+        await client.request("GET", f"/repos/{repository}/labels/{quote(name, safe='')}")
+        return False
+    except GitHubRejected as exc:
+        if exc.status_code != 404:
+            raise
+    await client.request(
+        "POST",
+        f"/repos/{repository}/labels",
+        json_body={"name": name, "color": _LABEL_COLOR, "description": description},
+        expected=frozenset({201}),
+    )
+    return True
+
+
+async def add_label(client: GitHubClient, repository: str, number: int, name: str) -> None:
+    """Add the label ``name`` to issue ``number`` (keeps its other labels)."""
+    await client.request(
+        "POST",
+        f"/repos/{repository}/issues/{number}/labels",
+        json_body={"labels": [name]},
+        expected=frozenset({200}),
+    )
 
 
 async def epic_issue_type(client: GitHubClient, owner: str, name: str) -> str | None:
@@ -308,7 +376,10 @@ __all__ = [
     "ISSUE_LINK_FIELDS",
     "LinkTarget",
     "add_blocked_by",
+    "add_label",
+    "add_sub_issue",
     "create_sub_issue",
+    "ensure_label",
     "epic_gate_issues",
     "epic_issue_type",
     "gate_marker",

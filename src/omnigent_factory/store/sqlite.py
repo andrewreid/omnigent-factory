@@ -35,6 +35,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 from omnigent_factory.core import codec
 from omnigent_factory.core.effects import READ_ONLY_KINDS, EffectIntent, EffectKind
@@ -79,6 +80,33 @@ _PARCEL_CACHE_LIMIT = 1024
 Reducer = Callable[[State, Event], TransitionResult]
 
 _RUNNING_LIFECYCLES_JSON = json.dumps(sorted(x.value for x in RUNNING_LIFECYCLES))
+
+
+@dataclass(frozen=True, slots=True)
+class FollowUpRow:
+    """One follow-up issue (``follow_ups`` table; ``service.follow_ups``)."""
+
+    issue_number: int
+    #: The issue whose run filed it (None: only labelled ``follow-up``).
+    source_issue: int | None
+    #: ``reported`` (in a stage result), ``detected`` (opened by the bot during a run) or
+    #: ``label`` (someone labelled it).
+    origin: str
+    #: Issues it must precede (each becomes "M blocked by this issue").
+    blocks: tuple[int, ...]
+    #: Link actions done once: ``label``, ``parent``, ``blocks:<M>``.
+    done: frozenset[str]
+    #: ``held`` (autopilot leaves it) or ``released`` (an owner removed the label).
+    hold: str
+    hold_at_us: int
+
+    def pending(self) -> tuple[str, ...]:
+        """Link actions still to do (none for a follow-up found only by its label)."""
+        if self.origin == "label":
+            return ()
+        # Blocked-by links first: the issues it precedes wait before it joins the epic.
+        wanted = [*(f"blocks:{n}" for n in self.blocks), "label", "parent"]
+        return tuple(a for a in wanted if a not in self.done)
 
 
 @dataclass(frozen=True, slots=True)
@@ -596,6 +624,169 @@ class SqliteStore:
 
     def set_epic_autopilot_override(self, repo_id: str, enabled: bool, config_value: bool) -> None:
         self._set_switch_override("epic_autopilot", repo_id, enabled, config_value)
+
+    # ------------------------------------------------------------------ follow-ups
+
+    _FOLLOW_UP_COLUMNS = (
+        "issue_number, source_issue, origin, blocks_json, done_json, hold, hold_at_us"
+    )
+
+    @staticmethod
+    def _follow_up_row(row: Sequence[Any]) -> FollowUpRow:
+        return FollowUpRow(
+            issue_number=int(row[0]),
+            source_issue=None if row[1] is None else int(row[1]),
+            origin=str(row[2]),
+            blocks=tuple(int(n) for n in json.loads(str(row[3]))),
+            done=frozenset(str(a) for a in json.loads(str(row[4]))),
+            hold=str(row[5]),
+            hold_at_us=int(row[6]),
+        )
+
+    def follow_up(self, repo_id: str, issue_number: int) -> FollowUpRow | None:
+        row = self._conn.execute(
+            f"SELECT {self._FOLLOW_UP_COLUMNS} FROM follow_ups "
+            "WHERE repo_id = ? AND issue_number = ?",
+            (repo_id, issue_number),
+        ).fetchone()
+        return None if row is None else self._follow_up_row(row)
+
+    def follow_ups(self, repo_id: str) -> list[FollowUpRow]:
+        rows = self._conn.execute(
+            f"SELECT {self._FOLLOW_UP_COLUMNS} FROM follow_ups WHERE repo_id = ? "
+            "ORDER BY issue_number",
+            (repo_id,),
+        ).fetchall()
+        return [self._follow_up_row(row) for row in rows]
+
+    def record_follow_up(
+        self,
+        repo_id: str,
+        issue_number: int,
+        *,
+        source_issue: int,
+        origin: str,
+        blocks: Sequence[int] = (),
+    ) -> FollowUpRow:
+        """Record (or extend) a follow-up of ``source_issue``: ``reported`` wins over
+        ``detected`` and ``label``; blocks only ever grow; done actions and the hold stay."""
+        now = self._clock.now_utc_us()
+        with self._txn() as conn:
+            row = conn.execute(
+                f"SELECT {self._FOLLOW_UP_COLUMNS} FROM follow_ups "
+                "WHERE repo_id = ? AND issue_number = ?",
+                (repo_id, issue_number),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO follow_ups (repo_id, issue_number, source_issue, origin, "
+                    "blocks_json, created_at_us, updated_at_us) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        repo_id,
+                        issue_number,
+                        source_issue,
+                        origin,
+                        json.dumps(sorted(set(blocks))),
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                old = self._follow_up_row(row)
+                kept = (
+                    old.origin
+                    if old.origin == "reported" or origin == "label"
+                    else ("reported" if origin == "reported" else "detected")
+                )
+                conn.execute(
+                    "UPDATE follow_ups SET source_issue = COALESCE(source_issue, ?), "
+                    "origin = ?, blocks_json = ?, updated_at_us = ? "
+                    "WHERE repo_id = ? AND issue_number = ?",
+                    (
+                        source_issue,
+                        kept,
+                        json.dumps(sorted(set(old.blocks) | set(blocks))),
+                        now,
+                        repo_id,
+                        issue_number,
+                    ),
+                )
+        found = self.follow_up(repo_id, issue_number)
+        assert found is not None  # noqa: S101 - written above
+        return found
+
+    def mark_follow_up_done(self, repo_id: str, issue_number: int, action: str) -> None:
+        with self._txn() as conn:
+            row = conn.execute(
+                "SELECT done_json FROM follow_ups WHERE repo_id = ? AND issue_number = ?",
+                (repo_id, issue_number),
+            ).fetchone()
+            if row is None:
+                return
+            done = sorted({*json.loads(str(row[0])), action})
+            conn.execute(
+                "UPDATE follow_ups SET done_json = ?, updated_at_us = ? "
+                "WHERE repo_id = ? AND issue_number = ?",
+                (json.dumps(done), self._clock.now_utc_us(), repo_id, issue_number),
+            )
+
+    def set_follow_up_hold(self, repo_id: str, issue_number: int, hold: str, at_us: int) -> bool:
+        """Set whether autopilot holds the issue, from a label event at ``at_us`` (an older
+        event than the one applied last changes nothing). An issue not yet known becomes a
+        ``label`` follow-up. Returns whether the stored hold changed."""
+        if hold not in ("held", "released"):
+            raise StoreError(f"unknown follow-up hold {hold}")
+        now = self._clock.now_utc_us()
+        with self._txn() as conn:
+            row = conn.execute(
+                "SELECT hold, hold_at_us FROM follow_ups WHERE repo_id = ? AND issue_number = ?",
+                (repo_id, issue_number),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO follow_ups (repo_id, issue_number, origin, hold, hold_at_us, "
+                    "created_at_us, updated_at_us) VALUES (?, ?, 'label', ?, ?, ?, ?)",
+                    (repo_id, issue_number, hold, at_us, now, now),
+                )
+                return True
+            if at_us < int(row[1]) or (str(row[0]) == hold and at_us == int(row[1])):
+                return False
+            conn.execute(
+                "UPDATE follow_ups SET hold = ?, hold_at_us = ?, updated_at_us = ? "
+                "WHERE repo_id = ? AND issue_number = ?",
+                (hold, at_us, now, repo_id, issue_number),
+            )
+            return str(row[0]) != hold
+
+    def epic_follow_up_builds(self, repo_id: str, epic_number: int) -> tuple[bool, int]:
+        """(the owner's ``factory:build-follow-ups`` is on the epic, when it last changed)."""
+        row = self._conn.execute(
+            "SELECT enabled, changed_at_us FROM epic_follow_up_builds "
+            "WHERE repo_id = ? AND epic_number = ?",
+            (repo_id, epic_number),
+        ).fetchone()
+        return (False, 0) if row is None else (bool(row[0]), int(row[1]))
+
+    def set_epic_follow_up_builds(
+        self, repo_id: str, epic_number: int, enabled: bool, at_us: int
+    ) -> bool:
+        """Apply an owner label change at ``at_us`` (older than the last applied: ignored).
+        Returns whether the stored value changed."""
+        with self._txn() as conn:
+            row = conn.execute(
+                "SELECT enabled, changed_at_us FROM epic_follow_up_builds "
+                "WHERE repo_id = ? AND epic_number = ?",
+                (repo_id, epic_number),
+            ).fetchone()
+            if row is not None and at_us < int(row[1]):
+                return False
+            conn.execute(
+                "INSERT INTO epic_follow_up_builds (repo_id, epic_number, enabled, "
+                "changed_at_us) VALUES (?, ?, ?, ?) ON CONFLICT(repo_id, epic_number) DO "
+                "UPDATE SET enabled = excluded.enabled, changed_at_us = excluded.changed_at_us",
+                (repo_id, epic_number, int(enabled), at_us),
+            )
+            return enabled if row is None else bool(row[0]) != enabled
 
     def _switch_table(self, table: str) -> str:
         if table not in self._SWITCH_TABLES:

@@ -62,6 +62,10 @@ plan for [auto-build](#auto-build).
 [idle-time auto-triage](#idle-time-auto-triage) (anyone may add it; the factory never
 starts anything because of it).
 
+`follow-up` marks an issue filed during another issue's run; epic autopilot holds it.
+Removing it yourself, or adding `factory:build-follow-ups` to the epic, releases it (see
+[Follow-ups](#follow-ups)).
+
 ### Card drags
 
 A rightward owner drag is a control; any leftward drag (by anyone, including a move to
@@ -171,7 +175,7 @@ blocks #825` to each line.
 | Auto-build and blockers | A queued card with an open blocker does not start: note `Waiting on #823`, `auto-build status` shows `waiting on #823`. It starts by itself once a read shows every blocker closed. A start whose fresh read cannot see every blocker is refused (fails closed; manual builds are not affected). |
 | Manual builds and blockers | A drag, `/approve` or `factory:build` still builds; the note reads `Started despite open blocker #823` (no comment). |
 | Ranking | After Rosie's ranking, a blocker always ranks above what it blocks, and sub-issues of one parent stay together where that rule allows. An owner-pinned Rank is kept even when it forces a violation; that is logged. |
-| Dependency links | Every result Rosie submits (triage, epic triage, plan, build, blocked) may list `related` issues; each `depends_on` or `blocks` entry becomes a native blocked-by link (`addBlockedBy`) once the result is accepted, created by the factory (Rosie needs no write access, and never asks you to add one): only between issues of this repository (an epic may be the blocker), skipped when it exists, never removing one, each logged. Parent/sub-issue links are not created (that would turn an issue into an epic, which changes what may be built). |
+| Dependency links | Every result Rosie submits (triage, epic triage, plan, build, blocked) may list `related` issues; each `depends_on` or `blocks` entry becomes a native blocked-by link (`addBlockedBy`) once the result is accepted, created by the factory (Rosie needs no write access, and never asks you to add one): only between issues of this repository (an epic may be the blocker), skipped when it exists, never removing one, each logged. Parent/sub-issue links are not created (that would turn an issue into an epic, which changes what may be built), except that a [follow-up](#follow-ups) joins its source issue's epic. |
 
 An issue with at least one sub-issue is an **epic**. It is never built: a drag, `/approve`
 or `factory:build` on it is refused with the note `Epic: build its sub-issues` (a drag is
@@ -279,8 +283,8 @@ sub-issues it comes before (never created twice); closing it unblocks them.
 | `Delayed` | Its build starts `epic_autopilot_delay_minutes` (60) after the plan was posted, unless you object first: a comment (a plan revision), a leftward drag, `/stop`, clearing its `Auto-build` field, assigning a person, or clearing the epic's `Autopilot` field. |
 | `Plan only` | Nothing: approve it as usual (drag, `/approve`, `Auto-build` = Queued). |
 
-Next sub-issue: open, assigned to nobody, not `factory:skip`, not an epic itself (a
-nested epic only blocks), every blocker closed (a merged PR closes it; blockers outside
+Next sub-issue: open, assigned to nobody, not `factory:skip`, not a held
+[follow-up](#follow-ups), not an epic itself (a nested epic only blocks), every blocker closed (a merged PR closes it; blockers outside
 the epic are waited on, never started), by the plan's build order, then `Rank`, then
 age. It goes straight to planning (no triage), its worktree synced with the base. Its
 plan must say whether it stays within its part of the epic; one that does not is never
@@ -296,6 +300,32 @@ e.g. `Epic · 3/9 done · autopilot: planning #882, next #883` or `Autopilot pau
 needs you`; no status comments. Clearing the epic's field turns it off and drops queued
 starts. Delayed starts and every step are stored with the issues, so a restart never
 repeats one.
+
+### Follow-ups
+
+Rosie lists every issue she files during a build or rework (say, a review-bot finding
+resolved as a follow-up) in her result's `follow_ups`, each with the issues it must come
+before (`[{"issue": 904, "blocks": [882, 884]}]`). For each, the factory adds the native
+link "882 blocked by 904", labels the issue `follow-up` (creating the label if needed)
+and, when the source issue is a sub-issue of an epic and the follow-up has no parent,
+makes it a sub-issue of that epic. Each step is done once, logged and retried after a
+failure; nothing is ever removed, and a label or parent you change afterwards is left as
+you set it. As a backstop, an issue the factory bot opens while another issue's run is
+open, naming that issue in its body, is treated as its follow-up (label and epic only,
+never blocked-by links); epic autopilot's own human-step issues and anything else the
+factory writes itself (a hidden `factory-` marker) are excluded.
+
+Epic autopilot does not start a sub-issue labelled `follow-up` unless it blocks another
+open sub-issue of the same epic; the epic note counts the rest (`2 follow-ups held`).
+Two owner overrides (only your own label changes count; a lost label webhook is
+recovered from the issue's timeline at the next board diff):
+
+| Override | Effect |
+|---|---|
+| Remove `follow-up` from the issue | Autopilot treats it as a normal sub-issue. Removal by anyone else, the bot included, changes nothing. |
+| Add `factory:build-follow-ups` to the epic | Autopilot builds every follow-up of that epic. Removing it restores the default. |
+
+Manual starts (a drag, `factory:build`, `/approve`) are not affected.
 
 ### Triage ranking
 

@@ -695,6 +695,36 @@ CREATE TABLE epic_autopilot (
 );
 """
 
+# Follow-ups (``service.follow_ups``): issues a run filed, or the bot opened during one.
+#
+# * follow_ups: per issue, the source issue whose run filed it (NULL: only labelled
+#   ``follow-up``), how it was found, the issues it must precede, the link actions done
+#   (each once: an owner's later undo is never redone) and whether autopilot holds it
+#   (``released``: an owner removed the label).
+# * epic_follow_up_builds: the owner's ``factory:build-follow-ups`` label on an epic.
+V16_SQL = """
+CREATE TABLE follow_ups (
+    repo_id TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    source_issue INTEGER,
+    origin TEXT NOT NULL CHECK (origin IN ('reported', 'detected', 'label')),
+    blocks_json TEXT NOT NULL DEFAULT '[]',
+    done_json TEXT NOT NULL DEFAULT '[]',
+    hold TEXT NOT NULL DEFAULT 'held' CHECK (hold IN ('held', 'released')),
+    hold_at_us INTEGER NOT NULL DEFAULT 0,
+    created_at_us INTEGER NOT NULL,
+    updated_at_us INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, issue_number)
+);
+CREATE TABLE epic_follow_up_builds (
+    repo_id TEXT NOT NULL,
+    epic_number INTEGER NOT NULL,
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    changed_at_us INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, epic_number)
+);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -711,4 +741,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(13, "board-diff-digests", V13_SQL),
     Migration(14, "auto-build", V14_SQL),
     Migration(15, "epic-autopilot", V15_SQL),
+    Migration(16, "follow-ups", V16_SQL),
 )

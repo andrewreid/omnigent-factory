@@ -205,6 +205,18 @@ class Review(_Strict):
     accepted: bool
 
 
+class FollowUp(_Strict):
+    """An issue the run filed (e.g. a review-bot finding resolved as a follow-up) and the
+    issues it must come before: the factory labels it ``follow-up``, adds it to the
+    source issue's epic and links each ``blocks`` issue as blocked by it."""
+
+    issue: Annotated[int, Field(ge=1)]
+    blocks: Annotated[list[Annotated[int, Field(ge=1)]], Field(max_length=20)] = []
+
+
+FollowUps = Annotated[list[FollowUp], Field(max_length=20)]
+
+
 class BuildResult(_Strict):
     kind: Literal["build_ready"]
     pr_number: Annotated[int, Field(ge=1)]
@@ -218,6 +230,7 @@ class BuildResult(_Strict):
     targeted_rechecks_used: Annotated[int, Field(ge=0, le=1)]
     release_readiness: Literal["ready", "needs_owner"]
     related: Annotated[list[Related], Field(max_length=20)] = []
+    follow_ups: FollowUps = []
 
 
 class CheckpointResult(_Strict):
@@ -241,6 +254,7 @@ class BlockedResult(_Strict):
     reason: Text
     done: Texts
     related: Annotated[list[Related], Field(max_length=20)] = []
+    follow_ups: FollowUps = []
 
 
 def blocked_on(r: BlockedResult) -> tuple[int, ...]:
@@ -308,11 +322,13 @@ RESULT_SHAPES: dict[str, str] = {
     '"review_vendor":str,"reviewed_head":sha40,"artifact_reference":str,'
     '"artifact_sha256":sha256,"accepted":bool},"findings":[{"id":str,"source":str,'
     '"severity":str,"disposition":str,"evidence":str}],"remediation_batches_used":0|1,'
-    '"targeted_rechecks_used":0|1,"release_readiness":"ready|needs_owner","related"?:[...]}',
+    '"targeted_rechecks_used":0|1,"release_readiness":"ready|needs_owner","related"?:[...],'
+    '"follow_ups"?:[{"issue":int,"blocks"?:[int]}]}',
     "checkpoint": '{"kind":"checkpoint","grant_id":str,"head_sha":sha40|null,"done":[str],'
     '"remaining":[str],"risks":[str],"worktree_state":str,"elicitation_id":str|null}',
     "blocked": '{"kind":"blocked","reason":str,"done":[str],"related"?:[{"issue":int,'
-    '"relation":"depends_on|blocks|...","note":str}]}',
+    '"relation":"depends_on|blocks|...","note":str}],"follow_ups"?:[{"issue":int,'
+    '"blocks"?:[int]}]}',
 }
 
 
@@ -404,6 +420,19 @@ def _check_epic_triage(r: EpicTriageResult, expected: Correlation) -> None:
         )
 
 
+def _check_follow_ups(items: list[FollowUp], own: int | None) -> None:
+    numbers = [item.issue for item in items]
+    if len(set(numbers)) != len(numbers):
+        raise ResultError("follow_ups: each issue at most once")
+    if own is not None and own in numbers:
+        raise ResultError("follow_ups: not this issue itself")
+    for item in items:
+        if len(set(item.blocks)) != len(item.blocks):
+            raise ResultError(f"follow_ups: #{item.issue} blocks each issue at most once")
+        if item.issue in item.blocks:
+            raise ResultError(f"follow_ups: #{item.issue} cannot block itself")
+
+
 def epic_plan_hash(result: Mapping[str, object]) -> str:
     """sha256 of an epic plan (a validated ``epic_triage`` result as JSON): binds approval."""
     text = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -444,6 +473,7 @@ def validate_result(result: Mapping[str, object], expected: Correlation) -> Pars
         raise ResultError("related: each issue at most once")
     if expected.issue_number is not None and expected.issue_number in related:
         raise ResultError("related: an issue cannot relate to itself")
+    _check_follow_ups(getattr(r, "follow_ups", []), expected.issue_number)
     contract_bytes: bytes | None = None
     if isinstance(r, BlockedResult):
         pass  # any stage may report that it could not finish
