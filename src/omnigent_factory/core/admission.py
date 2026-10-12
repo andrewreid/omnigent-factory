@@ -132,6 +132,7 @@ ADMISSION: dict[EventKind, Admission] = {
     # display only: another issue's accepted triage named this one
     EventKind.RELATED_MARKED: Admission(_ADAPTER),
     EventKind.EPIC_PROGRESS: Admission(_ADAPTER),
+    EventKind.AGENT_BLOCKED_ON: Admission(_ADAPTER),
     EventKind.AUTOPILOT_STATUS: Admission(_ADAPTER),
     EventKind.AUTOPILOT_GATE_CREATED: Admission(_ADAPTER),
     EventKind.AUTOPILOT_QUESTION: Admission(_ADAPTER),

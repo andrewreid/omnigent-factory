@@ -312,6 +312,12 @@ class FactoryService:
         try:
             for managed in self._managed:
                 await managed.start()
+            if self.native_links is not None:
+                # After the GitHub reconcile (fresh links), before any loop runs.
+                try:
+                    await self.native_links.recover_blocked_on()
+                except Exception:
+                    LOG.warning("blocked-on recovery failed", exc_info=True)
             await self.operator.start()
             self.accepting_admission = True
             if self.config_path is not None:

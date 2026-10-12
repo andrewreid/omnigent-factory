@@ -243,6 +243,14 @@ class BlockedResult(_Strict):
     related: Annotated[list[Related], Field(max_length=20)] = []
 
 
+def blocked_on(r: BlockedResult) -> tuple[int, ...]:
+    """The issues a ``blocked`` result names as its only obstacle: every ``related`` entry
+    is ``depends_on`` (any other relation, or none, is not a wait on other issues)."""
+    if not r.related or any(item.relation != "depends_on" for item in r.related):
+        return ()
+    return tuple(sorted({item.issue for item in r.related}))
+
+
 StageResult = Annotated[
     TriageResult | EpicTriageResult | PlanResult | BuildResult | CheckpointResult | BlockedResult,
     Field(discriminator="kind"),

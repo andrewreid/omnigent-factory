@@ -80,6 +80,8 @@ def project_bot(p: Parcel, *, queued: bool = False) -> BotState:
         return BotState.NEEDS_YOU
     if queued:
         return BotState.QUEUED
+    if Hold.BLOCKERS in p.holds and (cur is None or cur.quiescent):
+        return BotState.IDLE  # waits on open native blockers: nothing to do until they close
     if _running(p):
         return BotState.WORKING
     return BotState.IDLE
@@ -242,9 +244,11 @@ def project_note(p: Parcel, bot: BotState) -> str:
 
 
 def waiting_on_note(p: Parcel) -> str:
-    """``Waiting on #823``: a queued auto-build mark held by open blockers ("" if none)."""
+    """``Waiting on #823``: a queued auto-build mark, a held approval or a parked build run
+    waiting on open native blockers ("" if none)."""
     mark = p.auto_build
-    if mark is None or mark.status != AutoBuildStatus.QUEUED or p.links is None:
+    queued = mark is not None and mark.status == AutoBuildStatus.QUEUED
+    if not (queued or Hold.BLOCKERS in p.holds) or p.links is None:
         return ""
     blockers = p.links.open_blockers
     return f"Waiting on {blockers_text(blockers)}" if blockers else ""

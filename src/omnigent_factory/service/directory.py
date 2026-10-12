@@ -248,6 +248,10 @@ class ServiceDispatchDirectory:
                 reason=str(effect.args.get("reason") or "")[:500],
                 run_id=sid,
             )
+        if purpose == "blockers_closed":
+            return _template("blockers-closed-v1.txt").format(
+                blockers=str(effect.args.get("blockers") or "the blocking issues"), run_id=sid
+            )
         if purpose == "operator_note":
             note = str(effect.args.get("text") or "").strip()
             if not note:

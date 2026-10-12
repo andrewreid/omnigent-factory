@@ -146,7 +146,7 @@ NONCE_LABEL = "factory.dispatch"
 #: Retry delay after a Git lock of the shared clone outlasted the short in-process retry.
 GIT_LOCK_RETRY_US = 5_000_000
 #: Message purposes sent within a running stage: they never sync the worktree.
-_MID_STAGE = frozenset({"feedback", "readiness_wake"})
+_MID_STAGE = frozenset({"feedback", "readiness_wake", "blockers_closed"})
 _TURN_ITEM_TYPES = frozenset(
     {"message", "function_call", "function_call_output", "reasoning", "custom_tool_call"}
 )

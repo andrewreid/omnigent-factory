@@ -207,6 +207,9 @@ class Hold(enum.StrEnum):
     #: Terminal: the linked PR merged or the issue closed. Late checks, heads, reviews and
     #: readiness reads are audit only; only a fresh owner stage control starts again.
     COMPLETED = "completed"
+    #: Waiting on open native "blocked by" issues (the approval stands): Idle, no build
+    #: slot. A fresh read showing every blocker closed starts or wakes the build once.
+    BLOCKERS = "blockers"
 
 
 class InboxHoldReason(enum.StrEnum):
@@ -273,6 +276,7 @@ CONTROL_CLEARED_HOLDS = frozenset(
         Hold.PUBLICATION_PENDING,
         Hold.AGENT_BLOCKED,
         Hold.COMPLETED,
+        Hold.BLOCKERS,
     }
 )
 
@@ -961,6 +965,11 @@ class Parcel:
     slot_parked: bool = False
     #: Messages for the parked run, held until it is re-admitted (``HeldWake``).
     held_wakes: tuple[HeldWake, ...] = ()
+    #: Issues the build run's ``blocked`` result named as its only obstacle (its
+    #: ``depends_on`` entries): it waits on them once they are open native blockers.
+    blocked_on: tuple[int, ...] = ()
+    #: The time block of an approval held while native blockers are open (0 = none).
+    held_build_us: int = 0
     #: An epic's progress note (``Epic · 1/8 done · next: #823``), set by the factory's
     #: board pass only when it changes ("" = none).
     epic_note: str = ""

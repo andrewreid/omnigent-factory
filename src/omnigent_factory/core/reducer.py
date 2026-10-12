@@ -774,6 +774,7 @@ def _void_approval(ctx: _Ctx, reason: str) -> bool:
     if a is None:
         return False
     _drop_queued_move(ctx)
+    _end_blocker_wait(ctx)
     if a.valid:
         ctx.put_approval(replace(a, invalidated_reason=reason, invalidated_at_us=ctx.now))
     ctx.update(current_approval_id=None)
@@ -815,6 +816,7 @@ def _safety(ctx: _Ctx, reason: str, *, fence: FenceKind = FenceKind.SAFETY) -> N
             _begin_drain(ctx, s, fences=frozenset({fence}))
     ctx.hold(Hold.STOPPED if fence == FenceKind.STOPPED else Hold.SAFETY)
     ctx.unhold(Hold.AWAITING_OWNER)
+    _end_blocker_wait(ctx)  # a stopped issue never resumes by itself
     _ = reason
 
 
@@ -1332,6 +1334,7 @@ def _build_blocked_by_live(ctx: _Ctx) -> bool:
 
 def _after_approval(ctx: _Ctx, approval: Approval, duration_us: int, via: Via | None) -> None:
     ctx.unhold(*CONTROL_CLEARED_HOLDS)
+    _end_blocker_wait(ctx)
     ctx.update(readiness_wakes=0, findings_wakes=0)  # a new approved deliverable: own wakes
     _cancel_pending(ctx)
     _move(ctx, Stage.BUILDING, via)
@@ -1496,6 +1499,138 @@ def _refuse_epic_build(ctx: _Ctx, rollback: Stage | None) -> None:
     links = ctx.p.links
     if links is not None and links.epic:
         raise Rejected("epic", explain=True, rollback_to=rollback, note=EPIC_BUILD_NOTE)
+
+
+def _held_by_blockers(ctx: _Ctx, via: Via) -> bool:
+    """A plan approval other than the owner's drag (``/approve``) given in Planning while
+    the issue has open native blockers waits for them; a drag force-starts the build."""
+    links = ctx.p.links
+    return (
+        via != Via.DRAG
+        and ctx.origin_stage == Stage.SCOPED
+        and links is not None
+        and bool(links.open_blockers)
+    )
+
+
+def _hold_approval(ctx: _Ctx, duration_us: int) -> None:
+    """Record the approval and wait (Idle in Planning, no build slot): a fresh read
+    showing every blocker closed starts it once (``_settle_blockers``)."""
+    ctx.unhold(*CONTROL_CLEARED_HOLDS)
+    _cancel_pending(ctx)
+    ctx.hold(Hold.BLOCKERS)
+    ctx.update(held_build_us=duration_us, blocked_on=(), note="")
+
+
+def _approval_held(ctx: _Ctx) -> bool:
+    """The current plan approval waits on open blockers in Planning (``_hold_approval``)."""
+    a = ctx.p.current_approval
+    return (
+        Hold.BLOCKERS in ctx.p.holds
+        and ctx.p.held_build_us > 0
+        and ctx.p.stage == Stage.SCOPED
+        and a is not None
+        and a.valid
+        and a.kind == ApprovalKind.PLAN
+        and not _approval_active(ctx)
+    )
+
+
+def _end_blocker_wait(ctx: _Ctx) -> None:
+    ctx.unhold(Hold.BLOCKERS)
+    if ctx.p.held_build_us or ctx.p.blocked_on:
+        ctx.update(held_build_us=0, blocked_on=())
+
+
+def _approved_build_run(ctx: _Ctx) -> StageSession | None:
+    """The current approval's build run, open and unfenced (busy or idle)."""
+    s = ctx.p.current_session
+    a = ctx.p.current_approval
+    auth = ctx.p.authorization(s.authorization_id) if s is not None else None
+    if (
+        s is None
+        or s.kind != SessionKind.BUILD
+        or s.lifecycle != Lifecycle.ACTIVE
+        or s.fences
+        or s.execution_closed
+        or a is None
+        or not a.valid
+        or auth is None
+        or auth.approval_id != a.approval_id
+    ):
+        return None
+    return s
+
+
+def _settle_blockers(ctx: _Ctx) -> None:
+    """After every event: a build run that reported blocked only on other issues waits
+    (Idle, no slot) once each is an open native blocker; a wait on blockers ends when an
+    event's fresh read shows none open, starting the held approval or waking the run once.
+    Nothing resumes after a stop or safety fact, or on a closed or ineligible issue."""
+    p = ctx.p
+    if p.blocked_on and Hold.AGENT_BLOCKED not in p.holds:
+        ctx.update(blocked_on=())  # the blocked report was answered (or replaced)
+    elif p.blocked_on and p.links is not None and _approved_build_run(ctx) is not None:
+        open_ = {b.number for b in p.links.open_blockers if not b.repo}
+        if set(p.blocked_on) <= open_:
+            ctx.unhold(Hold.AGENT_BLOCKED)
+            ctx.hold(Hold.BLOCKERS)
+            ctx.update(blocked_on=(), held_build_us=0)
+    if Hold.BLOCKERS not in ctx.p.holds:
+        return
+    snap = ctx.event.evidence
+    if snap is None or snap.links is None or snap.links.open_blockers:
+        return
+    p = ctx.p
+    if p.holds & {Hold.STOPPED, Hold.SAFETY, Hold.COMPLETED} or not dispatchable(p):
+        _end_blocker_wait(ctx)
+        return
+    if not approval_ok(p):
+        _end_blocker_wait(ctx)
+        return
+    s = _approved_build_run(ctx)
+    if (
+        board_pending(p)
+        or p.open_decisions
+        or p.revision_pending
+        or (s is not None and not _idle_run(s))
+    ):
+        return  # judged again on a later fresh read (a run still ending its turn)
+    a = p.current_approval
+    assert a is not None  # noqa: S101 - approval_ok
+    if _approval_held(ctx):
+        _after_approval(ctx, a, p.held_build_us, None)  # ends the wait; admitted as usual
+        return
+    _end_blocker_wait(ctx)
+    if s is None:
+        return
+    if not work_allowed(ctx.p, s):
+        ctx.hold(Hold.AGENT_BLOCKED)  # cannot be woken now: Blocked, as before
+        return
+    closed = blockers_text(snap.links.blocked_by) if snap.links.blocked_by else "its blockers"
+    s = ctx.put_session(replace(s, quiescent=False, comment_pending=False))
+    _ensure_issuance(ctx, s)
+    ctx.emit(
+        EffectKind.SEND_MESSAGE,
+        session=s,
+        args={"purpose": MessagePurpose.BLOCKERS_CLOSED.value, "blockers": closed},
+    )
+    ctx.note(f"Blockers closed ({closed}): the build resumes")
+
+
+def _h_agent_blocked_on(ctx: _Ctx, body: ev.AgentBlockedOn) -> None:
+    """Boot recovery: the issues a blocked build run's stored result waits on."""
+    s = ctx.p.current_session
+    if s is None or s.session_id != body.session_id or s.kind != SessionKind.BUILD:
+        raise Rejected("agent-blocked-on-not-current-build")
+    if Hold.AGENT_BLOCKED not in ctx.p.holds:
+        raise Rejected("agent-not-blocked")
+    issues = tuple(sorted({n for n in body.issues if n >= 1 and n != ctx.p.issue_number}))
+    if not issues:
+        raise Rejected("agent-blocked-on-empty")
+    if issues == ctx.p.blocked_on:
+        raise Rejected("agent-blocked-on-recorded")
+    ctx.update(blocked_on=issues)
 
 
 def _started_despite_blockers(ctx: _Ctx) -> None:
@@ -2490,7 +2625,7 @@ def _continue_answered(ctx: _Ctx, s: StageSession) -> bool:
 def _relay_comment(ctx: _Ctx, s: StageSession, digest: str = "") -> None:
     """Relay an owner comment to an idle run once; it is not re-sent until the tree has
     been seen idle again, so a burst of comments becomes one message."""
-    ctx.unhold(Hold.AGENT_BLOCKED, Hold.RESULT_INVALID)  # the owner's steer answers it
+    ctx.unhold(Hold.AGENT_BLOCKED, Hold.RESULT_INVALID, Hold.BLOCKERS)  # the owner's steer
     s = ctx.put_session(replace(s, quiescent=False, comment_pending=False))
     _ensure_issuance(ctx, s)
     ctx.emit(
@@ -2622,9 +2757,15 @@ def _h_approve_plan(ctx: _Ctx, body: ev.ApprovePlan) -> None:
         raise Rejected("contract-not-posted-before-control", explain=True, rollback_to=rollback)
     size = latest.size
     duration = _grant_duration(ctx, body.duration_us, size)
+    held = _held_by_blockers(ctx, body.via)
+    if held and a is not None and a.full_hash == latest.full_hash and _approval_held(ctx):
+        return  # already approved and waiting on the same blockers
     approval = _new_approval(
         ctx, ApprovalKind.PLAN, latest.full_hash, contract_id=latest.contract_id
     )
+    if held:
+        _hold_approval(ctx, duration)
+        return
     _after_approval(ctx, approval, duration, body.via)
     _started_despite_blockers(ctx)
 
@@ -3210,7 +3351,7 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
             ctx.note(f"Kept in Building: {why}")
             return
         _retire_ready_run(ctx, run, r)
-        ctx.unhold(*_READY_CLEARED_HOLDS, Hold.AGENT_BLOCKED)
+        ctx.unhold(*_READY_CLEARED_HOLDS, Hold.AGENT_BLOCKED, Hold.BLOCKERS)
     if not body.verified:
         ctx.update(readiness=replace(r, verified=False))
         if in_ready:
@@ -3402,7 +3543,9 @@ def _run_unfinished(ctx: _Ctx, s: StageSession, *, owner_moved: bool = False) ->
     alternate complete/incomplete, and an incomplete one clears ``quiescent``).
     """
     waiting = s.lifecycle == Lifecycle.WAITING and s.wait_reason == WaitReason.CHECKS
-    reported = (_idle_run(s) and Hold.AGENT_BLOCKED in ctx.p.holds) or _wake_answered(ctx, s)
+    reported = (
+        _idle_run(s) and bool(ctx.p.holds & {Hold.AGENT_BLOCKED, Hold.BLOCKERS})
+    ) or _wake_answered(ctx, s)
     if s.fences or not ((waiting and (s.quiescent or owner_moved)) or reported):
         return "the build run is still working"
     if ctx.p.open_decisions:
@@ -4649,6 +4792,8 @@ def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
     if body.result_kind == ev.ResultKind.BLOCKED:
         # Honest "could not finish": Blocked with the agent's reason; nothing inferred.
         ctx.hold(Hold.AGENT_BLOCKED)
+        # Only other issues stop it: it waits instead once each is an open native blocker.
+        ctx.update(blocked_on=body.blocked_on if s.kind == SessionKind.BUILD else ())
         ctx.emit(EffectKind.PUBLISH_REPORT, args={"report": "blocked", "session_id": s.session_id})
         return
     if body.result_kind == ev.ResultKind.TRIAGE:
@@ -5057,7 +5202,7 @@ def _h_operator_resume(ctx: _Ctx, body: ev.OperatorResume) -> None:
     if not body.text.strip():
         raise Rejected("empty-note")
     _close_stale_decisions(ctx)
-    ctx.unhold(Hold.RESULT_INVALID, Hold.AGENT_BLOCKED)
+    ctx.unhold(Hold.RESULT_INVALID, Hold.AGENT_BLOCKED, Hold.BLOCKERS)
     s = _session(ctx, s.session_id)
     if s.lifecycle == Lifecycle.WAITING and s.wait_reason == WaitReason.DECISION:
         s = ctx.put_session(replace(s, lifecycle=Lifecycle.ACTIVE, wait_reason=None))
@@ -5168,6 +5313,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.AUTOPILOT_QUESTION: _h_autopilot_question,
     EventKind.RELATED_MARKED: _h_related_marked,
     EventKind.EPIC_PROGRESS: _h_epic_progress,
+    EventKind.AGENT_BLOCKED_ON: _h_agent_blocked_on,
     EventKind.CONTRACT_PUBLISHED: _h_contract_published,
     EventKind.PUBLICATION_ACKED: _h_publication_acked,
     EventKind.SESSION_CREATED: _h_session_created,
@@ -5312,6 +5458,8 @@ def build_parked(p: Parcel) -> bool:
         return False
     if s.lifecycle == Lifecycle.WAITING and s.wait_reason == WaitReason.CHECKS:
         return True
+    if Hold.BLOCKERS in p.holds:
+        return True  # waits on open native blockers (Idle)
     return project_bot(p) in (BotState.BLOCKED, BotState.NEEDS_YOU)
 
 
@@ -5592,6 +5740,7 @@ def transition(state: State, event: Event) -> TransitionResult:
         _settle_observed_move(ctx, accepted)
         _settle_auto_build(ctx)
         _settle_autopilot(ctx)
+        _settle_blockers(ctx)
         _settle_build_slot(ctx)
         _project_board(ctx)
         new_parcel = ctx.p

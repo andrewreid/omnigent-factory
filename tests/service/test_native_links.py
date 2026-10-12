@@ -348,3 +348,88 @@ async def test_each_board_diff_runs_the_epic_pass(service_config: ServiceConfig)
         r.service.native_links = Native()
         await r.service._board_diff_tick(0.0, frozenset())
         assert passes == [1]
+
+
+class _StoreService:
+    """Just what boot recovery uses: the store as the DB worker, and ``apply_event``."""
+
+    def __init__(self, store: Any, h: Harness) -> None:
+        from types import SimpleNamespace
+
+        self.store, self.trusted = store, h.cfg
+        self.config = SimpleNamespace(repo_id=h.cfg.repo_id)
+        self.clock = SimpleNamespace(now_utc_us=lambda: 10**18)
+        self.applied: list[ev.Event] = []
+
+        async def call(fn: Any) -> Any:
+            return fn(store)
+
+        self.db = SimpleNamespace(call=call)
+
+    async def apply_event(self, event: ev.Event) -> Any:
+        self.applied.append(event)
+        return self.store.apply_event(event, self.trusted)
+
+
+def _blocked_store(tmp_path: Any, related: list[dict[str, object]]) -> tuple[Any, Harness, Any]:
+    from omnigent_factory.store.sqlite import SqliteStore
+    from omnigent_factory.testing.fakes import FakeClock
+    from tests.test_wait_on_blockers import A, building_with_blocker, report_blocked
+
+    h = Harness()
+    building_with_blocker(h)
+    report_blocked(h, ())  # accepted before the reducer kept ``blocked_on``
+    store = SqliteStore.open(tmp_path / "factory.sqlite3", FakeClock())
+    store.ensure_repository(h.cfg)
+    store.query("UPDATE repositories SET paused = 0")  # as the harness ran it
+    for event, _ in h.log:
+        store.apply_event(event, h.cfg)
+    run = h.cur(A).session_id
+    result = {"kind": "blocked", "reason": "waits for #904", "done": [], "related": related}
+    stored = {run: {"factory_result": {"result": result}}}
+
+    async def read() -> list[RankingCard]:
+        return []
+
+    service = _StoreService(store, h)
+    native = NativeLinks(service, FakeClient({}), stored.get, read)  # type: ignore[arg-type]
+    return store, service, native
+
+
+@pytest.mark.asyncio
+async def test_boot_recovery_turns_a_blocked_run_into_a_wait_on_its_blockers(tmp_path: Any):
+    """#888: Blocked by a stored ``blocked`` result naming only #904 (an open native
+    blocker), accepted before the reducer kept it: boot recovery makes it wait, once."""
+    from omnigent_factory.core.types import BotState, Hold
+    from tests.test_wait_on_blockers import BLOCKED, A
+
+    related = [{"issue": 904, "relation": "depends_on", "note": "register"}]
+    store, service, native = _blocked_store(tmp_path, related)
+    try:
+        assert Hold.AGENT_BLOCKED in store.load_parcel(A).holds
+        assert await native.recover_blocked_on() == 1
+        [event] = service.applied
+        assert event.body == ev.AgentBlockedOn(session_id=event.body.session_id, issues=(904,))
+        parcel = store.load_parcel(A)
+        assert parcel.links == BLOCKED and parcel.bot == BotState.IDLE
+        assert Hold.BLOCKERS in parcel.holds and Hold.AGENT_BLOCKED not in parcel.holds
+        assert await native.recover_blocked_on() == 0  # nothing left to recover
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_boot_recovery_leaves_other_blocked_results_blocked(tmp_path: Any):
+    from omnigent_factory.core.types import Hold
+    from tests.test_wait_on_blockers import A
+
+    related = [
+        {"issue": 904, "relation": "depends_on", "note": "register"},
+        {"issue": 905, "relation": "overlaps", "note": "x"},
+    ]
+    store, service, native = _blocked_store(tmp_path, related)
+    try:
+        assert await native.recover_blocked_on() == 0 and not service.applied
+        assert Hold.AGENT_BLOCKED in store.load_parcel(A).holds
+    finally:
+        store.close()

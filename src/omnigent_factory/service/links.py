@@ -16,6 +16,9 @@ and re-read issues whose links changed.
   issue that blocks (or is a sub-issue of) a known issue, re-reads each affected issue of
   the repository the factory knows, so its links (and an auto-build waiting on a blocker)
   update without waiting for the board diff.
+* **Boot recovery.** A build run Blocked by a ``blocked`` result that names only other
+  issues, accepted before the reducer kept them, gets them from its stored result: it
+  then waits on those issues as open native blockers and resumes when they close.
 """
 
 from __future__ import annotations
@@ -27,11 +30,14 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from functools import partial
 from typing import Any
 
+from pydantic import ValidationError
+
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.codec import parcel_from_json
 from omnigent_factory.core.effects import EffectIntent, RetryableReadFailure
 from omnigent_factory.core.events import Event, Provenance
-from omnigent_factory.core.types import Parcel
+from omnigent_factory.core.protocol import BlockedResult, blocked_on
+from omnigent_factory.core.types import Hold, Parcel, SessionKind
 from omnigent_factory.github.client import GitHubAPIError, GitHubClient
 from omnigent_factory.github.links import (
     add_blocked_by,
@@ -312,6 +318,58 @@ class NativeLinks:
             LOG.warning("epic issue type failed issue=#%s reason=%s", number, exc)
             return
         LOG.info("epic issue type set issue=#%s", number)
+
+    # ------------------------------------------------------------------ boot recovery
+
+    async def recover_blocked_on(self) -> int:
+        """Boot: a build run Blocked by a ``blocked`` result accepted before the reducer kept
+        the issues it waits on (``ResultCandidate.blocked_on``) gets them from its stored
+        result, so a wait on open native blockers resumes by itself; returns how many."""
+        repo_id = self.service.config.repo_id
+        rows = await self.service.db.call(
+            lambda store: store.query(
+                "SELECT aggregate_json FROM parcels WHERE repo_id = ? AND EXISTS (SELECT 1 "
+                "FROM json_each(aggregate_json, '$.parcel.holds') WHERE value = ?)",
+                (repo_id, Hold.AGENT_BLOCKED.value),
+            )
+        )
+        applied = 0
+        for row in rows:
+            parcel = parcel_from_json(str(row[0]))
+            run = parcel.current_session
+            if run is None or run.kind != SessionKind.BUILD or parcel.blocked_on:
+                continue
+            stored = self.results(run.session_id)
+            record = stored.get("factory_result") if stored is not None else None
+            body = record.get("result") if isinstance(record, dict) else None
+            if not isinstance(body, dict) or body.get("kind") != "blocked":
+                continue
+            try:
+                issues = blocked_on(BlockedResult.model_validate(body))
+            except ValidationError:
+                continue
+            if not issues:
+                continue
+            now = self.service.clock.now_utc_us()
+            result = await self.service.apply_event(
+                Event(
+                    event_id=f"agent-blocked-on:{run.session_id}",
+                    repo_id=repo_id,
+                    parcel_id=parcel.parcel_id,
+                    source_time_us=now,
+                    provenance=Provenance.ADAPTER,
+                    body=ev.AgentBlockedOn(session_id=run.session_id, issues=issues),
+                    issue_number=parcel.issue_number,
+                )
+            )
+            if result.accepted:
+                applied += 1
+                LOG.info(
+                    "blocked build waits on issues issue=#%s waits_on=%s",
+                    parcel.issue_number,
+                    ",".join(f"#{n}" for n in issues),
+                )
+        return applied
 
     # ------------------------------------------------------------------ re-reads
 

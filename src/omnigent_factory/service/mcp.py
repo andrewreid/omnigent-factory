@@ -45,6 +45,7 @@ from omnigent_factory.core.events import Event, EventKind, Provenance
 from omnigent_factory.core.predicates import continued, work_allowed
 from omnigent_factory.core.protocol import (
     RESULT_SHAPES,
+    BlockedResult,
     BuildResult,
     Correlation,
     EpicTriageResult,
@@ -52,6 +53,7 @@ from omnigent_factory.core.protocol import (
     PlanResult,
     ResultError,
     TriageResult,
+    blocked_on,
     epic_plan_hash,
     validate_result,
 )
@@ -1237,7 +1239,11 @@ def _candidate(run: StageSession, parsed: ParsedResult) -> ev.ResultCandidate:
         )
     if r.kind == "checkpoint":
         return ev.ResultCandidate(**base, result_kind=ev.ResultKind.CHECKPOINT)  # type: ignore[arg-type]
-    return ev.ResultCandidate(**base, result_kind=ev.ResultKind.BLOCKED)  # type: ignore[arg-type]
+    return ev.ResultCandidate(
+        **base,  # type: ignore[arg-type]
+        result_kind=ev.ResultKind.BLOCKED,
+        blocked_on=blocked_on(r) if isinstance(r, BlockedResult) else (),
+    )
 
 
 def _checkpoint_from_blocked(payload: Mapping[str, Any], run: StageSession) -> dict[str, Any]:
@@ -1288,6 +1294,8 @@ def _expected_next(parcel: Parcel, run: StageSession | None) -> str:
             return "Wait: CI and review evidence are being checked; you may be woken once."
     if Hold.AGENT_BLOCKED in parcel.holds:
         return "Blocked reported: wait for the owner or operator."
+    if Hold.BLOCKERS in parcel.holds:
+        return "Waiting on open blocking issues: you are woken once every one is closed."
     return {
         SessionKind.TRIAGE: "Triage the issue and submit kind triage.",
         SessionKind.PLAN: "Plan and submit kind plan.",

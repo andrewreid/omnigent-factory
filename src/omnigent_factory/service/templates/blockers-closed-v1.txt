@@ -1,0 +1,4 @@
+Factory: build run {run_id} waited on {blockers}; every blocking issue is now closed. The
+approval stands: re-read the plan (factory_get_plan) and any new owner comments
+(factory_get_feedback), check what the blockers changed, and continue the build. Then submit
+build_ready, or kind "blocked" with the reason if something else still stops you.

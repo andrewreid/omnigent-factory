@@ -110,6 +110,7 @@ class EventKind(enum.StrEnum):
     ISSUE_SESSION_CLOSED = "IssueSessionClosed"
     RELATED_MARKED = "RelatedMarked"
     EPIC_PROGRESS = "EpicProgress"
+    AGENT_BLOCKED_ON = "AgentBlockedOn"
     AUTOPILOT_STATUS = "AutopilotStatus"
     AUTOPILOT_GATE_CREATED = "AutopilotGateCreated"
     AUTOPILOT_QUESTION = "AutopilotQuestion"
@@ -865,6 +866,18 @@ class EpicProgress(_Body):
 
 
 @dataclass(frozen=True, slots=True)
+class AgentBlockedOn(_Body):
+    """The issues the current build run's stored ``blocked`` result names as its only
+    obstacle (``ResultCandidate.blocked_on``), for a result accepted before the reducer
+    kept them. Recovered once at boot from the stored result; never authority."""
+
+    KIND: ClassVar[EventKind] = EventKind.AGENT_BLOCKED_ON
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    session_id: str = ""
+    issues: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class AutopilotStatus(_Body):
     """The autopilot pass's view of this epic: its card note (``Epic · 3/9 done ·
     autopilot: planning #882, next #883``) and why it is paused ("" = not paused).
@@ -925,6 +938,10 @@ class ResultCandidate(_Body):
     #: A plan of an autopilot sub-issue: "within" its part of the epic plan, "exceeds",
     #: or None (not given).
     epic_fit: str | None = None
+    #: A ``blocked`` result whose only obstacle is other issues (every ``related`` entry is
+    #: ``depends_on``): those issues. The run waits instead of showing Blocked while each
+    #: is an open native blocker of this issue.
+    blocked_on: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1078,6 +1095,7 @@ EventBody = (
     | IssueSessionClosed
     | RelatedMarked
     | EpicProgress
+    | AgentBlockedOn
     | AutopilotStatus
     | AutopilotGateCreated
     | AutopilotQuestion
@@ -1158,6 +1176,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         IssueSessionClosed,
         RelatedMarked,
         EpicProgress,
+        AgentBlockedOn,
         AutopilotStatus,
         AutopilotGateCreated,
         AutopilotQuestion,
@@ -1224,6 +1243,7 @@ __all__ = [
     "ActiveLimitReached",
     "ActiveTimeSample",
     "AdoptionResult",
+    "AgentBlockedOn",
     "ApprovalInvalidated",
     "ApprovePlan",
     "AssignedHuman",

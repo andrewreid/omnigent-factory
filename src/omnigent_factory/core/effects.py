@@ -106,6 +106,8 @@ class MessagePurpose(enum.StrEnum):
     OPERATOR_NOTE = "operator_note"
     #: One wake after fresh current-head evidence shows a failure the build can fix.
     READINESS_WAKE = "readiness_wake"
+    #: One wake of a build run that waited on open native blockers: all are closed now.
+    BLOCKERS_CLOSED = "blockers_closed"
 
 
 class RetryClass(enum.StrEnum):
