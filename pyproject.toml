@@ -34,6 +34,7 @@ dev = [
     "pytest>=8.4",
     "pytest-asyncio>=1.0",
     "ruff>=0.12",
+    "types-pyyaml>=6.0.12.20260906",
 ]
 
 [tool.pytest.ini_options]
@@ -81,6 +82,6 @@ module = "tests.*"
 disallow_untyped_defs = false
 
 [tool.uv.sources]
-omnigent-client = { git = "https://github.com/omnigent-ai/omnigent.git", rev = "1c0153aa87cb7c0eff57b3a3169a4f94b5967c6d", subdirectory = "sdks/python-client" }
-omnigent = { git = "https://github.com/omnigent-ai/omnigent.git", rev = "1c0153aa87cb7c0eff57b3a3169a4f94b5967c6d" }
-omnigent-ui-sdk = { git = "https://github.com/omnigent-ai/omnigent.git", rev = "1c0153aa87cb7c0eff57b3a3169a4f94b5967c6d", subdirectory = "sdks/ui" }
+omnigent-client = { git = "https://github.com/omnigent-ai/omnigent.git", rev = "addc3cb87ee0fa860f982082a2ce656fd14c8ab7", subdirectory = "sdks/python-client" }
+omnigent = { git = "https://github.com/omnigent-ai/omnigent.git", rev = "addc3cb87ee0fa860f982082a2ce656fd14c8ab7" }
+omnigent-ui-sdk = { git = "https://github.com/omnigent-ai/omnigent.git", rev = "addc3cb87ee0fa860f982082a2ce656fd14c8ab7", subdirectory = "sdks/ui" }
