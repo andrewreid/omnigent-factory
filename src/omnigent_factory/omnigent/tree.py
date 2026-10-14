@@ -112,6 +112,13 @@ class TreeObservation:
     complete: bool
     nodes: Mapping[str, NodeState]
     errors: tuple[str, ...] = ()
+    #: Remembered node IDs (from earlier scans only) the server no longer has (404):
+    #: deleted sessions, forgotten by the caller rather than retried forever.
+    gone: frozenset[str] = frozenset()
+    #: Nodes this walk or the inventory listed whose snapshot was not found (404): an
+    #: error here (the scan stays incomplete); the inventory may list a deleted session
+    #: until its next full read.
+    not_found: frozenset[str] = frozenset()
 
     @property
     def busy(self) -> bool:
@@ -268,10 +275,21 @@ async def finish_scan(
     known_ids: Iterable[str] = (),
     max_nodes: int = DEFAULT_MAX_NODES,
 ) -> TreeObservation:
-    """Step 3: read every node's current snapshot, root included."""
+    """Step 3: read every node's current snapshot, root included.
+
+    A node known only from earlier scans (absent from this walk and the inventory) whose
+    snapshot is not found was deleted: it is reported ``gone``, not an error, so one
+    deleted descendant never keeps every later scan incomplete (#889). Any other failed
+    read (a node this walk found, the root, a 5xx, a timeout, auth) stays an error.
+    """
+    remembered: set[str] = set()
     for kid in known_ids:
         if kid not in walk.parents:
             walk.parents[kid] = None  # retained: parent resolved from its snapshot
+            remembered.add(kid)
+    remembered.discard(root_id)
+    gone: set[str] = set()
+    not_found: set[str] = set()
     nodes: dict[str, NodeState] = {}
     pending = list(walk.parents.items())
     attempted: set[str] = set()
@@ -286,6 +304,11 @@ async def finish_scan(
         try:
             snap = await rest.get_json(f"/v1/sessions/{node_id}")
         except OmnigentReadError as exc:
+            if exc.status == 404 and node_id in remembered:
+                gone.add(node_id)
+                continue
+            if exc.status == 404:
+                not_found.add(node_id)
             walk.errors.append(f"snapshot {node_id}: {exc.reason}")
             continue
         node = node_from_snapshot(node_id, parent, snap, walk.summaries.get(node_id))
@@ -300,7 +323,14 @@ async def finish_scan(
                 pending.append((target, None))
     for event_owner in _unread_mirror_owners(nodes):
         walk.errors.append(f"mirrored prompt owner unread: {event_owner}")
-    return TreeObservation(root_id, not walk.errors, nodes, tuple(walk.errors))
+    return TreeObservation(
+        root_id,
+        not walk.errors,
+        nodes,
+        tuple(walk.errors),
+        gone=frozenset(gone),
+        not_found=frozenset(not_found),
+    )
 
 
 def _unread_mirror_owners(nodes: Mapping[str, NodeState]) -> list[str]:

@@ -73,6 +73,11 @@ class SessionIndex:
     def set_resync(self, seconds: float) -> None:
         self._resync_us = int(seconds * 1_000_000)
 
+    def resync_soon(self) -> None:
+        """Make the next read a full one: it drops sessions deleted since the last (a
+        deleted descendant the incremental reads still list, #889)."""
+        self._full_read_at_us = None
+
     def children(self, session_id: str) -> Iterable[str]:
         return tuple(sorted(self._children.get(session_id, ())))
 

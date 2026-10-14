@@ -361,3 +361,59 @@ async def test_an_observer_pass_shares_one_inventory_read(git_env: GitEnv) -> No
     for result in failed:
         assert not isinstance(result, Exception)
         assert not result.complete and not result.quiescent
+
+
+async def test_a_deleted_descendant_is_forgotten_and_never_keeps_scans_incomplete(
+    git_env: GitEnv, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#889: the adapter remembered every node it ever saw; one deleted descendant then
+    404'd on every scan (incomplete for the whole 30-minute drain), and nothing logged
+    why. A remembered node the server no longer has is forgotten; an incomplete scan logs
+    its read errors, rate-limited."""
+    rig = make_rig(git_env, page_limit=100)
+    rig.adapter.set_inventory_resync(0)  # every inventory read is a full read
+    rig.server.add(FakeSession(id=ROOT, agent_id=AGENT, created_at=NEW))
+    rig.server.add(
+        FakeSession(id="conv_sub", agent_id=AGENT, parent_session_id=ROOT, created_at=NEW)
+    )
+    assert "conv_sub" in (await rig.adapter.observe_tree(ROOT)).nodes
+    rig.server.sessions.pop("conv_sub")  # deleted on the server
+    obs = await rig.adapter.observe_tree(ROOT)
+    assert obs.complete and obs.quiescent and obs.gone == frozenset({"conv_sub"})
+    assert rig.adapter._known_nodes[ROOT] == {ROOT}
+    assert (await rig.adapter.observe_tree(ROOT)).quiescent
+    # A genuine read failure stays incomplete and is logged once per error set.
+    rig.server.add(
+        FakeSession(id="conv_sub2", agent_id=AGENT, parent_session_id=ROOT, created_at=NEW)
+    )
+    rig.server.fail_paths = {"/v1/sessions/conv_sub2"}
+    with caplog.at_level("WARNING", logger="omnigent_factory.omnigent.adapter"):
+        for _ in range(3):
+            assert not (await rig.adapter.observe_tree(ROOT)).complete
+    logged = [r.getMessage() for r in caplog.records if "incomplete" in r.getMessage()]
+    assert len(logged) == 1
+    assert ROOT in logged[0] and "conv_sub2" in logged[0] and "HTTP 503" in logged[0]
+    rig.clock.advance(11 * 60 * 1_000_000)
+    with caplog.at_level("WARNING", logger="omnigent_factory.omnigent.adapter"):
+        assert not (await rig.adapter.observe_tree(ROOT)).complete
+    assert len([r for r in caplog.records if "incomplete" in r.getMessage()]) == 2
+
+
+async def test_a_descendant_deleted_since_the_last_full_inventory_read_is_gone_next_scan(
+    git_env: GitEnv,
+) -> None:
+    """The incremental inventory still lists a session deleted since its last full read:
+    that scan stays incomplete (listed, not found), and forces the next read to be full,
+    so the following scan completes (#889)."""
+    rig = make_rig(git_env, page_limit=100)
+    rig.server.add(FakeSession(id=ROOT, agent_id=AGENT, created_at=NEW))
+    rig.server.add(
+        FakeSession(id="conv_sub", agent_id=AGENT, parent_session_id=ROOT, created_at=NEW)
+    )
+    assert (await rig.adapter.observe_tree(ROOT)).quiescent
+    rig.server.sessions.pop("conv_sub")
+    obs = await rig.adapter.observe_tree(ROOT)
+    assert not obs.complete and obs.not_found == frozenset({"conv_sub"})
+    obs = await rig.adapter.observe_tree(ROOT)
+    assert obs.complete and obs.quiescent and obs.gone == frozenset({"conv_sub"})
+    assert (await rig.adapter.observe_tree(ROOT)).quiescent

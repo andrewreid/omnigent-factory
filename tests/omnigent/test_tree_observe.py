@@ -416,3 +416,27 @@ async def test_elicitation_summary_is_redacted_and_bounded() -> None:
     assert text.startswith("claude_sdk_permission: Claude wants to use **Bash** (Bash(")
     assert "abcdefghijkl" not in text and "ghp_" not in text and "[redacted]" in text
     assert len(text) <= 300
+
+
+async def test_a_remembered_node_the_server_deleted_is_gone_not_an_error() -> None:
+    """#889: a descendant known only from earlier scans was deleted (404): the scan is
+    complete and reports it gone, instead of staying incomplete on every later scan."""
+    _, rest = _server()
+    obs = await scan_tree(rest, ROOT, known_ids=[ROOT, "conv_deleted"])
+    assert obs.complete and obs.quiescent and not obs.errors
+    assert obs.gone == frozenset({"conv_deleted"}) and "conv_deleted" not in obs.nodes
+
+
+async def test_a_remembered_node_whose_read_fails_otherwise_keeps_the_scan_incomplete() -> None:
+    server, rest = _server()
+    server.add(FakeSession(id="conv_c", agent_id=AGENT, parent_session_id="conv_x"))
+    server.fail_paths = {"/v1/sessions/conv_c"}  # 503: unknown, never gone
+    obs = await scan_tree(rest, ROOT, known_ids=["conv_c"])
+    assert not obs.complete and not obs.quiescent and not obs.gone
+    assert any("conv_c" in e and "503" in e for e in obs.errors)
+
+
+async def test_a_missing_root_is_never_gone() -> None:
+    _, rest = _server()
+    obs = await scan_tree(rest, "conv_missing", known_ids=["conv_missing"])
+    assert not obs.complete and not obs.gone

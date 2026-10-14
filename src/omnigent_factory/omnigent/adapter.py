@@ -141,6 +141,10 @@ from omnigent_factory.ports.omnigent import OMNIGENT_EFFECT_KINDS, SessionMatch,
 
 LOG = logging.getLogger(__name__)
 
+#: An incomplete scan of the same root with the same errors is logged at most this often
+#: (a draining run re-scans every few seconds).
+_SCAN_LOG_INTERVAL_US = 10 * 60 * 1_000_000
+
 ELICITATION_NOT_PENDING = "elicitation-not-pending"
 NONCE_LABEL = "factory.dispatch"
 #: Retry delay after a Git lock of the shared clone outlasted the short in-process retry.
@@ -253,6 +257,8 @@ class OmnigentExecutionAdapter:
         self._unquiet_at: dict[str, int] = {}
         #: Busy node IDs of each root's latest scan (named by the drain-timeout warning).
         self._busy_nodes: dict[str, tuple[str, ...]] = {}
+        #: Each root's last logged incomplete scan: monotonic time and its errors.
+        self._scan_logged: dict[str, tuple[int, tuple[str, ...]]] = {}
         # Required safety policy, compiled now so a bad deployment input fails at wiring.
         operator: tuple[pol.PolicySpec, ...] = ()
         if config.cel_expression is not None:
@@ -389,12 +395,38 @@ class OmnigentExecutionAdapter:
         return results
 
     def _record_scan(self, root_id: str, obs: TreeObservation) -> None:
-        self._known_nodes.setdefault(root_id, {root_id}).update(obs.nodes)
+        known = self._known_nodes.setdefault(root_id, {root_id})
+        known.update(obs.nodes)
+        known.difference_update(obs.gone)  # deleted sessions: never read again
+        if obs.not_found:
+            # Listed but not found: the inventory may still hold a deleted session. The
+            # next read is full, so the next scan sees it remembered only, then gone.
+            self._index.resync_soon()
+        self._log_incomplete(root_id, obs)
         if obs.quiescent:
             self._unquiet_at.pop(root_id, None)
         else:
             self._unquiet_at[root_id] = self.clock.monotonic_us()
         self._busy_nodes[root_id] = tuple(sorted(n.node_id for n in obs.nodes.values() if n.busy))
+
+    def _log_incomplete(self, root_id: str, obs: TreeObservation) -> None:
+        """Why a scan is incomplete (its read errors: node ids, routes and HTTP status or
+        error class, never credentials). Logged when the errors change, else at most every
+        ten minutes per root, so a drain re-scanning a broken tree does not flood."""
+        if obs.complete:
+            self._scan_logged.pop(root_id, None)
+            return
+        now = self.clock.monotonic_us()
+        last = self._scan_logged.get(root_id)
+        if last is not None and last[1] == obs.errors and now - last[0] < _SCAN_LOG_INTERVAL_US:
+            return
+        self._scan_logged[root_id] = (now, obs.errors)
+        LOG.warning(
+            "tree scan of session %s incomplete (%d read errors): %s",
+            root_id,
+            len(obs.errors),
+            "; ".join(obs.errors[:5]),
+        )
 
     def busy_nodes(self, root_id: str) -> tuple[str, ...]:
         """Busy node IDs from the latest scan of ``root_id`` (empty if never scanned)."""

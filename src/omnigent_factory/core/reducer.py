@@ -637,6 +637,12 @@ def _end_build_episode(ctx: _Ctx, s: StageSession) -> None:
 
 def _finish_drain(ctx: _Ctx, s: StageSession) -> None:
     target = s.drain_target or (Lifecycle.FENCED if s.fences else Lifecycle.RETIRED)
+    if s.restart_pending and target == Lifecycle.RETIRED and _rework_supersedes(ctx, s):
+        # #889: owner feedback queued a rework while the crashed run drained. The rework
+        # is the replacement (it carries the feedback): the crashed run retires and frees
+        # its building slot for it instead of restarting the old episode ahead of it.
+        s = ctx.put_session(replace(s, restart_pending=False))
+        ctx.note("Restart skipped: the queued rework replaces the crashed run")
     s = ctx.put_session(
         replace(
             s,
@@ -661,6 +667,23 @@ def _finish_drain(ctx: _Ctx, s: StageSession) -> None:
         _orphan_open_decisions(ctx, s.session_id)
     if s.restart_pending:
         _replace_after_crash(ctx, s)
+
+
+def _rework_supersedes(ctx: _Ctx, s: StageSession) -> bool:
+    """A rework episode (a newer build authorization of the current approval) is queued
+    behind the crashed unfenced build run ``s``."""
+    if s.kind != SessionKind.BUILD or s.fences or not _rework_queued(ctx):
+        return False
+    a = ctx.p.current_approval
+    queued = next(
+        (
+            x
+            for x in reversed(ctx.p.authorizations)
+            if a is not None and x.approval_id == a.approval_id and not x.cancelled
+        ),
+        None,
+    )
+    return queued is not None and queued.rework and queued.authorization_id != s.authorization_id
 
 
 def _orphan_open_decisions(ctx: _Ctx, session_id: str) -> None:
