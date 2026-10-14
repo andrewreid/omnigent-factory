@@ -3989,15 +3989,34 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
         ctx.note(f"Needs you: PR #{r.pr_number} not ready on {r.head_sha[:7]}: {reason}")
 
 
-def _needs_you_comment(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence, reason: str) -> None:
-    """The one comment when readiness puts the card at Needs you: the reason and, for
-    review-bot findings, each open thread (path, severity, title, link). Posted only on
-    entering the hold (callers check), so a restart or an unchanged re-read never posts
-    it again; a retry adopts the comment by its effect marker."""
+def _needs_you_comment(
+    ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence, reason: str, conflict: str = ""
+) -> None:
+    """The one comment when readiness puts the card at Needs you: every gap of the read
+    (failing required checks with links, open review-bot threads, a missing cross-vendor
+    review, a missing closing reference, a merge conflict) and whether the build run's
+    last turn ended without reporting back. Posted only on entering the hold (callers
+    check), so a restart or an unchanged re-read never posts it again; a retry adopts
+    the comment by its effect marker. ``reason`` stays for the card note and older text."""
+    s = ctx.p.session(r.session_id)
+    checks_failed = body.checks == ev.ChecksState.FAILED
+    links = body.failing_check_links or tuple(
+        ev.CheckRef(name=n) for n in body.failing_checks.split(_CHECK_SEP) if n
+    )
     args: dict[str, JsonValue] = {
         "pr_number": r.pr_number,
         "head_sha": r.head_sha,
         "reason": reason,
+        "checks_failed": checks_failed,
+        "failing_checks": (
+            [{"name": c.name, "url": c.url} for c in links] if checks_failed else []
+        ),
+        "findings_open": body.findings_open,
+        "review_missing": not body.review_accepted,
+        "closes_issue": body.closes_issue,
+        "issue": ctx.p.issue_number,
+        "conflict": conflict,
+        "run_stopped": s is not None and _ended_without_result(ctx, s),
     }
     if body.findings_open and body.open_findings:
         args["findings"] = [
@@ -4117,7 +4136,7 @@ def _merge_conflict(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None
         _invalidate_ready(ctx, reason)
     if Hold.READINESS_FAILED not in ctx.p.holds:
         ctx.hold(Hold.READINESS_FAILED)
-        _needs_you_comment(ctx, r, body, reason)
+        _needs_you_comment(ctx, r, body, reason, conflict=base)
         ctx.note(f"Needs you: PR #{r.pr_number} on {r.head_sha[:7]}: {reason}")
 
 

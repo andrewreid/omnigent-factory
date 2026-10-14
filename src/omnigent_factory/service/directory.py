@@ -673,12 +673,10 @@ class PublicationRenderer:
             text = _public_result(body, agent_display_name(self.config))
         elif effect.kind == EffectKind.POST_COMMENT and effect.args.get("template") == "decision":
             text = _decision_text(effect.args)
-        elif (
-            effect.kind == EffectKind.POST_COMMENT
-            and effect.args.get("template") == "ready-blocked"
-            and isinstance(effect.args.get("findings"), list)
+        elif effect.kind == EffectKind.POST_COMMENT and effect.args.get("template") == (
+            "ready-blocked"
         ):
-            text = _findings_blocked_text(effect.args, review_bot_name(self.config))
+            text = needs_you_text(effect.args, review_bot_name(self.config))
         elif effect.kind == EffectKind.POST_COMMENT:
             template = str(effect.args.get("template") or "status")
             text = _status_text(template, effect.args, agent_display_name(self.config))
@@ -687,35 +685,107 @@ class PublicationRenderer:
         return _safe_publication(text, self.config)
 
 
-def _findings_blocked_text(args: Mapping[str, Any], bot_name: str = "Review bot") -> str:
-    """Needs you for review-bot findings: the reason, then each open thread (severity,
-    path, title, link), so the owner sees what is left without opening the PR."""
+#: Thread lines a Needs you comment lists before "and N more".
+_NEEDS_YOU_THREADS = 10
+#: The open threads a read carries at most (more may exist beyond it).
+_FINDINGS_CAP = 20
+
+
+def needs_you_text(args: Mapping[str, Any], bot_name: str = "Review bot") -> str:
+    """Needs you when the PR isn't ready and no automatic fix attempt is left: written
+    like a colleague asking for direction. A headline with the counts, the failing
+    required checks (linked), each open review-bot thread (severity, path, title, link;
+    the first ten), whether the last run stopped without reporting back, and the
+    question. Built only from the read and the run state the reducer recorded.
+
+    Effects recorded before the gaps were carried (no ``review_missing``) keep their
+    reason as the headline."""
+    number = args.get("pr_number")
+    head = _plain_code(str(args.get("head_sha") or "")[:7])
     findings = [f for f in args.get("findings") or [] if isinstance(f, dict)]
-    head = str(args.get("head_sha") or "")[:7]
-    count = len(findings)
-    noun = "finding" if count == 1 else "findings"
-    lines = [
-        f"PR #{args.get('pr_number')} isn't ready at `{head}`: {args.get('reason')}. "
-        "I have no automatic fix attempt left, so I need your call.",
-        "",
-    ]
-    if args.get("further_round"):
-        lines.append(
-            f"{bot_name} has {count} open {noun} on `{head}`, a further review round "
-            "after a fix commit:"
-        )
+    checks = [c for c in args.get("failing_checks") or [] if isinstance(c, dict)]
+    structured = "review_missing" in args
+    if structured:
+        gaps = _needs_you_gaps(args, bot_name, len(findings), len(checks))
+        headline = f"PR #{number} isn't ready: {gaps} (head `{head}`)."
     else:
-        lines.append(f"{bot_name} has {count} open {noun} on `{head}`:")
-    lines.append("")
-    for f in findings:
-        badge = f"**{f.get('severity')}** " if f.get("severity") else ""
-        path = str(f.get("path") or "").replace("`", "'")
-        path = f"`{path}`" if path else "(no file)"
-        title = " ".join(str(f.get("title") or "").replace("`", "'").split())
-        url = str(f.get("url") or "")
-        line = f"- {badge}{path}: {title or 'untitled'}"
-        lines.append(f"{line} ([thread]({url}))" if url else line)
+        headline = f"PR #{number} isn't ready (head `{head}`): {args.get('reason')}."
+    lines = [headline]
+    if checks:
+        lines += ["", "**Failing required checks**", ""]
+        for check in checks:
+            name = " ".join(str(check.get("name") or "").split())
+            url = str(check.get("url") or "")
+            label = name.replace("[", "(").replace("]", ")") or "unnamed check"
+            lines.append(f"- [{label}]({url})" if url else f"- `{_plain_code(name)}`")
+    if findings:
+        further = (
+            " (a further review round after a fix commit)" if args.get("further_round") else ""
+        )
+        lines += ["", f"**Unresolved {bot_name} threads**{further}", ""]
+        for f in findings[:_NEEDS_YOU_THREADS]:
+            lines.append(_thread_line(f))
+        rest = len(findings) - _NEEDS_YOU_THREADS
+        if rest > 0:
+            more = f"{rest}+" if len(findings) >= _FINDINGS_CAP else str(rest)
+            lines.append(f"- and {more} more")
+    if args.get("run_stopped"):
+        lines += [
+            "",
+            "My last run stopped before it reported back (it may have been interrupted).",
+        ]
+    lines += [
+        "",
+        "Should I keep working on these, or do you want to take a look yourself? "
+        "Reply here and I'll keep going.",
+    ]
     return "\n".join(lines)
+
+
+def _needs_you_gaps(args: Mapping[str, Any], bot_name: str, threads: int, checks: int) -> str:
+    """The headline's gaps with counts, e.g. "4 Codex threads are unresolved and 1
+    required check is failing"."""
+    parts = []
+    if args.get("conflict"):
+        parts.append(f"it has a merge conflict with `{_plain_code(str(args['conflict']))}`")
+    if args.get("findings_open"):
+        if threads:
+            count = f"{threads}+" if threads >= _FINDINGS_CAP else str(threads)
+            noun, verb = ("thread", "is") if threads == 1 else ("threads", "are")
+            parts.append(f"{count} {bot_name} {noun} {verb} unresolved")
+        else:
+            parts.append(f"{bot_name} threads are unresolved")
+    if args.get("checks_failed"):
+        if checks:
+            noun, verb = ("check", "is") if checks == 1 else ("checks", "are")
+            parts.append(f"{checks} required {noun} {verb} failing")
+        else:
+            parts.append("required checks are failing")
+    if args.get("review_missing"):
+        parts.append("no cross-vendor review covers this head yet")
+    if args.get("closes_issue") is False:
+        issue = args.get("issue")
+        parts.append(
+            f"the PR doesn't close #{issue}" if issue else "the PR doesn't close the issue"
+        )
+    if not parts:
+        return str(args.get("reason") or "it doesn't meet the readiness checks")
+    return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def _thread_line(f: Mapping[str, Any]) -> str:
+    badge = f"**{f.get('severity')}** " if f.get("severity") else ""
+    path = _plain_code(str(f.get("path") or ""))
+    path = f"`{path}`" if path else "(no file)"
+    title = " ".join(_plain_code(str(f.get("title") or "")).split())
+    url = str(f.get("url") or "")
+    line = f"- {badge}{path}: {title or 'untitled'}"
+    return f"{line} ([thread]({url}))" if url else line
+
+
+def _plain_code(text: str) -> str:
+    """Text safe inside a code span: a backtick would end it early."""
+    return text.replace("`", "'")
 
 
 def _decision_text(args: Mapping[str, Any]) -> str:
@@ -870,8 +940,6 @@ def _plan_context(plan: dict[str, Any] | None) -> str:
 _STATUS_TEXT = {
     "checkpoint": "I've used the time I was given and I'm wrapping up. "
     "`/continue` (or e.g. `/continue 2h`) gives me more.",
-    "ready-blocked": "PR #{pr_number} isn't ready at `{head_sha}`: {reason}. "
-    "I have no automatic fix attempt left, so I need your call.",
     "create-rejected": "Omnigent refused to create the session ({reason}), so this is blocked.",
     "adoption-ambiguous": "I couldn't tell which Omnigent session is mine ({matches} matches), "
     "so this is blocked for operator review.",

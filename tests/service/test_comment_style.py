@@ -263,8 +263,8 @@ async def test_findings_needs_you_lists_each_open_thread_plainly(service_config:
     )
     for bad in FORBIDDEN:
         assert bad not in text, (bad, text)
-    assert "PR #799 isn't ready at `9bb7f7f`" in text
-    assert "2 open findings on `9bb7f7f`, a further review round after a fix commit" in text
+    assert "PR #799 isn't ready (head `9bb7f7f`)" in text
+    assert "**Unresolved Codex threads** (a further review round after a fix commit)" in text
     assert (
         "- **P1** `api/src/export_delivery.ts`: Keep the row when the retry fails "
         "([thread](https://github.com/o/r/pull/799#discussion_r1))"

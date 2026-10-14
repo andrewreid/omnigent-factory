@@ -29,6 +29,7 @@ from omnigent_factory.core.events import (
     MERGE_CONFLICT,
     MERGE_UNKNOWN,
     BotEyes,
+    CheckRef,
     ChecksState,
     FindingRef,
 )
@@ -174,6 +175,8 @@ class GitHubAPIAdapter:
         self.cross_vendor_review = cross_vendor_review
         self._last_checks_summary = ""
         self._last_failing_checks = ""
+        #: The failing checks of the last checks read, with links (Needs you comment).
+        self._last_failing_links: tuple[CheckRef, ...] = ()
         #: Kind of the review bot's latest answer to the head last read ("" = none).
         self._last_bot_answer = ""
         #: Commit of each review thread the review bot opened, from the last thread read.
@@ -726,6 +729,7 @@ class GitHubAPIAdapter:
                 review_bot_pending_since_us=review_bot_since,
                 base_sync=base_sync,
                 failing_checks=self._last_failing_checks,
+                failing_check_links=self._last_failing_links,
                 review_bot_verdict=verdict,
                 review_bot_eyes=self._last_bot_eyes,
                 open_findings=() if findings_dispositioned else self._last_open_findings,
@@ -1040,6 +1044,7 @@ class GitHubAPIAdapter:
         fetched: list[tuple[int, str, int | None, str, str]] = []  # id, name, app, state, label
         runs: list[tuple[str, int | None, str]] = []  # (name, app id, state)
         labels: list[str] = []  # conclusion-level labels for the human summary
+        urls: dict[tuple[str, int | None], tuple[int, str]] = {}  # newest run's page
         page = 1
         while True:
             result: Any = await self.client.get_json(
@@ -1055,6 +1060,11 @@ class GitHubAPIAdapter:
                 app_id = app.get("id") if isinstance(app, dict) else None
                 raw_id = run.get("id")
                 conclusion = run.get("conclusion")
+                run_id = raw_id if isinstance(raw_id, int) else 0
+                key = (str(run["name"]), app_id if isinstance(app_id, int) else None)
+                page_url = run.get("html_url") or run.get("details_url")
+                if isinstance(page_url, str) and run_id >= urls.get(key, (-1, ""))[0]:
+                    urls[key] = (run_id, page_url)
                 fetched.append(
                     (
                         raw_id if isinstance(raw_id, int) else 0,
@@ -1085,6 +1095,7 @@ class GitHubAPIAdapter:
         statuses = combined.get("statuses") if isinstance(combined, dict) else None
         # Legacy statuses are history too: the latest per context (highest ID) decides.
         latest_status: dict[str, tuple[int, str, str]] = {}
+        status_urls: dict[str, str] = {}
         for status in statuses if isinstance(statuses, list) else []:
             if isinstance(status, dict) and isinstance(status.get("context"), str):
                 raw_id = status.get("id")
@@ -1096,6 +1107,8 @@ class GitHubAPIAdapter:
                         _status_state(status.get("state")),
                         str(status.get("state") or "pending"),
                     )
+                    target = status.get("target_url")
+                    status_urls[context] = target if isinstance(target, str) else ""
         # Statuses carry no app: they can satisfy only an unpinned requirement.
         legacy = {context: state for context, (_, state, _) in latest_status.items()}
         for context, (_, state, label) in latest_status.items():
@@ -1103,12 +1116,26 @@ class GitHubAPIAdapter:
             labels.append(label)
         self._last_checks_summary = _checks_summary(labels)
         self._last_failing_checks = ""
+        self._last_failing_links = ()
+
+        def link(name: str, app_id: int | None) -> CheckRef:
+            """A failing check's page: its newest run (of that app, when pinned), else
+            its commit status's target."""
+            found = [
+                (run_id, url)
+                for (run_name, run_app), (run_id, url) in urls.items()
+                if run_name == name and (app_id is None or run_app == app_id)
+            ]
+            url = max(found)[1] if found else status_urls.get(name, "")
+            return CheckRef(name=name[:200], url=url[:300] if url.startswith("https://") else "")
+
         required: set[tuple[str, int | None]] = set(self.required_checks)
         if not required and base_ref is not None:
             required = await self._derived_required_checks(base_ref)
         if required:
             states = []
             failing: list[str] = []
+            links: list[CheckRef] = []
             for name, app_id in sorted(required, key=lambda c: (c[0], c[1] or 0)):
                 # A pinned requirement is satisfied only by that exact app's latest run.
                 found = [
@@ -1121,9 +1148,13 @@ class GitHubAPIAdapter:
                 states.append(_combine(found) if found else "pending")
                 if states[-1] == "failed":
                     failing.append(name)
+                    links.append(link(name, app_id))
             self._last_failing_checks = _names(failing)
+            self._last_failing_links = _distinct_links(links)
             return _checks_from(states)
-        self._last_failing_checks = _names([name for name, _, state in runs if state == "failed"])
+        failed = [(name, app_id) for name, app_id, state in runs if state == "failed"]
+        self._last_failing_checks = _names([name for name, _ in failed])
+        self._last_failing_links = _distinct_links([link(name, app) for name, app in failed])
         return _checks_from([state for _, _, state in runs]) if runs else ChecksState.PENDING
 
     async def _derived_required_checks(self, base_ref: str) -> set[tuple[str, int | None]]:
@@ -2132,6 +2163,14 @@ def _checks_from(states: list[str]) -> ChecksState:
     if combined == "failed":
         return ChecksState.FAILED
     return ChecksState.PENDING if combined == "pending" else ChecksState.GREEN
+
+
+def _distinct_links(links: list[CheckRef]) -> tuple[CheckRef, ...]:
+    """One link per check name, first seen first, at most 20."""
+    seen: dict[str, CheckRef] = {}
+    for ref in links:
+        seen.setdefault(ref.name, ref)
+    return tuple(seen.values())[:20]
 
 
 def _names(names: list[str]) -> str:

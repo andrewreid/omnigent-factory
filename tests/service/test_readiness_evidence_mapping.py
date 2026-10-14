@@ -159,14 +159,22 @@ def test_base_sync_and_failing_check_names_reach_the_reducer(
         "verified": False,
         "base_sync": True,
         "failing_checks": "api / Dependency audit",
+        "failing_check_links": [
+            {"name": "api / Dependency audit", "url": "https://github.com/o/r/runs/1"},
+            {"name": "", "url": "https://github.com/o/r/runs/2"},
+        ],
     }
     event = executor._ack_event(fetch, Ack("686", detail))
     assert event is not None and isinstance(event.body, ev.ReadinessEvidence)
     assert event.body.base_sync is True
     assert event.body.failing_checks == "api / Dependency audit"
+    assert event.body.failing_check_links == (
+        ev.CheckRef(name="api / Dependency audit", url="https://github.com/o/r/runs/1"),
+    )
     legacy = executor._ack_event(fetch, Ack("686", {"head_sha": HEAD, "verified": False}))
     assert legacy is not None and isinstance(legacy.body, ev.ReadinessEvidence)
     assert legacy.body.base_sync is False and legacy.body.failing_checks == ""
+    assert legacy.body.failing_check_links == ()
 
 
 def test_the_verdict_reaches_the_reducer(service_config):

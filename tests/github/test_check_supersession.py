@@ -183,3 +183,31 @@ async def test_failing_check_names_are_semicolon_separated_since_names_contain_c
     assert state == ChecksState.FAILED
     assert names == f"{audit}; {web}"  # required names in sorted order
     assert names.split("; ") == [audit, web]
+
+
+@pytest.mark.asyncio
+async def test_failing_checks_carry_the_newest_runs_page_for_the_needs_you_comment():
+    """#889: the owner's comment links each failing required check to its run."""
+    audit = "api / Dependency audit"
+    runs = [*PASSING, (20, audit, "failure"), (22, audit, "failure"), (21, "optional", "failure")]
+    required = [*REQUIRED, audit, ("ci/legacy", None)]
+    base = server(runs, required, [(1, "ci/legacy", "failure")])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = base(request)
+        data = json.loads(response.content)
+        if request.url.path.endswith("/check-runs"):
+            for run in data["check_runs"]:
+                run["html_url"] = f"https://github.com/o/r/runs/{run['id']}"
+        if request.url.path.endswith("/status"):
+            for status in data["statuses"]:
+                status["target_url"] = "https://ci.example/legacy"
+        return httpx.Response(response.status_code, json=data)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        gh = adapter(http)
+        assert await gh._checks_state(HEAD, "main") == ChecksState.FAILED
+        assert gh._last_failing_links == (
+            ev.CheckRef(name=audit, url="https://github.com/o/r/runs/22"),
+            ev.CheckRef(name="ci/legacy", url="https://ci.example/legacy"),
+        )

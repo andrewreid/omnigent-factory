@@ -47,7 +47,7 @@ from types import MappingProxyType
 from typing import Protocol, runtime_checkable
 
 from omnigent_factory.core.effects import EffectKind, RetryableReadFailure
-from omnigent_factory.core.events import MERGE_CONFLICT, ChecksState, FindingRef
+from omnigent_factory.core.events import MERGE_CONFLICT, CheckRef, ChecksState, FindingRef
 from omnigent_factory.core.types import IssueLinks, IssueSnapshot, Stage
 from omnigent_factory.ports.adapter import EffectAdapter
 
@@ -261,6 +261,8 @@ class PullRequestEvidence:
     base_sync: bool = False
     #: Names of the failing (required, when a required set exists) checks, "; "-joined.
     failing_checks: str = ""
+    #: Those checks with their links (at most 20), for the owner's Needs you comment.
+    failing_check_links: tuple[CheckRef, ...] = ()
     #: How the review bot answered ``head_sha`` (only when it did), for the Ready report.
     review_bot_verdict: str = ""
     #: The bot's 👀 for its latest unanswered trigger: "seen", "absent", "unknown" (its

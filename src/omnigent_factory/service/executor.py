@@ -577,6 +577,7 @@ class EffectExecutor:
                 ),
                 base_sync=detail.get("base_sync") is True,
                 failing_checks=str(detail.get("failing_checks") or "")[:200],
+                failing_check_links=_check_refs(detail.get("failing_check_links")),
                 review_bot_verdict=str(detail.get("review_bot_verdict") or "")[:200],
                 read_started_us=_json_int(detail.get("read_started_us"), 0),
                 review_bot_eyes=_bot_eyes(detail.get("review_bot_eyes")),
@@ -662,6 +663,17 @@ def _mergeable_state(value: object) -> str:
     """A read's mergeability ("" for anything not a known value: never a conflict)."""
     known = (ev.MERGE_CLEAN, ev.MERGE_CONFLICT, ev.MERGE_UNKNOWN)
     return str(value) if value in known else ""
+
+
+def _check_refs(value: object) -> tuple[ev.CheckRef, ...]:
+    """The failing required checks of a read with their links, bounded (owner text)."""
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        ev.CheckRef(name=str(item.get("name") or "")[:200], url=str(item.get("url") or "")[:300])
+        for item in value[:20]
+        if isinstance(item, dict) and item.get("name")
+    )
 
 
 def _finding_refs(value: object) -> tuple[ev.FindingRef, ...]:

@@ -171,6 +171,15 @@ class FindingRef:
     url: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class CheckRef:
+    """One failing required check, for the owner's Needs you comment."""
+
+    name: str = ""
+    #: The check run's (or commit status's) page on GitHub ("" = none reported).
+    url: str = ""
+
+
 class _Body:
     KIND: ClassVar[EventKind]
     CLASS: ClassVar[EventClass]
@@ -573,6 +582,9 @@ class ReadinessEvidence(_Body):
     base_sync: bool = False
     #: Names of the failing required checks, "; "-separated (names may contain commas).
     failing_checks: str = ""
+    #: The failing required checks with their links (at most 20), for the Needs you
+    #: comment; ``failing_checks`` stays the source of the names elsewhere.
+    failing_check_links: tuple[CheckRef, ...] = ()
     #: How the review bot answered this head, when it did (``review_bot_pending_since_us``
     #: 0), e.g. "👍 on `f7493c8`" ("" = no answer or not told).
     review_bot_verdict: str = ""
@@ -1260,6 +1272,7 @@ __all__ = [
     "BasePushed",
     "BotEyes",
     "CapacityAvailable",
+    "CheckRef",
     "ChecksChanged",
     "ChecksState",
     "Closed",
