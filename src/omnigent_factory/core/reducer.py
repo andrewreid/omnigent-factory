@@ -686,6 +686,41 @@ def _rework_supersedes(ctx: _Ctx, s: StageSession) -> bool:
     return queued is not None and queued.rework and queued.authorization_id != s.authorization_id
 
 
+#: Lifecycles of a live run that may be paused at an idle point (its tree quiescent).
+_PAUSABLE = frozenset(
+    {Lifecycle.ACTIVE, Lifecycle.WAITING, Lifecycle.CHECKPOINT_GRACE, Lifecycle.CHECKPOINT_WAIT}
+)
+
+#: The card note when an older build run gives way to the owner's queued rework.
+HANDOVER_NOTE = "Switching to your feedback: earlier build stopped at its next pause"
+
+
+def _yield_to_rework(ctx: _Ctx, s: StageSession | None) -> bool:
+    """#889: the current build run ``s`` works under an older authorization while a
+    rework carrying owner feedback is queued for the same approval. It never goes Ready,
+    is never woken again, and is retired at its next idle point (never mid-turn), freeing
+    its slot so the queued rework is admitted under its own authorization. Fences, stops
+    and closure keep their own handling. Returns whether ``s`` gives way (the caller
+    stops); the handover itself starts only once its tree is observed quiescent.
+    """
+    if s is None or s.session_id != ctx.p.current_session_id or not _rework_supersedes(ctx, s):
+        return False
+    if (
+        s.lifecycle in _PAUSABLE
+        and s.quiescent
+        and not s.restart_pending
+        and Hold.STOPPED not in ctx.p.holds
+        and not _completed(ctx)
+    ):
+        # The rework starts afresh (as it would have, queued on a finished build): the
+        # old run's readiness and Needs you no longer stand.
+        ctx.unhold(*_READY_CLEARED_HOLDS)
+        ctx.update(readiness=None, readiness_wakes=0, findings_wakes=0)
+        _begin_drain(ctx, replace(s, comment_pending=False), interrupt=False)
+        ctx.note(HANDOVER_NOTE)
+    return True
+
+
 def _orphan_open_decisions(ctx: _Ctx, session_id: str) -> None:
     """A finished (or hard-fenced) session can no longer receive answers: close its prompts."""
     for d in ctx.p.decisions:
@@ -1131,6 +1166,8 @@ def _maybe_ready(ctx: _Ctx) -> None:
     s = ctx.p.session(r.session_id)
     if s is None or s.session_id != ctx.p.current_session_id:
         return
+    if _yield_to_rework(ctx, s):
+        return  # never Ready (or Ready + Queued) while the owner's rework waits
     waiting = (
         s.lifecycle == Lifecycle.WAITING and s.wait_reason == WaitReason.CHECKS and s.quiescent
     )
@@ -2568,6 +2605,13 @@ def _build_feedback(ctx: _Ctx, body: ev.PlanFeedback, *, answered: bool = False)
         and _feedback_rework(ctx)  # e.g. Needs you with no fix attempt left
     ):
         return
+    if build is not None and _rework_supersedes(ctx, build):
+        # The owner's queued rework reads every owner comment (factory_get_feedback): this
+        # one is not relayed to the older run it replaces. An idle run gives way now, a
+        # busy one when its turn ends.
+        if not busy:
+            _yield_to_rework(ctx, build)
+        return
     if answered:
         _deliver_answers(ctx)
         return
@@ -3427,6 +3471,8 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
     )
     _refresh_ready_report(ctx, body.checks_summary)
     run = None if in_ready else _open_run(ctx, r)
+    if _yield_to_rework(ctx, run):
+        return
     if run is not None and _ended_without_result(ctx, run) and not _wake_answered(ctx, run):
         # Woken by an owner comment, it ended its turn without re-submitting: never left
         # as Working; the owner decides (a later build_ready clears this on a green read).
@@ -3944,6 +3990,8 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
         )
         if busy:
             return  # re-evaluated by the next reconcile read or a new result
+    if _yield_to_rework(ctx, s):
+        return  # no wake, Needs you or parked Ready for a run the owner's rework replaces
     if (
         _red_only(body)
         and (ctx.p.readiness_wakes >= 1 or body.base_sync)
@@ -4934,6 +4982,8 @@ def _h_tree_quiescent(ctx: _Ctx, body: ev.TreeQuiescent) -> None:
             ctx.put_session(replace(other, external_active=False))
     if not any(x.external_active for x in ctx.p.sessions):
         ctx.unhold(Hold.EXTERNAL_ACTIVITY)
+    if s.lifecycle in _PAUSABLE and _yield_to_rework(ctx, s):
+        return  # its turn ended: it gives way to the owner's queued rework
     if s.lifecycle == Lifecycle.DRAINING or (
         s.lifecycle == Lifecycle.BLOCKED and s.drain_target is not None
     ):
