@@ -2505,8 +2505,9 @@ def _feedback_note(ctx: _Ctx) -> None:
 
 
 def _h_feedback_read(ctx: _Ctx, body: ev.FeedbackRead) -> None:
-    """``factory_get_feedback`` served these comments to a run: 👍 each one marked 👀,
-    and drop the "Feedback received" note once none is left unread."""
+    """``factory_get_feedback`` served these comments to a run: 👍 each one marked 👀
+    (the 👍 supersedes the bot's 👀, which the adapter then removes), and drop the
+    "Feedback received" note once none is left unread."""
     _session(ctx, body.session_id)
     read = set(body.event_ids)
     done = [e for e in ctx.p.unread_feedback if e in read]
@@ -2518,7 +2519,7 @@ def _h_feedback_read(ctx: _Ctx, body: ev.FeedbackRead) -> None:
         if match is not None:
             ctx.emit(
                 EffectKind.REACT_COMMENT,
-                args={"comment_id": int(match.group(1)), "content": "+1"},
+                args={"comment_id": int(match.group(1)), "content": "+1", "supersedes": "eyes"},
             )
     if not ctx.p.unread_feedback and ctx.p.note.startswith("Feedback received"):
         ctx.note("")

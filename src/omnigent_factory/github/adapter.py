@@ -1922,13 +1922,43 @@ class GitHubAPIAdapter:
         content = effect.args.get("content")
         if not isinstance(comment_id, int) or content not in {"+1", "confused", "eyes"}:
             return DefinitiveFailure("REACT_COMMENT requires comment_id and +1/confused/eyes")
+        path = f"/repos/{self.repository}/issues/comments/{comment_id}/reactions"
         await self.client.request(
-            "POST",
-            f"/repos/{self.repository}/issues/comments/{comment_id}/reactions",
-            json_body={"content": content},
-            expected=frozenset({200, 201}),
+            "POST", path, json_body={"content": content}, expected=frozenset({200, 201})
         )
-        return Ack(str(comment_id), {"content": str(content)})
+        detail: dict[str, Any] = {"content": str(content)}
+        if effect.args.get("supersedes") == "eyes":
+            detail["eyes_removed"] = await self._remove_own_eyes(path)
+        return Ack(str(comment_id), detail)
+
+    async def _remove_own_eyes(self, path: str) -> bool:
+        """Delete the factory bot's own 👀 on a comment once its 👍 is up (best effort).
+
+        Found by listing (no recorded id, so a 👀 from before this rule is found too) and
+        matched on the bot's user id: nobody else's reaction is touched. 404 means it is
+        already gone. A 5xx or an uncertain write raises, so the effect is retried (the 👍
+        repost is idempotent); any other refusal is logged and the 👍 stands alone.
+        """
+        removed = False
+        try:
+            for reaction in await self.client.paginate(f"{path}?per_page=100"):
+                user = reaction.get("user") if isinstance(reaction, dict) else None
+                if (
+                    isinstance(user, dict)
+                    and user.get("id") == self.bot_user_id
+                    and reaction.get("content") == "eyes"
+                    and isinstance(reaction.get("id"), int)
+                ):
+                    await self.client.request(
+                        "DELETE", f"{path}/{reaction['id']}", expected=frozenset({204, 404})
+                    )
+                    removed = True
+        except GitHubRejected as exc:
+            if exc.status_code >= 500:
+                raise
+            LOG.warning("could not remove the factory's 👀 reaction: %s", exc)
+            return False
+        return removed
 
     async def _project_item_id(self, parcel_id: str) -> str | None:
         query = """

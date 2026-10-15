@@ -367,6 +367,106 @@ async def test_reaction_posts_once_and_uncertainty_retries_instead_of_blocking()
     assert isinstance(result, DefinitiveFailure)
 
 
+class _Reactions:
+    """GitHub's reactions on comment 60: the bot (777) and another user both have 👀."""
+
+    PATH = "/repos/SA-Ambulance/timesheets/issues/comments/60/reactions"
+
+    def __init__(self, *, delete_status: int = 204, list_bot_eyes: bool = True) -> None:
+        self.delete_status = delete_status
+        self.listed: list[dict] = [{"id": 900, "content": "eyes", "user": {"id": 555}}]
+        if list_bot_eyes:
+            self.listed.append({"id": 901, "content": "eyes", "user": {"id": 777}})
+        self.listed.append({"id": 902, "content": "+1", "user": {"id": 777}})
+        self.calls: list[tuple[str, str]] = []
+        self.fail_delete_once: Exception | None = None
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.calls.append((request.method, request.url.path))
+        if request.method == "POST":
+            return httpx.Response(200, json={"id": 902})
+        if request.method == "GET":
+            return httpx.Response(200, json=self.listed)
+        if self.fail_delete_once is not None:
+            exc, self.fail_delete_once = self.fail_delete_once, None
+            raise exc
+        reaction_id = int(request.url.path.rsplit("/", 1)[1])
+        self.listed = [r for r in self.listed if r["id"] != reaction_id]
+        return httpx.Response(self.delete_status)
+
+
+def _read_ack() -> EffectIntent:
+    return _effect(EffectKind.REACT_COMMENT, comment_id=60, content="+1", supersedes="eyes")
+
+
+@pytest.mark.asyncio
+async def test_read_thumbs_up_goes_up_first_then_removes_only_the_bots_eyes():
+    gh = _Reactions()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(gh)) as c:
+        result = await _adapter(c).execute(_read_ack(), CTX)
+    assert result == Ack("60", {"content": "+1", "eyes_removed": True})
+    assert gh.calls == [
+        ("POST", gh.PATH),
+        ("GET", gh.PATH),
+        ("DELETE", f"{gh.PATH}/901"),  # never 900: another user's 👀
+    ]
+    assert [r["id"] for r in gh.listed] == [900, 902]
+
+
+@pytest.mark.asyncio
+async def test_eyes_already_gone_is_success():
+    gh = _Reactions(delete_status=404)  # deleted between the list and the delete
+    async with httpx.AsyncClient(transport=httpx.MockTransport(gh)) as c:
+        result = await _adapter(c).execute(_read_ack(), CTX)
+    assert isinstance(result, Ack) and result.detail["eyes_removed"] is True
+    gone = _Reactions(list_bot_eyes=False)  # no 👀 of the bot's at all
+    async with httpx.AsyncClient(transport=httpx.MockTransport(gone)) as c:
+        result = await _adapter(c).execute(_read_ack(), CTX)
+    assert result == Ack("60", {"content": "+1", "eyes_removed": False})
+    assert [m for m, _ in gone.calls] == ["POST", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_eyes_removal_interrupted_after_thumbs_up_completes_once_on_retry():
+    gh = _Reactions()
+    gh.fail_delete_once = httpx.ReadTimeout("lost", request=httpx.Request("DELETE", "/"))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(gh)) as c:
+        first = await _adapter(c).execute(_read_ack(), CTX)  # 👍 up, delete uncertain
+        assert isinstance(first, RetryableReadFailure)
+        # The daemon restarts: the unacked effect runs again on a fresh adapter.
+        second = await _adapter(c).execute(_read_ack(), CTX)
+        third = await _adapter(c).execute(_read_ack(), CTX)  # a late duplicate retry
+    assert second == Ack("60", {"content": "+1", "eyes_removed": True})
+    assert third == Ack("60", {"content": "+1", "eyes_removed": False})
+    deletes = [p for m, p in gh.calls if m == "DELETE"]
+    assert deletes == [f"{gh.PATH}/901", f"{gh.PATH}/901"]  # the lost one, then once
+    assert [r["id"] for r in gh.listed] == [900, 902]
+
+
+@pytest.mark.asyncio
+async def test_eyes_removal_failure_never_fails_the_thumbs_up():
+    refused = _Reactions(delete_status=403)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(refused)) as c:
+        result = await _adapter(c).execute(_read_ack(), CTX)
+    assert result == Ack("60", {"content": "+1", "eyes_removed": False})
+    flaky = _Reactions(delete_status=502)  # server error: retried by the effect machinery
+    async with httpx.AsyncClient(transport=httpx.MockTransport(flaky)) as c:
+        result = await _adapter(c).execute(_read_ack(), CTX)
+    assert isinstance(result, RetryableReadFailure)
+    assert flaky.calls[0] == ("POST", flaky.PATH)
+
+
+@pytest.mark.asyncio
+async def test_command_thumbs_up_does_not_touch_eyes():
+    gh = _Reactions()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(gh)) as c:
+        result = await _adapter(c).execute(
+            _effect(EffectKind.REACT_COMMENT, comment_id=60, content="+1"), CTX
+        )
+    assert result == Ack("60", {"content": "+1"})
+    assert gh.calls == [("POST", gh.PATH)]
+
+
 @pytest.mark.asyncio
 async def test_feedback_eyes_reaction_posts_and_unknown_content_is_refused():
     seen: list[tuple[str, dict]] = []

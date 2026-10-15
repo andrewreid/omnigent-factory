@@ -159,6 +159,20 @@ def test_accepted_issue_comment_gets_eyes_then_thumbs_up_once_read():
     assert not reactions(r)
 
 
+def test_read_thumbs_up_supersedes_the_eyes_and_a_command_ack_does_not():
+    """The 👍 for read feedback asks the adapter to drop the bot's 👀; nothing else does."""
+    h = Harness()
+    b = busy_build(h)
+    eyes = Harness.of(comment(h, C1), EffectKind.REACT_COMMENT)
+    assert [e.args.get("supersedes") for e in eyes] == [None]
+    r = h.send(P, ev.FeedbackRead(session_id=b.session_id, event_ids=(C1,)))
+    [up] = Harness.of(r, EffectKind.REACT_COMMENT)
+    assert up.args == {"comment_id": 6096243669, "content": "+1", "supersedes": "eyes"}
+    restart(h)  # read once: a reload never emits a second 👍
+    r = h.send(P, ev.FeedbackRead(session_id=b.session_id, event_ids=(C1,)))
+    assert not r.audit.accepted and not reactions(r)
+
+
 def test_a_review_has_no_reaction_and_a_redelivered_comment_no_second_eyes():
     h = Harness()
     busy_build(h)
