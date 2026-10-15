@@ -535,8 +535,13 @@ class StageSession:
     #: Owner comments relayed to this (build) run while it waited on checks; each one
     #: opens a fresh result slot so the run can re-submit the same head.
     feedback_wakes: int = 0
-    #: An owner comment arrived mid-turn: relay it if the turn ends without a result.
+    #: An owner comment was not yet relayed (it came while a relay was gated or inside the
+    #: coalescing window): relay it on the next permitted relay (the window passed on a
+    #: periodic reconcile, or the turn ended without a result).
     comment_pending: bool = False
+    #: When an owner-feedback message was last relayed to this run (0: never). Comments
+    #: within ``FEEDBACK_COALESCE_US`` of it are folded into one later relay.
+    feedback_relayed_us: int = 0
     #: When the current drain began (0: not draining, or a drain recorded before this
     #: field existed). The scheduler ends a drain still waiting after the drain timeout.
     drain_started_us: int = 0
@@ -924,6 +929,9 @@ class Parcel:
     bot: BotState = BotState.IDLE
     #: Latest informational status reason (replaces status comments; "" when none).
     note: str = ""
+    #: Event IDs of accepted owner issue comments the factory marked 👀 that no run has
+    #: read yet (``factory_get_feedback``); each gets 👍 once read.
+    unread_feedback: tuple[str, ...] = ()
     #: The "Factory note" value last written to the board (derived, like ``bot``).
     board_note: str = ""
     #: The in-flight daemon board write: at most one per parcel (serialised).

@@ -128,6 +128,7 @@ ADMISSION: dict[EventKind, Admission] = {
     # factory tool calls, resolved to the current run by the service (never by arguments)
     EventKind.RESULT_CANDIDATE: Admission(_MCP),
     EventKind.OWNER_QUESTION: Admission(_MCP),
+    EventKind.FEEDBACK_READ: Admission(_MCP),
     EventKind.ISSUE_SESSION_CLOSED: Admission(_ADAPTER),
     # display only: another issue's accepted triage named this one
     EventKind.RELATED_MARKED: Admission(_ADAPTER),

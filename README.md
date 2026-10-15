@@ -121,13 +121,17 @@ by column:
 | Inbox, Done | Recorded only. |
 | Triage | Re-runs triage (or is read by the triage run in progress). |
 | Planning | Revises the plan; voids any approval of the previous version. |
-| Building | Guidance to the build within its approval: relayed to an idle run or one waiting on checks, read by a busy run before it can submit. On a finished build, or at `Needs you` with no fix attempt left, it starts a rework. |
+| Building | Guidance to the build within its approval: relayed at once, to an idle run, one waiting on checks, or a busy one (its turn or its workers still running), at most one message per 2 minutes; the run must also read it before it can submit. On a finished build, or at `Needs you` with no fix attempt left, it starts a rework. |
 | Ready | Starts a rework (back to Building, `Rework: owner feedback`). |
 | Any, at `Bot: Checkpoint` | Recorded only; the run needs `/continue` before it reads it. |
 
 On the parcel's PR, an owner conversation comment, or a review that requests changes,
 comments, or approves with text, counts as the same plain comment (so on a Ready card it
-starts a rework). Not after `/stop` or once merged. See
+starts a rework). Not after `/stop` or once merged. An accepted issue or PR conversation
+comment gets 👀 when taken and 👍 once a run has read it (`factory_get_feedback`); a
+review has no reaction API, so it only gets the note. While a run has it, the card's
+`Factory note` says `Feedback received: relayed to Rosie` (or `... Rosie reads it before
+submitting` when it was folded or gated). See
 [Steering by comment](#steering-by-comment) for details.
 
 ### Bot and Factory note
@@ -478,7 +482,9 @@ reason, written only when it changes and cleared when the card moves on. Blocked
 Checkpoint, Needs you and Queued cards without a specific reason get a derived note.
 `Bot: Queued` marks an approved build waiting for capacity; its note (`Queued: 2nd in line`)
 follows the queue as builds ahead are admitted (refreshed by the periodic reconcile). Owner command comments get a
-reaction: 👍 accepted, 😕 refused (the reason is in the note). Config keys:
+reaction: 👍 accepted, 😕 refused (the reason is in the note). Plain owner comments get 👀
+when taken and 👍 once a run has read them (the 👀 stays; GitHub has no webhook for
+reactions either way). Reactions are display only: a failed one blocks nothing. Config keys:
 `note_field_node_id` and `bot_options.Queued`; `doctor` checks both exist.
 
 Comments read like a fellow developer's: plain GitHub Markdown in the agent's own words
@@ -575,11 +581,21 @@ issue only; reactions and other people's comments never count. In Triage a comme
 re-runs triage in the issue session (a revised triage comment follows); in Planning it
 revises the plan; in Building it is relayed to a build waiting on checks without touching
 the approval. Elsewhere it only waits for later stages. A run whose turn ended without a result (its tree is idle) gets the comment
-as one message, even if it reported blocked; a comment that arrives mid-turn is relayed when
-that turn ends without a result (periodic tree scans can be incomplete, so this is the
-fallback). Further comments wait until the run is idle again.
-A run that is mid-turn gets no extra message: its result is refused until
-it has read every comment, so a burst of comments folds into the run in progress.
+as one message, even if it reported blocked.
+
+A build that is busy (its turn running, or its turn ended while the workers it dispatched
+still run) gets the comment at once as a mid-build message: read it with
+`factory_get_feedback`, redirect in-flight workers, stay within the approved plan, ask
+with `factory_ask_owner` if it asks for more (#884: a turn and its workers can run for
+hours). Omnigent delivers it straight away to a root whose turn has ended (it starts a
+turn); to a root mid-turn it is queued and delivered as the next turn when that turn ends
+(the claude-sdk harness cannot inject into a running turn). Comments within 2 minutes of
+the last relay are folded into one message, sent on the first periodic reconcile after
+the window (or when the turn ends without a result, whichever is first); a comment is
+never relayed twice, a restart included (the reducer state and the event dedupe are
+durable). A gated run (stopped, open question, approval invalid) only records it.
+A busy triage or plan run gets no extra message. Every run's result is refused until it
+has read every comment, so a burst still folds into the run in progress.
 
 **Rework.** Owner feedback on a Ready card (an issue comment, a PR comment or review, or
 dragging the card back to Building) moves it to Building with the note `Rework: owner
@@ -718,6 +734,13 @@ reducer never replays. Retention runs every 15 minutes in the daemon, in short b
 | `delivery_body_retention_days` | `0.083` (2 h) | Body and headers of processed deliveries that no event, or only check/PR/review observations, references. The row and its GUID stay for duplicate detection. |
 | `delivery_row_retention_days` | `14` | Rows (and delivery attempts) of processed deliveries whose body was pruned, unless an event, a parked delivery, a parcel hold or stored review comments reference them; quarantined attempts are kept. A delivery that produced no event (ignored, no transition) loses its body and headers as soon as it is processed (GUID and sha256 stay). |
 | `completed_reconcile_interval_seconds` | `3600` | Not a deletion: only when no board diff is wired, a parcel with no live work is reconciled at this cadence instead of every `reconcile_interval_seconds`. |
+
+Active time is stored rounded up to 5-minute steps (`ActiveTimeSample`, one event per
+step instead of one per 10 s observer pass; 92% fewer rows on the live database), never
+past the grant's end until the estimate reaches it, so a checkpoint comes on the same
+pass as before and a crash can only over-count. A changed cost total (`CostSample`,
+audit only; the cost backstop is the Omnigent policy) is stored at most every 5 minutes
+per run.
 
 An issue read (`GitHubSnapshot`) whose values equal the parcel's newest stored read and
 changes nothing is not stored at all (nor its read effect or audit row); when a newer read

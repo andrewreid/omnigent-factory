@@ -165,8 +165,12 @@ def test_a_burst_of_feedback_is_one_rework():
     assert [q.parcel_id for q in h.admission.queue if q.status == QueueStatus.QUEUED] == [P]
     h.send(P, ev.CapacityAvailable())
     run = h.create_ok()
-    # Mid-turn: recorded only (the MCP gate makes the run read it before build_ready).
+    # Mid-turn: relayed to the running rework at once, then folded for the window (the
+    # MCP gate still makes the run read every comment before build_ready).
     r = comment(h, "four")
+    [msg] = Harness.of(r, EffectKind.SEND_MESSAGE)
+    assert r.audit.accepted and msg.args["midturn"] is True
+    r = comment(h, "five")
     assert r.audit.accepted and not Harness.of(r, EffectKind.SEND_MESSAGE)
     assert h.cur().session_id == run.session_id and len(h.p().authorizations) == auths
 

@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 
 from omnigent_factory.core import events as ev
@@ -36,6 +37,30 @@ LOG = logging.getLogger(__name__)
 
 #: Lifecycles a run may be parked in (:meth:`OmnigentObserver._parked`).
 _PARKABLE_LIFECYCLES = frozenset({Lifecycle.ACTIVE, Lifecycle.WAITING, Lifecycle.FENCED})
+
+#: Active time is persisted rounded *up* to this step (never past the grant's last
+#: microsecond until it is really spent): one event per step instead of one per pass,
+#: and a crash between steps can only over-count (see :func:`persisted_active_us`).
+ACTIVE_TIME_STEP_US = 5 * 60 * 1_000_000
+#: A changed cost total is persisted at most this often per run (audit only: the cost
+#: backstop is the Omnigent policy, not these samples).
+COST_SAMPLE_INTERVAL_US = 5 * 60 * 1_000_000
+
+
+def persisted_active_us(
+    actual_us: int, duration_us: int, step_us: int = ACTIVE_TIME_STEP_US
+) -> int:
+    """The active time to store for an upper-bound estimate ``actual_us``.
+
+    Rounded up to the next ``step_us`` so the stored value always covers the estimate
+    (a crash loses nothing: the next tracker starts from it), but capped one microsecond
+    short of the grant until the estimate reaches it, so the limit (``remaining_us ==
+    0``) is reached on exactly the pass it was before, never early.
+    """
+    rounded = -(-actual_us // step_us) * step_us if actual_us > 0 else 0
+    if actual_us >= duration_us:
+        return rounded  # spent: >= duration, so the limit is reached on this pass
+    return min(rounded, duration_us - 1)
 
 
 class OmnigentObserver:
@@ -72,6 +97,7 @@ class OmnigentObserver:
         self._last_tree: dict[str, tuple[bool, bool, bool]] = {}
         self._last_activity: dict[str, int] = {}
         self._last_cost: dict[str, int | None] = {}
+        self._last_cost_at: dict[str, int] = {}
         self._crashed: set[str] = set()
 
     async def start(self) -> None:
@@ -90,12 +116,7 @@ class OmnigentObserver:
             session = parcel.current_session
             tracker = self._trackers.get(session.session_id) if session is not None else None
             if tracker is not None:
-                sample = tracker.sample()
-                await self._apply(
-                    parcel,
-                    sample,
-                    f"shutdown-activity:{sample.grant_id}:{sample.consumed_us}",
-                )
+                await self._activity(parcel, tracker)  # the stored value covers the estimate
 
     def healthy(self) -> bool:
         return self._task is None or not self._task.done()
@@ -209,16 +230,19 @@ class OmnigentObserver:
         await self._activity(parcel, tracker)
         cost = observation.root.total_cost_usd if observation.root is not None else None
         microdollars = None if cost is None else int(cost * 1_000_000)
+        last_cost_at = self._last_cost_at.get(session.session_id)
+        mono = self.clock.monotonic_us()
         if (
             session.session_id not in self._last_cost
             or self._last_cost[session.session_id] != microdollars
-        ):
+        ) and (last_cost_at is None or mono - last_cost_at >= COST_SAMPLE_INTERVAL_US):
             await self._apply(
                 parcel,
                 ev.CostSample(session_id=session.session_id, microdollars=microdollars),
                 f"cost:{session.session_id}:{now}",
             )
             self._last_cost[session.session_id] = microdollars
+            self._last_cost_at[session.session_id] = mono
         await self._prompts(parcel, observation.owned_elicitations())
         if (
             observation.root is not None
@@ -276,11 +300,25 @@ class OmnigentObserver:
         return tracker
 
     async def _activity(self, parcel: Parcel, tracker: ActivityTracker) -> None:
+        """Persist the grant's active time only when the estimate passes what is stored
+        (stored values are rounded up, see :func:`persisted_active_us`)."""
         sample = tracker.sample()
-        if self._last_activity.get(sample.grant_id) == sample.consumed_us:
+        session = parcel.current_session
+        stored = self._last_activity.get(sample.grant_id, 0)
+        if session is not None and session.grant.grant_id == sample.grant_id:
+            stored = max(stored, session.grant.consumed_us)
+            duration = session.grant.duration_us
+        else:
+            duration = sample.consumed_us  # unknown grant: store the estimate as is
+        if sample.consumed_us <= stored:
             return
-        await self._apply(parcel, sample, f"activity:{sample.grant_id}:{sample.consumed_us}")
-        self._last_activity[sample.grant_id] = sample.consumed_us
+        value = persisted_active_us(sample.consumed_us, duration)
+        await self._apply(
+            parcel,
+            replace(sample, consumed_us=value),
+            f"activity:{sample.grant_id}:{value}",
+        )
+        self._last_activity[sample.grant_id] = value
 
     async def _prompts(
         self, parcel: Parcel, prompts: Mapping[str, tuple[str, Mapping[str, Any]]]

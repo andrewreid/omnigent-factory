@@ -302,12 +302,14 @@ def test_comment_reaches_an_idle_triage_run_without_a_second_run():
     assert h.cur().session_id == run.session_id
 
 
-def test_busy_tree_gets_no_extra_message():
+def test_busy_tree_gets_one_message_per_burst():
     h = Harness()
     build = h.to_building()
     h.quiesce(P, build.session_id)
     h.send(P, ev.RuntimeActivity(session_id=build.session_id, busy=True))
-    assert not feedback_messages(comment(h))
+    [msg] = feedback_messages(comment(h))
+    assert msg.args["midturn"] is True
+    assert not feedback_messages(comment(h, "and Y"))  # inside the coalescing window
 
 
 # -------------------------------------------------------- session housekeeping
@@ -352,12 +354,15 @@ def test_replaced_issue_session_is_archived():
     assert h.p().current_session.lifecycle == Lifecycle.ACTIVE
 
 
-def test_comment_during_a_turn_is_relayed_when_the_turn_ends_without_a_result():
-    """Periodic scans can report an incomplete tree, so the run may look busy when the
-    comment arrives; it is delivered at the next idle observation instead."""
+def test_comment_folded_mid_turn_is_relayed_when_the_turn_ends_without_a_result():
+    """A comment inside the coalescing window of a mid-turn relay is delivered at the
+    next idle observation (or the next reconcile after the window), once."""
     h = Harness()
     build = h.to_building()
-    assert not feedback_messages(comment(h, "mid-turn"))
+    [first] = feedback_messages(comment(h, "mid-turn"))
+    assert first.args["midturn"] is True
+    assert not feedback_messages(comment(h, "and also"))
+    assert h.cur().comment_pending
     r = h.quiesce(P, build.session_id)
     [msg] = feedback_messages(r)
     assert msg.preconditions.session_id == build.session_id

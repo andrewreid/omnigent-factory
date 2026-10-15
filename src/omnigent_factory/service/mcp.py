@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import re
 import uuid
 from collections.abc import Callable, Mapping
@@ -96,6 +97,8 @@ TOOL_NAMES = (
     "factory_submit_result",
     "factory_submit_ranking",
 )
+
+LOG = logging.getLogger(__name__)
 
 #: Most issues ``factory_list_issues`` returns (one short line each).
 MAX_LISTED_ISSUES = 200
@@ -572,6 +575,7 @@ class FactoryTools:
         if run is not None and comments:
             run_id, newest = run.session_id, max(int(c["sequence"]) for c in comments)
             await self.service.db.call(lambda store: store.record_feedback_read(run_id, newest))
+            await self._acknowledge_read(parcel, run, comments, newest)
         boundary = self._boundary(run)
         answers = []
         for d in parcel.decisions:
@@ -601,6 +605,32 @@ class FactoryTools:
             "owner's directions for this issue, a later comment overriding an earlier one. "
             "new = posted since your last result for this stage (or since this run started).",
         }
+
+    async def _acknowledge_read(
+        self,
+        parcel: Parcel,
+        run: StageSession,
+        comments: list[dict[str, Any]],
+        newest: int,
+    ) -> None:
+        """Tell the reducer which 👀-marked comments this run has now been shown (it
+        reacts 👍). Display only: a failure never fails the read."""
+        served = tuple(str(c["event_id"]) for c in comments)
+        if not set(served) & set(parcel.unread_feedback):
+            return
+        event = Event(
+            # One read per run and newest comment: a repeated read is a duplicate.
+            event_id=f"mcp:feedback-read:{run.session_id}:{newest}",
+            repo_id=self.config.repo_id,
+            parcel_id=parcel.parcel_id,
+            source_time_us=self.service.clock.now_utc_us(),
+            provenance=Provenance.MCP,
+            body=ev.FeedbackRead(session_id=run.session_id, event_ids=served),
+        )
+        try:
+            await self.service.apply_event(event)
+        except Exception:
+            LOG.warning("feedback read acknowledgement failed", exc_info=True)
 
     async def _new_since(self, caller: Caller) -> int:
         """This session's last result time for the run's stage, else the run's start."""

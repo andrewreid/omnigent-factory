@@ -1,9 +1,10 @@
 """Owner steering through plain issue comments, per column (reducer rows).
 
 A plain owner comment is recorded in every column; Triaged re-runs triage in the issue
-session, Scoped revises the plan, Building relays it to an idle build within its
-approval, and nothing starts elsewhere. A run executing a turn gets no extra message (the
-MCP submit gate makes it read every comment first), so a burst never queues several runs.
+session, Scoped revises the plan, Building relays it to the build within its approval
+(at once even mid-turn, one message per coalescing window), and nothing starts
+elsewhere. A busy plan or triage run gets no extra message (the MCP submit gate makes it
+read every comment first), so a burst never queues several runs.
 """
 
 from __future__ import annotations
@@ -34,6 +35,11 @@ def starts_run(result):
 
 def messages(result):
     return Harness.of(result, EffectKind.SEND_MESSAGE)
+
+
+def work(result):
+    """Effects that start or steer agent work (display writes such as notes excluded)."""
+    return [e for e in result.effects if e.kind in WORK_BEARING_KINDS]
 
 
 def comment(h: Harness, text: str = "you missed X", **kw):
@@ -71,7 +77,7 @@ def test_B_comments_during_a_rerun_never_start_a_second_run():
     h.create_ok()
     for text in ("three", "four"):
         r = comment(h, text)
-        assert r.audit.accepted and r.effects == ()
+        assert r.audit.accepted and not work(r)
     assert h.cur().session_id == rerun.session_id
     assert sum(1 for s in h.p().sessions if s.kind == SessionKind.TRIAGE) == 2
 
@@ -82,7 +88,7 @@ def test_B_comment_during_first_triage_is_folded_into_it():
     h.send(P, ev.RequestTriage(via=Via.DRAG))
     run = h.create_ok()
     r = comment(h, "also check Y")
-    assert r.audit.accepted and r.effects == ()
+    assert r.audit.accepted and not work(r)
     assert h.cur().session_id == run.session_id
 
 
@@ -193,14 +199,21 @@ def test_D_build_comment_wakes_waiting_build_without_voiding_approval():
     assert h.p().stage == Stage.BUILDING
 
 
-def test_D_comment_while_build_turn_runs_is_recorded_only():
+def test_D_comment_while_build_turn_runs_is_relayed_at_once():
+    """#884: a build turn (and the workers it waits on) can run for hours; the owner's
+    direction reaches it now, not when the tree goes quiet."""
     h = Harness()
     b = h.to_building()
     approval = h.p().current_approval_id
     r = comment(h, "prefer the smaller change")
-    assert r.audit.accepted and r.effects == ()
+    assert r.audit.accepted
+    [msg] = messages(r)
+    assert msg.args["purpose"] == MessagePurpose.FEEDBACK.value and msg.args["midturn"] is True
     assert h.p().current_approval_id == approval
-    assert h.cur().session_id == b.session_id and not h.cur().fences
+    run = h.cur()
+    assert run.session_id == b.session_id and not run.fences
+    assert run.lifecycle == Lifecycle.ACTIVE and run.feedback_wakes == 1
+    assert not run.comment_pending and not starts_run(r)
 
 
 # ------------------------------------------------------------------ E: elsewhere

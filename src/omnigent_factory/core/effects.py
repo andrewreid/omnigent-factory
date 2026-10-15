@@ -35,7 +35,8 @@ class EffectKind(enum.StrEnum):
     #: Clear the epic's "Autopilot" field (``args.value`` ""; the factory only ever clears
     #: it, the owner's own webhook is the control).
     SET_AUTOPILOT = "set_autopilot"
-    #: React to an owner command comment (+1 accepted, confused refused).
+    #: React to an owner comment: a command (+1 accepted, confused refused), or plain
+    #: feedback (eyes taken, +1 once a run has read it).
     REACT_COMMENT = "react_comment"
     POST_COMMENT = "post_comment"
     PUBLISH_CONTRACT = "publish_contract"

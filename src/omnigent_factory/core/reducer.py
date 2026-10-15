@@ -2433,12 +2433,19 @@ def _h_plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
     runs). What it starts depends on the column: Triaged re-runs triage, Scoped revises
     the plan, Building nudges the build within its approval (or reworks a finished one),
     Ready reworks the build (see ``_rework``); elsewhere nothing starts.
-    A run that is executing a turn gets no message: ``factory_submit_result`` refuses a
-    result until the run has read every recorded comment, so a burst of comments folds
-    into the run in progress instead of queuing several re-runs.
+    A busy plan or triage run gets no message: ``factory_submit_result`` refuses a result
+    until the run has read every recorded comment, so a burst of comments folds into the
+    run in progress instead of queuing several re-runs. A busy build is told at once
+    (coalesced, see ``_build_feedback``): its workers may build for hours.
+    Every accepted issue comment gets 👀, and 👍 once a run has read it (``FeedbackRead``).
     """
     _control(ctx)
     _require_eligible(ctx)
+    _steer(ctx, body)
+    _acknowledge_feedback(ctx)
+
+
+def _steer(ctx: _Ctx, body: ev.PlanFeedback) -> None:
     stage = ctx.origin_stage
     answered = _answer_questions(ctx)
     if not answered:
@@ -2453,6 +2460,59 @@ def _h_plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
         _plan_feedback(ctx, body)
     elif stage == Stage.TRIAGED:
         _triage_feedback(ctx)
+
+
+def _acknowledge_feedback(ctx: _Ctx) -> None:
+    """Show the owner the comment was taken: 👀 on the comment (a PR review has no
+    reaction API), tracked until a run reads it. Display only: a failed reaction
+    blocks nothing."""
+    match = _COMMENT_EVENT_ID.fullmatch(ctx.event.event_id)
+    if match is not None and ctx.event.event_id not in ctx.p.unread_feedback:
+        ctx.update(unread_feedback=(*ctx.p.unread_feedback, ctx.event.event_id))
+        ctx.emit(
+            EffectKind.REACT_COMMENT,
+            args={"comment_id": int(match.group(1)), "content": "eyes"},
+        )
+
+
+def _feedback_note(ctx: _Ctx) -> None:
+    """An accepted owner comment that reached a live run (relayed now, or queued for
+    it) is shown on the card, unless this event set a note of its own (a rework, a
+    revised plan, a lapsed mark): that note explains the card better."""
+    if ctx.event.kind != EventKind.PLAN_FEEDBACK or ctx.note_set:
+        return
+    relayed = any(
+        e.kind == EffectKind.SEND_MESSAGE
+        and e.args.get("purpose")
+        in (MessagePurpose.FEEDBACK.value, MessagePurpose.ANSWER_RELAY.value)
+        and effect_still_valid(ctx.p, e) is None
+        for e in ctx.effects
+    )
+    cur = ctx.p.current_session
+    if relayed:
+        ctx.note(FEEDBACK_RELAYED_NOTE)
+    elif cur is not None and cur.comment_pending and not cur.execution_closed:
+        ctx.note(FEEDBACK_QUEUED_NOTE)
+
+
+def _h_feedback_read(ctx: _Ctx, body: ev.FeedbackRead) -> None:
+    """``factory_get_feedback`` served these comments to a run: 👍 each one marked 👀,
+    and drop the "Feedback received" note once none is left unread."""
+    _session(ctx, body.session_id)
+    read = set(body.event_ids)
+    done = [e for e in ctx.p.unread_feedback if e in read]
+    if not done:
+        raise Rejected("nothing-unread")
+    ctx.update(unread_feedback=tuple(e for e in ctx.p.unread_feedback if e not in read))
+    for event_id in done:
+        match = _COMMENT_EVENT_ID.fullmatch(event_id)
+        if match is not None:
+            ctx.emit(
+                EffectKind.REACT_COMMENT,
+                args={"comment_id": int(match.group(1)), "content": "+1"},
+            )
+    if not ctx.p.unread_feedback and ctx.p.note.startswith("Feedback received"):
+        ctx.note("")
 
 
 def _answer_questions(ctx: _Ctx) -> bool:
@@ -2589,9 +2649,20 @@ def _triage_feedback(ctx: _Ctx) -> None:
     _start_stage(ctx, SessionKind.TRIAGE, ctx.config.block_us(ctx.p.size or Size.S))
 
 
-def _build_feedback(ctx: _Ctx, body: ev.PlanFeedback, *, answered: bool = False) -> None:
-    """Building: relay the comment to an idle build within its approval (never voids it).
+#: Owner comments within this long of the last feedback relay to a run are folded into
+#: one later relay (the periodic reconcile or the turn's end), so a burst is one message.
+FEEDBACK_COALESCE_US = 120 * 1_000_000
 
+FEEDBACK_RELAYED_NOTE = "Feedback received: relayed to Rosie"
+FEEDBACK_QUEUED_NOTE = "Feedback received: Rosie reads it before submitting"
+
+
+def _build_feedback(ctx: _Ctx, body: ev.PlanFeedback, *, answered: bool = False) -> None:
+    """Building: relay the comment to the build within its approval (never voids it).
+
+    An idle build is woken with it. A busy build (a turn running, or workers it waits on)
+    gets it at once as a mid-build message (#884: a turn can run for hours), unless one
+    went out within ``FEEDBACK_COALESCE_US``: that comment is folded into the next relay.
     A comment that answers an open question is relayed as that answer. On Needs you with
     no fix attempt left (``readiness_failed``) or a closed run, it starts a rework instead
     (the answer then reaches the rework run with the comment).
@@ -2617,7 +2688,10 @@ def _build_feedback(ctx: _Ctx, body: ev.PlanFeedback, *, answered: bool = False)
         return
     if busy:
         assert build is not None  # noqa: S101 - busy implies a build
-        ctx.put_session(replace(build, comment_pending=True))  # see _h_tree_quiescent
+        if not _midturn_relay(ctx, build, body.text_digest):
+            # Gated or coalesced: the reconcile after the window, or the turn's end
+            # (_h_tree_quiescent), relays it; the submit gate makes the run read it anyway.
+            ctx.put_session(replace(build, comment_pending=True))
         return
     waiting = (
         build is not None
@@ -2689,17 +2763,62 @@ def _continue_answered(ctx: _Ctx, s: StageSession) -> bool:
     return continued(ctx.p, s) and r is not None and r.reviewed_head in ("", r.head_sha)
 
 
-def _relay_comment(ctx: _Ctx, s: StageSession, digest: str = "") -> None:
-    """Relay an owner comment to an idle run once; it is not re-sent until the tree has
-    been seen idle again, so a burst of comments becomes one message."""
+def _relay_comment(ctx: _Ctx, s: StageSession, digest: str = "", *, midturn: bool = False) -> None:
+    """Relay owner feedback to a run once. A later comment is not re-sent to it until
+    the coalescing window has passed or its tree has been seen idle again, so a burst of
+    comments becomes one message. ``midturn``: the run is busy (it reads the feedback
+    and steers its in-flight work instead of re-submitting)."""
     ctx.unhold(Hold.AGENT_BLOCKED, Hold.RESULT_INVALID, Hold.BLOCKERS)  # the owner's steer
-    s = ctx.put_session(replace(s, quiescent=False, comment_pending=False))
-    _ensure_issuance(ctx, s)
-    ctx.emit(
-        EffectKind.SEND_MESSAGE,
-        session=s,
-        args={"purpose": MessagePurpose.FEEDBACK.value, "text_digest": digest},
+    s = ctx.put_session(
+        replace(s, quiescent=False, comment_pending=False, feedback_relayed_us=ctx.now)
     )
+    _ensure_issuance(ctx, s)
+    args: dict[str, JsonValue] = {"purpose": MessagePurpose.FEEDBACK.value, "text_digest": digest}
+    if midturn:
+        args["midturn"] = True
+    ctx.emit(EffectKind.SEND_MESSAGE, session=s, args=args)
+
+
+def _relay_permitted(ctx: _Ctx, s: StageSession) -> bool:
+    """A feedback relay to ``s`` is allowed now: no open owner question, the work gate
+    open and, for a build, its approval still valid."""
+    return (
+        not ctx.p.open_decisions
+        and work_allowed(ctx.p, s)
+        and (s.kind != SessionKind.BUILD or approval_ok(ctx.p))
+    )
+
+
+def _midturn_relay(ctx: _Ctx, build: StageSession, digest: str = "") -> bool:
+    """Relay owner feedback to a busy build now, unless gated or inside the coalescing
+    window of the last relay. A relayed comment is an owner wake (``feedback_wakes``):
+    the run may re-submit the same head, and a turn that ends without a new result is
+    not read as a finished readiness wake."""
+    if not _relay_permitted(ctx, build):
+        return False
+    if build.feedback_relayed_us and ctx.now - build.feedback_relayed_us < FEEDBACK_COALESCE_US:
+        return False
+    build = ctx.put_session(replace(build, feedback_wakes=build.feedback_wakes + 1))
+    _relay_comment(ctx, build, digest, midturn=True)
+    return True
+
+
+def _flush_pending_feedback(ctx: _Ctx) -> None:
+    """Periodic reconcile: relay comments folded while a build stays busy once the
+    coalescing window has passed (an idle build gets them from _h_tree_quiescent)."""
+    cur = ctx.p.current_session
+    if (
+        cur is None
+        or not cur.comment_pending
+        or cur.kind != SessionKind.BUILD
+        or ctx.p.stage != Stage.BUILDING
+        or cur.lifecycle != Lifecycle.ACTIVE
+        or _idle_run(cur)
+        or _rework_supersedes(ctx, cur)
+    ):
+        return
+    if _midturn_relay(ctx, cur) and not ctx.note_set:
+        ctx.note(FEEDBACK_RELAYED_NOTE)
 
 
 def _build_ended(ctx: _Ctx) -> bool:
@@ -5336,6 +5455,7 @@ def _h_reconcile_due(ctx: _Ctx, body: ev.ReconcileDue) -> None:
     _ = body
     ctx.emit(EffectKind.RECONCILE_PARCEL)
     _close_stale_decisions(ctx)
+    _flush_pending_feedback(ctx)
     cur = ctx.p.current_session
     if _awaiting_evidence(ctx):
         r = ctx.p.readiness
@@ -5422,6 +5542,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.ELICITATION_RESOLVED: _h_elicitation_resolved,
     EventKind.ELICITATION_GONE: _h_elicitation_gone,
     EventKind.OWNER_QUESTION: _h_owner_question,
+    EventKind.FEEDBACK_READ: _h_feedback_read,
     EventKind.POLICIES_VERIFIED: _h_policies_verified,
     EventKind.POLICY_GUARD_FAILED: _h_policy_guard_failed,
     EventKind.RESULT_CANDIDATE: _h_result,
@@ -5834,6 +5955,8 @@ def transition(state: State, event: Event) -> TransitionResult:
         _settle_autopilot(ctx)
         _settle_blockers(ctx)
         _settle_build_slot(ctx)
+        if accepted:
+            _feedback_note(ctx)
         _project_board(ctx)
         new_parcel = ctx.p
         kept: list[EffectIntent] = []

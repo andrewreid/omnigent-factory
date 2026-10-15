@@ -1903,8 +1903,8 @@ class GitHubAPIAdapter:
     async def _react(self, effect: EffectIntent) -> AdapterOutcome:
         comment_id = effect.args.get("comment_id")
         content = effect.args.get("content")
-        if not isinstance(comment_id, int) or content not in {"+1", "confused"}:
-            return DefinitiveFailure("REACT_COMMENT requires comment_id and +1/confused")
+        if not isinstance(comment_id, int) or content not in {"+1", "confused", "eyes"}:
+            return DefinitiveFailure("REACT_COMMENT requires comment_id and +1/confused/eyes")
         await self.client.request(
             "POST",
             f"/repos/{self.repository}/issues/comments/{comment_id}/reactions",

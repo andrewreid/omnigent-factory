@@ -157,7 +157,7 @@ class EventFactory:
                 provenance = Provenance.SCHEDULER
             if isinstance(body, ev.InboxHoldSet | ev.InboxHoldReleased):
                 provenance = Provenance.INBOX
-            if isinstance(body, ev.ResultCandidate | ev.OwnerQuestion):
+            if isinstance(body, ev.ResultCandidate | ev.OwnerQuestion | ev.FeedbackRead):
                 provenance = Provenance.MCP
         if actor is None and cls == EventClass.CONTROL and provenance not in _ACTORLESS:
             actor = OWNER_ID

@@ -227,6 +227,8 @@ class ServiceDispatchDirectory:
             )
         if purpose == "feedback":
             if spec.kind == SessionKind.BUILD:
+                if effect.args.get("midturn") is True:
+                    return _template("build-feedback-midturn-v1.txt").format(run_id=sid)
                 return _template("build-feedback-v2.txt").format(run_id=sid)
             if spec.kind == SessionKind.TRIAGE:
                 return _template("triage-comment-v1.txt").format(run_id=sid)

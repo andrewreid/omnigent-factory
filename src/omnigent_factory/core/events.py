@@ -104,6 +104,7 @@ class EventKind(enum.StrEnum):
     ELICITATION_RESOLVED = "ElicitationResolved"
     ELICITATION_GONE = "ElicitationGone"
     OWNER_QUESTION = "OwnerQuestion"
+    FEEDBACK_READ = "FeedbackRead"
     POLICIES_VERIFIED = "PoliciesVerified"
     POLICY_GUARD_FAILED = "PolicyGuardFailed"
     RESULT_CANDIDATE = "ResultCandidate"
@@ -817,6 +818,21 @@ class OwnerQuestion(_Body):
 
 
 @dataclass(frozen=True, slots=True)
+class FeedbackRead(_Body):
+    """``factory_get_feedback`` served these owner comments (event IDs) to the run.
+
+    Display only: the factory acknowledges each comment it marked 👀 with 👍 and clears
+    the "Feedback received" card note. The submit gate does not use it (it reads the
+    MCP read table directly).
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.FEEDBACK_READ
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    session_id: str = ""
+    event_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class PoliciesVerified(_Body):
     """Outcome of a VERIFY_POLICIES effect for one run.
 
@@ -1101,6 +1117,7 @@ EventBody = (
     | ElicitationResolved
     | ElicitationGone
     | OwnerQuestion
+    | FeedbackRead
     | PoliciesVerified
     | PolicyGuardFailed
     | ResultCandidate
@@ -1182,6 +1199,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         ElicitationResolved,
         ElicitationGone,
         OwnerQuestion,
+        FeedbackRead,
         PoliciesVerified,
         PolicyGuardFailed,
         ResultCandidate,
@@ -1296,6 +1314,7 @@ __all__ = [
     "EventBody",
     "EventClass",
     "EventKind",
+    "FeedbackRead",
     "FindingRef",
     "GitHubSnapshot",
     "GraceExpired",

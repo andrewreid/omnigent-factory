@@ -265,11 +265,11 @@ def test_replayed_command_does_not_react_twice():
     assert again.duplicate and again.effects == ()
 
 
-def test_free_form_feedback_and_non_comment_controls_get_no_reaction():
+def test_free_form_feedback_gets_eyes_and_non_comment_controls_no_reaction():
     h = Harness()
     h.plan_published()
     r = _command(h, ev.PlanFeedback(text_digest="x"), comment_id=58)
-    assert not reactions(r)
+    assert reactions(r) == [(58, "eyes")]  # taken; +1 once a run reads it
     r = h.send(P, ev.RequestPlan(via=Via.DRAG))
     assert not reactions(r)
 
@@ -365,3 +365,25 @@ async def test_reaction_posts_once_and_uncertainty_retries_instead_of_blocking()
             _effect(EffectKind.REACT_COMMENT, comment_id=55, content="+1"), CTX
         )
     assert isinstance(result, DefinitiveFailure)
+
+
+@pytest.mark.asyncio
+async def test_feedback_eyes_reaction_posts_and_unknown_content_is_refused():
+    seen: list[tuple[str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(201, json={"id": 2})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+        result = await _adapter(c).execute(
+            _effect(EffectKind.REACT_COMMENT, comment_id=58, content="eyes"), CTX
+        )
+        refused = await _adapter(c).execute(
+            _effect(EffectKind.REACT_COMMENT, comment_id=58, content="heart"), CTX
+        )
+    assert result == Ack("58", {"content": "eyes"})
+    assert seen == [
+        ("/repos/SA-Ambulance/timesheets/issues/comments/58/reactions", {"content": "eyes"})
+    ]
+    assert isinstance(refused, DefinitiveFailure)

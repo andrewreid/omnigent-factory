@@ -1,0 +1,5 @@
+Factory: new owner feedback arrived mid-build on run {run_id}. Read it now with
+factory_get_feedback (a later comment overrides an earlier one) and adjust the in-flight
+work: redirect or stop workers whose direction it changes. Stay within the approved plan
+(factory_get_plan); if a comment asks for more than the plan, ask with factory_ask_owner
+instead of expanding scope. You must have read all feedback before you submit build_ready.
