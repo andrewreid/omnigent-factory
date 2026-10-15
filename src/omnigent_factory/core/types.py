@@ -323,7 +323,8 @@ class DecisionImpact(enum.StrEnum):
     UNKNOWN = "unknown"
 
 
-#: Linked issues kept per list (sub-issues, blockers, blocked); a longer list is cut.
+#: Linked issues per list (sub-issues, blockers, blocked) in an issue read's first
+#: request; a longer list is paged to its end (``github.links.complete_links``).
 MAX_LINKED_ISSUES = 50
 #: Linked-issue titles are cut to this length (display only).
 LINK_TITLE_MAX = 120
@@ -349,11 +350,12 @@ class LinkedIssue:
 @dataclass(frozen=True, slots=True)
 class IssueLinks:
     """GitHub-native links of one issue from a fresh read: parent, sub-issues, blocked-by
-    and blocking. A read that could not see every blocker is never an ``IssueLinks``
-    (it is None: unreadable, which fails closed for auto-build)."""
+    and blocking. A read that could not see every entry of any list is never an
+    ``IssueLinks`` (it is None: unreadable, which fails closed for auto-build)."""
 
     parent: LinkedIssue | None = None
-    #: Sub-issues (at most ``MAX_LINKED_ISSUES``); the totals are GitHub's summary.
+    #: Every sub-issue (a per-issue read pages the list; a board read has none); the
+    #: totals are GitHub's summary.
     sub_issues: tuple[LinkedIssue, ...] = ()
     sub_total: int = 0
     sub_completed: int = 0

@@ -16,7 +16,7 @@ import pytest
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.effects import EffectKind
-from omnigent_factory.core.events import EventKind
+from omnigent_factory.core.events import Event, EventKind, Provenance
 from omnigent_factory.core.types import (
     MICROS_PER_MINUTE,
     AutoBuildStatus,
@@ -796,7 +796,7 @@ class StubClient:
         if "createIssue" in query:
             self.created.append(variables["input"])
             return {"createIssue": {"issue": {"number": 77}}}
-        if "subIssues(first: 100)" in query:
+        if "subIssues(first: 100" in query:
             nodes = [{"number": n, "body": b} for n, b in self.sub_bodies.items()]
             return {"repository": {"issue": {"subIssues": {"nodes": nodes}}}}
         return {
@@ -847,3 +847,60 @@ async def test_github_gates_find_by_marker_and_create_one_assigned_sub_issue(
         assert created["body"].endswith(gate_marker(1, "tenant"))
         assert "@someone" not in created["body"] and "<!-- x" not in created["body"]
         assert "#2, #3" in created["body"]
+
+
+# ------------------------------------------------------------------ long sub-issue lists (#878)
+
+
+async def test_an_epic_stored_with_a_cut_sub_issue_list_is_re_read_and_later_subs_start(
+    service_config: ServiceConfig,
+):
+    # #878: a read from before paging kept the first 50 sub-issues (all closed); the
+    # open ones (#2, #3 here) come after them, so the pass found nothing to start.
+    closed = tuple((100 + i, False) for i in range(50))
+    full = epic_links(*closed, (2, True), (3, True))
+    cut = replace(full, sub_issues=full.sub_issues[:50])
+    h = history()
+    f = h.f(EPIC)
+    h.apply(f.make(ev.GitHubSnapshot(), evidence=snapshot(read_at_us=f.now, links=cut)))
+    assert h.p(EPIC).links == cut
+    async with rig(on(service_config), h) as r:
+        assert await r.autopilot.run_once() == "#1: nothing to start"
+        # The pass asked for a fresh read of the epic ...
+        assert len(await r.effects(EffectKind.RECONCILE_PARCEL)) == 1
+        assert await r.count(EventKind.RECONCILE_DUE) == 1
+        # ... which (the adapter's per-issue read now pages the list) returns every one.
+        now = r.clock.now_utc_us()
+        await r.service.apply_event(
+            Event(
+                event_id=f"test-read:{now}",
+                repo_id=r.config.repo_id,
+                parcel_id=EPIC,
+                source_time_us=now,
+                provenance=Provenance.ADAPTER,
+                body=ev.GitHubSnapshot(),
+                evidence=snapshot(read_at_us=now, links=full),
+            )
+        )
+        assert (await r.parcel(EPIC)).links == full
+        assert await r.autopilot.run_once() == "#1: started #2"
+        # A full list is never re-read for its length.
+        r.clock.advance(10 * MICROS_PER_MINUTE)
+        await r.autopilot.run_once()
+        assert await r.count(EventKind.RECONCILE_DUE) == 1
+
+
+async def test_a_cut_epic_list_is_re_read_at_most_every_interval(service_config: ServiceConfig):
+    full = epic_links(*((100 + i, False) for i in range(50)), (2, True))
+    cut = replace(full, sub_issues=full.sub_issues[:50])
+    h = history()
+    f = h.f(EPIC)
+    h.apply(f.make(ev.GitHubSnapshot(), evidence=snapshot(read_at_us=f.now, links=cut)))
+    async with rig(on(service_config), h) as r:
+        # GitHub keeps returning the cut list (e.g. a read that fails to finish paging).
+        await r.autopilot.run_once()
+        await r.autopilot.run_once()
+        assert await r.count(EventKind.RECONCILE_DUE) == 1
+        r.clock.advance(6 * MICROS_PER_MINUTE)
+        await r.autopilot.run_once()
+        assert await r.count(EventKind.RECONCILE_DUE) == 2

@@ -41,7 +41,12 @@ from omnigent_factory.github.client import (
     GitHubRejected,
     RateLimited,
 )
-from omnigent_factory.github.links import BOARD_LINK_FIELDS, ISSUE_LINK_FIELDS, parse_links
+from omnigent_factory.github.links import (
+    BOARD_LINK_FIELDS,
+    ISSUE_LINK_FIELDS,
+    complete_links,
+    parse_links,
+)
 from omnigent_factory.ports.github import (
     GITHUB_EFFECT_KINDS,
     STATUS_OPTION_IDS,
@@ -570,7 +575,8 @@ class GitHubAPIAdapter:
             if not isinstance(items, dict):
                 raise GitHubAPIError("issue projectItems were unavailable")
             if after is None and isinstance(node, dict):
-                links = parse_links(node, self.repository_node_id)
+                full = await complete_links(self.client, parcel_id, node)
+                links = parse_links(full, self.repository_node_id)
             nodes = items.get("nodes")
             if not isinstance(nodes, list):
                 raise GitHubAPIError("issue projectItems nodes were malformed")

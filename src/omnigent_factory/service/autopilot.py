@@ -25,6 +25,9 @@ Each pass, per approved epic (one decision per sub-issue; the reducer re-checks 
   a waiting sub-issue whose stored blockers that read contradicts, or cannot confirm, is
   re-read (bounded per epic and pass, at most every ``REREAD_INTERVAL_US`` per issue), and the
   reducer starts nothing without a fresh per-issue read showing every blocker closed.
+* an epic whose stored sub-issue list is shorter than GitHub's sub-issue total (a read
+  from before the per-issue read paged the list, e.g. one cut at 50) is re-read, at most
+  every ``REREAD_INTERVAL_US``; the pass goes on with the list it has meanwhile.
 * a sub-issue labelled ``follow-up`` (``service.follow_ups``) is held, not started, unless
   it natively blocks another open sub-issue of the epic, the owner removed its label, or
   the owner put ``factory:build-follow-ups`` on the epic; the note counts held ones.
@@ -269,6 +272,8 @@ class EpicAutopilotService:
         if links is None or not links.epic:
             return await self._status(epic, "Epic · autopilot: waiting for its links", "")
         progress = f"Epic · {links.sub_completed}/{links.sub_total} done"
+        if len(links.sub_issues) < links.sub_total:
+            await self._reread_short_epic(epic, links)
         if not enabled:
             return await self._status(
                 epic, f"{progress} · autopilot off (factory switch)", "the factory switch is off"
@@ -456,6 +461,22 @@ class EpicAutopilotService:
             done += 1
             LOG.info("epic autopilot re-reading blockers issue=#%s", sub.number)
             await self.service.reread(pid)
+
+    async def _reread_short_epic(self, epic: Parcel, links: IssueLinks) -> None:
+        """Re-read an epic whose stored sub-issues are fewer than its total, so the next
+        pass sees every one (at most every ``REREAD_INTERVAL_US``)."""
+        now = self.service.clock.now_utc_us()
+        pid = epic.parcel_id
+        if now - self._reread_at.get(pid, -REREAD_INTERVAL_US) < REREAD_INTERVAL_US:
+            return
+        self._reread_at[pid] = now
+        LOG.info(
+            "epic autopilot re-reading sub-issues issue=#%s stored=%s total=%s",
+            epic.issue_number,
+            len(links.sub_issues),
+            links.sub_total,
+        )
+        await self.service.reread(pid)
 
     async def _start(self, sub: Sub, epic: int, epoch: str) -> bool:
         assert sub.parcel is not None  # noqa: S101 - candidates have one
