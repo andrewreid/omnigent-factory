@@ -210,6 +210,10 @@ class Hold(enum.StrEnum):
     #: Waiting on open native "blocked by" issues (the approval stands): Idle, no build
     #: slot. A fresh read showing every blocker closed starts or wakes the build once.
     BLOCKERS = "blockers"
+    #: The health sweep found the current run stalled (quiet after a nudge with no
+    #: progress, nudged too often, or busy with nothing moving): Needs you. Cleared by
+    #: real progress, a result, an owner comment or a new stage (``StallWatch``).
+    STALLED = "stalled"
 
 
 class InboxHoldReason(enum.StrEnum):
@@ -252,6 +256,7 @@ NEEDS_YOU_HOLDS = frozenset(
         Hold.PR_CLOSED,
         Hold.NO_PROJECT_ITEM,
         Hold.APPROVAL_VOIDED,
+        Hold.STALLED,
     }
 )
 #: ``EXTERNAL_ACTIVITY`` is in neither set: it clears by itself once the issue session is
@@ -277,6 +282,7 @@ CONTROL_CLEARED_HOLDS = frozenset(
         Hold.AGENT_BLOCKED,
         Hold.COMPLETED,
         Hold.BLOCKERS,
+        Hold.STALLED,
     }
 )
 
@@ -493,6 +499,48 @@ class Grant:
         return max(0, self.duration_us - self.consumed_us)
 
 
+class StallEscalation(enum.StrEnum):
+    """Why the health sweep handed a stalled run to the owner (``Hold.STALLED``)."""
+
+    #: Quiet without a result after a nudge, with no real progress since it.
+    QUIET = "quiet"
+    #: Nudged ``max_stall_nudges_per_run`` times with no new commit or result between.
+    LOOP = "loop"
+    #: Busy with nothing new anywhere in its tree for ``stall_frozen_minutes``.
+    FROZEN = "frozen"
+
+
+@dataclass(frozen=True, slots=True)
+class StallWatch:
+    """The health sweep's stall episodes for one run (see ``service.health_sweep``).
+
+    An episode starts when the run goes quiet without a result; it gets one nudge, and
+    a new episode (so a new nudge) needs real progress since that nudge (``progress``
+    changed: a worker started or reported, or the branch head moved; or a result or
+    question). The counters never reset within a run, so effect dedupe keys derived from
+    them (``stall:<session>:<n>``) stay unique.
+    """
+
+    #: Nudges sent to this run (each starts a new episode); never reset within the run.
+    nudges_sent: int = 0
+    #: When the current episode's nudge went out (0: none outstanding).
+    nudged_at_us: int = 0
+    #: The real-progress signature at that nudge (or at the escalation).
+    progress: str = ""
+    #: The tree's last activity when nudged or escalated (UTC us; 0 unknown).
+    idle_since_us: int = 0
+    #: The outstanding nudge restarted a dead runner (case B): not counted in ``budget``.
+    recovery: bool = False
+    #: The run's own nudges since the last new commit, result or owner reset (loop guard).
+    budget: int = 0
+    #: The branch head ``budget`` was last reset at ("" unknown).
+    commit: str = ""
+    #: Handed to the owner (with ``Hold.STALLED``); None while the run is watched.
+    escalated: StallEscalation | None = None
+    #: Escalations of this run; never reset within the run (comment dedupe keys).
+    escalations: int = 0
+
+
 @dataclass(frozen=True, slots=True)
 class StageSession:
     """One stage run (epoch) and its entire recursive worker tree.
@@ -548,6 +596,8 @@ class StageSession:
     #: A build run retired for Ready was re-opened once for review-bot findings that
     #: arrived after Ready (#799). Never again: a later late finding is the owner's.
     reopened: bool = False
+    #: Health-sweep stall episodes of this run (``StallWatch``).
+    stall: StallWatch = field(default_factory=StallWatch)
 
 
 @dataclass(frozen=True, slots=True)

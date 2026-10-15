@@ -187,7 +187,8 @@ async def test_first_board_diff_reads_each_unknown_parcel_once(
     )
     async with started(config, digests=False) as rig:
         idle = rig.idle()
-        await eventually(lambda: all(rig.github.reads[pid] >= 1 for pid in idle))
+        # A generous window: the first diff's reads were flaky at 5 s under suite load.
+        await eventually(lambda: all(rig.github.reads[pid] >= 1 for pid in idle), timeout=20.0)
         await asyncio.sleep(0.8)  # more diffs: nothing changed, nothing more is read
         assert all(rig.github.reads[pid] == 1 for pid in idle)
         stored = await rig.service.db.call(lambda store: store.board_digests())

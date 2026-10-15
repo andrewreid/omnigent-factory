@@ -29,6 +29,7 @@ from omnigent_factory.core.events import Event, Provenance
 from omnigent_factory.core.predicates import board_pending, run_closed, settled
 from omnigent_factory.core.projection import admission_key, auto_build_capacity_available
 from omnigent_factory.core.reducer import awaiting_evidence
+from omnigent_factory.core.stall import stall_view
 from omnigent_factory.core.types import (
     MICROS_PER_MINUTE,
     AdmissionSnapshot,
@@ -179,6 +180,9 @@ class FactoryService:
         #: writes and re-reads (composition; ``service.links.NativeLinks``). None: not
         #: wired.
         self.native_links: Any = None
+        #: Omnigent liveness and stalled-run recovery (composition;
+        #: ``service.health_sweep.HealthSweep``). None: not wired.
+        self.health_sweep: Any = None
         #: Per tracked parcel: (loop time its next per-issue read is due, the cadence
         #: that time was scheduled for) (reconcile loop).
         self._reconcile_due: dict[str, tuple[float, float]] = {}
@@ -492,12 +496,15 @@ class FactoryService:
         except Exception:
             return {"status": "unhealthy"}
         parked = self.parked.records()
-        if parked:
-            return {
-                "status": "degraded",
-                "paused": admission.paused,
-                "parked_deliveries": len(parked),
-            }
+        sweep = self.health_sweep.degraded() if self.health_sweep is not None else None
+        if parked or sweep:
+            out: dict[str, object] = {"status": "degraded", "paused": admission.paused}
+            if parked:
+                out["parked_deliveries"] = len(parked)
+            if sweep:
+                out["reason"] = sweep["reason"]  # e.g. omnigent_unhealthy, host_offline
+                out["detail"] = sweep["detail"]
+            return out
         return {"status": "ok", "paused": admission.paused}
 
     async def _delivery_loop(self) -> None:
@@ -1415,6 +1422,7 @@ class FactoryService:
             "unknown_effects": unknown,
             "parked_deliveries": len(parked),
             "boot_id": self.executor.boot_id,
+            "health_sweep": (self.health_sweep.status() if self.health_sweep is not None else None),
         }
 
     async def _explain(self, parcel_id: str) -> dict[str, object]:
@@ -1435,6 +1443,12 @@ class FactoryService:
             "lifecycle": session.lifecycle.value if session else None,
             "fences": sorted(fence.value for fence in session.fences) if session else [],
             "last_reason": audit[-1]["reason"] if audit else None,
+            "stall": stall_view(session.stall) if session else None,
+            "health_sweep": (
+                self.health_sweep.run_status(session.session_id)
+                if session is not None and self.health_sweep is not None
+                else None
+            ),
         }
 
     async def _recovery(self) -> dict[str, object]:

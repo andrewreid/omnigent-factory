@@ -10,7 +10,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from omnigent_factory.core import events as ev
@@ -63,6 +63,30 @@ def persisted_active_us(
     return min(rounded, duration_us - 1)
 
 
+@dataclass(frozen=True, slots=True)
+class TreeReading:
+    """The latest tree scan of a run, kept for the health sweep (in memory only)."""
+
+    observation: TreeObservation
+    #: When it was read (UTC us).
+    read_at_us: int
+    #: When this process first saw the tree as it is now (node ids, statuses, items,
+    #: ``updated_at``): the fallback activity time when the server sends no
+    #: ``updated_at`` (a restart starts it afresh: later, never earlier).
+    unchanged_since_us: int
+
+    @property
+    def last_activity_us(self) -> int:
+        return self.observation.last_activity_us or self.unchanged_since_us
+
+
+def _fingerprint(observation: TreeObservation) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        (n.node_id, n.status, n.task_status, n.items_hint, n.updated_at_us, n.busy)
+        for _nid, n in sorted(observation.nodes.items())
+    )
+
+
 class OmnigentObserver:
     """Feed tree, prompt, result, crash, cost and time observations through the service."""
 
@@ -99,6 +123,19 @@ class OmnigentObserver:
         self._last_cost: dict[str, int | None] = {}
         self._last_cost_at: dict[str, int] = {}
         self._crashed: set[str] = set()
+        self._readings: dict[str, TreeReading] = {}
+        self._fingerprints: dict[str, tuple[tuple[tuple[object, ...], ...], int]] = {}
+
+    def reading(self, session_id: str) -> TreeReading | None:
+        """The latest tree scan of run ``session_id`` this process made (None: none)."""
+        return self._readings.get(session_id)
+
+    def _remember(self, session_id: str, observation: TreeObservation, now: int) -> None:
+        fingerprint = _fingerprint(observation)
+        previous = self._fingerprints.get(session_id)
+        since = previous[1] if previous is not None and previous[0] == fingerprint else now
+        self._fingerprints[session_id] = (fingerprint, since)
+        self._readings[session_id] = TreeReading(observation, now, since)
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="omnigent-observer")
@@ -150,7 +187,12 @@ class OmnigentObserver:
         (``observe_trees``); a failed refresh makes each scan incomplete, never idle.
         """
         due: list[tuple[Parcel, StageSession, str]] = []
-        for parcel in await self._parcels():
+        parcels = await self._parcels()
+        open_runs = {p.current_session_id for p in parcels}
+        for stale in set(self._readings) - open_runs:  # closed runs: nothing watches them
+            self._readings.pop(stale, None)
+            self._fingerprints.pop(stale, None)
+        for parcel in parcels:
             session = parcel.current_session
             if session is None or session.root_id is None or run_closed(parcel, session):
                 continue
@@ -207,6 +249,7 @@ class OmnigentObserver:
         tracker.gap_ended()
         tracker.observe_tree(observation)
         now = self.clock.now_utc_us()
+        self._remember(session.session_id, observation, now)
         if self._last_runtime.get(session.session_id) != observation.busy:
             await self._apply(
                 parcel,

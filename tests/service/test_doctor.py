@@ -147,6 +147,8 @@ async def test_doctor_resolves_live_ids_and_does_not_create_local_state(tmp_path
             },
             "/v1/projects": {"object": "list", "data": [{"id": "project-1", "name": "Timesheets"}]},
             "/api/version": {"version": "0.0.0-other"},  # drift is a warning, never a failure
+            "/health": {"status": "ok"},
+            "/v1/hosts/host-1": {"host_id": "host-1", "status": "online"},
             "/v1/sessions": {
                 "object": "list",
                 "data": [
@@ -187,6 +189,8 @@ async def test_doctor_resolves_live_ids_and_does_not_create_local_state(tmp_path
         w.startswith("omnigent_version: server 0.0.0-other differs") for w in report.warnings
     )
     assert report.resolved["omnigent_host_id"] == "host-1"
+    assert report.checks["omnigent_health"] == "ok"
+    assert report.checks["omnigent_host_online"] == "online"
     assert report.resolved["omnigent_project_id"] == "project-1"
     assert report.resolved["repository_database_id"] == 123
     assert "github_token_revoke" in report.checks

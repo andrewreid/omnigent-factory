@@ -109,6 +109,8 @@ class MessagePurpose(enum.StrEnum):
     READINESS_WAKE = "readiness_wake"
     #: One wake of a build run that waited on open native blockers: all are closed now.
     BLOCKERS_CLOSED = "blockers_closed"
+    #: One health-sweep nudge to a run whose turn ended without a result (stalled).
+    STALL_NUDGE = "stall_nudge"
 
 
 class RetryClass(enum.StrEnum):

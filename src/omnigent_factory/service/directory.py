@@ -254,6 +254,8 @@ class ServiceDispatchDirectory:
             return _template("blockers-closed-v1.txt").format(
                 blockers=str(effect.args.get("blockers") or "the blocking issues"), run_id=sid
             )
+        if purpose == "stall_nudge":
+            return _template("stall-nudge-v1.txt").format(run_id=sid)
         if purpose == "operator_note":
             note = str(effect.args.get("text") or "").strip()
             if not note:
@@ -950,6 +952,12 @@ _STATUS_TEXT = {
     "confirmed idle.",
     "restart-exhausted": "The session stopped and couldn't be restarted automatically, so this "
     "is blocked.",
+    "stalled-quiet": "I've stalled: nothing has moved since {since}, and a nudge at {nudged} "
+    "didn't get me going again, so this needs you. A reply here reaches me.",
+    "stalled-loop": "I keep ending my turn without a result: {nudges} nudges in a row with no "
+    "new commit or result in between, so this needs you. A reply here reaches me.",
+    "stalled-frozen": "My session shows as busy, but nothing has happened anywhere in it since "
+    "{since}, so this needs you. A reply here reaches me.",
     "autopilot-order": "I've paused autopilot on this epic: I can't tell which sub-issue goes "
     "next, because neither the epic plan's build order nor blocked-by links between the "
     "sub-issues say. Which order should they go in?",

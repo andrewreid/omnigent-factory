@@ -99,10 +99,20 @@ async def test_production_composition_binds_every_external_effect_and_real_verif
         assert "/contents/" not in request.url.path, "factory must not read repo files"
         return httpx.Response(500)
 
+    omnigent_up = {"up": True}
+
+    def omnigent(request: httpx.Request) -> httpx.Response:
+        # Only the health sweep's global check answers: Omnigent and its host are up.
+        if request.url.path == "/health" and omnigent_up["up"]:
+            return httpx.Response(200, json={"status": "ok"})
+        if request.url.path == "/v1/hosts/host":
+            return httpx.Response(200, json={"host_id": "host", "status": "online"})
+        return httpx.Response(500)
+
     production = await build_production(
         config,
         github_transport=httpx.MockTransport(github),
-        omnigent_transport=httpx.MockTransport(lambda _: httpx.Response(500)),
+        omnigent_transport=httpx.MockTransport(omnigent),
     )
     started = False
     try:
@@ -124,7 +134,14 @@ async def test_production_composition_binds_every_external_effect_and_real_verif
         assert (config.wrapper_bin_dir / "git-credential-omnigent-factory").is_file()
         assert (config.wrapper_bin_dir / "gh").is_file()
         assert config.broker_socket.is_socket()
+        assert production.service.health_sweep is not None
+        await production.service.health_sweep.sweep_once()
         assert await production.service.health() == {"status": "ok", "paused": True}
+        omnigent_up["up"] = False  # Omnigent down: /healthz says so, with the reason
+        await production.service.health_sweep.sweep_once()
+        health = await production.service.health()
+        assert health["status"] == "degraded" and health["reason"] == "omnigent_unhealthy"
+        assert (await production.service.operator_command("status", {}))["health_sweep"]
     finally:
         if started:
             await production.service.stop()

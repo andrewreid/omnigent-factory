@@ -9,6 +9,7 @@ import stat
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
@@ -63,6 +64,7 @@ from omnigent_factory.service.github_delivery import (
     GitHubDeliveryProcessor,
     GitHubWebhookVerifier,
 )
+from omnigent_factory.service.health_sweep import HealthSweep
 from omnigent_factory.service.label_recovery import LabelRecovery
 from omnigent_factory.service.links import GitHubGates, NativeLinks
 from omnigent_factory.service.locking import ProcessLock
@@ -412,6 +414,14 @@ async def build_production(
         omnigent=omnigent,
         omnigent_adapter=omnigent_adapter,
     )
+    sweep = HealthSweep(
+        service,
+        omnigent,
+        observer.reading,
+        host_id=_required_text(config.omnigent_host_id, "omnigent_host_id"),
+        branch_head=partial(run_branch_head, directory, config.source_clone),
+    )
+    service.health_sweep = sweep
     service.board_diff = BoardDiff(service, github.board_cards)
     service.label_recovery = LabelRecovery(service, github.label_events, github.issue_snapshot)
     board = BoardIndex(github.board_issues, clock)
@@ -481,7 +491,7 @@ async def build_production(
     service.bind_integrations(
         adapters=(github, recording_omnigent, broker, CleanupAdapter(cleaner)),
         delivery_processor=processor,
-        managed=(runtime,),
+        managed=(runtime, sweep),
     )
     return ProductionComposition(
         service,
@@ -506,6 +516,29 @@ GITHUB_HTTP_LIMITS = httpx.Limits(
 )
 #: Waiting for a pooled connection is not a GitHub timeout: allow a queue behind a burst.
 GITHUB_HTTP_TIMEOUT = httpx.Timeout(15.0, pool=60.0)
+
+
+async def run_branch_head(
+    directory: ServiceDispatchDirectory, source_clone: Path, session_id: str
+) -> str:
+    """The run's branch head in the factory's source clone (its worktrees share refs), so
+    a worker's commit counts as progress before it is pushed ("" unknown)."""
+    spec = await directory.stage_spec(session_id)
+    if spec is None or not spec.branch:
+        return ""
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "-C",
+        str(source_clone),
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        f"refs/heads/{spec.branch}^{{commit}}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    return out.decode().strip() if proc.returncode == 0 else ""
 
 
 def github_http_client(transport: httpx.AsyncBaseTransport | None = None) -> httpx.AsyncClient:

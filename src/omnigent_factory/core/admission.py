@@ -129,6 +129,8 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.RESULT_CANDIDATE: Admission(_MCP),
     EventKind.OWNER_QUESTION: Admission(_MCP),
     EventKind.FEEDBACK_READ: Admission(_MCP),
+    # the health sweep's reading of a run (it only proposes; the reducer re-checks)
+    EventKind.STALL_OBSERVED: Admission(_ADAPTER),
     EventKind.ISSUE_SESSION_CLOSED: Admission(_ADAPTER),
     # display only: another issue's accepted triage named this one
     EventKind.RELATED_MARKED: Admission(_ADAPTER),

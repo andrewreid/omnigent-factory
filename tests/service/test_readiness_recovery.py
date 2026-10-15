@@ -175,7 +175,9 @@ async def test_boot_requeues_unknown_reads_and_a_detail_less_ack_is_retried(
     )
     await service.start()
     try:
-        for _ in range(300):
+        # Up to ~15 s of real time (it was ~3 s, flaky under suite load); it stops as
+        # soon as the retried read is done.
+        for _ in range(1500):
             clock.advance(1_000_000)  # the retry of the detail-less ack comes due
             stored = await service.db.call(lambda s: s.get_effect(fetch.effect_id))
             if stored is not None and stored.state == "done":

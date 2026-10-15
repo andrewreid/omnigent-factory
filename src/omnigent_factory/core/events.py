@@ -118,6 +118,7 @@ class EventKind(enum.StrEnum):
     TREE_QUIESCENT = "TreeQuiescent"
     STOP_TIMEOUT = "StopTimeout"
     SESSION_CRASHED = "SessionCrashed"
+    STALL_OBSERVED = "StallObserved"
     ACTIVE_TIME_SAMPLE = "ActiveTimeSample"
     COST_SAMPLE = "CostSample"
     POLICY_READY = "PolicyReady"
@@ -984,6 +985,49 @@ class TreeQuiescent(_Body):
     pending_waiter: bool = False
 
 
+class StallAction(enum.StrEnum):
+    """What the health sweep asks of a stalled run (``StallObserved``)."""
+
+    #: Quiet without a result for ``stall_nudge_minutes``: one nudge message (or, past
+    #: the run's loop guard, Needs you instead).
+    NUDGE = "nudge"
+    #: Nudged ``stall_escalate_minutes`` ago with no real progress since: Needs you.
+    ESCALATE = "escalate"
+    #: Busy with nothing new anywhere in its tree for ``stall_frozen_minutes``: Needs
+    #: you, never a message.
+    FROZEN = "frozen"
+    #: An escalated run made progress again: it is watched afresh.
+    PROGRESS = "progress"
+
+
+@dataclass(frozen=True, slots=True)
+class StallObserved(_Body):
+    """The health sweep's reading of the current run (``service.health_sweep``).
+
+    The reducer re-checks every gate (current, ACTIVE, unfenced, no open question or
+    owner hold, the work gate and approval for a nudge) and the run's ``StallWatch``
+    episode; the sweep only proposes. ``progress`` is the real-progress signature
+    (workers and branch head, never the root's own items); ``idle_since_us`` the newest
+    activity anywhere in the tree.
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.STALL_OBSERVED
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    session_id: str = ""
+    action: StallAction = StallAction.NUDGE
+    idle_since_us: int = 0
+    progress: str = ""
+    #: The run's branch head ("" unknown): a new one resets the loop-guard budget.
+    commit: str = ""
+    #: Case B: the root's runner is gone (host online); the nudge relaunches it and is
+    #: not counted against the run's budget.
+    recovery: bool = False
+    #: ESCALATE: the nudge must be at least this old (``stall_escalate_minutes``).
+    escalate_after_us: int = 0
+    #: NUDGE: the loop guard (``max_stall_nudges_per_run``).
+    max_nudges: int = 3
+
+
 @dataclass(frozen=True, slots=True)
 class StopTimeout(_Body):
     KIND: ClassVar[EventKind] = EventKind.STOP_TIMEOUT
@@ -1129,6 +1173,7 @@ EventBody = (
     | AutopilotGateCreated
     | AutopilotQuestion
     | TreeQuiescent
+    | StallObserved
     | StopTimeout
     | SessionCrashed
     | ActiveTimeSample
@@ -1211,6 +1256,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         AutopilotGateCreated,
         AutopilotQuestion,
         TreeQuiescent,
+        StallObserved,
         StopTimeout,
         SessionCrashed,
         ActiveTimeSample,
@@ -1353,6 +1399,8 @@ __all__ = [
     "SessionCreated",
     "SessionKind",
     "Size",
+    "StallAction",
+    "StallObserved",
     "Stop",
     "StopTimeout",
     "Transferred",

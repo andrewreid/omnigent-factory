@@ -396,9 +396,9 @@ waits up to 90 s for it instead of failing.
 
 | Command | What it does |
 |---|---|
-| `status` | Readiness, pause state, building count/cap with the running and parked builds, queue, pending/unknown effects, parked deliveries. |
-| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. It also reads the configured agent's bundle (through its newest session, or the `--live` probe) and fails naming any factory MCP tool the agent's `tools:` allowlist for the factory server leaves out (a warning when the bundle cannot be read). It warns when the App installation is not subscribed to `push` (tick Push in the App settings) or to `sub_issues`/`issue_dependencies` (Sub issues, Issue dependencies), when the subscribed events can be read, and when the repository has no `Epic` issue type (epics are then not typed). |
-| `explain <parcel>` | The parcel's persisted state: stage, bot, sessions, holds, effects. |
+| `status` | Readiness, pause state, building count/cap with the running and parked builds, queue, pending/unknown effects, parked deliveries, and the [health sweep](#health-sweep-and-stalled-runs): Omnigent state, breaker, nudges last sweep and each open run's state and stall episode. |
+| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. It also reads the configured agent's bundle (through its newest session, or the `--live` probe) and fails naming any factory MCP tool the agent's `tools:` allowlist for the factory server leaves out (a warning when the bundle cannot be read). It warns when the App installation is not subscribed to `push` (tick Push in the App settings) or to `sub_issues`/`issue_dependencies` (Sub issues, Issue dependencies), when the subscribed events can be read, and when the repository has no `Epic` issue type (epics are then not typed). It fails when Omnigent's own `/health` is not ok and warns when the configured host is offline. |
+| `explain <parcel>` | The parcel's persisted state: stage, bot, sessions, holds, effects, the current run's stall episode (`stall`) and what the last health sweep made of it. |
 | `recovery` | Failed/unknown effects and parked webhook deliveries. |
 | `retry-effect <effect_id>` | Requeue a failed/unknown `publish_triage`/`publish_report`/`post_comment`; it adopts an existing comment by its marker, so it never duplicates. |
 | `rerender-comment <effect_id>` | Re-render a published comment in place (found by its marker). |
@@ -420,7 +420,7 @@ waits up to 90 s for it instead of failing.
 | `sessions prune [--dry-run]` | Delete (or list) the factory sessions session retention would remove now (through the daemon). |
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id` and `session_retention_days`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `session_retention_days` and the health sweep settings; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.
@@ -475,7 +475,8 @@ A triage/report/status publication that failed definitively leaves the card at
 Bot comments notify the owner, so the factory comments only when he must read or act:
 triage, plan, Ready report (again after a rework), agent questions, checkpoint
 (`/continue`) and blocks that need owner action (agent blocked, restart exhausted, create
-refused, stop unverified, ambiguous adoption, PR not Ready with no fix attempt left). Everything else (queued, stopped,
+refused, stop unverified, ambiguous adoption, PR not Ready with no fix attempt left, a
+stalled run). Everything else (queued, stopped,
 approval acknowledged/invalidated, Ready withdrawn, rework, PR closed unmerged, refused
 commands, invalid result, ...) is the card's `Factory note` text field: one line with the latest
 reason, written only when it changes and cleared when the card moves on. Blocked,
@@ -722,6 +723,68 @@ parked tree a scan sees busy counts as running again. All trees due in one
 pass share one archive-inclusive inventory read (taken after every tree's child walk); its
 full resync runs every `session_inventory_resync_hours` (default `6`, hot-reloadable). A
 failed read still makes every scan of the pass incomplete, never idle.
+
+### Health sweep and stalled runs
+
+A run can go quiet without ever submitting a result: #891's build ended its turn waiting
+on a worker and Omnigent never woke it for the worker's second turn. Idle runs accrue no
+active time, so no grant ever ran out and the card sat `Working` for hours. The health
+sweep catches that. Every `health_sweep_interval_minutes` it makes one `GET /health`, one
+read of the configured host (`GET /v1/hosts/<id>`) and one batched
+`GET /health?session_ids=...` for every open run's runner/host liveness; trees come from
+the observer's latest scans (no extra reads) and the branch head from the factory clone.
+
+**Global gate and breaker.** If `/health` fails or the host is offline, nothing is done to
+any run that sweep and `/healthz` answers `degraded` with `reason` `omnigent_unhealthy` or
+`host_offline`. No card note is written for an outage: it would touch every card at once
+and need clearing afterwards; the card keeps its own reason. Three failed checks in a row,
+a nudge whose write failed or is unconfirmed (a 5xx, a timeout) or a nudge Omnigent
+answered with `runner_failed_to_start` open a breaker for `omnigent_breaker_minutes`
+(`/healthz` reason `omnigent_breaker_open`): the sweep then only observes. The breaker is in
+memory, so a restart closes it (three more failed checks reopen it). Nothing is ever sent
+to a session whose host is not online (Omnigent would consume the message as a failed
+turn).
+
+**What it acts on.** Only the current run of a parcel, of any kind (triage, plan, build),
+while it is ACTIVE: not WAITING (on the owner, checks or plan approval), DRAINING (the drain
+timeout handles it), at a checkpoint, stopped or fenced; and only with no open question, no
+owner or blocking hold (Needs you, Blocked, awaiting the owner, waiting on blockers),
+no unconfirmed write, no owner comment queued for it, no result submitted, no queued
+rework and its build slot not parked. A nudge also needs the ordinary work gate and, for
+a build, a valid approval: the sweep adds no authority, approval or time.
+
+| Case | When | What happens |
+|---|---|---|
+| A. Quiet without a result | Turn ended, no result, nothing new anywhere in the tree for `stall_nudge_minutes` | One nudge for this stall episode ("your turn ended without submitting a result; check your workers' latest reports and session history, then continue or report blocked"). No real progress within `stall_escalate_minutes` after it: `Needs you`, one comment and the note `Stalled: nudged <time>, no progress since`. `max_stall_nudges_per_run` nudges with no new commit or result between them: `Needs you` (`Stalled: 3 nudges without a new commit or result`). |
+| B. Runner gone | `runner_online` false, host online | Quiet: as A, but the nudge (which relaunches the runner) does not count toward the run's nudge limit. Still `running` with no activity for 15 min: left to Omnigent to reconcile to idle; a `running` session is never poked. |
+| C. Busy but frozen | Busy, nothing new anywhere in the tree for `stall_frozen_minutes`, no live background task | `Needs you`, one comment, note `Stalled: no activity since <time>`. No message, no interrupt. |
+| D. Root failed | Root status `failed` | Unchanged: `SessionCrashed` (one restart, then Blocked). |
+
+**Real progress** (needed for a new episode, and it clears a stalled card by itself): a
+worker (any session in the tree but the root) appeared or its `updated_at`, status or
+task status changed (it started, worked or reported); the run's branch head moved (a
+commit, pushed or not); a result was submitted; a question was asked. A reply from the
+root alone (e.g. to the nudge) is not progress. A frozen card also clears on any new
+activity in its tree. An owner comment, `/continue` or a new stage resets the nudge
+count; the comment is relayed to the run as usual.
+
+Episodes live in the run's persisted state (`explain` shows them as `stall`); nudges and
+escalation comments carry dedupe keys from never-reset counters
+(`stall:<run>:<n>`, `stall:<run>:escalation:<n>`), so a restart or a repeated sweep never
+duplicates one. At most `max_nudges_per_sweep` nudges go out per sweep.
+
+```toml
+health_sweep = true                 # the sweep (off: no checks, no nudges)
+health_sweep_interval_minutes = 5
+stall_nudge_minutes = 30            # quiet this long: one nudge
+stall_escalate_minutes = 30         # no progress this long after a nudge: Needs you
+stall_frozen_minutes = 120          # busy with nothing moving this long: Needs you
+max_stall_nudges_per_run = 3        # nudges without a new commit or result: Needs you
+max_nudges_per_sweep = 3
+omnigent_breaker_minutes = 30       # observe-only time after Omnigent looked unhealthy
+```
+
+All are hot-reloadable (`reload`).
 
 ### State database size
 

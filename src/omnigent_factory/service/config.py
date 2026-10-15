@@ -65,6 +65,14 @@ HOT_RELOAD_KEYS = frozenset(
         "delivery_row_retention_days",
         "idle_fallback_seconds",
         "parked_observation_interval_seconds",
+        "health_sweep",
+        "health_sweep_interval_minutes",
+        "stall_nudge_minutes",
+        "stall_escalate_minutes",
+        "stall_frozen_minutes",
+        "max_stall_nudges_per_run",
+        "max_nudges_per_sweep",
+        "omnigent_breaker_minutes",
     }
 )
 
@@ -290,6 +298,24 @@ class ServiceConfig(BaseModel):
     #: Hours between full reads of the archive-inclusive Omnigent session inventory (tree
     #: scans otherwise read only sessions created since the last read).
     session_inventory_resync_hours: float = Field(default=6.0, gt=0)
+    #: Health sweep (``service.health_sweep``): checks Omnigent and each live run's
+    #: liveness on this cadence, nudges a run whose turn ended without a result once per
+    #: stall episode, and hands stalled runs to the owner (Needs you).
+    health_sweep: bool = True
+    health_sweep_interval_minutes: float = Field(default=5.0, gt=0, le=24 * 60)
+    #: Quiet (turn ended, no result, nothing new anywhere in the tree) this long: nudge.
+    stall_nudge_minutes: float = Field(default=30.0, gt=0)
+    #: No real progress this long after a nudge: Needs you.
+    stall_escalate_minutes: float = Field(default=30.0, gt=0)
+    #: Busy with nothing new anywhere in the tree this long: Needs you (no message).
+    stall_frozen_minutes: float = Field(default=120.0, gt=0)
+    #: Nudges of one run with no new commit or result between them before Needs you.
+    max_stall_nudges_per_run: int = Field(default=3, ge=1, le=100)
+    #: Nudge messages per sweep across all runs.
+    max_nudges_per_sweep: int = Field(default=3, ge=0, le=100)
+    #: How long the sweep only observes after Omnigent looked unhealthy (3 failed checks
+    #: in a row, a failed nudge write or a nudge Omnigent could not start a runner for).
+    omnigent_breaker_minutes: float = Field(default=30.0, gt=0)
 
     @field_validator("owners")
     @classmethod

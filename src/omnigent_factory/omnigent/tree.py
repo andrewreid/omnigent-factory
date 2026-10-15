@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from omnigent_client import TERMINAL_TASK_STATUSES
@@ -58,6 +59,11 @@ class NodeState:
     task_status: str | None = None
     total_cost_usd: float | None = None
     items_hint: int = 0
+    #: The session's ``updated_at`` (UTC microseconds; 0 when the server sent none): it
+    #: moves with every new item, so it is the node's last activity.
+    updated_at_us: int = 0
+    #: ``last_task_error.code`` of its latest turn (e.g. ``runner_failed_to_start``).
+    last_error: str | None = None
 
     @property
     def elicitation_ids(self) -> tuple[str, ...]:
@@ -136,6 +142,16 @@ class TreeObservation:
     def root(self) -> NodeState | None:
         return self.nodes.get(self.root_id)
 
+    @property
+    def last_activity_us(self) -> int:
+        """The newest ``updated_at`` anywhere in the tree (0: none reported)."""
+        return max((n.updated_at_us for n in self.nodes.values()), default=0)
+
+    @property
+    def workers(self) -> tuple[NodeState, ...]:
+        """Every node but the root, in node-id order."""
+        return tuple(n for nid, n in sorted(self.nodes.items()) if nid != self.root_id)
+
     def node_with_elicitation(self, elicitation_id: str) -> NodeState | None:
         """The session that *owns* ``elicitation_id`` (never an ancestor's mirror)."""
         for node in self.nodes.values():
@@ -207,6 +223,11 @@ def node_from_snapshot(
     )
     cost = snap.get("total_cost_usd")
     items = snap.get("items")
+    updated = _epoch_us(snap.get("updated_at"))
+    if not updated and summary is not None:
+        updated = _epoch_us(summary.get("updated_at"))
+    error = snap.get("last_task_error")
+    code = error.get("code") if isinstance(error, dict) else None
     return NodeState(
         node_id=node_id,
         parent_id=parent_id if parent_id is not None else snap.get("parent_session_id"),
@@ -219,7 +240,32 @@ def node_from_snapshot(
         task_status=task_status if isinstance(task_status, str) else None,
         total_cost_usd=float(cost) if isinstance(cost, int | float) else None,
         items_hint=len(items) if isinstance(items, list) else 0,
+        updated_at_us=updated,
+        last_error=code if isinstance(code, str) else None,
     )
+
+
+def _epoch_us(value: object) -> int:
+    """An Omnigent timestamp (epoch seconds, possibly fractional, or ISO 8601) in UTC
+    microseconds; 0 when absent or unreadable."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int | float):
+        seconds = float(value)
+        if seconds > 1e14:  # already microseconds
+            return int(seconds)
+        if seconds > 1e11:  # milliseconds
+            return int(seconds * 1_000)
+        return int(seconds * 1_000_000) if seconds > 0 else 0
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return 0
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return int(parsed.timestamp() * 1_000_000)
+    return 0
 
 
 @dataclass

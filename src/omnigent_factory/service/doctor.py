@@ -613,6 +613,35 @@ async def _check_server_version(rest: OmnigentRest, report: DoctorReport) -> Non
         report.pass_check("omnigent_version", f"{server} (pinned commit {commit})")
 
 
+async def _check_omnigent_health(rest: OmnigentRest, report: DoctorReport) -> None:
+    """Omnigent's own ``/health`` (what the health sweep gates on) and whether the
+    configured host is online (a host offline fails no run, but nothing is nudged)."""
+    try:
+        body = await rest.get_json("/health")
+    except OmnigentReadError as exc:
+        report.fail("omnigent_health", exc.reason)
+        return
+    if body.get("status") != "ok":
+        report.fail("omnigent_health", f"/health status {body.get('status')!r}")
+        return
+    report.pass_check("omnigent_health", "ok")
+    host = report.resolved.get("omnigent_host_id")
+    if host is None:
+        return
+    try:
+        row = await rest.get_json(f"/v1/hosts/{host}")
+    except OmnigentReadError as exc:
+        report.warn("omnigent_host_online", f"host status unreadable: {exc.reason}")
+        return
+    if row.get("status") == "online":
+        report.pass_check("omnigent_host_online", "online")
+    else:
+        report.warn(
+            "omnigent_host_online",
+            f"host is {row.get('status')!r}: runs make no progress and nothing is nudged",
+        )
+
+
 def _pinned_commit() -> str:
     try:
         from omnigent import _build_info  # noqa: PLC0415
@@ -648,6 +677,7 @@ async def _check_omnigent(config: ServiceConfig, rest: OmnigentRest, report: Doc
         if reached:
             report.pass_check("omnigent_reachable", "authenticated API reads succeeded")
             await _check_server_version(rest, report)
+            await _check_omnigent_health(rest, report)
     except OmnigentReadError as exc:
         report.fail("omnigent_auth", exc.reason)
 

@@ -1,0 +1,3 @@
+Factory: run {run_id}: your turn ended without submitting a result. Check your workers'
+latest reports and session history (a worker may have finished without waking you), then
+continue, or report blocked with factory_submit_result (kind "blocked" with the reason).

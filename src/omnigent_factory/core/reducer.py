@@ -78,6 +78,12 @@ from omnigent_factory.core.projection import (
     triage_queued_note,
     work_live,
 )
+from omnigent_factory.core.stall import (
+    STALLED_NOTE_PREFIX,
+    clock_text,
+    stall_gate,
+    stalled_note,
+)
 from omnigent_factory.core.types import (
     AUTO_BUILD_QUEUED,
     AUTO_BUILD_STARTED,
@@ -126,6 +132,8 @@ from omnigent_factory.core.types import (
     Stage,
     StageAuthorization,
     StageSession,
+    StallEscalation,
+    StallWatch,
     State,
     TrustedConfig,
     UnknownEffect,
@@ -2441,6 +2449,7 @@ def _h_plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
     """
     _control(ctx)
     _require_eligible(ctx)
+    _reset_stall(ctx)  # the owner steers: a stalled run is watched afresh
     _steer(ctx, body)
     _acknowledge_feedback(ctx)
 
@@ -3057,7 +3066,7 @@ def _h_continue(ctx: _Ctx, body: ev.Continue) -> None:
         ready=False,
         policy_generation=s.grant.policy_generation + 1,
     )
-    s = ctx.put_session(replace(s, grant=grant))
+    s = ctx.put_session(replace(s, grant=grant, stall=_fresh_episode(s.stall, budget=True)))
     ctx.emit(
         EffectKind.REPLACE_COST_POLICY,
         session=s,
@@ -4998,6 +5007,8 @@ def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
         return
     if s.comment_pending:
         s = ctx.put_session(replace(s, comment_pending=False))
+    _reset_stall(ctx)  # a result: the run is not stalled
+    s = _session(ctx, s.session_id)
     if body.result_kind == ev.ResultKind.BLOCKED:
         # Honest "could not finish": Blocked with the agent's reason; nothing inferred.
         ctx.hold(Hold.AGENT_BLOCKED)
@@ -5163,6 +5174,132 @@ def _h_session_crashed(ctx: _Ctx, body: ev.SessionCrashed) -> None:
     ctx.comment("restart-exhausted", session_id=s.session_id)
     ctx.note("Blocked: session stopped and could not be restarted")
     _begin_drain(ctx, s)
+
+
+def _h_stall_observed(ctx: _Ctx, body: ev.StallObserved) -> None:
+    """The health sweep's reading of a stalled current run (``service.health_sweep``).
+
+    Every gate is re-checked here (``stall_gate``): a nudge never reaches a stopped,
+    fenced, closed, waiting or owner-held run, nor bypasses the work gate or approval.
+    One nudge per stall episode; a new episode needs real progress since the nudge
+    (``progress`` changed), a result, a question or an owner comment. With none within
+    the escalation window, or once the run's own nudges reach the loop guard with no new
+    commit or result between them, the run goes to the owner (Needs you, one comment).
+    A frozen busy run gets no message at all, only Needs you. Effect dedupe keys come
+    from the run's never-reset counters, so a replay or restart cannot duplicate them.
+    """
+    s = _current(ctx, body.session_id)
+    blocked = stall_gate(ctx.p, ctx.admission, body.action)
+    if blocked is not None:
+        raise Rejected(blocked)
+    w = s.stall
+    if body.action == ev.StallAction.PROGRESS:
+        frozen_moved = (
+            w.escalated == StallEscalation.FROZEN and body.idle_since_us > w.idle_since_us
+        )
+        if body.progress == w.progress and not frozen_moved:
+            raise Rejected("no-progress")
+        ctx.put_session(replace(s, stall=_fresh_episode(w, budget=False)))
+        return
+    if body.action == ev.StallAction.FROZEN:
+        _escalate(ctx, s, StallEscalation.FROZEN, body)
+        return
+    if body.action == ev.StallAction.ESCALATE:
+        if not w.nudged_at_us:
+            raise Rejected("no-nudge-outstanding")
+        if body.progress != w.progress:
+            raise Rejected("progress-since-nudge")
+        if ctx.now - w.nudged_at_us < body.escalate_after_us:
+            raise Rejected("escalation-not-due")
+        _escalate(ctx, s, StallEscalation.QUIET, body)
+        return
+    # NUDGE
+    if w.nudged_at_us and body.progress == w.progress:
+        raise Rejected("nudge-outstanding")  # one nudge per episode
+    if body.commit and body.commit != w.commit:
+        w = replace(w, budget=0, commit=body.commit)  # a new commit: the run moves on
+    if not body.recovery and w.budget >= body.max_nudges:
+        s = ctx.put_session(replace(s, stall=w))
+        _escalate(ctx, s, StallEscalation.LOOP, body)
+        return
+    w = replace(
+        w,
+        nudges_sent=w.nudges_sent + 1,
+        nudged_at_us=ctx.now,
+        progress=body.progress,
+        idle_since_us=body.idle_since_us,
+        recovery=body.recovery,
+        budget=w.budget if body.recovery else w.budget + 1,
+    )
+    s = ctx.put_session(replace(s, quiescent=False, stall=w))
+    _ensure_issuance(ctx, s)
+    ctx.emit(
+        EffectKind.SEND_MESSAGE,
+        session=s,
+        args={"purpose": MessagePurpose.STALL_NUDGE.value, "recovery": body.recovery},
+        dedupe=f"stall:{s.session_id}:{w.nudges_sent}",
+    )
+
+
+def _escalate(ctx: _Ctx, s: StageSession, kind: StallEscalation, body: ev.StallObserved) -> None:
+    """Hand the stalled run to the owner: Needs you, a card note and one comment."""
+    w = s.stall
+    since = body.idle_since_us or w.idle_since_us
+    w = replace(
+        w,
+        escalated=kind,
+        escalations=w.escalations + 1,
+        progress=body.progress,
+        idle_since_us=since,
+    )
+    ctx.put_session(replace(s, stall=w))
+    ctx.hold(Hold.STALLED)
+    ctx.note(stalled_note(kind, idle_since_us=since, nudged_at_us=w.nudged_at_us, nudges=w.budget))
+    ctx.emit(
+        EffectKind.POST_COMMENT,
+        args={
+            "template": f"stalled-{kind.value}",
+            "session_id": s.session_id,
+            "since": clock_text(since),
+            "nudged": clock_text(w.nudged_at_us),
+            "nudges": w.budget,
+        },
+        dedupe=f"stall:{s.session_id}:escalation:{w.escalations}",
+    )
+
+
+def _fresh_episode(w: StallWatch, *, budget: bool) -> StallWatch:
+    """Progress ends the episode (no nudge outstanding, not escalated). ``budget``: a
+    result, an owner comment or /continue also resets the loop guard. The never-reset
+    counters are kept (dedupe keys)."""
+    fresh = replace(w, nudged_at_us=0, progress="", idle_since_us=0, recovery=False, escalated=None)
+    return replace(fresh, budget=0) if budget else fresh
+
+
+def _reset_stall(ctx: _Ctx) -> None:
+    """A result, an owner comment or /continue: the current run starts afresh."""
+    s = ctx.p.current_session
+    if s is not None and s.stall != _fresh_episode(s.stall, budget=True):
+        ctx.put_session(replace(s, stall=_fresh_episode(s.stall, budget=True)))
+
+
+def _settle_stall(ctx: _Ctx) -> None:
+    """After every event: ``Hold.STALLED`` stands only while the current run is ACTIVE,
+    unfenced and escalated; a question it asked ends its stall episode (progress)."""
+    s = ctx.p.current_session
+    if s is not None and ctx.p.open_decisions and (s.stall.nudged_at_us or s.stall.escalated):
+        s = ctx.put_session(replace(s, stall=_fresh_episode(s.stall, budget=False)))
+    keep = (
+        s is not None
+        and s.stall.escalated is not None
+        and s.lifecycle == Lifecycle.ACTIVE
+        and not s.fences
+        and not s.execution_closed
+    )
+    if Hold.STALLED in ctx.p.holds and not keep:
+        ctx.unhold(Hold.STALLED)
+        if ctx.p.note.startswith(STALLED_NOTE_PREFIX) and not ctx.note_set:
+            ctx.update(note="")
 
 
 def _h_active_time(ctx: _Ctx, body: ev.ActiveTimeSample) -> None:
@@ -5550,6 +5687,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.TREE_QUIESCENT: _h_tree_quiescent,
     EventKind.STOP_TIMEOUT: _h_stop_timeout,
     EventKind.SESSION_CRASHED: _h_session_crashed,
+    EventKind.STALL_OBSERVED: _h_stall_observed,
     EventKind.ACTIVE_TIME_SAMPLE: _h_active_time,
     EventKind.COST_SAMPLE: _h_cost_sample,
     EventKind.POLICY_READY: _h_policy_ready,
@@ -5954,6 +6092,7 @@ def transition(state: State, event: Event) -> TransitionResult:
         _settle_auto_build(ctx)
         _settle_autopilot(ctx)
         _settle_blockers(ctx)
+        _settle_stall(ctx)
         _settle_build_slot(ctx)
         if accepted:
             _feedback_note(ctx)

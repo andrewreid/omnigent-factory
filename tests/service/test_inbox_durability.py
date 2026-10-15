@@ -91,7 +91,17 @@ async def test_parked_state_survives_restart(service_config: ServiceConfig):
     await service.start()
     try:
         await service.persist_delivery(DeliveryRecord("poison", "issues", b"{}", {}))
-        await wait_for_async(lambda: service.parked.contains("poison"))
+        # Wait for the durable row, not the in-memory mirror: ``park`` fills the mirror
+        # before its commit, so stopping on the mirror alone raced the write (flaky).
+        await wait_for_async(lambda: service.parked.contains("poison"), timeout=15.0)
+        await wait_for_async(
+            lambda: service.db.call(
+                lambda store: store.query(
+                    "SELECT 1 FROM parked_deliveries WHERE delivery_guid = ?", ("poison",)
+                )
+            ),
+            timeout=15.0,
+        )
     finally:
         await service.stop()
     assert not (service_config.state_dir / LEGACY_REGISTRY).exists()  # no side file
@@ -104,7 +114,8 @@ async def test_parked_state_survives_restart(service_config: ServiceConfig):
         await start_triage(again, "P")
         await start_triage(again, "Q", issue_number=2)
         await wait_for_async(
-            lambda: any(e.parcel_id == "Q" for e in omnigent.executed(EffectKind.CREATE_SESSION))
+            lambda: any(e.parcel_id == "Q" for e in omnigent.executed(EffectKind.CREATE_SESSION)),
+            timeout=15.0,
         )
         assert not any(e.parcel_id == "P" for e in omnigent.executed(EffectKind.CREATE_SESSION))
         assert (await again.health())["status"] == "degraded"
