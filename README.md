@@ -151,6 +151,15 @@ issues whose triage named this one, e.g. `Related: #12 (overlap), #9 (conflict)`
 cleared when the card moves on); any status reason or Blocked, Needs you, Checkpoint or
 Queued note takes precedence.
 
+Both fields are display only. The periodic board diff reads them with the rest of the
+card (no extra request) and rewrites a value that differs from the one the factory last
+wrote (a lost, cancelled or hand-edited write), logging `board drift corrected`; a card
+with a Bot/note write in flight, of unknown outcome or landed within the last two minutes
+is left for a later diff. A required check read red on a PR head first seen less than
+`red_check_confirm_seconds` (default 120, hot-reloadable, 0 = off) ago shows as checks
+running until a second read (scheduled for the window's end) confirms it or the window
+ends: a just-pushed head's check rollup can read red for a moment.
+
 ### Related issues
 
 Triage checks the other open issues on the board (`factory_list_issues`) for duplicates,
@@ -420,7 +429,7 @@ waits up to 90 s for it instead of failing.
 | `sessions prune [--dry-run]` | Delete (or list) the factory sessions session retention would remove now (through the daemon). |
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `session_retention_days` and the health sweep settings; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `session_retention_days` and the health sweep settings; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.

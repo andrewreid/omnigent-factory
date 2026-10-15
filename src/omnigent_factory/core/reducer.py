@@ -3270,24 +3270,33 @@ def _h_snapshot(ctx: _Ctx, body: ev.GitHubSnapshot) -> None:
     if evidence is None:
         raise Rejected("snapshot-without-evidence")
     _ = body
-    # Drift correction from a fresh read: write Bot / Factory note only when the board
-    # shows another value than the derived one (a change in this event is written by
-    # the projection).
+    _correct_board_drift(ctx, evidence.bot, evidence.note)
+
+
+def _h_board_fields(ctx: _Ctx, body: ev.BoardFieldsObserved) -> None:
+    """The board diff's Bot/note read: drift correction only (no other transition)."""
+    _correct_board_drift(ctx, body.bot, body.note)
+
+
+def _correct_board_drift(ctx: _Ctx, seen_bot: str | None, seen_note: str | None) -> None:
+    """Drift correction from a fresh read: write Bot / Factory note only when the board
+    shows another value than the derived one (a change in this event is written by the
+    projection). None: the value was not read."""
     derived = project_bot(ctx.p, queued=_queued(ctx))
     if (
-        evidence.bot is not None
+        seen_bot is not None
         and ctx.p.in_project
         and derived == ctx.p.bot
-        and evidence.bot != derived.value
+        and seen_bot != derived.value
     ):
         ctx.emit(EffectKind.SET_BOT, args={"bot": derived.value})
     note = project_note(ctx.p, derived)
     if (
-        evidence.note is not None
+        seen_note is not None
         and ctx.p.in_project
         and derived == ctx.p.bot
         and note == ctx.p.board_note
-        and evidence.note != note
+        and seen_note != note
     ):
         ctx.emit(EffectKind.SET_NOTE, args={"note": note})
 
@@ -3430,9 +3439,9 @@ def _invalidate_ready(ctx: _Ctx, reason: str) -> None:
     ctx.note(f"No longer ready: {_words(reason)}" + (f" on {head}" if head else ""))
 
 
-def _fetch_evidence(ctx: _Ctx, r: Readiness) -> None:
+def _fetch_evidence(ctx: _Ctx, r: Readiness, *, not_before_us: int = 0) -> None:
     """A fresh read of the linked PR: actual head, current checks, review, findings and
-    whether it merges into its base.
+    whether it merges into its base (``not_before_us``: not before then).
 
     A review that predates a merge conflict seen on the PR never carries to a newer head
     as a base sync (``sync_carry`` false): the merge that resolved it is new work.
@@ -3447,6 +3456,8 @@ def _fetch_evidence(ctx: _Ctx, r: Readiness) -> None:
     }
     if reviewed == ctx.p.conflict_reviewed_head:
         args["sync_carry"] = False
+    if not_before_us > ctx.now:
+        args["not_before_us"] = not_before_us
     ctx.emit(EffectKind.FETCH_PR_EVIDENCE, args=args)
 
 
@@ -3774,14 +3785,33 @@ def _mark_red(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
     GitHub's check rollup for one head can differ from read to read (#461: 17 vs 18
     runs, one failure hidden in alternate reads), so the names accumulate while the
     same head stays red; a pending or green read or a new head starts afresh.
+
+    The first red read on a head first seen less than ``red_confirm_us`` ago (#891: the
+    rollup of a fresh head can read red for a moment) is shown as checks running until a
+    second red read confirms it or that window ends; the confirming read is scheduled
+    for the window's end. Display only: the readiness record is the same either way.
     """
     names = [n for n in body.failing_checks.split(_CHECK_SEP) if n]
     if r.sync_red:
         names += [n for n in r.red_checks.split(_CHECK_SEP) if n]
     red_checks = _CHECK_SEP.join(sorted(set(names)))[:200]
-    ctx.update(
-        readiness=replace(r, verified=False, ready=False, sync_red=True, red_checks=red_checks)
+    until = 0
+    if not r.sync_red and r.head_seen_at_us and ctx.config.red_confirm_us:
+        until = r.head_seen_at_us + ctx.config.red_confirm_us
+        if until <= ctx.now:
+            until = 0
+    r = replace(
+        r,
+        verified=False,
+        ready=False,
+        sync_red=True,
+        red_checks=red_checks,
+        red_unconfirmed_until_us=until,
     )
+    ctx.update(readiness=r)
+    if until:
+        _fetch_evidence(ctx, r, not_before_us=until)  # the confirming read, never later
+        return
     ctx.note(sync_red_note(red_checks))
 
 
@@ -3867,6 +3897,14 @@ def _restore_withdrawn(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> R
     ctx.update(readiness=r)
     _move(ctx, Stage.READY)
     return r
+
+
+def _head_seen_at(ctx: _Ctx, head: str) -> int:
+    """When ``head`` was first seen: a re-submission of the same head keeps it."""
+    r = ctx.p.readiness
+    if r is not None and r.head_sha == head and r.head_seen_at_us:
+        return r.head_seen_at_us
+    return ctx.now
 
 
 def _settle_at(ctx: _Ctx, head: str) -> int:
@@ -4089,6 +4127,8 @@ def _head_changed(ctx: _Ctx, r: Readiness, head: str) -> None:
         read_started_us=0,  # no read of the new head applied yet
         eyes_trigger_us=0,
         unknown_since_us=0,
+        head_seen_at_us=ctx.now,
+        red_unconfirmed_until_us=0,
     )
     ctx.update(readiness=r)
     ctx.unhold(Hold.CHECKS_FAILED, Hold.READINESS_FAILED)
@@ -5060,6 +5100,7 @@ def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
                 body.head_sha,
                 reviewed_head=body.head_sha,
                 settle_at_us=_settle_at(ctx, body.head_sha),
+                head_seen_at_us=_head_seen_at(ctx, body.head_sha),
             )
         )
         s = ctx.put_session(
@@ -5643,6 +5684,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.INBOX_HOLD_SET: _h_inbox_hold_set,
     EventKind.INBOX_HOLD_RELEASED: _h_inbox_hold_released,
     EventKind.GITHUB_SNAPSHOT: _h_snapshot,
+    EventKind.BOARD_FIELDS_OBSERVED: _h_board_fields,
     EventKind.COLUMN_OBSERVED: _h_column_observed,
     EventKind.PR_OBSERVED: _h_pr_observed,
     EventKind.CHECKS_CHANGED: _h_checks_changed,
@@ -5982,6 +6024,7 @@ def _project_board(ctx: _Ctx) -> None:
     # served their purpose.
     if ctx.p.related_marks and ctx.p.stage not in (None, ctx.origin_stage or Stage.INBOX):
         ctx.update(related_marks=())
+    _expire_red_unconfirmed(ctx)
     old_bot = ctx.p.bot
     bot = project_bot(ctx.p, queued=_queued(ctx))
     if ctx.p.note and not ctx.note_set:
@@ -5999,6 +6042,19 @@ def _project_board(ctx: _Ctx) -> None:
     if note != ctx.p.board_note:
         ctx.update(board_note=note)
         ctx.emit(EffectKind.SET_NOTE, args={"note": note})
+
+
+def _expire_red_unconfirmed(ctx: _Ctx) -> None:
+    """An unconfirmed red (``_mark_red``) whose window has ended is shown from now on."""
+    r = ctx.p.readiness
+    if r is None or not r.red_unconfirmed_until_us:
+        return
+    if not r.sync_red:
+        ctx.update(readiness=replace(r, red_unconfirmed_until_us=0))  # a later read cleared it
+    elif ctx.now >= r.red_unconfirmed_until_us:
+        ctx.update(readiness=replace(r, red_unconfirmed_until_us=0))
+        if not ctx.note_set:
+            ctx.note(sync_red_note(r.red_checks))
 
 
 def _ordinal(n: int) -> str:

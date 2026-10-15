@@ -81,6 +81,7 @@ class EventKind(enum.StrEnum):
     INBOX_HOLD_RELEASED = "InboxHoldReleased"
     # observation: GitHub
     GITHUB_SNAPSHOT = "GitHubSnapshot"
+    BOARD_FIELDS_OBSERVED = "BoardFieldsObserved"
     COLUMN_OBSERVED = "ColumnObserved"
     PR_OBSERVED = "PRObserved"
     CHECKS_CHANGED = "ChecksChanged"
@@ -512,6 +513,20 @@ class GitHubSnapshot(_Body):
 
     KIND: ClassVar[EventKind] = EventKind.GITHUB_SNAPSHOT
     CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+
+
+@dataclass(frozen=True, slots=True)
+class BoardFieldsObserved(_Body):
+    """The board diff's read of the card's Bot and "Factory note" values (None: not read).
+
+    Display only: a value other than the one the factory last wrote is rewritten (drift
+    correction); never a command, never any other transition.
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.BOARD_FIELDS_OBSERVED
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    bot: str | None = None
+    note: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1184,6 +1199,7 @@ EventBody = (
     | CapacityAvailable
     | RetryDue
     | ReconcileDue
+    | BoardFieldsObserved
 )
 
 #: Every body class, keyed by kind. Used by the codec and totality tests.
@@ -1267,6 +1283,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         CapacityAvailable,
         RetryDue,
         ReconcileDue,
+        BoardFieldsObserved,
     )
 }
 
@@ -1334,6 +1351,7 @@ __all__ = [
     "AutopilotStatus",
     "AutopilotWithdraw",
     "BasePushed",
+    "BoardFieldsObserved",
     "BotEyes",
     "CapacityAvailable",
     "CheckRef",

@@ -378,6 +378,9 @@ class GitHubAPIAdapter:
               bot: fieldValueByName(name: "Bot") {
                 ... on ProjectV2ItemFieldSingleSelectValue { optionId }
               }
+              note: fieldValueByName(name: "Factory note") {
+                ... on ProjectV2ItemFieldTextValue { text field { ... on ProjectV2Field { id } } }
+              }
               autoBuild: fieldValueByName(name: "Auto-build") {
                 ... on ProjectV2ItemFieldSingleSelectValue { optionId }
               }
@@ -467,7 +470,17 @@ class GitHubAPIAdapter:
             title=str(content.get("title") or ""),
             updated_at=str(content.get("updatedAt") or ""),
             links=parse_links(content, self.repository_node_id),
+            bot=self._board_bot_name(item.get("bot")),
+            note=self._note_text(item.get("note")),
         )
+
+    def _board_bot_name(self, value: object) -> str | None:
+        """Bot display value of a board-diff card ("" = empty; None = unknown)."""
+        if self.board_schema is None:
+            return None
+        if value is None or value == {}:
+            return ""
+        return self._bot_name(value)
 
     def _board_issue(self, item: object) -> BoardIssue | None:
         if not isinstance(item, dict):
@@ -1358,6 +1371,10 @@ class GitHubAPIAdapter:
                 return await self._ensure_project_item(effect)
             if effect.kind == EffectKind.FETCH_PR_EVIDENCE:
                 read_started_us = self._now_us()  # before any read: covers earlier webhooks
+                not_before = effect.args.get("not_before_us")
+                if isinstance(not_before, int) and read_started_us < not_before:
+                    # A scheduled read (e.g. confirming a fresh head's red check).
+                    return RetryableReadFailure("scheduled read", not_before - read_started_us)
                 number = effect.args.get("pr_number")
                 if not isinstance(number, int):
                     return DefinitiveFailure("FETCH_PR_EVIDENCE requires pr_number")

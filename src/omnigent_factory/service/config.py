@@ -35,6 +35,7 @@ HOT_RELOAD_KEYS = frozenset(
         "review_bot_grace_minutes",
         "review_bot_ack_minutes",
         "review_bot_max_wait_minutes",
+        "red_check_confirm_seconds",
         "review_bot_login",
         "review_bot_mention",
         "independent_reviewer_ids",
@@ -179,6 +180,10 @@ class ServiceConfig(BaseModel):
     #: Minutes after a trigger a bot showing 👀 (or whose state cannot be read) is waited
     #: for at most; its answer ends the wait at once.
     review_bot_max_wait_minutes: int = Field(default=45, ge=0, le=720)
+    #: Seconds after a PR head is first seen during which a red required check is shown
+    #: (Bot Blocked) only once a second read confirms it or the window ends: a fresh
+    #: head's check rollup can read red for a moment (#891). Display only; 0 = at once.
+    red_check_confirm_seconds: float = Field(default=120.0, ge=0, le=3600)
     #: The review bot's GitHub login ("" = unknown: the grace always applies).
     review_bot_login: str = "chatgpt-codex-connector[bot]"
     #: The mention that asks the review bot for a (re-)review.
@@ -435,6 +440,7 @@ class ServiceConfig(BaseModel):
             review_grace_us=self.review_bot_grace_minutes * MICROS_PER_MINUTE,
             review_ack_us=self.review_bot_ack_minutes * MICROS_PER_MINUTE,
             review_cap_us=self.review_bot_max_wait_minutes * MICROS_PER_MINUTE,
+            red_confirm_us=int(self.red_check_confirm_seconds * 1_000_000),
             triage_concurrency=self.triage_concurrency,
             auto_build_concurrency=self.auto_build_concurrency,
         )

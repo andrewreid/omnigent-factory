@@ -22,6 +22,7 @@ from omnigent_factory.core.types import (
     Parcel,
     QueueEntry,
     QueueStatus,
+    Readiness,
     ReservationKind,
     Stage,
     StageSession,
@@ -117,15 +118,22 @@ def ready_bot_ok(p: Parcel, bot: BotState) -> bool:
 
 
 def checks_running(p: Parcel) -> bool:
-    """In Ready while a new head's or a re-run's checks are evaluated (not red)."""
+    """In Ready while a new head's or a re-run's checks are evaluated (not red, or red
+    not yet confirmed on a fresh head)."""
     r = p.readiness
     return (
         p.stage == Stage.READY
         and r is not None
         and not r.ready
-        and not r.sync_red
+        and (not r.sync_red or red_unconfirmed(r))
         and Hold.COMPLETED not in p.holds
     )
+
+
+def red_unconfirmed(r: Readiness) -> bool:
+    """A first red read on a fresh head, not yet confirmed (see
+    ``Readiness.red_unconfirmed_until_us``): shown as checks running, not Blocked."""
+    return r.sync_red and r.red_unconfirmed_until_us > 0
 
 
 def unexplained_move(p: Parcel) -> bool:
@@ -149,6 +157,7 @@ def sync_red(p: Parcel) -> bool:
         p.stage == Stage.READY
         and r is not None
         and r.sync_red
+        and not red_unconfirmed(r)
         and not r.ready
         and Hold.COMPLETED not in p.holds
     )

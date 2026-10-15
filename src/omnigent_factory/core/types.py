@@ -701,6 +701,13 @@ class Readiness:
     #: The latest read could not tell whether the PR merges cleanly into its base (GitHub
     #: was still computing it): the next catch-up read asks again.
     merge_unknown: bool = False
+    #: When ``head_sha`` was first seen (0 = older records: never damped).
+    head_seen_at_us: int = 0
+    #: A first red read on a head seen less than ``TrustedConfig.red_confirm_us`` ago
+    #: (#891: a fresh head's rollup can briefly read red): Bot and note keep showing the
+    #: checks as running until a second red read confirms it or this time passes (0 =
+    #: none). Display only: ``sync_red`` and every decision are as without it.
+    red_unconfirmed_until_us: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1197,6 +1204,9 @@ class TrustedConfig:
     #: How long after a trigger a review bot showing 👀 (or whose state cannot be read)
     #: is waited for at most.
     review_cap_us: int = 0
+    #: How long after a PR head is first seen a red required check needs a second red
+    #: read (or this long to pass) before Bot shows Blocked (0 = at once).
+    red_confirm_us: int = 0
     #: Triage runs that may hold a slot at once, repository-wide (owner and auto-triage
     #: starts alike); a triage request beyond it waits for a slot.
     triage_concurrency: int = 1

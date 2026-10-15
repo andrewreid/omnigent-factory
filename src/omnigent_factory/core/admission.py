@@ -101,6 +101,8 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.INBOX_HOLD_RELEASED: Admission(_INBOX | _OPERATOR),
     # GitHub observations
     EventKind.GITHUB_SNAPSHOT: Admission(frozenset({Provenance.RECONCILER, Provenance.ADAPTER})),
+    # the board diff's Bot/"Factory note" read: display drift correction only
+    EventKind.BOARD_FIELDS_OBSERVED: Admission(frozenset({Provenance.RECONCILER})),
     # A daemon_effect_id is honoured only from ADAPTER (checked in the handler).
     EventKind.COLUMN_OBSERVED: Admission(_OBSERVED),
     EventKind.PR_OBSERVED: Admission(_OBSERVED),

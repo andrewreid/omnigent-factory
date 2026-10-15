@@ -189,6 +189,11 @@ class BoardCard:
     #: does not move ``updatedAt`` for every link change, and a blocker closing changes
     #: only the blocker. None when unreadable.
     links: IssueLinks | None = None
+    #: Bot display value ("" = empty; None = unreadable or an unknown option) and
+    #: "Factory note" text ("" = empty; None = not read): drift correction only, never
+    #: part of :attr:`digest` (the factory's own writes would read as card changes).
+    bot: str | None = None
+    note: str | None = None
 
     @property
     def digest(self) -> str:

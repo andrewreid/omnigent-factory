@@ -144,6 +144,7 @@ PRUNABLE_OBSERVATIONS: dict[str, tuple[str, ...]] = {
     EventKind.BASE_PUSHED.value: ("github:push:",),
     EventKind.RECONCILE_DUE.value: ("reconcile:",),
     EventKind.GITHUB_SNAPSHOT.value: ("effect:", "startup-github:"),
+    EventKind.BOARD_FIELDS_OBSERVED.value: ("board-drift:",),
     EventKind.READINESS_EVIDENCE.value: ("effect:",),
     EventKind.TREE_QUIESCENT.value: ("effect:", "tree:"),
     EventKind.COST_SAMPLE.value: ("cost:",),
