@@ -281,10 +281,15 @@ class Stop(_Body):
 
 @dataclass(frozen=True, slots=True)
 class RequestRework(_Body):
-    """Explicit owner rework control from Ready (same approval, new build episode)."""
+    """Explicit owner rework control from Ready (same approval, new build episode).
+
+    ``batch_id``: not a drag but the owner's ticks in the Ready report
+    (``service.deferred``): the factory moves the card and the rework's brief is exactly
+    the ticked items."""
 
     KIND: ClassVar[EventKind] = EventKind.REQUEST_REWORK
     CLASS: ClassVar[EventClass] = EventClass.CONTROL
+    batch_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -622,6 +627,12 @@ class ReadinessEvidence(_Body):
     #: The base branch head GitHub's mergeability was computed against, and its name.
     base_head: str = ""
     base_ref: str = ""
+    #: Review-bot rounds of the issue so far and its budget (0 = not counted: older
+    #: reads, no bot configured); at or past the budget no further review is awaited.
+    review_rounds_used: int = 0
+    review_rounds_budget: int = 0
+    #: The card's round line, e.g. "Codex round 2/2" ("" with no budget).
+    review_rounds_note: str = ""
 
 
 #: ``ReadinessEvidence.mergeable`` values.

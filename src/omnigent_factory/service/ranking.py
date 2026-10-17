@@ -582,8 +582,11 @@ class Ranker:
         if edit is None:
             return
         node_id, field_id, change = edit
-        if field_id is not None and field_id == config.auto_build_field_node_id:
-            return  # the Auto-build field: an approval control, not a ranking choice
+        if field_id is not None and field_id in (
+            config.auto_build_field_node_id,
+            config.review_rounds_field_node_id,
+        ):
+            return  # an approval control or the review budget, not a ranking choice
         now = self._now()
         if config.rank_field_node_id and field_id == config.rank_field_node_id:
             await self._owner_rank(node_id, change, now)

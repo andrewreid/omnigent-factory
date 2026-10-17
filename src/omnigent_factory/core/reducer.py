@@ -1194,6 +1194,8 @@ def _maybe_ready(ctx: _Ctx) -> None:
     ctx.emit(EffectKind.DISABLE_ISSUANCE, session=s)
     _release_build(ctx, keep_pr=True)
     _move(ctx, Stage.READY)
+    if r.review_rounds_note:
+        ctx.note(r.review_rounds_note)  # e.g. "Codex round 2/2"
     _publish_ready_report(ctx, r.checks_summary)
 
 
@@ -2918,6 +2920,7 @@ def _rework(ctx: _Ctx, via: Via | None, *, conflict: str = "") -> None:
 
 
 _REWORK_NOTE = "Rework: owner feedback"
+_ITEMS_REWORK_NOTE = "Rework: Ready report items ticked"
 
 
 def _h_approve_plan(ctx: _Ctx, body: ev.ApprovePlan) -> None:
@@ -3095,8 +3098,12 @@ def _h_request_rework(ctx: _Ctx, body: ev.RequestRework) -> None:
     reason = _rework_refusal(ctx)
     if reason is not None:
         raise Rejected(f"rework refused: {reason}", explain=True)
+    if body.batch_id:
+        # Ready report items the owner ticked: the factory moves the card itself.
+        _rework(ctx, None)
+        ctx.note(_ITEMS_REWORK_NOTE)
+        return
     _rework(ctx, Via.DRAG)
-    _ = body
 
 
 def _h_pause(ctx: _Ctx, body: ev.Pause | ev.Unpause) -> None:
@@ -3532,6 +3539,19 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
         return
     if body.read_started_us > r.read_started_us:
         r = replace(r, read_started_us=body.read_started_us)
+        ctx.update(readiness=r)
+    rounds = (body.review_rounds_used, body.review_rounds_budget, body.review_rounds_note)
+    if body.review_rounds_budget and rounds != (
+        r.review_rounds_used,
+        r.review_rounds_budget,
+        r.review_rounds_note,
+    ):
+        r = replace(
+            r,
+            review_rounds_used=rounds[0],
+            review_rounds_budget=rounds[1],
+            review_rounds_note=rounds[2],
+        )
         ctx.update(readiness=r)
     r = _review_bot_window(
         ctx, r, body.review_bot_pending_since_us, body.review_bot_verdict, body.review_bot_eyes
@@ -4047,12 +4067,20 @@ def _review_bot_window(
     first such read. Without it (older reads, no bot configured) the grace runs from the
     later of the trigger and the build result.
 
+    With the issue's review rounds used up (``Readiness.review_rounds_*``), no further
+    review is awaited: whatever the bot still says on this head is beyond the budget.
+
     ``review_bot`` keeps the Ready report's review-bot line: the verdict as read, or no
     response (Ready is then only reached once the wait has passed).
     """
     cfg = ctx.config
+    used, budget = r.review_rounds_used, r.review_rounds_budget
+    rounds = f" · round {used}/{budget}" if budget else ""
     if since == 0:
-        line = verdict[:200] or f"responded on `{r.head_sha[:7]}`"
+        line = (verdict[:200] or f"responded on `{r.head_sha[:7]}`") + rounds
+        window = replace(r, review_bot_done=True, review_bot=line, unknown_since_us=0)
+    elif budget and used >= budget:
+        line = f"no further review awaited ({used}/{budget} rounds used)"
         window = replace(r, review_bot_done=True, review_bot=line, unknown_since_us=0)
     elif since is None:
         window = replace(r, review_bot_done=False, review_bot="")
@@ -4220,6 +4248,8 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
                 "head_sha": r.head_sha,
                 # Findings only: the message asks for an outcome for each finding.
                 "wake": "checks" if check_wake else "findings",
+                "rounds_used": r.review_rounds_used,
+                "rounds_budget": r.review_rounds_budget,
             },
         )
         return

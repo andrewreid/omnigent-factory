@@ -62,7 +62,8 @@ plan for [auto-build](#auto-build).
 [idle-time auto-triage](#idle-time-auto-triage) (anyone may add it; the factory never
 starts anything because of it).
 
-`follow-up` marks an issue filed during another issue's run; epic autopilot holds it.
+`follow-up` marks an issue the factory filed from another issue's run (one per PR, see
+[Follow-ups](#follow-ups)); epic autopilot holds it.
 Removing it yourself, or adding `factory:build-follow-ups` to the epic, releases it (see
 [Follow-ups](#follow-ups)).
 
@@ -316,17 +317,76 @@ repeats one.
 
 ### Follow-ups
 
-Rosie lists every issue she files during a build or rework (say, a review-bot finding
-resolved as a follow-up) in her result's `follow_ups`, each with the issues it must come
-before (`[{"issue": 904, "blocks": [882, 884]}]`). For each, the factory adds the native
-link "882 blocked by 904", labels the issue `follow-up` (creating the label if needed)
-and, when the source issue is a sub-issue of an epic and the follow-up has no parent,
-makes it a sub-issue of that epic. Each step is done once, logged and retried after a
-failure; nothing is ever removed, and a label or parent you change afterwards is left as
-you set it. As a backstop, an issue the factory bot opens while another issue's run is
-open, naming that issue in its body, is treated as its follow-up (label and epic only,
-never blocked-by links); epic autopilot's own human-step issues and anything else the
-factory writes itself (a hidden `factory-` marker) are excluded.
+Rosie no longer opens issues (her shell policy denies `gh issue create` and the REST and
+GraphQL equivalents, chained commands included; the refusal points to `split_out` and
+`deferred`). Every review finding gets exactly one
+outcome: **fix in this PR** (a real defect in the plan's area with a small, local fix; the
+default for in-scope nits), **follow-up** (a real defect with real-world impact outside the
+plan, or one that would materially grow the PR) or **advisory** (no realistic trigger in
+this repository, a style preference, hardening against threats not in play: a one-line
+reply, nothing filed). She replies on the thread, resolves it and lists follow-ups and
+advisories in her build_ready or blocked result's `deferred` (severity, path, title, thread
+URL, reason, optional `blocks`).
+
+The factory files the follow-ups of one PR as **one** issue, `Follow-ups from #<PR>`: a
+checklist, one line per item, labelled `follow-up`, a sub-issue of the source issue's epic,
+with a native blocked-by link for every `blocks` issue. Items a later result adds go into
+the same issue. A hidden marker makes the create restart-safe: an unclear create is looked
+up by its marker before any retry, so the issue is never opened twice. When a rework fixes
+an item, the factory ticks its line (`→ fixed in #<PR> (<sha>)`); it never closes the
+issue, you do. Each link step is done once, logged and retried after a failure; nothing is
+ever removed, and a label or parent you change afterwards is left as you set it. The older
+`follow_ups` result field (issues a run opened itself) is still accepted: those issues are
+labelled and linked as before and listed in the Ready report. As a backstop, an issue the
+factory bot opens while another issue's run is open, naming that issue in its body, is
+treated as its follow-up (label and epic only, never blocked-by links); epic autopilot's
+own human-step issues and anything else the factory writes itself (a hidden `factory-`
+marker) are excluded.
+
+**Owner-directed splits.** When you tell a run "do these bits, file the rest as an issue"
+(in triage, planning or a build), Rosie lists each separate piece in her result's
+`split_out` (title, body, reason, `relation` to this issue: `none`, `blocks` or
+`blocked_by`, optional `blocks`; at most 10 per result). The factory opens one issue per
+piece (never consolidated), in the Inbox like any new issue, with the line "Split out of
+#N at the owner's direction". It gets no `follow-up` label and is not follow-up lineage
+(its own build may defer follow-ups); it joins the source issue's epic and gets native
+blocked-by links per `relation` and `blocks`. It is filed once (keyed by source issue and
+title; an unclear create is found by its marker before any retry), posts no comment of its
+own: the stage's normal comment (triage, plan, blocked or Ready report) lists it under
+**Split out**. Splits are not Ready report checkboxes and not subject to the depth limit.
+
+**Depth limit.** A follow-up never spawns follow-ups: when the issue being built is itself
+a follow-up (the factory recorded it as one of another issue, a consolidated issue
+included), `factory_submit_result` refuses `deferred` follow-ups (and `follow_ups`) with
+"fix each of these findings in this PR, or give it outcome advisory". `follow_up_max_depth`
+(default 1, hot-reloadable) sets how many generations are allowed.
+
+**Review rounds.** The board's `Review rounds` NUMBER field is how many review-bot reviews
+an issue's PR gets; empty, `review_rounds_default` (2, hot-reloadable) applies, and an
+epic's value applies to its sub-issues without their own. Only your own board edit counts
+(as for `Auto-build`): a value without your webhook is not trusted. One round is one review
+of a head the bot pushed, counted per issue across runs; comments and reworks do not reset
+it. From round `max(2, budget)` on, only P1 findings with real impact must be fixed; P2/P3
+take the outcome rule. Once the rounds are used up the run wraps up (fixes remaining
+in-scope P1s, defers the rest, stops asking the bot), the factory neither waits for another
+review nor wakes the run for findings on heads beyond the budget, and the card goes to
+Ready when otherwise ready, with the note `Codex round 2/2`. `factory_get_status` shows
+`review_rounds` (used, budget, strict_from_round).
+
+**Ready report checkboxes.** The Ready report ends with a **Deferred** list: one line per
+deferred item and advisory (``- [ ] Fix now: P2 `path` title (in #<issue>)`` or
+`(advisory: reason)`), plus `- [ ] One more Codex review round` once the rounds are used up. Tick lines
+to have them done: only your ticks count (the comment's `edited` webhook from an owner,
+diffed against the previous body; a hidden marker per line, never its text). Ticks within
+2 minutes of the first become one rework (back to Building through the normal queue, same
+branch and PR, the plan approval stands) whose brief is exactly the ticked items; "One more
+round" raises that issue's budget by one and has Rosie ask the bot again. Each line then
+shows what happened (`→ fixing (rework started)`, `→ fixed in <sha>`, `→ not started:
+<reason>`); the factory re-reads the comment before writing and keeps ticks it has not yet
+processed. Unticking does nothing; a tick is acted on once, a restart included. A lost
+webhook is recovered when the board diff next reads the Ready card: a ticked line with no
+recorded tick counts only if the comment's edit history shows you as the editor who ticked
+it; otherwise it is ignored and logged.
 
 Epic autopilot does not start a sub-issue labelled `follow-up` unless it blocks another
 open sub-issue of the same epic; the epic note counts the rest (`2 follow-ups held`).
@@ -429,7 +489,7 @@ waits up to 90 s for it instead of failing.
 | `sessions prune [--dry-run]` | Delete (or list) the factory sessions session retention would remove now (through the daemon). |
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `session_retention_days` and the health sweep settings; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, `review_rounds_default`, `follow_up_max_depth`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `session_retention_days` and the health sweep settings; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.
@@ -452,6 +512,9 @@ epic_autopilot_concurrency = 1   # sub-issues per epic in progress (Parallel ove
 autopilot_field_node_id = ""     # the epic "Autopilot" SINGLE_SELECT field (restart)
 autopilot_options = { Full = "", Delayed = "", "Plan only" = "" }  # its options (restart)
 parallel_field_node_id = ""      # the epic "Parallel" NUMBER field (restart)
+review_rounds_field_node_id = "" # the "Review rounds" NUMBER field (restart)
+review_rounds_default = 2        # review-bot rounds of an issue whose field is empty
+follow_up_max_depth = 1          # follow-up generations that may defer follow-ups
 ranking = false                  # idle-time ranking of the Triage and Planning columns
 ranking_min_new_triages = 5      # new/changed triage results that start a ranking
 ranking_status_update = true     # short project status update per ranking
@@ -469,6 +532,10 @@ option IDs as `auto_build_options = { Queued = "...", Started = "..." }` and res
 daemon (these two keys are not hot-reloadable). While `auto_build` is on or the field
 is configured, `doctor` fails when the field is missing (naming its ID and options when
 the board already has one) or its IDs differ.
+
+Create the `Review rounds` NUMBER field the same way and record its node ID as
+`review_rounds_field_node_id` (restart); unset, every issue gets `review_rounds_default`;
+`doctor` fails when a configured ID does not match.
 
 Create the `Autopilot` (SINGLE_SELECT: `Full`, `Delayed`, `Plan only`) and `Parallel`
 (NUMBER) fields the same way (`setup render` lists both), record their IDs as
@@ -621,15 +688,14 @@ comments fold into the queued or running rework run.
 
 ### Review bots
 
-Every review-bot finding needs an outcome; a clean bot verdict is not required. The build
-fixes in-scope findings; for a valid out-of-scope finding it opens a follow-up issue (as
-the bot, so it lands in the board Inbox), replies on the thread with the disposition and
-link, and resolves the thread; an advisory finding gets a reply and is resolved. It
-resolves only threads it replied to: readiness counts a bot thread as handled when the
-factory bot replied or a person resolved it, and a thread the bot resolved without a reply
-stays open. The agent's shell policy allows `gh issue create`, thread replies and
-`resolveReviewThread`, and denies closing, deleting, transferring or locking issues and PRs
-(CLI, REST and GraphQL), merging and administration. While the review bot
+Every review-bot finding needs an outcome (fix in this PR, follow-up or advisory, see
+[Follow-ups](#follow-ups)); a clean bot verdict is not required. The build replies on the
+thread with the outcome and resolves it; it resolves only threads it replied to:
+readiness counts a bot thread as handled when the factory bot replied or a person resolved
+it, and a thread the bot resolved without a reply stays open. The agent's shell policy
+allows thread replies and `resolveReviewThread`, and denies opening issues, closing,
+deleting, transferring or locking issues and PRs (CLI, REST and GraphQL), merging and
+administration. While the review bot
 (`review_bot_login`, default `chatgpt-codex-connector[bot]`) can still respond to the PR
 head, the card is not Ready, so late bot comments are handled by the build's findings
 wake instead of pulling a Ready card back. The bot can still respond until it has
@@ -658,15 +724,16 @@ review_bot_max_wait_minutes = 45  # 👀 or unreadable: wait at most this long
 review_bot_grace_minutes = 10     # used when the bot's 👀 cannot be told (no login set)
 ```
 
-The Ready report is the agent's summary (what changed, decisions, follow-ups; no CI or
-review-bot status) followed by the factory's lines from the read that decided Ready: PR,
-CI and `Review bot` (e.g. `Codex: 👍 on <sha>`, `Codex: reviewed <sha>, 2 findings, all
+The Ready report is the agent's summary (what changed, decisions; no CI or review-bot
+status) followed by the factory's lines from the read that decided Ready: PR, CI and
+`Review bot` (e.g. `Codex: 👍 on <sha>`, `Codex: reviewed <sha>, 2 findings, all
 with outcomes`, or `Codex: no response within the grace window`). While the card stays in
 Ready on that head, a later read that changes those lines (a late verdict, the check
 summary, a red check) edits the report in place (found by its marker; edits do not
 notify), never posting a second one. GitHub sends no webhook for a +1 reaction, so a
 Ready card whose report still shows no bot response is re-read on each reconcile, for up
-to 24 hours after the wait. A new head, withdrawal or rework never edits it.
+to 24 hours after the wait. A new head, withdrawal or rework never edits it. The report
+ends with the [Deferred checkboxes](#follow-ups); an in-place edit keeps your ticks.
 
 ### Merge conflicts with main
 

@@ -69,6 +69,26 @@ Relation = Literal["duplicate", "overlaps", "conflicts", "depends_on", "blocks",
 RelatedNote = Annotated[str, StringConstraints(min_length=1, max_length=300)]
 
 
+SplitTitle = Annotated[str, StringConstraints(min_length=1, max_length=200)]
+SplitBody = Annotated[str, StringConstraints(min_length=1, max_length=4000)]
+
+
+class SplitOut(_Strict):
+    """Work the owner directed be filed as its own issue ("do these bits, file the rest
+    as an issue"). The factory opens one issue per item (Inbox, no ``follow-up`` label),
+    in the source issue's epic, linked per ``relation`` (the new issue to the source:
+    ``blocks`` it or is ``blocked_by`` it) and ``blocks``."""
+
+    title: SplitTitle
+    body: SplitBody
+    reason: Annotated[str, StringConstraints(min_length=1, max_length=300)]
+    relation: Literal["none", "blocks", "blocked_by"] = "none"
+    blocks: Annotated[list[Annotated[int, Field(ge=1)]], Field(max_length=20)] = []
+
+
+SplitOuts = Annotated[list[SplitOut], Field(max_length=10)]
+
+
 class Related(_Strict):
     """This issue <relation> ``issue`` (another open issue found during triage)."""
 
@@ -87,6 +107,7 @@ class TriageResult(_Strict):
     labels: Annotated[list[Label], Field(max_length=20)]
     missing_information: Texts
     related: Annotated[list[Related], Field(max_length=20)] = []
+    split_out: SplitOuts = []
 
 
 class EpicOrder(_Strict):
@@ -161,6 +182,7 @@ class EpicTriageResult(_Strict):
     missing_information: Texts = []
     related: Annotated[list[Related], Field(max_length=20)] = []
     plan: EpicPlanSection | None = None
+    split_out: SplitOuts = []
 
 
 class EpicFit(_Strict):
@@ -179,6 +201,7 @@ class PlanResult(_Strict):
     open_decision_ids: Texts
     related: Annotated[list[Related], Field(max_length=20)] = []
     epic_fit: EpicFit | None = None
+    split_out: SplitOuts = []
 
 
 class Verification(_Strict):
@@ -216,6 +239,28 @@ class FollowUp(_Strict):
 
 FollowUps = Annotated[list[FollowUp], Field(max_length=20)]
 
+Severity = Literal["P0", "P1", "P2", "P3"]
+ShortText = Annotated[str, StringConstraints(max_length=300)]
+
+
+class Deferred(_Strict):
+    """A review finding not fixed in this PR, with its outcome: ``follow_up`` (a real
+    defect outside the plan or too large for this PR: the factory files every one of a
+    PR in one consolidated follow-up issue) or ``advisory`` (nothing to file). Each gets
+    a checkbox in the Ready report; the owner may tick it to have it fixed now."""
+
+    severity: Severity
+    path: ShortText = ""
+    title: RelatedNote
+    thread_url: ShortText = ""
+    reason: RelatedNote
+    outcome: Literal["follow_up", "advisory"] = "follow_up"
+    #: Issues the follow-up must come before (native blocked-by links).
+    blocks: Annotated[list[Annotated[int, Field(ge=1)]], Field(max_length=20)] = []
+
+
+DeferredList = Annotated[list[Deferred], Field(max_length=50)]
+
 
 class BuildResult(_Strict):
     kind: Literal["build_ready"]
@@ -230,7 +275,10 @@ class BuildResult(_Strict):
     targeted_rechecks_used: Annotated[int, Field(ge=0, le=1)]
     release_readiness: Literal["ready", "needs_owner"]
     related: Annotated[list[Related], Field(max_length=20)] = []
+    #: Issues the run filed itself (kept for compatibility: the factory now files them).
     follow_ups: FollowUps = []
+    deferred: DeferredList = []
+    split_out: SplitOuts = []
 
 
 class CheckpointResult(_Strict):
@@ -255,6 +303,8 @@ class BlockedResult(_Strict):
     done: Texts
     related: Annotated[list[Related], Field(max_length=20)] = []
     follow_ups: FollowUps = []
+    deferred: DeferredList = []
+    split_out: SplitOuts = []
 
 
 def blocked_on(r: BlockedResult) -> tuple[int, ...]:
@@ -303,19 +353,25 @@ RESULT_SHAPES: dict[str, str] = {
     "triage": '{"kind":"triage","summary":str,"priority":"P0|P1|P2|P3","size":"S|M|L",'
     '"recommendation":"fix|wont_fix|duplicate|needs_info","duplicate_issue":int|null,'
     '"labels":[str],"missing_information":[str],"related"?:[{"issue":int,'
-    '"relation":"duplicate|overlaps|conflicts|depends_on|blocks|supersedes","note":str}]}',
+    '"relation":"duplicate|overlaps|conflicts|depends_on|blocks|supersedes","note":str}],'
+    '"split_out"?:[{"title":str,"body":str,"reason":str,"relation"?:"none|blocks|blocked_by",'
+    '"blocks"?:[int]}]}',
     "epic_triage": '{"kind":"epic_triage","summary":str,"coverage":{"gaps":[str],'
     '"overlaps":[str]},"build_order":[{"issue":int,"reason":str}],"links"?:[{"issue":int,'
     '"blocked_by":int,"reason":str}],"missing_information"?:[str],"related"?:[...],'
     '"plan"?:{"parts":[{"issue":int,"scope":str}],"coordination":[str],"human_gates"?:'
     '[{"key":"slug","title":str,"steps":str,"blocks":[int]}],"external_blockers"?:'
-    '[{"issue":int,"note":str}]}}',
+    '[{"issue":int,"note":str}]},'
+    '"split_out"?:[{"title":str,"body":str,"reason":str,"relation"?:"none|blocks|blocked_by",'
+    '"blocks"?:[int]}]}',
     "plan": '{"kind":"plan","publication_kind":"contract|info","approach":str,"risks":[str],'
     '"contract":{"goal":str,"acceptance_criteria":[{"id":str,"criterion":str,'
     '"verification":str}],"non_goals":[str],"size":"S|M|L","resolved_decisions":'
     '[{"decision_id":str,"answer":str,"source_event_id":str}]},"open_decision_ids":[str],"related"?:[{"issue":int,'
     '"relation":"depends_on|blocks|duplicate|overlaps|conflicts|supersedes","note":str}],'
-    '"epic_fit"?:{"within":bool,"note":str}}',
+    '"epic_fit"?:{"within":bool,"note":str},'
+    '"split_out"?:[{"title":str,"body":str,"reason":str,"relation"?:"none|blocks|blocked_by",'
+    '"blocks"?:[int]}]}',
     "build_ready": '{"kind":"build_ready","pr_number":int>=1,"branch":str,"head_sha":sha40,'
     '"summary":str,"verification":[{"command":str,"file_set":[str],'
     '"outcome":"passed|failed|not_run","evidence":str}],"review":{"implementation_vendor":str,'
@@ -323,11 +379,17 @@ RESULT_SHAPES: dict[str, str] = {
     '"artifact_sha256":sha256,"accepted":bool},"findings":[{"id":str,"source":str,'
     '"severity":str,"disposition":str,"evidence":str}],"remediation_batches_used":0|1,'
     '"targeted_rechecks_used":0|1,"release_readiness":"ready|needs_owner","related"?:[...],'
-    '"follow_ups"?:[{"issue":int,"blocks"?:[int]}]}',
+    '"deferred"?:[{"severity":"P0|P1|P2|P3","path"?:str,"title":str,"thread_url"?:str,'
+    '"reason":str,"outcome"?:"follow_up|advisory","blocks"?:[int]}],'
+    '"split_out"?:[{"title":str,"body":str,"reason":str,"relation"?:"none|blocks|blocked_by",'
+    '"blocks"?:[int]}]}',
     "checkpoint": '{"kind":"checkpoint","grant_id":str,"head_sha":sha40|null,"done":[str],'
     '"remaining":[str],"risks":[str],"worktree_state":str,"elicitation_id":str|null}',
     "blocked": '{"kind":"blocked","reason":str,"done":[str],"related"?:[{"issue":int,'
-    '"relation":"depends_on|blocks|...","note":str}],"follow_ups"?:[{"issue":int,'
+    '"relation":"depends_on|blocks|...","note":str}],"deferred"?:[{"severity":'
+    '"P0|P1|P2|P3","path"?:str,"title":str,"thread_url"?:str,"reason":str,'
+    '"outcome"?:"follow_up|advisory","blocks"?:[int]}],'
+    '"split_out"?:[{"title":str,"body":str,"reason":str,"relation"?:"none|blocks|blocked_by",'
     '"blocks"?:[int]}]}',
 }
 
@@ -367,6 +429,12 @@ class Correlation:
     epic_plan: bool = False
     #: The issue is a sub-issue epic autopilot drives: its plan must say ``epic_fit``.
     epic_part: bool = False
+    #: Follow-up lineage: how many follow-up hops separate this issue from an ordinary
+    #: one (0: not a follow-up) and its source issue. At ``follow_up_max_depth`` or more,
+    #: the run may not defer anything as a follow-up (fix it here or mark it advisory).
+    follow_up_depth: int = 0
+    follow_up_source: int | None = None
+    follow_up_max_depth: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,6 +501,37 @@ def _check_follow_ups(items: list[FollowUp], own: int | None) -> None:
             raise ResultError(f"follow_ups: #{item.issue} cannot block itself")
 
 
+def _check_split_out(items: list[SplitOut], own: int | None) -> None:
+    titles = [" ".join(item.title.lower().split()) for item in items]
+    if len(set(titles)) != len(titles):
+        raise ResultError("split_out: each title at most once")
+    for item in items:
+        if own is not None and own in item.blocks:
+            raise ResultError('split_out: blocks names this issue: use relation "blocks"')
+        if len(set(item.blocks)) != len(item.blocks):
+            raise ResultError("split_out: blocks each issue at most once")
+
+
+def _check_deferred(r: BuildResult | BlockedResult, expected: Correlation) -> None:
+    for item in r.deferred:
+        if expected.issue_number is not None and expected.issue_number in item.blocks:
+            raise ResultError("deferred: a follow-up cannot block this issue itself")
+        if len(set(item.blocks)) != len(item.blocks):
+            raise ResultError("deferred: blocks each issue at most once")
+    filed = [item for item in r.deferred if item.outcome == "follow_up"]
+    if expected.follow_up_depth >= expected.follow_up_max_depth and (filed or r.follow_ups):
+        source = (
+            f" (a follow-up of #{expected.follow_up_source})"
+            if expected.follow_up_source is not None
+            else ""
+        )
+        raise ResultError(
+            f"deferred: this issue is itself a follow-up{source}, so nothing more may be "
+            "deferred as a follow-up: fix each of these findings in this PR, or give it "
+            'outcome "advisory" with a one-line reason (no follow_ups either)'
+        )
+
+
 def epic_plan_hash(result: Mapping[str, object]) -> str:
     """sha256 of an epic plan (a validated ``epic_triage`` result as JSON): binds approval."""
     text = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -474,6 +573,9 @@ def validate_result(result: Mapping[str, object], expected: Correlation) -> Pars
     if expected.issue_number is not None and expected.issue_number in related:
         raise ResultError("related: an issue cannot relate to itself")
     _check_follow_ups(getattr(r, "follow_ups", []), expected.issue_number)
+    if isinstance(r, BuildResult | BlockedResult):
+        _check_deferred(r, expected)
+    _check_split_out(getattr(r, "split_out", []), expected.issue_number)
     contract_bytes: bytes | None = None
     if isinstance(r, BlockedResult):
         pass  # any stage may report that it could not finish

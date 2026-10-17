@@ -710,6 +710,11 @@ class Readiness:
     #: checks as running until a second red read confirms it or this time passes (0 =
     #: none). Display only: ``sync_red`` and every decision are as without it.
     red_unconfirmed_until_us: int = 0
+    #: Review-bot rounds of the issue and its budget from the latest read (0 = not
+    #: counted), and the card's line for them, e.g. "Codex round 2/2".
+    review_rounds_used: int = 0
+    review_rounds_budget: int = 0
+    review_rounds_note: str = ""
 
 
 @dataclass(frozen=True, slots=True)

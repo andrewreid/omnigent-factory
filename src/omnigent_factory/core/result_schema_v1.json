@@ -268,6 +268,13 @@
           "items": {
             "$ref": "#/$defs/related"
           }
+        },
+        "split_out": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/split_out"
+          }
         }
       }
     },
@@ -461,6 +468,13 @@
               }
             }
           }
+        },
+        "split_out": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/split_out"
+          }
         }
       }
     },
@@ -520,6 +534,13 @@
               "minLength": 1,
               "maxLength": 300
             }
+          }
+        },
+        "split_out": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/split_out"
           }
         }
       }
@@ -703,6 +724,20 @@
           "items": {
             "$ref": "#/$defs/follow_up"
           }
+        },
+        "deferred": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "$ref": "#/$defs/deferred"
+          }
+        },
+        "split_out": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/split_out"
+          }
         }
       }
     },
@@ -787,6 +822,112 @@
           "maxItems": 20,
           "items": {
             "$ref": "#/$defs/follow_up"
+          }
+        },
+        "deferred": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {
+            "$ref": "#/$defs/deferred"
+          }
+        },
+        "split_out": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/split_out"
+          }
+        }
+      }
+    },
+    "deferred": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "severity",
+        "title",
+        "reason"
+      ],
+      "properties": {
+        "severity": {
+          "enum": [
+            "P0",
+            "P1",
+            "P2",
+            "P3"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "thread_url": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "outcome": {
+          "enum": [
+            "follow_up",
+            "advisory"
+          ]
+        },
+        "blocks": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    },
+    "split_out": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "body",
+        "reason"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "relation": {
+          "enum": [
+            "none",
+            "blocks",
+            "blocked_by"
+          ]
+        },
+        "blocks": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "integer",
+            "minimum": 1
           }
         }
       }

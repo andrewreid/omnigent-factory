@@ -7,7 +7,7 @@ import json
 import os
 import re
 import secrets
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -63,6 +63,10 @@ class ServiceDispatchDirectory:
         self.config = config
         self.root = config.state_dir / "dispatches"
         self.results = config.state_dir / "results"
+        #: The brief of a rework the owner started by ticking Ready report items, by the
+        #: rework's source event (``service.deferred.Deferrals.rework_brief``); None: not
+        #: wired. Pinned in the dispatch snapshot, so a restart sends the same text.
+        self.rework_brief: Callable[[Parcel, str], Awaitable[str | None]] | None = None
 
     async def stage_spec(self, session_id: str) -> StageSpec | None:
         existing = self._read(self.root / f"{_safe(session_id)}.json")
@@ -114,9 +118,15 @@ class ServiceDispatchDirectory:
         if session.kind == SessionKind.PLAN and claim is not None and claim.active:
             template_name = _AUTOPILOT_PLAN_TEMPLATE  # a sub-issue epic autopilot drives
         auth = parcel.authorization(session.authorization_id)
+        brief = ""
         if session.kind == SessionKind.BUILD and auth is not None and auth.rework:
             # Owner feedback on the built work, or a merge conflict with the base branch.
             template_name = _CONFLICT_TEMPLATE if auth.conflict else _REWORK_TEMPLATE
+            if not auth.conflict and self.rework_brief is not None:
+                # Items the owner ticked in the Ready report: pinned with the snapshot.
+                brief = await self.rework_brief(parcel, auth.source_event_id) or ""
+                if brief:
+                    template_name = _ITEMS_REWORK_TEMPLATE
         template = _template(template_name)
         evidence = await self.issue_evidence(parcel)
         return {
@@ -133,6 +143,7 @@ class ServiceDispatchDirectory:
             "template": template_name,
             "template_sha256": hashlib.sha256(template.encode()).hexdigest(),
             "untrusted_boundary": _new_boundary(),
+            "brief": brief,
             "guidance": (
                 self.config.triage_guidance
                 if session.kind == SessionKind.TRIAGE
@@ -243,12 +254,16 @@ class ServiceDispatchDirectory:
                 )
             # Findings only (the check wake spent or not needed): ask for an outcome each.
             findings = effect.args.get("wake") == "findings"
-            name = "readiness-findings-wake-v2.txt" if findings else "readiness-wake-v9.txt"
+            name = _FINDINGS_WAKE_TEMPLATE if findings else _READINESS_WAKE_TEMPLATE
             return _template(name).format(
                 pr_number=int(str(effect.args.get("pr_number") or 0)),
                 head_sha=str(effect.args.get("head_sha") or ""),
                 reason=str(effect.args.get("reason") or "")[:500],
                 run_id=sid,
+                rounds=rounds_line(
+                    _json_int(effect.args.get("rounds_used")),
+                    _json_int(effect.args.get("rounds_budget")),
+                ),
             )
         if purpose == "blockers_closed":
             return _template("blockers-closed-v1.txt").format(
@@ -280,6 +295,7 @@ class ServiceDispatchDirectory:
             "handoff": self._handoff(parcel, sid),
             # Templates before the base sync have no {base_note}: format ignores it.
             "base_note": base_note(snapshot.get("base_sync"), spec.kind),
+            "brief": str(snapshot.get("brief") or ""),
         }
         if spec.kind == SessionKind.BUILD:
             _authority_text, authority_hash = _authority(parcel)
@@ -586,6 +602,13 @@ class PublicationRenderer:
     def __init__(self, directory: ServiceDispatchDirectory, config: ServiceConfig) -> None:
         self.directory = directory
         self.config = config
+        #: The Ready report's Deferred checkboxes (``service.deferred.Deferrals``
+        #: ``report_section``; its markers are added after the text is made safe). None:
+        #: not wired.
+        self.deferred_section: Callable[[Parcel], Awaitable[str]] | None = None
+        #: The stage comment's "Split out" lines for a run's owner-directed splits
+        #: (``service.splits.Splits.section``); None: not wired.
+        self.split_section: Callable[[Parcel, str], Awaitable[str]] | None = None
 
     async def triage_fields(self, effect: EffectIntent) -> TriageFields | None:
         """Priority/Size/labels of the stored triage result a PUBLISH_TRIAGE publishes."""
@@ -631,6 +654,11 @@ class PublicationRenderer:
             )
         )
 
+    async def _splits(self, parcel: Parcel, session_id: str) -> str:
+        if self.split_section is None or not session_id:
+            return ""
+        return await self.split_section(parcel, session_id)
+
     def _stored_result(self, effect: EffectIntent) -> dict[str, Any] | None:
         sid = str(effect.args.get("session_id") or effect.preconditions.session_id or "")
         if not sid:
@@ -652,7 +680,11 @@ class PublicationRenderer:
             if contract is None:
                 return None
             plan = self.directory.plan_result_for(contract.source_session_id, contract.canonical)
-            return render_contract_comment(parcel, contract, plan, self.config)
+            rendered = render_contract_comment(parcel, contract, plan, self.config)
+            if rendered is None:
+                return None
+            # After the hash-bound section: only that section is verified.
+            return rendered + await self._splits(parcel, contract.source_session_id)
         if (
             effect.kind == EffectKind.PUBLISH_REPORT and effect.args.get("report") == "ready"
         ) or effect.kind == EffectKind.EDIT_REPORT:
@@ -670,11 +702,22 @@ class PublicationRenderer:
                 self.config.repository,
                 review_bot_name(self.config),
             )
+            section = (
+                ""
+                if parcel.readiness is None
+                else await self._splits(parcel, parcel.readiness.session_id)
+            )
+            if self.deferred_section is not None:
+                # Each line is made safe on its own: its hidden action marker must stay.
+                section += await self.deferred_section(parcel)
+            return _safe_publication(text, self.config) + section
         elif effect.kind in {EffectKind.PUBLISH_TRIAGE, EffectKind.PUBLISH_REPORT}:
             body = self._stored_result(effect)
             if body is None:
                 return None
             text = _public_result(body, agent_display_name(self.config))
+            sid = str(effect.args.get("session_id") or effect.preconditions.session_id or "")
+            return _safe_publication(text, self.config) + await self._splits(parcel, sid)
         elif effect.kind == EffectKind.POST_COMMENT and effect.args.get("template") == "decision":
             text = _decision_text(effect.args)
         elif effect.kind == EffectKind.POST_COMMENT and effect.args.get("template") == (
@@ -1322,21 +1365,47 @@ def _new_boundary() -> str:
 
 #: First-message template of each stage run (the dispatch snapshot pins name and bytes).
 _FIRST_TEMPLATES = {
-    SessionKind.TRIAGE: "triage-v8.txt",
-    SessionKind.PLAN: "plan-v8.txt",
-    SessionKind.BUILD: "build-v11.txt",
+    SessionKind.TRIAGE: "triage-v9.txt",
+    SessionKind.PLAN: "plan-v9.txt",
+    SessionKind.BUILD: "build-v12.txt",
 }
-_RETRIAGE_TEMPLATE = "triage-feedback-v5.txt"
+_RETRIAGE_TEMPLATE = "triage-feedback-v6.txt"
 #: The triage of an epic (an issue with sub-issues), first run and re-runs alike.
-_EPIC_TRIAGE_TEMPLATE = "epic-triage-v2.txt"
+_EPIC_TRIAGE_TEMPLATE = "epic-triage-v3.txt"
 #: The epic planning pass of an epic on autopilot (the epic triage plus the epic plan).
-_EPIC_PLAN_TEMPLATE = "epic-plan-v1.txt"
+_EPIC_PLAN_TEMPLATE = "epic-plan-v2.txt"
 #: A plan run of a sub-issue epic autopilot drives (keeps to its part of the epic plan).
-_AUTOPILOT_PLAN_TEMPLATE = "plan-autopilot-v1.txt"
-_REWORK_TEMPLATE = "build-rework-v8.txt"
+_AUTOPILOT_PLAN_TEMPLATE = "plan-autopilot-v2.txt"
+_REWORK_TEMPLATE = "build-rework-v9.txt"
+#: A rework the owner started by ticking Ready report items: its brief is those items.
+_ITEMS_REWORK_TEMPLATE = "build-rework-items-v1.txt"
+#: Readiness wakes of a waiting build run (red checks and other gaps; findings only).
+_READINESS_WAKE_TEMPLATE = "readiness-wake-v10.txt"
+_FINDINGS_WAKE_TEMPLATE = "readiness-findings-wake-v3.txt"
 #: A rework run, or a wake of the waiting build run, for a merge conflict with the base.
 _CONFLICT_TEMPLATE = "build-conflict-v2.txt"
 _CONFLICT_WAKE_TEMPLATE = "readiness-conflict-wake-v1.txt"
+
+
+def rounds_line(used: int, budget: int) -> str:
+    """The review-round line of a readiness wake ("" when the budget is not known)."""
+    if budget <= 0:
+        return ""
+    strict = max(2, budget)
+    if used >= budget:
+        return (
+            f"Review rounds: {used} of {budget} used, the budget is spent: fix remaining "
+            "in-scope P1 findings, defer the rest by the outcome rule and do not ask the "
+            "review bot for another review."
+        )
+    return (
+        f"Review rounds: {used} of {budget} used; from round {strict} on only P1 findings "
+        "with real impact must be fixed, P2/P3 take the outcome rule."
+    )
+
+
+def _json_int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def base_note(record: object, kind: SessionKind) -> str:

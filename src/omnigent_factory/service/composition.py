@@ -45,6 +45,7 @@ from omnigent_factory.service.board_index import BoardIndex
 from omnigent_factory.service.cleanup import CleanupAdapter, WorkspaceCleaner
 from omnigent_factory.service.config import ConfigError, ServiceConfig
 from omnigent_factory.service.credentials import AppInstallationTokenMinter, StoreExecutionGate
+from omnigent_factory.service.deferred import Deferrals
 from omnigent_factory.service.directory import (
     PublicationRenderer,
     RecordingOmnigentAdapter,
@@ -73,8 +74,10 @@ from omnigent_factory.service.observer import OmnigentObserver
 from omnigent_factory.service.omnigent_auth import log_expiry, omnigent_auth
 from omnigent_factory.service.ranking import Ranker
 from omnigent_factory.service.related import RelatedMarker
+from omnigent_factory.service.review_rounds import ReviewRounds, read_item_number
 from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.service.session_retention import SessionRetention
+from omnigent_factory.service.splits import Splits
 from omnigent_factory.service.tokens import DaemonTokenProvider
 
 LOG = logging.getLogger(__name__)
@@ -437,6 +440,21 @@ async def build_production(
     service.native_links = native_links
     follow_ups = FollowUps(service, native_links, github.label_events)
     service.follow_ups = follow_ups
+    rounds = ReviewRounds(service, partial(read_item_number, github.client))
+    github.review_rounds = rounds.observe
+    deferred = Deferrals(
+        service,
+        github.client,
+        follow_ups,
+        rounds,
+        lambda text: safe_publication(text, service.config),
+    )
+    service.deferred = deferred
+    splits = Splits(service, native_links, lambda text: safe_publication(text, service.config))
+    service.splits = splits
+    publications.split_section = splits.section
+    directory.rework_brief = deferred.rework_brief
+    publications.deferred_section = deferred.report_section
 
     def write_links(issue: int, result: Mapping[str, Any]) -> None:
         native_links.schedule_result(issue, result)
@@ -485,9 +503,15 @@ async def build_production(
     cleaner = WorkspaceCleaner(directory, workspaces, config.worktree_root)
     service.workspace_cleaner = cleaner
     processor = GitHubDeliveryProcessor(service, normalizer, github, clock)
-    processor.field_observer = ranker.note_owner_field
+
+    async def note_owner_field(body: bytes) -> None:
+        await ranker.note_owner_field(body)
+        await rounds.note_owner_field(body)
+
+    processor.field_observer = note_owner_field
     processor.native_links = native_links
     processor.follow_ups = follow_ups
+    processor.deferred = deferred
     service.bind_integrations(
         adapters=(github, recording_omnigent, broker, CleanupAdapter(cleaner)),
         delivery_processor=processor,
@@ -503,6 +527,9 @@ async def build_production(
             board=board,
             ranker=ranker,
             link_writer=write_links,
+            result_observer=deferred.schedule_result,
+            split_observer=splits.schedule_result,
+            review_rounds=rounds,
         ),
     )
 

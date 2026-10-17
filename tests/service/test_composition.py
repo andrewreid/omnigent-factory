@@ -123,6 +123,13 @@ async def test_production_composition_binds_every_external_effect_and_real_verif
         }
         assert externally_handled <= adapters.keys()
         assert production.service.delivery_processor is not None
+        # Follow-up discipline: ticks, consolidated issues and review rounds are wired.
+        deferred = production.service.deferred
+        assert deferred is not None
+        assert production.service.delivery_processor.deferred is deferred
+        assert production.service.splits is not None
+        github_adapter = adapters[EffectKind.FETCH_PR_EVIDENCE]
+        assert getattr(github_adapter, "review_rounds", None) is not None
         assert production.verifier.secret_file == config.resolved_webhook_secret_file
         assert production.service.config.max_building == 2
         assert production.service.config.checkpoint_block_hours == {"S": 3, "M": 5, "L": 7}

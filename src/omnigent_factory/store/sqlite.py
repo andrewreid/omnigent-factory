@@ -716,6 +716,28 @@ class SqliteStore:
         assert found is not None  # noqa: S101 - written above
         return found
 
+    def follow_up_lineage(self, repo_id: str, issue_number: int) -> tuple[int, int | None]:
+        """(how many follow-up hops lead from an ordinary issue to this one, its source
+        issue): 0 and None when the factory never recorded it as a follow-up of another
+        issue (a ``follow-up`` label alone is not lineage). Cycles stop the walk."""
+        depth = 0
+        source: int | None = None
+        seen = {issue_number}
+        current = issue_number
+        while depth < 20:
+            row = self._conn.execute(
+                "SELECT source_issue FROM follow_ups WHERE repo_id = ? AND issue_number = ?",
+                (repo_id, current),
+            ).fetchone()
+            if row is None or row[0] is None or int(row[0]) in seen:
+                break
+            current = int(row[0])
+            seen.add(current)
+            if depth == 0:
+                source = current
+            depth += 1
+        return depth, source
+
     def mark_follow_up_done(self, repo_id: str, issue_number: int, action: str) -> None:
         with self._txn() as conn:
             row = conn.execute(

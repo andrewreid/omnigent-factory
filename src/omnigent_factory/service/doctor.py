@@ -415,6 +415,7 @@ async def _check_project(config: ServiceConfig, client: GitHubClient, report: Do
         _check_auto_build_field(config, by_id, report)
     if config.epic_autopilot or config.autopilot_field_node_id or config.parallel_field_node_id:
         _check_autopilot_fields(config, by_id, report)
+    _check_review_rounds_field(config, by_id, report)
     ranking_set_up = config.ranking or bool(config.rank_field_node_id)
     if ranking_set_up:
         _check_rank_field(config, by_id, report)
@@ -510,6 +511,29 @@ def _check_autopilot_fields(
             report.fail("github_autopilot_field", "Parallel NUMBER field ID does not match")
             return
     report.pass_check("github_autopilot_field", "Autopilot field and option IDs match")
+
+
+def _check_review_rounds_field(
+    config: ServiceConfig, by_id: dict[Any, Any], report: DoctorReport
+) -> None:
+    """The owner's "Review rounds" NUMBER field (``review_rounds_field_node_id``)."""
+    if not config.review_rounds_field_node_id:
+        # Optional: without it every issue gets the default (no owner value to read).
+        report.pass_check(
+            "github_review_rounds_field",
+            "not configured: every issue gets review_rounds_default "
+            f"({config.review_rounds_default}) review rounds",
+        )
+        return
+    field = by_id.get(config.review_rounds_field_node_id)
+    if (
+        not isinstance(field, dict)
+        or field.get("name") != "Review rounds"
+        or field.get("dataType") != "NUMBER"
+    ):
+        report.fail("github_review_rounds_field", "Review rounds NUMBER field ID does not match")
+        return
+    report.pass_check("github_review_rounds_field", "Review rounds number field ID matches")
 
 
 def _check_rank_field(config: ServiceConfig, by_id: dict[Any, Any], report: DoctorReport) -> None:

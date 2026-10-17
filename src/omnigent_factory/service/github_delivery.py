@@ -177,6 +177,9 @@ class GitHubDeliveryProcessor:
         #: run, and ``follow-up`` / ``factory:build-follow-ups`` label changes. None: not
         #: wired.
         self.follow_ups: Any = None
+        #: Ready report checkboxes (``service.deferred.Deferrals``): the owner's ticks in
+        #: an edited report comment. None: not wired.
+        self.deferred: Any = None
 
     async def process(self, delivery: DeliveryRecord) -> None:
         try:
@@ -209,6 +212,15 @@ class GitHubDeliveryProcessor:
                 await self.follow_ups.on_issues_delivery(delivery.body)
             except Exception:
                 LOG.warning("follow-up handling failed delivery_guid=%s", delivery.delivery_guid)
+
+        if self.deferred is not None and delivery.event_name == "issue_comment":
+            try:
+                # Authenticated (normalized above); its own durable state, no transition.
+                await self.deferred.on_comment_delivery(delivery.body)
+            except Exception:
+                LOG.warning(
+                    "ready report tick handling failed delivery_guid=%s", delivery.delivery_guid
+                )
 
         if self.field_observer is not None and delivery.event_name == "projects_v2_item":
             try:

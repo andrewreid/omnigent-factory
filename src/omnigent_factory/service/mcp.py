@@ -157,6 +157,15 @@ class FactoryTools:
         #: Creates the native blocked-by links an accepted result reports
         #: (``service.links.NativeLinks.schedule_result``); None: not wired.
         self.link_writer: Callable[[int, Mapping[str, Any]], None] | None = None
+        #: Records and files an accepted result's deferred findings
+        #: (``service.deferred.Deferrals.schedule_result``); None: not wired.
+        self.result_observer: Callable[[Parcel, str, Mapping[str, Any]], None] | None = None
+        #: Files an accepted result's owner-directed ``split_out`` issues
+        #: (``service.splits.Splits.schedule_result``); None: not wired.
+        self.split_observer: Callable[[Parcel, str, Mapping[str, Any]], None] | None = None
+        #: The issue's review rounds (``service.review_rounds.ReviewRounds``); None: not
+        #: wired.
+        self.review_rounds: Any = None
 
     # ------------------------------------------------------------------ resolution
 
@@ -701,6 +710,28 @@ class FactoryTools:
             "fix_wakes_max": 1,
             "findings_wakes_used": parcel.findings_wakes,
             "findings_wakes_max": 1,
+            "review_rounds": await self._review_rounds(parcel),
+            "follow_up_depth": await self._follow_up_depth(parcel),
+        }
+
+    async def _review_rounds(self, parcel: Parcel) -> dict[str, Any] | None:
+        """Review-bot rounds of the issue: used, budget, exhausted, strict_from_round."""
+        if self.review_rounds is None:
+            return None
+        rounds = await self.review_rounds.status(parcel.parcel_id)
+        return None if rounds is None else dict(rounds.as_status())
+
+    async def _follow_up_depth(self, parcel: Parcel) -> dict[str, Any]:
+        """Whether this issue may defer findings as follow-ups (its lineage depth)."""
+        number = parcel.issue_number or 0
+        depth, source = await self.service.db.call(
+            lambda store: store.follow_up_lineage(self.config.repo_id, number)
+        )
+        return {
+            "depth": depth,
+            "source_issue": source,
+            "max_depth": self.config.follow_up_max_depth,
+            "may_defer_follow_ups": depth < self.config.follow_up_max_depth,
         }
 
     # ------------------------------------------------------------------ mutations
@@ -855,6 +886,13 @@ class FactoryTools:
                     "call factory_get_plan in this run first, then echo its plan_hash"
                 )
             payload.setdefault("branch", f"factory/issue-{parcel.issue_number or 0}")
+        depth, source = (
+            await self.service.db.call(
+                lambda store: store.follow_up_lineage(self.config.repo_id, parcel.issue_number or 0)
+            )
+            if kind in ("build_ready", "blocked") and parcel.issue_number is not None
+            else (0, None)
+        )
         corr = Correlation(
             parcel.parcel_id,
             run.session_id,
@@ -867,6 +905,9 @@ class FactoryTools:
             sub_issues=epic_sub_issues(parcel),
             epic_plan=parcel.autopilot is not None,
             epic_part=parcel.autopilot_claim is not None and parcel.autopilot_claim.active,
+            follow_up_depth=depth,
+            follow_up_source=source,
+            follow_up_max_depth=self.config.follow_up_max_depth,
         )
         try:
             parsed = validate_result(payload, corr)
@@ -910,6 +951,19 @@ class FactoryTools:
         if self.link_writer is not None and parcel.issue_number is not None and out.get("accepted"):
             # The factory writes the links the result reports: no agent needs that access.
             self.link_writer(parcel.issue_number, parsed.result.result.model_dump(mode="json"))
+        if self.split_observer is not None and out.get("accepted"):
+            self.split_observer(
+                parcel, run.session_id, parsed.result.result.model_dump(mode="json")
+            )
+        if (
+            self.result_observer is not None
+            and out.get("accepted")
+            and kind in ("build_ready", "blocked")
+            and not in_checkpoint
+        ):
+            self.result_observer(
+                parcel, run.session_id, parsed.result.result.model_dump(mode="json")
+            )
         return out
 
     async def submit_ranking(
@@ -1413,7 +1467,8 @@ def build_mcp_server(tools: FactoryTools, config: ServiceConfig) -> FastMCP:
     @server.tool(
         name="factory_get_status",
         description="Run id, stage, what is expected next, time left, holds, open questions, "
-        "PR readiness gaps (checks, findings, closing reference) and fix wakes used.",
+        "PR readiness gaps (checks, findings, closing reference), fix wakes used, review "
+        "rounds (used, budget, strict_from_round) and whether follow-ups may be deferred.",
     )
     async def factory_get_status(session_id: str) -> dict[str, Any]:
         return await tools.get_status(session_id)
@@ -1588,10 +1643,16 @@ def build_endpoint(
     board: BoardIndex | None = None,
     ranker: Any = None,  # noqa: ANN401 - service.ranking.Ranker
     link_writer: Callable[[int, Mapping[str, Any]], None] | None = None,
+    result_observer: Callable[[Parcel, str, Mapping[str, Any]], None] | None = None,
+    split_observer: Callable[[Parcel, str, Mapping[str, Any]], None] | None = None,
+    review_rounds: Any = None,  # noqa: ANN401 - service.review_rounds.ReviewRounds
 ) -> McpEndpoint:
     tools = FactoryTools(service, directory, config, board)
     tools.ranker = ranker
     tools.link_writer = link_writer
+    tools.result_observer = result_observer
+    tools.split_observer = split_observer
+    tools.review_rounds = review_rounds
 
     def adopt_reloaded(new: ServiceConfig) -> None:
         tools.config = new

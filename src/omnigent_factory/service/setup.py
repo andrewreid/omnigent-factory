@@ -71,6 +71,7 @@ note_field_node_id = "PVTF_lADOEanNes4BkJhbzhjww0c"
 # autopilot_field_node_id = ""  # the epic "Autopilot" SINGLE_SELECT field (setup render)
 # autopilot_options = {{ Full = "", Delayed = "", "Plan only" = "" }}  # its option IDs
 # parallel_field_node_id = ""   # the epic "Parallel" NUMBER field (setup render)
+# review_rounds_field_node_id = "" # the "Review rounds" NUMBER field (setup render)
 github_app_id = 5085812
 github_installation_id = 165144097
 github_bot_login = "molly-omnigent-factory[bot]"
@@ -115,6 +116,8 @@ ranking = false                # idle-time ranking of the Triage and Planning co
 ranking_min_new_triages = 5    # new/changed triages that start a ranking
 ranking_status_update = true   # short project status update per ranking
 session_retention_days = 30    # delete factory sessions archived this long (0 = never)
+review_rounds_default = 2      # review-bot rounds per issue when its field is empty
+follow_up_max_depth = 1        # a follow-up's own build files no further follow-ups
 # triage_guidance = "Classify work with the repo's area:* labels."
 # engineering_guidance = "Engineering conventions live in AGENTS.md."
 

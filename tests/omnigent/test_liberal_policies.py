@@ -67,8 +67,9 @@ NORMAL = [
     "curl -fsSL https://registry.npmjs.org/vitest | head -c 200",
     "rm -rf api/node_modules/.vite && mkdir -p /tmp/factory-scratch",
     "echo 'the owner merges; the factory never runs gh pr' > NOTES.txt",
-    # Review-bot dispositions: a follow-up issue, a thread reply and resolving the thread.
-    "gh issue create --title 'Ship SWA config' --body-file /tmp/f.md --label area:tooling",
+    # Review-bot dispositions: a thread reply and resolving the thread (follow-up issues
+    # are the factory's: see test_issue_creation_is_the_factorys).
+    "gh issue view 700 --json title,state",
     "gh api repos/SA-Ambulance/timesheets/pulls/686/comments/4130465711/replies -f body=@/tmp/r.md",
     "gh api graphql -f query='mutation { addPullRequestReviewThreadReply("
     'input: {pullRequestReviewThreadId: "PRRT_x", body: "FOLLOW_UP: #700"}) { comment { id } } }\'',
@@ -173,6 +174,47 @@ def _result(verdict: Any) -> str:
     if verdict is None:
         return "ALLOW"
     return str(verdict.get("result") if isinstance(verdict, dict) else verdict)
+
+
+#: Opening an issue in any form: the factory files follow-ups (``deferred``) itself.
+ISSUE_CREATE = [
+    "gh issue create --title 'Ship SWA config' --body-file /tmp/f.md --label area:tooling",
+    "gh issue new -t x -F body.md",
+    "cd api && pnpm test && gh issue create --title x --body-file f.md",
+    "pnpm lint; gh issue create -t x",
+    "gh pr checks 12 || gh issue create -t x -F f",
+    "gh api repos/SA-Ambulance/timesheets/issues -f title=x -F body=@f.md",
+    "gh api -X POST /repos/SA-Ambulance/timesheets/issues --input issue.json",
+    "gh api --method=POST repos/SA-Ambulance/timesheets/issues --input issue.json",
+    "curl -X POST https://api.github.com/repos/SA-Ambulance/timesheets/issues -d @f.json",
+    "curl -s https://api.github.com/repos/SA-Ambulance/timesheets/issues --data @f.json",
+    'gh api graphql -f query=\'mutation { createIssue(input: {repositoryId: "R", '
+    'title: "x"}) { issue { number } } }\'',
+]
+#: Reading issues and commenting stay allowed.
+ISSUE_READS = [
+    "gh issue view 700 --json title,body",
+    "gh issue list --label follow-up --state open",
+    "gh api repos/SA-Ambulance/timesheets/issues?state=open --paginate",
+    "gh api repos/SA-Ambulance/timesheets/issues/700",
+    "gh api repos/SA-Ambulance/timesheets/issues/700/comments -f body=@reply.md",
+    "gh issue comment 700 --body-file reply.md",
+]
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+@pytest.mark.parametrize("command", ISSUE_CREATE)
+def test_issue_creation_is_the_factorys(command: str, read_only: bool) -> None:
+    spec = pol.factory_cel_policy("main", read_only=read_only)
+    verdict = cel_policy(**spec.factory_params)(_event(command))
+    assert _result(verdict) == "DENY", command
+    reason = verdict["reason"]
+    assert "files issues itself" in reason and "`split_out`" in reason and "`deferred`" in reason
+
+
+@pytest.mark.parametrize("command", ISSUE_READS)
+def test_reading_and_commenting_on_issues_stays_allowed(cel: Any, command: str) -> None:
+    assert _result(cel(_event(command))) == "ALLOW", command
 
 
 @pytest.mark.parametrize("command", NORMAL)

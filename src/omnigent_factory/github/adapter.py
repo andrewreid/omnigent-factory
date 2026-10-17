@@ -7,7 +7,7 @@ import inspect
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
@@ -33,6 +33,7 @@ from omnigent_factory.core.events import (
     ChecksState,
     FindingRef,
 )
+from omnigent_factory.core.report_lines import keep_ticks
 from omnigent_factory.core.types import IssueLinks, IssueSnapshot, Stage
 from omnigent_factory.github.client import (
     AmbiguousRequest,
@@ -188,6 +189,16 @@ class GitHubAPIAdapter:
         self._last_bot_thread_commits: tuple[str, ...] = ()
         #: The bot threads without an outcome, from the last thread read.
         self._last_open_findings: tuple[FindingRef, ...] = ()
+        #: Every bot thread without an outcome with the commit it was opened on (uncapped).
+        self._last_open_commits: tuple[tuple[FindingRef, str | None], ...] = ()
+        #: The review bot's reviews of PR heads from the last read: (commit or commit
+        #: prefix, review time), one review round each (``service.review_rounds``).
+        self._last_bot_rounds: tuple[tuple[str, int], ...] = ()
+        #: Records the rounds a PR read saw and returns the issue's rounds and budget
+        #: (``service.review_rounds.ReviewRounds.observe``); None: rounds not counted.
+        self.review_rounds: (
+            Callable[[str, int, Sequence[tuple[str, int]]], Awaitable[Any]] | None
+        ) = None
         #: The review bot's 👀 for its latest unanswered trigger, from the last read.
         self._last_bot_eyes = ""
         if independent_reviewer_ids & (owner_ids | {bot_user_id}):
@@ -731,6 +742,16 @@ class GitHubAPIAdapter:
             findings_dispositioned = await self._bot_threads_settled(pr_number)
             closes_issue = await self._closes_issue(pr_number, ref.parcel_id)
             review_bot_since = await self._review_bot_pending_since(pr, pr_number, head_sha)
+            rounds = await self._review_rounds(ref, pr_number, head_sha, base_sync)
+            if rounds is not None and rounds.over_budget:
+                # Findings on a head reviewed beyond the budget are not waited for.
+                kept = [
+                    f
+                    for f, oid in self._last_open_commits
+                    if oid is None or not any(oid.startswith(k) for k in rounds.over_budget)
+                ]
+                findings_dispositioned = not kept
+                self._last_open_findings = tuple(kept[:_MAX_FINDINGS])
             verdict = self._review_bot_verdict(head_sha, review_bot_since, findings_dispositioned)
             author = pr.get("user")
             return PullRequestEvidence(
@@ -758,11 +779,36 @@ class GitHubAPIAdapter:
                 mergeable=_mergeable(pr),
                 base_head=str(base.get("sha") or "") if isinstance(base, dict) else "",
                 base_ref=base_ref if isinstance(base_ref, str) else "",
+                review_rounds_used=rounds.used if rounds is not None else 0,
+                review_rounds_budget=rounds.budget if rounds is not None else 0,
+                review_rounds_note=(
+                    f"{self._review_bot_name()} round {rounds.used}/{rounds.budget}"
+                    if rounds is not None and rounds.budget > 0
+                    else ""
+                ),
             )
         except RateLimited as exc:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
         except GitHubAPIError as exc:
             return RetryableReadFailure(str(exc))
+
+    async def _review_rounds(
+        self, ref: IssueRef, pr_number: int, head_sha: str, base_sync: bool
+    ) -> Any:  # noqa: ANN401 - service.review_rounds.RoundsView
+        """The issue's review rounds after recording the ones this read saw; a head that
+        only syncs the base branch is not a round. None: rounds are not counted."""
+        if self.review_rounds is None or not self.review_bot_login:
+            return None
+        seen = [r for r in self._last_bot_rounds if not (base_sync and r[0] == head_sha)]
+        return await self.review_rounds(ref.parcel_id, pr_number, seen)
+
+    def _review_bot_name(self) -> str:
+        """The review bot's name for the card ("@codex" reads "Codex")."""
+        name = self.review_bot_mention.strip().lstrip("@") or self.review_bot_login.removesuffix(
+            "[bot]"
+        )
+        name = " ".join(name.split())
+        return name[:1].upper() + name[1:] if name else "Review bot"
 
     async def _pull(self, pr_number: int) -> dict[str, Any]:
         pr: Any = await self.client.get_json(f"/repos/{self.repository}/pulls/{pr_number}")
@@ -787,6 +833,7 @@ class GitHubAPIAdapter:
         """
         self._last_bot_answer = ""
         self._last_bot_eyes = ""
+        self._last_bot_rounds = ()
         login = self.review_bot_login
         if not login:
             return None
@@ -815,6 +862,7 @@ class GitHubAPIAdapter:
         reactions = await self.client.paginate(
             f"/repos/{self.repository}/issues/{pr_number}/reactions?per_page=100"
         )
+        rounds: list[tuple[str, int]] = []
         for item, at_key, kind in (
             *((r, "submitted_at", "review") for r in reviews),
             *((c, "created_at", "comment") for c in comments),
@@ -825,6 +873,10 @@ class GitHubAPIAdapter:
             author = user.get("login") if isinstance(user, dict) else None
             body = str(item.get("body") or "")
             at = self._parse_time_us(item.get(at_key))
+            if author == login and at:
+                reviewed = _reviewed_commit(item, body, head_sha)
+                if reviewed:
+                    rounds.append((reviewed, at))
             if author == login:
                 if at and (item.get("commit_id") == head_sha or self._names_commit(body, head_sha)):
                     answers.append((at, kind))
@@ -844,8 +896,10 @@ class GitHubAPIAdapter:
             at = self._parse_time_us(reaction.get("created_at"))
             if reaction.get("content") == "+1" and at > pushed:
                 answers.append((at, "reaction"))
+                rounds.append((head_sha, at))
             elif reaction.get("content") == "eyes" and at:
                 eyes.append(at)
+        self._last_bot_rounds = tuple(rounds)
         if not answers:
             trigger = max([pushed, *pings])
         else:
@@ -1248,9 +1302,11 @@ class GitHubAPIAdapter:
         after: str | None = None
         self._last_bot_thread_commits = ()
         self._last_open_findings = ()
+        self._last_open_commits = ()
         bot_login = self.review_bot_login.removesuffix("[bot]")  # GraphQL omits "[bot]"
         bot_commits: list[str] = []
         open_findings: list[FindingRef] = []
+        open_commits: list[tuple[FindingRef, str | None]] = []
         while True:
             data = await self.client.graphql(
                 query, {"owner": owner, "name": name, "number": pr_number, "after": after}
@@ -1282,11 +1338,14 @@ class GitHubAPIAdapter:
                     for a in authors[1:]
                 )
                 if not answered:
-                    open_findings.append(_finding_ref(thread))
+                    ref = _finding_ref(thread)
+                    open_findings.append(ref)
+                    open_commits.append((ref, oid))
             page = threads.get("pageInfo") if isinstance(threads, dict) else None
             if not isinstance(page, dict) or not page.get("hasNextPage"):
                 self._last_bot_thread_commits = tuple(bot_commits)
                 self._last_open_findings = tuple(open_findings[:_MAX_FINDINGS])
+                self._last_open_commits = tuple(open_commits)
                 return not open_findings
             cursor = page.get("endCursor")
             if not isinstance(cursor, str):
@@ -1745,6 +1804,8 @@ class GitHubAPIAdapter:
         if found is None:
             return DefinitiveFailure("no bot comment carries the report marker")
         comment_id, current = found
+        # The owner's ticks in the Deferred section stay (``core.report_lines``).
+        text = keep_ticks(current, text)
         body = f"{text}\n\n{self._effect_marker(report_id)}"
         if current == body:
             return Ack(comment_id, {"edited": False})
@@ -2128,6 +2189,20 @@ def _finding_ref(thread: dict[str, Any]) -> FindingRef:
         title=title[:120],
         url=url[:300] if url.startswith("https://") else "",
     )
+
+
+def _reviewed_commit(item: dict[str, Any], body: str, head_sha: str) -> str:
+    """The commit a review-bot review (its ``commit_id``) or verdict comment ("Reviewed
+    commit: `<prefix>`") answered: the full head SHA when it names the head, else the
+    SHA or prefix as given ("" = neither)."""
+    commit = item.get("commit_id")
+    if isinstance(commit, str) and commit:
+        return commit
+    match = _REVIEWED_COMMIT.search(body)
+    if match is None:
+        return ""
+    prefix = match.group(1).lower()
+    return head_sha if head_sha.startswith(prefix) else prefix
 
 
 def _bot_thread_commit(comments: object, bot_login: str) -> str | None:

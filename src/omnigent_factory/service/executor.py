@@ -586,6 +586,9 @@ class EffectExecutor:
                 mergeable=_mergeable_state(detail.get("mergeable")),
                 base_head=str(detail.get("base_head") or "")[:64],
                 base_ref=str(detail.get("base_ref") or "")[:255],
+                review_rounds_used=_json_int(detail.get("review_rounds_used"), 0),
+                review_rounds_budget=_json_int(detail.get("review_rounds_budget"), 0),
+                review_rounds_note=str(detail.get("review_rounds_note") or "")[:80],
             )
         elif effect.kind == EffectKind.RESOLVE_ELICITATION:
             body = ev.ElicitationResolved(

@@ -283,6 +283,11 @@ class PullRequestEvidence:
     #: The base branch head and name the PR was read against.
     base_head: str = ""
     base_ref: str = ""
+    #: Review-bot rounds of the issue so far and its budget (0 = not counted), and the
+    #: card's line for them ("Codex round 2/2"); see ``service.review_rounds``.
+    review_rounds_used: int = 0
+    review_rounds_budget: int = 0
+    review_rounds_note: str = ""
 
     @property
     def verified(self) -> bool:

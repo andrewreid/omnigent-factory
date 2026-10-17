@@ -155,11 +155,22 @@ CEL_REASON = (
     "branch, repository/ruleset/branch-protection/collaborator/secret/workflow "
     "administration, dispatching workflows, deleting workflow runs, logs, artifacts or "
     "caches, closing, deleting, transferring or locking issues and pull requests and "
-    "deleting repositories are the owner's. Everything else is allowed (e.g. opening a "
-    "follow-up issue, replying to and resolving review threads, re-running or cancelling "
-    "CI with gh run rerun / gh run cancel). If this matched text "
+    "deleting repositories are the owner's. Everything else is allowed (e.g. replying to "
+    "and resolving review threads, re-running or cancelling CI with gh run rerun / gh run "
+    "cancel). If this matched text "
     "inside a message, commit body or file content, write that text to a file and pass it "
     "by path (e.g. --body-file / -F) and rerun the command."
+)
+
+ISSUE_CREATE_REASON = (
+    "Denied by factory policy: the factory files issues itself, so they carry provenance "
+    "and are never filed twice. Work the owner directed be filed as its own issue goes in "
+    "your result's `split_out` field (title, body, reason, relation none|blocks|blocked_by, "
+    "optional blocks); a review finding you defer goes in `deferred` (severity, path, "
+    "title, thread_url, reason, outcome follow_up or advisory, optional blocks). Reply to "
+    "a review thread with its outcome and resolve it. If this matched text inside a "
+    "message or file content, write that text to a file and pass it by path (e.g. "
+    "--body-file / -F)."
 )
 
 #: MCP GitHub tools that merge or administer (matched against ``event.data.name``).
@@ -265,6 +276,31 @@ _GIT_OPTION = (
 _END = r"($|[\s;&|)`'\"])"
 
 
+def _issue_create_pattern() -> str:
+    """Opening an issue: ``gh issue create``/``new``, a POST to ``repos/<o>/<r>/issues``
+    (``gh api`` with fields, ``curl`` with data, or any client with an explicit POST method)
+    and the GraphQL ``createIssue`` mutation. Raw-text scan like the deny list, so chained
+    commands (``a && gh issue create``) match too; an issue comment
+    (``issues/<n>/comments``) and reads stay allowed."""
+    path = r"repos/[^\s/]+/[^\s/'\"]+/issues/?(\s|$|['\"?])"
+    post = r"(-X|--request|--method)(\s|=)*['\"]?(?i:post)\b"
+    fields = r"(-f|-F|--field|--raw-field|--input)(\s|=)"
+    data = r"(-d|--data|--data-raw|--data-binary|--json)(\s|=)"
+    gh_api = r"\bgh\s+api\b" + _SEG
+    curl = r"\bcurl\b" + _SEG
+    rules = [
+        r"\bgh\s+issue\s+(create|new)\b",
+        gh_api + fields + _SEG + path,
+        gh_api + path + _SEG + fields,
+        curl + data + _SEG + path,
+        curl + path + _SEG + data,
+        post + _SEG + path,
+        path + _SEG + post,
+        r"\bcreateIssue\b",
+    ]
+    return "(" + "|".join(rules) + ")"
+
+
 def _read_only_pattern() -> str:
     """Git subcommands that move HEAD or change the working tree or index (#761).
 
@@ -325,8 +361,11 @@ def factory_cel_expression(default_branch: str = "main", *, read_only: bool = Fa
         f" && has({args}.branch) && {args}.branch == {_cel_string(default_branch)})"
     )
     shell = _command_matches(_shell_pattern(default_branch))
+    issue_create = _command_matches(_issue_create_pattern())
     rule = (
-        f"({is_call}) && ({admin_tool} || {file_to_default} || {shell})"
+        f"({is_call}) && {issue_create}"
+        f' ? {{"result": "DENY", "reason": {_cel_string(ISSUE_CREATE_REASON)}}}'
+        f" : ({is_call}) && ({admin_tool} || {file_to_default} || {shell})"
         f' ? {{"result": "DENY", "reason": {_cel_string(CEL_REASON)}}}'
         ' : {"result": "ALLOW"}'
     )

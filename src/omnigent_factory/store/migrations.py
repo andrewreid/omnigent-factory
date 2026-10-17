@@ -725,6 +725,130 @@ CREATE TABLE epic_follow_up_builds (
 );
 """
 
+# Follow-up discipline (``service.deferred``, ``service.review_rounds``); additive only.
+#
+# * deferred_items: review findings a build/blocked result deferred (``deferred``, or a
+#   legacy ``follow_ups`` issue), per source issue and stable item key; ``listed``: in the
+#   PR's consolidated follow-up issue; ``closed_out``: that issue's line says it was fixed.
+# * consolidated_follow_ups: the one follow-up issue the factory files per PR (``creating``
+#   while a create may have landed: it is found by its marker before any retry).
+# * report_actions / report_action_batches: Ready report checkboxes the owner ticked
+#   (exactly once per action) and the reworks they started (one per batch).
+# * review_round_budgets: the owner's "Review rounds" field per issue (their own board
+#   edits only); review_rounds: review-bot reviews of the issue's PR heads (one round per
+#   reviewed commit, across runs); review_round_grants: "one more round" ticks.
+V17_SQL = """
+CREATE TABLE deferred_items (
+    repo_id TEXT NOT NULL,
+    source_issue INTEGER NOT NULL,
+    item_key TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    pr_number INTEGER NOT NULL DEFAULT 0,
+    session_id TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL,
+    thread_url TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL CHECK (outcome IN ('follow_up', 'advisory', 'filed')),
+    blocks_json TEXT NOT NULL DEFAULT '[]',
+    issue_number INTEGER,
+    listed INTEGER NOT NULL DEFAULT 0 CHECK (listed IN (0, 1)),
+    closed_out INTEGER NOT NULL DEFAULT 0 CHECK (closed_out IN (0, 1)),
+    created_at_us INTEGER NOT NULL,
+    updated_at_us INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, source_issue, item_key)
+);
+CREATE TABLE consolidated_follow_ups (
+    repo_id TEXT NOT NULL,
+    source_issue INTEGER NOT NULL,
+    pr_number INTEGER NOT NULL,
+    issue_number INTEGER,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'creating', 'created')),
+    created_at_us INTEGER NOT NULL,
+    updated_at_us INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, source_issue, pr_number)
+);
+CREATE TABLE report_actions (
+    repo_id TEXT NOT NULL,
+    parcel_id TEXT NOT NULL,
+    action_id TEXT NOT NULL,
+    comment_id INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('ticked', 'started', 'refused', 'done')),
+    ticked_at_us INTEGER NOT NULL,
+    actor_id INTEGER NOT NULL,
+    via TEXT NOT NULL CHECK (via IN ('webhook', 'recovered')),
+    batch_id TEXT,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at_us INTEGER NOT NULL,
+    updated_at_us INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, parcel_id, action_id)
+);
+CREATE TABLE report_action_batches (
+    repo_id TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    parcel_id TEXT NOT NULL,
+    event_id TEXT NOT NULL UNIQUE,
+    actions_json TEXT NOT NULL,
+    brief TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('applying', 'started', 'refused', 'done')),
+    reason TEXT NOT NULL DEFAULT '',
+    created_at_us INTEGER NOT NULL,
+    updated_at_us INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, batch_id)
+);
+CREATE TABLE review_round_budgets (
+    repo_id TEXT NOT NULL,
+    issue_node_id TEXT NOT NULL,
+    value INTEGER,
+    actor_id INTEGER NOT NULL,
+    changed_at_us INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, issue_node_id)
+);
+CREATE TABLE review_rounds (
+    repo_id TEXT NOT NULL,
+    parcel_id TEXT NOT NULL,
+    commit_key TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    reviewed_at_us INTEGER NOT NULL,
+    recorded_at_us INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, parcel_id, commit_key)
+);
+CREATE TABLE review_round_grants (
+    repo_id TEXT NOT NULL,
+    parcel_id TEXT NOT NULL,
+    grant_key TEXT NOT NULL,
+    granted_at_us INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, parcel_id, grant_key)
+);
+"""
+
+# Owner-directed splits (``service.splits``): one issue per ``split_out`` item, keyed by
+# source issue and title; ``creating`` while a create may have landed (found by its marker
+# before any retry); ``done_json``: link actions done once (parent, blocked-by links).
+# Not follow-ups: no ``follow_ups`` row, so no label, hold or lineage.
+V18_SQL = """
+CREATE TABLE split_issues (
+    repo_id TEXT NOT NULL,
+    source_issue INTEGER NOT NULL,
+    item_key TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    relation TEXT NOT NULL DEFAULT 'none' CHECK (relation IN ('none', 'blocks', 'blocked_by')),
+    blocks_json TEXT NOT NULL DEFAULT '[]',
+    issue_number INTEGER,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'creating', 'created')),
+    done_json TEXT NOT NULL DEFAULT '[]',
+    attempt_at_us INTEGER NOT NULL DEFAULT 0,
+    created_at_us INTEGER NOT NULL,
+    updated_at_us INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, source_issue, item_key)
+);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -742,4 +866,6 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(14, "auto-build", V14_SQL),
     Migration(15, "epic-autopilot", V15_SQL),
     Migration(16, "follow-ups", V16_SQL),
+    Migration(17, "follow-up-discipline", V17_SQL),
+    Migration(18, "owner-directed-splits", V18_SQL),
 )

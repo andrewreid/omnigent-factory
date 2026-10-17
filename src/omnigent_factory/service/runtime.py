@@ -202,6 +202,12 @@ class FactoryService:
         self.follow_ups: Any = None
         #: Labels of changed or unknown cards, checked by ``follow_ups`` with their read.
         self._follow_up_checks: dict[str, tuple[str, ...]] = {}
+        #: Deferred findings: consolidated follow-up issues and the Ready report's
+        #: checkboxes (composition; ``service.deferred.Deferrals``). None: not wired.
+        self.deferred: Any = None
+        #: Owner-directed split issues (composition; ``service.splits.Splits``). None: not
+        #: wired.
+        self.splits: Any = None
         self._fatal_exit = fatal_exit
         self._fatal_reason: str | None = None
         self._delivery_failures: dict[str, int] = {}
@@ -332,6 +338,16 @@ class FactoryService:
                     await self.follow_ups.retry_pending()
                 except Exception:
                     LOG.warning("follow-up linking failed", exc_info=True)
+            if self.deferred is not None:
+                try:
+                    await self.deferred.retry_pending()
+                except Exception:
+                    LOG.warning("consolidated follow-up issues failed", exc_info=True)
+            if self.splits is not None:
+                try:
+                    await self.splits.retry_pending()
+                except Exception:
+                    LOG.warning("split issues failed", exc_info=True)
             await self.operator.start()
             self.accepting_admission = True
             if self.config_path is not None:
@@ -827,6 +843,12 @@ class FactoryService:
     async def _reconcile_tick(self) -> None:
         loop_now = asyncio.get_running_loop().time()
         interval = self.config.reconcile_interval_seconds
+        if self.deferred is not None:
+            try:
+                # Ready report ticks whose batch window has passed start their rework.
+                await self.deferred.tick()
+            except Exception:
+                LOG.warning("ready report ticks failed", exc_info=True)
         live, idle = await self.live_parcel_ids()
         if self.board_diff is not None:
             await self._board_diff_tick(loop_now, live)
@@ -880,6 +902,18 @@ class FactoryService:
                 await self.follow_ups.retry_pending()
             except Exception:
                 LOG.warning("follow-up linking failed", exc_info=True)
+        if self.deferred is not None:
+            try:
+                await self.deferred.retry_pending()
+                # A Ready report tick whose webhook was lost (owner edits only).
+                await self.deferred.catch_up()
+            except Exception:
+                LOG.warning("deferred findings catch-up failed", exc_info=True)
+        if self.splits is not None:
+            try:
+                await self.splits.retry_pending()
+            except Exception:
+                LOG.warning("split issues failed", exc_info=True)
 
     async def reread(self, parcel_id: str) -> None:
         """A per-issue read now (e.g. a native link of the issue changed)."""

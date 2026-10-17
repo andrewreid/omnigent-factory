@@ -523,21 +523,24 @@ async def test_held_follow_ups_are_counted_in_the_epic_note(service_config: Serv
 # ------------------------------------------------------------------ instructions (1)
 
 
-async def test_build_instructions_ask_for_every_filed_issue_in_follow_ups():
+async def test_build_instructions_no_longer_ask_the_run_to_open_issues():
+    """The factory files follow-ups itself now (``service.deferred``): current templates
+    ask for ``deferred``; older ones stay for runs pinned to them."""
     from omnigent_factory.service import directory as d
 
     root = Path(d.__file__).parent / "templates"
     current = (
         d._FIRST_TEMPLATES[d.SessionKind.BUILD],
         d._REWORK_TEMPLATE,
-        "readiness-wake-v9.txt",
-        "readiness-findings-wake-v2.txt",
+        d._READINESS_WAKE_TEMPLATE,
+        d._FINDINGS_WAKE_TEMPLATE,
     )
     for name in current:
         text = " ".join((root / name).read_text("utf-8").split())
-        assert "Every issue you open goes in follow_ups, with blocks naming" in text, name
-    for old in ("build-v10.txt", "build-rework-v7.txt"):  # pinned in-flight runs keep theirs
-        assert "follow_ups" not in (root / old).read_text("utf-8")
+        assert "deferred" in text and "Never open issues" in text, name
+        assert "Every issue you open goes in follow_ups" not in text, name
+    for old in ("build-v11.txt", "build-rework-v8.txt"):  # pinned in-flight runs keep theirs
+        assert "Every issue you open goes in follow_ups" in (root / old).read_text("utf-8")
 
 
 # ------------------------------------------------------------------ helpers

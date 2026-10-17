@@ -74,6 +74,8 @@ HOT_RELOAD_KEYS = frozenset(
         "max_stall_nudges_per_run",
         "max_nudges_per_sweep",
         "omnigent_breaker_minutes",
+        "review_rounds_default",
+        "follow_up_max_depth",
     }
 )
 
@@ -229,6 +231,15 @@ class ServiceConfig(BaseModel):
     autopilot_options: dict[str, str] = Field(default_factory=dict)
     #: Projects v2 NUMBER field "Parallel" ("" = not set up: the concurrency applies).
     parallel_field_node_id: str = ""
+    #: Projects v2 NUMBER field "Review rounds": review-bot rounds an issue (or, on an
+    #: epic, each of its sub-issues without their own) gets; only the owner's own edits
+    #: count ("" = not set up: ``review_rounds_default`` applies).
+    review_rounds_field_node_id: str = ""
+    #: Review-bot rounds of an issue whose field is empty (or not owner-set).
+    review_rounds_default: int = Field(default=2, ge=1, le=20)
+    #: Follow-up lineage depth at which a run may no longer defer findings as follow-ups
+    #: (1: a follow-up issue's own build fixes or marks advisory everything it finds).
+    follow_up_max_depth: int = Field(default=1, ge=0, le=10)
     #: Triage ranking: while the factory is idle, one read-only session orders the Triage
     #: and Planning columns on one scale (the ``Rank`` field). ``omnigent-factory ranking
     #: on|off`` overrides it until it changes here.

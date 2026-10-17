@@ -172,6 +172,9 @@ def render_project_migration(
         },
         # Sub-issues of an epic autopilot runs at once; record as parallel_field_node_id.
         {"name": "Parallel", "dataType": "NUMBER"},
+        # Review-bot rounds of an issue (an epic's value applies to its sub-issues);
+        # record as review_rounds_field_node_id.
+        {"name": "Review rounds", "dataType": "NUMBER"},
     ]
     create_fields = [{"input": {"projectId": PROJECT_NODE_ID, **field}} for field in fields]
     views: list[dict[str, Any]] = []
@@ -231,7 +234,7 @@ def render_project_migration(
             "persist every returned node and database id (Rank: rank_field_node_id; "
             "Auto-build: auto_build_field_node_id and auto_build_options Queued/Started; "
             "Autopilot: autopilot_field_node_id and autopilot_options Full/Delayed/Plan only; "
-            "Parallel: parallel_field_node_id)",
+            "Parallel: parallel_field_node_id; Review rounds: review_rounds_field_node_id)",
             "verify every preserved option id and existing item value",
             f"keep item-added to {status_names[Stage.INBOX]} and disable PR-driven moves",
             "retire Agent/Audit and old views only after new views verify",
