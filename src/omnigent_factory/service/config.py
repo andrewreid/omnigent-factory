@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import re
 import stat
 import tomllib
 from collections.abc import Mapping
@@ -92,6 +94,12 @@ class ServiceConfig(BaseModel):
     #: 127.0.0.1 listener on this port (the same socket as ``bind_host`` when that is
     #: loopback on the same port); plaintext HTTP behind the bearer token only.
     mcp_port: int = Field(default=8787, ge=1, le=65535)
+    #: Extra ``Host`` header values ``/mcp`` accepts beside loopback and
+    #: ``bind_host:bind_port`` (DNS-rebinding protection): hostnames or IP addresses, with
+    #: or without ``:port`` (IPv6 in brackets); no port means ``bind_port`` and
+    #: ``mcp_port``. Only the Host check: the listener-address gate and the bearer token
+    #: still apply. Restart required (the MCP app is built at startup).
+    mcp_allowed_hosts: tuple[str, ...] = ()
     #: Bearer token for ``/mcp`` (default ``<secrets_dir>/mcp-token``, mode 0600; created
     #: by ``omnigent-factory setup mcp-token``).
     mcp_token_file: Path | None = None
@@ -353,6 +361,18 @@ class ServiceConfig(BaseModel):
     def blank_omnigent_id_is_unset(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value
 
+    @field_validator("mcp_allowed_hosts")
+    @classmethod
+    def mcp_allowed_hosts_valid(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized: list[str] = []
+        for entry in value:
+            host, port = parse_allowed_host(entry)
+            authority = f"[{host}]" if ":" in host else host
+            item = authority if port is None else f"{authority}:{port}"
+            if item not in normalized:
+                normalized.append(item)
+        return tuple(normalized)
+
     @field_validator("status_names")
     @classmethod
     def status_names_complete(cls, value: dict[str, str]) -> dict[str, str]:
@@ -487,6 +507,61 @@ class ServiceConfig(BaseModel):
         except ConfigError as exc:
             errors.append(str(exc))
         return errors
+
+
+_HOST_LABEL = re.compile(r"(?!-)[a-z0-9-]{1,63}(?<!-)")
+
+
+def parse_allowed_host(entry: str) -> tuple[str, int | None]:
+    """One ``mcp_allowed_hosts`` entry as (host, port or None): host lowercased, IPv6
+    without brackets. Raises ``ValueError`` for anything but a hostname or a specific IP
+    address with an optional port (no wildcard, scheme, path, user info or blank)."""
+    text = entry.strip() if isinstance(entry, str) else ""
+    if not text:
+        raise ValueError("mcp_allowed_hosts entries must not be blank")
+    if text != entry or any(c in text for c in "*/?#@\\ \t") or "://" in text:
+        raise ValueError(f"mcp_allowed_hosts entry {entry!r} must be a bare host[:port]")
+    port_text: str | None = None
+    if text.startswith("["):
+        host, bracket, rest = text[1:].partition("]")
+        if not bracket or (rest and not rest.startswith(":")):
+            raise ValueError(f"mcp_allowed_hosts entry {entry!r} has malformed brackets")
+        port_text = rest[1:] if rest else None
+        try:
+            address = ipaddress.IPv6Address(host)
+        except ValueError:
+            raise ValueError(f"mcp_allowed_hosts entry {entry!r} is not an IPv6 address") from None
+        host = str(address)
+    elif text.count(":") > 1:
+        try:
+            host = str(ipaddress.IPv6Address(text))
+        except ValueError:
+            raise ValueError(
+                f"mcp_allowed_hosts entry {entry!r}: write IPv6 addresses in brackets"
+            ) from None
+    else:
+        host, colon, port_text = text.partition(":")
+        port_text = port_text if colon else None
+        host = host.lower()
+        try:
+            host = str(ipaddress.IPv4Address(host))
+        except ValueError:
+            labels = host.split(".")
+            if (
+                len(host) > 253
+                or not all(_HOST_LABEL.fullmatch(label) for label in labels)
+                or labels[-1].isdigit()
+            ):
+                raise ValueError(
+                    f"mcp_allowed_hosts entry {entry!r} is not a hostname or IP address"
+                ) from None
+    if host in {"0.0.0.0", "::"}:  # noqa: S104 - detects, never binds
+        raise ValueError(f"mcp_allowed_hosts entry {entry!r} is a wildcard address")
+    if port_text is None:
+        return host, None
+    if not (port_text.isascii() and port_text.isdigit()) or not 1 <= int(port_text) <= 65535:
+        raise ValueError(f"mcp_allowed_hosts entry {entry!r} has an invalid port")
+    return host, int(port_text)
 
 
 def _mode(path: Path) -> int:

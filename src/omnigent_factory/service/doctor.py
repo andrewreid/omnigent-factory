@@ -11,7 +11,7 @@ import socket
 import stat
 import subprocess
 import tarfile
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,7 +30,7 @@ from omnigent_factory.omnigent.rest import (
 from omnigent_factory.ports.credentials import TokenRefusal
 from omnigent_factory.service.composition import _private_file
 from omnigent_factory.service.config import ServiceConfig
-from omnigent_factory.service.mcp import TOOL_NAMES
+from omnigent_factory.service.mcp import TOOL_NAMES, configured_host_authorities
 from omnigent_factory.service.omnigent_auth import expiry, expiry_message, omnigent_auth
 
 
@@ -188,16 +188,29 @@ async def _check_mcp_listener(
     report: DoctorReport,
     *,
     transport: httpx.AsyncBaseTransport | None = None,
+    resolve: Callable[[str, int], object] | None = None,
 ) -> None:
     """The /mcp listeners answer (401 without a token proves the gate is up): the
-    ``bind_host`` listener (``mcp_listener``) and, when separate, the loopback one
-    (``mcp_listener_loopback``). Read-only: one tokenless POST each.
+    ``bind_host`` listener (``mcp_listener``), when separate the loopback one
+    (``mcp_listener_loopback``), and each ``mcp_allowed_hosts`` authority
+    (``mcp_allowed_host:<host:port>``, addressed by that name; one that does not resolve
+    is a warning). Read-only: one tokenless POST each.
 
     Advisory: doctor also runs before the daemon is first started.
     """
     probes = [("mcp_listener", _mcp_url(config.bind_host, config.bind_port))]
     if ("127.0.0.1", config.mcp_port) != (config.bind_host, config.bind_port):
         probes.append(("mcp_listener_loopback", _mcp_url("127.0.0.1", config.mcp_port)))
+    lookup = resolve or _resolve
+    for authority in configured_host_authorities(config):
+        name = f"mcp_allowed_host:{authority}"
+        host, _, port = authority.rpartition(":")
+        try:
+            await asyncio.to_thread(lookup, host.strip("[]"), int(port))
+        except OSError as exc:
+            report.warn(name, f"{host} does not resolve ({exc}); allowed but unreachable")
+            continue
+        probes.append((name, f"http://{authority}/mcp/"))
     async with httpx.AsyncClient(transport=transport, timeout=5.0) as client:
         for name, url in probes:
             try:
@@ -209,6 +222,10 @@ async def _check_mcp_listener(
                 report.pass_check(name, f"{url} is up and requires the bearer token")
             else:
                 report.fail(name, f"{url} answered HTTP {resp.status_code} without a token")
+
+
+def _resolve(host: str, port: int) -> object:
+    return socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
 
 
 def _authority(host: str, port: int) -> str:

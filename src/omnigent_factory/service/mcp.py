@@ -77,7 +77,7 @@ from omnigent_factory.core.types import (
     WaitReason,
 )
 from omnigent_factory.service.board_index import BoardIndex, BoardUnavailable
-from omnigent_factory.service.config import ServiceConfig
+from omnigent_factory.service.config import ServiceConfig, parse_allowed_host
 from omnigent_factory.service.directory import (
     ServiceDispatchDirectory,
     approved_epic_plan,
@@ -1432,6 +1432,10 @@ def build_mcp_server(tools: FactoryTools, config: ServiceConfig) -> FastMCP:
         authority = f"[{bind[0]}]:{bind[1]}" if ":" in bind[0] else f"{bind[0]}:{bind[1]}"
         hosts.append(authority)
         origins.append(f"http://{authority}")
+    for authority in configured_host_authorities(config):
+        if authority not in hosts:
+            hosts.append(authority)
+            origins.append(f"http://{authority}")
     server = FastMCP(
         "factory",
         instructions="Omnigent factory tools for the issue session's current stage run. "
@@ -1596,6 +1600,20 @@ def bind_listener(config: ServiceConfig) -> tuple[str, int] | None:
     return host, config.bind_port
 
 
+def configured_host_authorities(config: ServiceConfig) -> list[str]:
+    """``mcp_allowed_hosts`` as ``host:port`` Host header values; an entry without a port
+    stands for both listener ports (``bind_port`` and ``mcp_port``)."""
+    authorities: list[str] = []
+    for entry in config.mcp_allowed_hosts:
+        host, port = parse_allowed_host(entry)
+        name = f"[{host}]" if ":" in host else host
+        ports = (config.bind_port, config.mcp_port) if port is None else (port,)
+        for each in ports:
+            if f"{name}:{each}" not in authorities:
+                authorities.append(f"{name}:{each}")
+    return authorities
+
+
 class McpGate:
     """Bearer-authenticated front of the MCP session manager.
 
@@ -1709,5 +1727,6 @@ __all__ = [
     "bind_listener",
     "build_endpoint",
     "build_mcp_server",
+    "configured_host_authorities",
     "read_token",
 ]

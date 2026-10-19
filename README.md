@@ -651,6 +651,23 @@ forward `/mcp`, and serving it on a LAN `bind_host` is the operator's choice (po
 `FACTORY_MCP_URL` at either address). The factory clone's `info/exclude` ignores
 `/.molly/`.
 
+`/mcp` checks the `Host` header (DNS-rebinding protection): by default it accepts only the
+loopback names and `bind_host:bind_port`, and answers any other name with
+`421 Invalid Host header`. To reach it by a hostname (or another IP) that resolves to
+this host, list it under `[service]`:
+
+```toml
+mcp_allowed_hosts = ["coder.example.lan", "10.0.0.5:8787", "[fd00::5]"]
+```
+
+Entries are hostnames or IP addresses with an optional `:port` (IPv6 in brackets); one
+without a port is accepted on `bind_port` and `mcp_port`. Wildcards (`*`, `0.0.0.0`),
+schemes, paths and blank entries fail config load. The matching `Origin`
+(`http://<host:port>`) is allowed too. This widens only the Host check: the listener
+address check (404) and the bearer token still apply. The MCP app is built at startup, so
+a change needs a restart (`reload` refuses it). `doctor` also probes each allowed
+host by name (tokenless, expecting 401) and warns when a name does not resolve.
+
 ### Steering by comment
 
 Every plain (non-command) comment from an owner is recorded, and so is, on the parcel's

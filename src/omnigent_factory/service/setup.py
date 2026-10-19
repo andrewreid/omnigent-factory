@@ -59,6 +59,7 @@ runtime_dir = "%t/omnigent-factory"
 bind_host = "127.0.0.1"  # set to this host's LAN address for ingress
 bind_port = 8787
 mcp_port = 8787  # /mcp also on 127.0.0.1:<mcp_port> beside bind_host:bind_port (bearer)
+# mcp_allowed_hosts = ["coder.example.lan"]  # extra /mcp Host names/IPs[:port] (restart)
 repo_id = "{_toml_string(config.repo_id)}"
 repository = "SA-Ambulance/timesheets"
 owners = [114979]
