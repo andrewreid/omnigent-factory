@@ -383,10 +383,10 @@ def _vacuum(config: ServiceConfig) -> int:
 
 
 def listener_sockets(config: ServiceConfig) -> list[socket.socket]:
-    """The configured (LAN) listener plus the loopback-only MCP listener.
+    """The configured (LAN) listener plus the loopback MCP listener.
 
-    One socket when both are the same address. ``/mcp`` is refused on every listener
-    except loopback (``McpGate``); only ``/webhooks/github`` is forwarded by ingress.
+    One socket when both are the same address. ``/mcp`` is served on both (bearer token,
+    ``McpGate``); only ``/webhooks/github`` is forwarded by ingress.
     """
     wanted = [(config.bind_host, config.bind_port)]
     if (MCP_HOST, config.mcp_port) != (config.bind_host, config.bind_port):

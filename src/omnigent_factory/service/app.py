@@ -1,7 +1,8 @@
-"""The deliberately tiny ASGI surface: health, the GitHub webhook and (loopback) MCP.
+"""The deliberately tiny ASGI surface: health, the GitHub webhook and MCP.
 
-Public ingress forwards only ``/webhooks/github``. ``/mcp`` is refused on any listener or
-peer that is not loopback (:class:`omnigent_factory.service.mcp.McpGate`).
+Public ingress forwards only ``/webhooks/github``. ``/mcp`` is served (bearer token only)
+on the ``bind_host`` listener and loopback, and refused on any other listener address
+(:class:`omnigent_factory.service.mcp.McpGate`).
 """
 
 from __future__ import annotations

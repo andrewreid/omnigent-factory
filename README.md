@@ -633,7 +633,8 @@ is clean and nothing is in progress; otherwise the card's note says why, e.g.
 `Blocked: worktree off branch factory/issue-761 (detached at 469e2af, uncommitted changes)`.
 
 Stage messages are short pointers; the agent works through eight MCP tools served by the
-daemon at `http://127.0.0.1:<mcp_port>/mcp/` (loopback only, bearer token):
+daemon at `http://<bind_host>:<bind_port>/mcp/` and `http://127.0.0.1:<mcp_port>/mcp/`
+(bearer token; any other listener address gets 404):
 `factory_get_issue`, `factory_get_plan`, `factory_get_feedback`, `factory_get_status`,
 `factory_list_issues` (a compact index of the other open board issues, read from GitHub
 through a one-minute cache), `factory_ask_owner`, `factory_submit_result` and
@@ -643,8 +644,11 @@ through a one-minute cache), `factory_ask_owner`, `factory_submit_result` and
 carrying any other id, and the daemon resolves issue, run and stage from its own store.
 Create the token once with `omnigent-factory setup mcp-token` (written to
 `<secrets_dir>/mcp-token`, mode 0600, never printed) and give it to the agent host as
-`FACTORY_MCP_TOKEN`; `doctor` checks the token file, the loopback listener, the agent
-and a dry compile of the identity policy. The factory clone's `info/exclude` ignores
+`FACTORY_MCP_TOKEN`; `doctor` checks the token file, the `bind_host` and loopback
+listeners (one tokenless probe each), the agent and a dry compile of the identity policy.
+The endpoint is plaintext HTTP protected only by the bearer token: ingress must never
+forward `/mcp`, and serving it on a LAN `bind_host` is the operator's choice (point
+`FACTORY_MCP_URL` at either address). The factory clone's `info/exclude` ignores
 `/.molly/`.
 
 ### Steering by comment

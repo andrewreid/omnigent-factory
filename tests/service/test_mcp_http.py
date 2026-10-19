@@ -1,4 +1,4 @@
-"""The mounted ``/mcp`` endpoint over HTTP: loopback-only, bearer, six tools, JSON-RPC."""
+"""The mounted ``/mcp`` endpoint over HTTP: bind_host + loopback, bearer, tools, JSON-RPC."""
 
 from __future__ import annotations
 
@@ -39,10 +39,12 @@ def _rpc(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
 HEADERS = {"accept": "application/json, text/event-stream", "content-type": "application/json"}
 
 
-def _client(app: Any, *, server: str = "127.0.0.1", peer: str = "127.0.0.1") -> Any:
+def _client(
+    app: Any, *, server: str = "127.0.0.1", peer: str = "127.0.0.1", port: int = 8787
+) -> Any:
     from starlette.testclient import TestClient
 
-    return TestClient(app, base_url=f"http://{server}:{8787}", client=(peer, 50123))
+    return TestClient(app, base_url=f"http://{server}:{port}", client=(peer, 50123))
 
 
 def _app(config: ServiceConfig) -> tuple[Any, FactoryService]:
@@ -58,7 +60,7 @@ def _app(config: ServiceConfig) -> tuple[Any, FactoryService]:
     return create_app(service, object(), endpoint), service  # type: ignore[arg-type]
 
 
-def test_mcp_http_requires_loopback_and_bearer(service_config: ServiceConfig) -> None:
+def test_mcp_http_requires_the_bearer_on_loopback(service_config: ServiceConfig) -> None:
     token = _token(service_config)
     app, _service = _app(service_config)
     listing = _rpc("tools/list")
@@ -68,15 +70,46 @@ def test_mcp_http_requires_loopback_and_bearer(service_config: ServiceConfig) ->
         assert client.post("/mcp/", json=listing, headers=wrong).status_code == 401
         query = client.post(f"/mcp/?token={token}", json=listing, headers=HEADERS)
         assert query.status_code == 401  # never accepted in the query string
+
+
+def test_mcp_http_is_served_on_the_bind_host_listener(service_config: ServiceConfig) -> None:
+    token = _token(service_config)
+    lan = service_config.model_copy(update={"bind_host": "192.168.1.5", "bind_port": 8787})
+    listing = _rpc("tools/list")
     auth = {**HEADERS, "authorization": f"Bearer {token}"}
-    app, _service = _app(service_config)
-    with _client(app, peer="192.168.1.20") as client:
-        assert client.post("/mcp/", json=listing, headers=auth).status_code == 404
-    app, _service = _app(service_config)
-    with _client(app, server="192.168.1.5", peer="127.0.0.1") as client:
-        # The LAN listener never serves /mcp, whoever connects.
+    wrong = {**HEADERS, "authorization": "Bearer " + "x" * 43}
+    app, _service = _app(lan)
+    with _client(app, server="192.168.1.5", peer="192.168.1.20") as client:
+        # Any LAN peer reaching the bind_host listener, but only with the bearer token.
+        assert client.post("/mcp/", json=listing, headers=HEADERS).status_code == 401
+        assert client.post("/mcp/", json=listing, headers=wrong).status_code == 401
+        response = client.post("/mcp/", json=listing, headers=auth)
+        assert response.status_code == 200, response.text
+        assert [t["name"] for t in response.json()["result"]["tools"]] == list(TOOL_NAMES)
+        assert client.get("/healthz").status_code in (200, 503)
+    app, _service = _app(lan)
+    with _client(app, server="127.0.0.1", peer="127.0.0.1") as client:
+        # The loopback listener keeps serving beside it.
+        assert client.post("/mcp/", json=listing, headers=auth).status_code == 200
+
+
+def test_mcp_http_refuses_other_listener_addresses(service_config: ServiceConfig) -> None:
+    token = _token(service_config)
+    listing = _rpc("tools/list")
+    auth = {**HEADERS, "authorization": f"Bearer {token}"}
+    lan = service_config.model_copy(update={"bind_host": "192.168.1.5", "bind_port": 8787})
+    app, _service = _app(lan)
+    with _client(app, server="192.168.1.6", peer="127.0.0.1") as client:
+        # Neither bind_host nor loopback: never /mcp, whoever connects.
         assert client.post("/mcp/", json=listing, headers=auth).status_code == 404
         assert client.get("/healthz").status_code in (200, 503)
+    app, _service = _app(lan)
+    with _client(app, server="192.168.1.5", port=9999) as client:
+        assert client.post("/mcp/", json=listing, headers=auth).status_code == 404
+    wildcard = service_config.model_copy(update={"bind_host": "0.0.0.0"})  # noqa: S104
+    app, _service = _app(wildcard)
+    with _client(app, server="192.168.1.5", peer="192.168.1.20") as client:
+        assert client.post("/mcp/", json=listing, headers=auth).status_code == 404
 
 
 def test_mcp_http_missing_token_file_refuses(service_config: ServiceConfig) -> None:

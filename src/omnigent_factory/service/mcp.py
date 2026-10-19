@@ -1,12 +1,13 @@
 """The factory MCP endpoint: eight tools for the issue session's current stage run.
 
 Served by the daemon's own Starlette app under ``/mcp`` (stateless Streamable HTTP, JSON
-responses), reachable only through the loopback listener and only with the static bearer
-token (:class:`McpGate`). Transport authentication is not caller attribution: every tool
-takes the caller's Omnigent ``session_id``, which the per-root ``factory-caller`` policy
-pins on the normal Omnigent path, and the service resolves parcel, current run and stage
-from its own store. Issue numbers, stages or plan contents in arguments never select
-authority. Unknown, child and superseded session ids are refused.
+responses), reachable through the configured ``bind_host`` listener and the loopback
+listener, and only with the static bearer token (:class:`McpGate`); it is plaintext HTTP,
+so ingress must never forward ``/mcp``. Transport authentication is not caller
+attribution: every tool takes the caller's Omnigent ``session_id``, which the per-root
+``factory-caller`` policy pins on the normal Omnigent path, and the service resolves
+parcel, current run and stage from its own store. Issue numbers, stages or plan contents
+in arguments never select authority. Unknown, child and superseded session ids are refused.
 
 Reads are local store/file reads (no network waits), except ``factory_list_issues``: one
 board read shared through a short cache. The two mutations
@@ -1424,6 +1425,13 @@ def _digest(text: str) -> str:
 def build_mcp_server(tools: FactoryTools, config: ServiceConfig) -> FastMCP:
     """Stateless Streamable HTTP, JSON responses; eight stable tools (discovery is cached)."""
     port = config.mcp_port
+    hosts = [f"127.0.0.1:{port}", f"localhost:{port}", "127.0.0.1", "localhost"]
+    origins = [f"http://127.0.0.1:{port}", f"http://localhost:{port}"]
+    bind = bind_listener(config)
+    if bind is not None:
+        authority = f"[{bind[0]}]:{bind[1]}" if ":" in bind[0] else f"{bind[0]}:{bind[1]}"
+        hosts.append(authority)
+        origins.append(f"http://{authority}")
     server = FastMCP(
         "factory",
         instructions="Omnigent factory tools for the issue session's current stage run. "
@@ -1433,8 +1441,8 @@ def build_mcp_server(tools: FactoryTools, config: ServiceConfig) -> FastMCP:
         streamable_http_path="/",
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
-            allowed_hosts=[f"127.0.0.1:{port}", f"localhost:{port}", "127.0.0.1", "localhost"],
-            allowed_origins=[f"http://127.0.0.1:{port}", f"http://localhost:{port}"],
+            allowed_hosts=hosts,
+            allowed_origins=origins,
         ),
     )
 
@@ -1579,11 +1587,22 @@ def is_loopback(address: object) -> bool:
     return host == "::1" or host.startswith("127.")
 
 
-class McpGate:
-    """Loopback-only, bearer-authenticated front of the MCP session manager.
+def bind_listener(config: ServiceConfig) -> tuple[str, int] | None:
+    """The configured ``bind_host`` listener as (host without brackets, port); None for a
+    wildcard ``bind_host``, which never serves ``/mcp`` beyond loopback."""
+    host = config.bind_host.strip("[]")
+    if host in {"", "0.0.0.0", "::"}:  # noqa: S104 - detects, never binds
+        return None
+    return host, config.bind_port
 
-    Refuses (404) any request that arrived on a non-loopback listener or from a
-    non-loopback peer, so the LAN webhook listener never exposes ``/mcp``.
+
+class McpGate:
+    """Bearer-authenticated front of the MCP session manager.
+
+    Serves the configured ``bind_host`` listener (``bind``) and loopback listeners, from
+    any peer that reaches them; refuses (404) a request that arrived on any other
+    listener address. The endpoint is plaintext HTTP protected only by the bearer token:
+    ingress must never forward ``/mcp``.
     """
 
     def __init__(
@@ -1591,15 +1610,24 @@ class McpGate:
         manager: StreamableHTTPSessionManager,
         token: Callable[[], str | None],
         ready: Callable[[], bool],
+        bind: tuple[str, int] | None = None,
     ) -> None:
         self.manager = manager
         self.token = token
         self.ready = ready
+        self.bind = bind
+
+    def _served(self, server: object) -> bool:
+        if is_loopback(server):
+            return True
+        if self.bind is None or not isinstance(server, tuple | list) or len(server) < 2:
+            return False
+        return (str(server[0]), server[1]) == self.bind
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             return
-        if not is_loopback(scope.get("server")) or not is_loopback(scope.get("client")):
+        if not self._served(scope.get("server")):
             await _plain(send, 404, b"not found")
             return
         expected = self.token()
@@ -1666,7 +1694,9 @@ def build_endpoint(
     def token() -> str | None:
         return read_token(token_path)
 
-    return McpEndpoint(McpGate(manager, token, lambda: service.ready), manager)
+    return McpEndpoint(
+        McpGate(manager, token, lambda: service.ready, bind_listener(config)), manager
+    )
 
 
 __all__ = [
@@ -1676,6 +1706,7 @@ __all__ = [
     "FactoryTools",
     "McpEndpoint",
     "McpGate",
+    "bind_listener",
     "build_endpoint",
     "build_mcp_server",
     "read_token",

@@ -88,8 +88,9 @@ class ServiceConfig(BaseModel):
     state_dir: Path = Field(default_factory=lambda: Path.home() / ".local/state/omnigent-factory")
     bind_host: str = "127.0.0.1"
     bind_port: int = Field(default=8787, ge=1, le=65535)
-    #: The factory MCP endpoint (``/mcp``) is served only on a 127.0.0.1 listener on this
-    #: port (the same socket as ``bind_host`` when that is loopback on the same port).
+    #: The factory MCP endpoint (``/mcp``) is served on the ``bind_host`` listener and on a
+    #: 127.0.0.1 listener on this port (the same socket as ``bind_host`` when that is
+    #: loopback on the same port); plaintext HTTP behind the bearer token only.
     mcp_port: int = Field(default=8787, ge=1, le=65535)
     #: Bearer token for ``/mcp`` (default ``<secrets_dir>/mcp-token``, mode 0600; created
     #: by ``omnigent-factory setup mcp-token``).

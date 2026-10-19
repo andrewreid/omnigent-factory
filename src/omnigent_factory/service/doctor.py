@@ -189,23 +189,35 @@ async def _check_mcp_listener(
     *,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> None:
-    """The loopback /mcp listener answers (401 without a token proves the gate is up).
+    """The /mcp listeners answer (401 without a token proves the gate is up): the
+    ``bind_host`` listener (``mcp_listener``) and, when separate, the loopback one
+    (``mcp_listener_loopback``). Read-only: one tokenless POST each.
 
     Advisory: doctor also runs before the daemon is first started.
     """
-    url = f"http://127.0.0.1:{config.mcp_port}/mcp/"
-    try:
-        async with httpx.AsyncClient(transport=transport, timeout=5.0) as client:
-            resp = await client.post(url, json={})
-    except httpx.HTTPError as exc:
-        report.warn(
-            "mcp_listener", f"{url} unreachable ({type(exc).__name__}); daemon not running?"
-        )
-        return
-    if resp.status_code in (401, 503):
-        report.pass_check("mcp_listener", f"{url} is up and requires the bearer token")
-    else:
-        report.fail("mcp_listener", f"{url} answered HTTP {resp.status_code} without a token")
+    probes = [("mcp_listener", _mcp_url(config.bind_host, config.bind_port))]
+    if ("127.0.0.1", config.mcp_port) != (config.bind_host, config.bind_port):
+        probes.append(("mcp_listener_loopback", _mcp_url("127.0.0.1", config.mcp_port)))
+    async with httpx.AsyncClient(transport=transport, timeout=5.0) as client:
+        for name, url in probes:
+            try:
+                resp = await client.post(url, json={})
+            except httpx.HTTPError as exc:
+                report.warn(name, f"{url} unreachable ({type(exc).__name__}); daemon not running?")
+                continue
+            if resp.status_code in (401, 503):
+                report.pass_check(name, f"{url} is up and requires the bearer token")
+            else:
+                report.fail(name, f"{url} answered HTTP {resp.status_code} without a token")
+
+
+def _authority(host: str, port: int) -> str:
+    bare = host.strip("[]")
+    return f"[{bare}]:{port}" if ":" in bare else f"{bare}:{port}"
+
+
+def _mcp_url(host: str, port: int) -> str:
+    return f"http://{_authority(host, port)}/mcp/"
 
 
 async def _check_github(
@@ -759,12 +771,16 @@ def missing_factory_tools(
     servers: Iterable[tuple[str, str | None, Sequence[str] | None]],
     mcp_port: int,
     served: Sequence[str] = TOOL_NAMES,
+    bind: str | None = None,
 ) -> list[str] | None:
     """The served factory tools the agent cannot call, from its MCP servers as
     (name, url, tool allowlist or None for every tool); None when it declares no factory
-    server. The factory server is the one named ``factory``, or whose URL is the factory
-    listener (``FACTORY_MCP_URL`` or the loopback ``mcp_port``)."""
-    listener = (f"127.0.0.1:{mcp_port}", f"localhost:{mcp_port}", "FACTORY_MCP_URL")
+    server. The factory server is the one named ``factory``, or whose URL is a factory
+    listener (``FACTORY_MCP_URL``, the loopback ``mcp_port`` or ``bind``, the
+    ``bind_host:bind_port`` authority)."""
+    listener = [f"127.0.0.1:{mcp_port}", f"localhost:{mcp_port}", "FACTORY_MCP_URL"]
+    if bind is not None:
+        listener.append(bind)
     allowed: set[str] = set()
     found = False
     for name, url, tools in servers:
@@ -861,7 +877,8 @@ async def _check_agent_factory_tools(
     except Exception as exc:  # a bundle this client cannot parse
         report.warn(name, f"agent bundle unreadable: {type(exc).__name__}: {exc}"[:300])
         return
-    missing = missing_factory_tools(servers, config.mcp_port)
+    bind = _authority(config.bind_host, config.bind_port)
+    missing = missing_factory_tools(servers, config.mcp_port, bind=bind)
     if missing is None:
         report.fail(name, "the agent declares no factory MCP server; it can call no factory tool")
     elif missing:

@@ -231,6 +231,30 @@ async def test_doctor_mcp_checks_fail_without_token_and_on_an_open_endpoint(tmp_
     assert report.ok, report.errors
 
 
+@pytest.mark.asyncio
+async def test_doctor_probes_the_bind_host_and_the_loopback_mcp_listener() -> None:
+    from omnigent_factory.service.doctor import DoctorReport, _check_mcp_listener
+
+    config = ServiceConfig(
+        repo_id="R", owners=frozenset({1}), bind_host="192.168.1.5", bind_port=8787, mcp_port=8788
+    )
+    probes: list[tuple[str, str, bool]] = []
+
+    def mcp(request: httpx.Request) -> httpx.Response:
+        probes.append((request.method, str(request.url), "authorization" in request.headers))
+        return httpx.Response(401)
+
+    report = DoctorReport()
+    await _check_mcp_listener(config, report, transport=httpx.MockTransport(mcp))
+    assert report.ok, report.errors
+    assert probes == [
+        ("POST", "http://192.168.1.5:8787/mcp/", False),
+        ("POST", "http://127.0.0.1:8788/mcp/", False),
+    ]
+    assert report.checks["mcp_listener"].endswith("requires the bearer token")
+    assert report.checks["mcp_listener_loopback"].endswith("requires the bearer token")
+
+
 def _live_rest(handler) -> OmnigentRest:
     return OmnigentRest("https://omnigent.test", transport=httpx.MockTransport(handler))
 
@@ -346,6 +370,10 @@ def test_missing_factory_tools_compares_the_allowlist_with_the_served_tools():
     # Other servers' allowlists never count; no factory server at all is None.
     others = [("github", "https://api.example/mcp", list(TOOL_NAMES))]
     assert missing_factory_tools(others, 8787) is None
+    # ... or by its bind_host URL.
+    lan = [("fac", "http://192.168.1.5:8787/mcp/", None)]
+    assert missing_factory_tools(lan, 8787) is None
+    assert missing_factory_tools(lan, 8787, bind="192.168.1.5:8787") == []
     assert missing_factory_tools([], 8787) is None
 
 

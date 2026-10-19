@@ -45,7 +45,9 @@ WantedBy=default.target
 
 Route `factory.reid.ee` through the owner's Cloudflare/Kubernetes ingress to the
 coder host at `{config.bind_host}:{config.bind_port}`. Expose only
-`POST /webhooks/github`. Do not publish `/healthz` or the private operator socket.
+`POST /webhooks/github`. Do not publish `/healthz`, `/mcp` or the private operator socket.
+`/mcp` is plaintext HTTP protected only by its bearer token; it is served on this address
+and on loopback, so exposing it on the LAN is the operator's choice.
 
 TLS, hostname routing, source controls, and request-size policy belong to the
 owner-managed ingress. Never route the credential or operator Unix sockets.
@@ -56,7 +58,7 @@ state_dir = "{_toml_string(config.state_dir)}"
 runtime_dir = "%t/omnigent-factory"
 bind_host = "127.0.0.1"  # set to this host's LAN address for ingress
 bind_port = 8787
-mcp_port = 8787  # loopback-only /mcp listener (127.0.0.1); Rosie's FACTORY_MCP_URL
+mcp_port = 8787  # /mcp also on 127.0.0.1:<mcp_port> beside bind_host:bind_port (bearer)
 repo_id = "{_toml_string(config.repo_id)}"
 repository = "SA-Ambulance/timesheets"
 owners = [114979]
