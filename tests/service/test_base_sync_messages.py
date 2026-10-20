@@ -104,21 +104,21 @@ def test_current_stage_templates_carry_the_sync_note_and_old_ones_are_kept() -> 
         d._CONFLICT_TEMPLATE,
     }
     assert current == {
-        "triage-v9.txt",
-        "plan-v9.txt",
-        "build-v12.txt",
-        "triage-feedback-v6.txt",
-        "epic-triage-v3.txt",
-        "build-rework-v9.txt",
-        "build-rework-items-v1.txt",
+        "triage-v10.txt",
+        "plan-v10.txt",
+        "build-v13.txt",
+        "triage-feedback-v7.txt",
+        "epic-triage-v4.txt",
+        "build-rework-v10.txt",
+        "build-rework-items-v2.txt",
         "build-conflict-v2.txt",
     }
     for name in current:
         assert "{base_note}" in (TEMPLATES / name).read_text("utf-8"), name
     for name in (
-        "build-v12.txt",
-        "build-rework-v9.txt",
-        "build-rework-items-v1.txt",
+        "build-v13.txt",
+        "build-rework-v10.txt",
+        "build-rework-items-v2.txt",
         "build-conflict-v2.txt",
     ):
         text = " ".join((TEMPLATES / name).read_text("utf-8").split())

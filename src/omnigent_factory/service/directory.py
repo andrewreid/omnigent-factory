@@ -1365,20 +1365,20 @@ def _new_boundary() -> str:
 
 #: First-message template of each stage run (the dispatch snapshot pins name and bytes).
 _FIRST_TEMPLATES = {
-    SessionKind.TRIAGE: "triage-v9.txt",
-    SessionKind.PLAN: "plan-v9.txt",
-    SessionKind.BUILD: "build-v12.txt",
+    SessionKind.TRIAGE: "triage-v10.txt",
+    SessionKind.PLAN: "plan-v10.txt",
+    SessionKind.BUILD: "build-v13.txt",
 }
-_RETRIAGE_TEMPLATE = "triage-feedback-v6.txt"
+_RETRIAGE_TEMPLATE = "triage-feedback-v7.txt"
 #: The triage of an epic (an issue with sub-issues), first run and re-runs alike.
-_EPIC_TRIAGE_TEMPLATE = "epic-triage-v3.txt"
+_EPIC_TRIAGE_TEMPLATE = "epic-triage-v4.txt"
 #: The epic planning pass of an epic on autopilot (the epic triage plus the epic plan).
-_EPIC_PLAN_TEMPLATE = "epic-plan-v2.txt"
+_EPIC_PLAN_TEMPLATE = "epic-plan-v3.txt"
 #: A plan run of a sub-issue epic autopilot drives (keeps to its part of the epic plan).
-_AUTOPILOT_PLAN_TEMPLATE = "plan-autopilot-v2.txt"
-_REWORK_TEMPLATE = "build-rework-v9.txt"
+_AUTOPILOT_PLAN_TEMPLATE = "plan-autopilot-v3.txt"
+_REWORK_TEMPLATE = "build-rework-v10.txt"
 #: A rework the owner started by ticking Ready report items: its brief is those items.
-_ITEMS_REWORK_TEMPLATE = "build-rework-items-v1.txt"
+_ITEMS_REWORK_TEMPLATE = "build-rework-items-v2.txt"
 #: Readiness wakes of a waiting build run (red checks and other gaps; findings only).
 _READINESS_WAKE_TEMPLATE = "readiness-wake-v10.txt"
 _FINDINGS_WAKE_TEMPLATE = "readiness-findings-wake-v3.txt"

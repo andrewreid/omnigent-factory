@@ -561,15 +561,36 @@ class SplitIssue:
     done: frozenset[str]
     attempt_at_us: int
 
+    @property
+    def source_relation(self) -> str:
+        """``relation`` with a legacy value (``blocks``/``blocked_by``) read as
+        ``after_source``."""
+        return split_relation(self.relation)
+
     def pending_links(self) -> tuple[str, ...]:
         """Link actions still to do: ``parent`` (the source's epic), ``blocks:<M>``
-        ("M blocked by this issue") and ``blocked_by:<S>`` (this issue blocked by S)."""
+        ("M blocked by this issue") and ``blocked_by:<S>`` (this issue blocked by S).
+        The source link is done once either direction to the source is done, so a legacy
+        row linked under the old reading is never linked the other way too."""
         wanted = ["parent", *(f"blocks:{n}" for n in self.blocks)]
-        if self.relation == "blocks":
-            wanted.append(f"blocks:{self.source_issue}")
-        elif self.relation == "blocked_by":
-            wanted.append(f"blocked_by:{self.source_issue}")
+        source = (f"blocks:{self.source_issue}", f"blocked_by:{self.source_issue}")
+        if not self.done.intersection(source):
+            if self.source_relation == "before_source":
+                wanted.append(source[0])
+            elif self.source_relation == "after_source":
+                wanted.append(source[1])
         return tuple(a for a in dict.fromkeys(wanted) if a not in self.done)
+
+
+#: Split relations before ``after_source``/``before_source``; their subject was unstated,
+#: so both read as the common case, ``after_source``.
+LEGACY_SPLIT_RELATIONS = frozenset({"blocks", "blocked_by"})
+
+
+def split_relation(relation: str) -> str:
+    """A split's relation to its source issue: ``none``, ``after_source`` (the new issue
+    is blocked by the source) or ``before_source`` (the new issue blocks the source)."""
+    return "after_source" if relation in LEGACY_SPLIT_RELATIONS else relation
 
 
 @dataclass(frozen=True, slots=True)

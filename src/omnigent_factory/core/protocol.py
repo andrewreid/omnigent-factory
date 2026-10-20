@@ -77,12 +77,14 @@ class SplitOut(_Strict):
     """Work the owner directed be filed as its own issue ("do these bits, file the rest
     as an issue"). The factory opens one issue per item (Inbox, no ``follow-up`` label),
     in the source issue's epic, linked per ``relation`` (the new issue to the source:
-    ``blocks`` it or is ``blocked_by`` it) and ``blocks``."""
+    ``after_source`` is blocked by it, ``before_source`` blocks it) and ``blocks`` (issues
+    the new issue blocks). Legacy ``blocks``/``blocked_by`` relations are still accepted
+    for one release and read as ``after_source``."""
 
     title: SplitTitle
     body: SplitBody
     reason: Annotated[str, StringConstraints(min_length=1, max_length=300)]
-    relation: Literal["none", "blocks", "blocked_by"] = "none"
+    relation: Literal["none", "after_source", "before_source", "blocks", "blocked_by"] = "none"
     blocks: Annotated[list[Annotated[int, Field(ge=1)]], Field(max_length=20)] = []
 
 
@@ -348,30 +350,33 @@ MAX_ERROR_DETAIL_CHARS = 200
 _RESULT_KINDS = frozenset({"triage", "epic_triage", "plan", "build_ready", "checkpoint", "blocked"})
 
 
+#: ``split_out`` items: ``relation`` is the new issue's to this issue (after_source: blocked
+#: by this issue; before_source: blocks it), ``blocks`` the issues the new issue blocks.
+_SPLIT_SHAPE = (
+    '"split_out"?:[{"title":str,"body":str,"reason":str,'
+    '"relation"?:"none|after_source(new issue blocked by this one)|before_source(new issue '
+    'blocks this one)","blocks"?:[int(issues the new issue blocks)]}]}'
+)
+
 #: Compact field types per result kind, quoted in tool errors and descriptions.
 RESULT_SHAPES: dict[str, str] = {
     "triage": '{"kind":"triage","summary":str,"priority":"P0|P1|P2|P3","size":"S|M|L",'
     '"recommendation":"fix|wont_fix|duplicate|needs_info","duplicate_issue":int|null,'
     '"labels":[str],"missing_information":[str],"related"?:[{"issue":int,'
     '"relation":"duplicate|overlaps|conflicts|depends_on|blocks|supersedes","note":str}],'
-    '"split_out"?:[{"title":str,"body":str,"reason":str,"relation"?:"none|blocks|blocked_by",'
-    '"blocks"?:[int]}]}',
+    + _SPLIT_SHAPE,
     "epic_triage": '{"kind":"epic_triage","summary":str,"coverage":{"gaps":[str],'
     '"overlaps":[str]},"build_order":[{"issue":int,"reason":str}],"links"?:[{"issue":int,'
     '"blocked_by":int,"reason":str}],"missing_information"?:[str],"related"?:[...],'
     '"plan"?:{"parts":[{"issue":int,"scope":str}],"coordination":[str],"human_gates"?:'
     '[{"key":"slug","title":str,"steps":str,"blocks":[int]}],"external_blockers"?:'
-    '[{"issue":int,"note":str}]},'
-    '"split_out"?:[{"title":str,"body":str,"reason":str,"relation"?:"none|blocks|blocked_by",'
-    '"blocks"?:[int]}]}',
+    '[{"issue":int,"note":str}]},' + _SPLIT_SHAPE,
     "plan": '{"kind":"plan","publication_kind":"contract|info","approach":str,"risks":[str],'
     '"contract":{"goal":str,"acceptance_criteria":[{"id":str,"criterion":str,'
     '"verification":str}],"non_goals":[str],"size":"S|M|L","resolved_decisions":'
     '[{"decision_id":str,"answer":str,"source_event_id":str}]},"open_decision_ids":[str],"related"?:[{"issue":int,'
     '"relation":"depends_on|blocks|duplicate|overlaps|conflicts|supersedes","note":str}],'
-    '"epic_fit"?:{"within":bool,"note":str},'
-    '"split_out"?:[{"title":str,"body":str,"reason":str,"relation"?:"none|blocks|blocked_by",'
-    '"blocks"?:[int]}]}',
+    '"epic_fit"?:{"within":bool,"note":str},' + _SPLIT_SHAPE,
     "build_ready": '{"kind":"build_ready","pr_number":int>=1,"branch":str,"head_sha":sha40,'
     '"summary":str,"verification":[{"command":str,"file_set":[str],'
     '"outcome":"passed|failed|not_run","evidence":str}],"review":{"implementation_vendor":str,'
@@ -380,17 +385,13 @@ RESULT_SHAPES: dict[str, str] = {
     '"severity":str,"disposition":str,"evidence":str}],"remediation_batches_used":0|1,'
     '"targeted_rechecks_used":0|1,"release_readiness":"ready|needs_owner","related"?:[...],'
     '"deferred"?:[{"severity":"P0|P1|P2|P3","path"?:str,"title":str,"thread_url"?:str,'
-    '"reason":str,"outcome"?:"follow_up|advisory","blocks"?:[int]}],'
-    '"split_out"?:[{"title":str,"body":str,"reason":str,"relation"?:"none|blocks|blocked_by",'
-    '"blocks"?:[int]}]}',
+    '"reason":str,"outcome"?:"follow_up|advisory","blocks"?:[int]}],' + _SPLIT_SHAPE,
     "checkpoint": '{"kind":"checkpoint","grant_id":str,"head_sha":sha40|null,"done":[str],'
     '"remaining":[str],"risks":[str],"worktree_state":str,"elicitation_id":str|null}',
     "blocked": '{"kind":"blocked","reason":str,"done":[str],"related"?:[{"issue":int,'
     '"relation":"depends_on|blocks|...","note":str}],"deferred"?:[{"severity":'
     '"P0|P1|P2|P3","path"?:str,"title":str,"thread_url"?:str,"reason":str,'
-    '"outcome"?:"follow_up|advisory","blocks"?:[int]}],'
-    '"split_out"?:[{"title":str,"body":str,"reason":str,"relation"?:"none|blocks|blocked_by",'
-    '"blocks"?:[int]}]}',
+    '"outcome"?:"follow_up|advisory","blocks"?:[int]}],' + _SPLIT_SHAPE,
 }
 
 
@@ -507,7 +508,7 @@ def _check_split_out(items: list[SplitOut], own: int | None) -> None:
         raise ResultError("split_out: each title at most once")
     for item in items:
         if own is not None and own in item.blocks:
-            raise ResultError('split_out: blocks names this issue: use relation "blocks"')
+            raise ResultError('split_out: blocks names this issue: use relation "before_source"')
         if len(set(item.blocks)) != len(item.blocks):
             raise ResultError("split_out: blocks each issue at most once")
 

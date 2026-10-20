@@ -2,9 +2,13 @@
 rest as an issue"), filed by the factory, one issue per item.
 
 * **Reported.** A triage, epic triage, plan, build_ready or blocked result lists the
-  pieces in ``split_out`` (title, body, reason, ``relation`` to the source issue: ``none``,
-  ``blocks`` (the new issue blocks it) or ``blocked_by``, and ``blocks``). Agents never
-  open issues themselves (the shell policy denies it); this field is the way.
+  pieces in ``split_out`` (title, body, reason, ``relation`` of the new issue to the
+  source issue: ``none``, ``after_source`` (the new issue is blocked by the source) or
+  ``before_source`` (the new issue blocks the source), and ``blocks``: issues the new issue
+  blocks). Legacy ``blocks``/``blocked_by`` relations (subject unstated) are read as
+  ``after_source`` for one release, in results and in stored rows alike, with a
+  deprecation line. Agents never open issues themselves (the shell policy denies it);
+  this field is the way.
 * **Filed.** Each item becomes its own issue (separate work, never consolidated): the
   title as given, the body with a provenance line ("Split out of #N at the owner's
   direction") and a hidden marker. It lands in the Inbox like any new issue, with NO
@@ -15,7 +19,7 @@ rest as an issue"), filed by the factory, one issue per item.
 * **Linked.** When the source issue is a sub-issue of an epic, the new issue joins that
   epic (unless it already has a parent); ``relation`` and ``blocks`` become native
   blocked-by links. Each link step is done once, logged and retried after a failure;
-  nothing is ever removed.
+  nothing is ever removed (a source link done in either direction is never redone).
 * **Shown.** No comment of its own: the stage's normal comment (triage, plan, blocked or
   Ready report) lists the split issues with links (``section``).
 """
@@ -49,6 +53,22 @@ def split_key(title: str) -> str:
 
 def split_marker(source: int, key: str) -> str:
     return f"<!-- factory-split source={source} key={key} -->"
+
+
+def _deprecated(source: int, relation: str) -> None:
+    LOG.info(
+        "deprecated split relation=%s source=#%s read as after_source "
+        "(use after_source or before_source)",
+        relation,
+        source,
+    )
+
+
+def _relation(source: int, relation: str) -> str:
+    """A submitted relation, a legacy one read as ``after_source`` (logged)."""
+    if relation in ds.LEGACY_SPLIT_RELATIONS:
+        _deprecated(source, relation)
+    return ds.split_relation(relation)
 
 
 class Splits:
@@ -110,7 +130,7 @@ class Splits:
                 title=str(item.get("title") or ""),
                 body=str(item.get("body") or ""),
                 reason=str(item.get("reason") or ""),
-                relation=str(item.get("relation") or "none"),
+                relation=_relation(source, str(item.get("relation") or "none")),
                 blocks=tuple(
                     n
                     for n in item.get("blocks") or []
@@ -228,7 +248,12 @@ class Splits:
 
     async def _link(self, split: ds.SplitIssue, number: int) -> None:
         source = split.source_issue
-        for action in split.pending_links():
+        pending = split.pending_links()
+        if split.relation in ds.LEGACY_SPLIT_RELATIONS and any(
+            a.endswith(f":{source}") for a in pending
+        ):
+            _deprecated(source, split.relation)
+        for action in pending:
             if action == "parent":
                 ok = await self._parent(number, source)
             elif action.startswith("blocks:"):

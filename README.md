@@ -345,12 +345,16 @@ marker) are excluded.
 
 **Owner-directed splits.** When you tell a run "do these bits, file the rest as an issue"
 (in triage, planning or a build), Rosie lists each separate piece in her result's
-`split_out` (title, body, reason, `relation` to this issue: `none`, `blocks` or
-`blocked_by`, optional `blocks`; at most 10 per result). The factory opens one issue per
+`split_out` (title, body, reason, `relation` of the new issue to this issue: `none`,
+`after_source` (the new issue is blocked by this one) or `before_source` (the new issue
+blocks this one), optional `blocks`: issues the new issue blocks; at most 10 per result).
+The legacy values `blocks` and `blocked_by` are still accepted for one release and read as
+`after_source`. The factory opens one issue per
 piece (never consolidated), in the Inbox like any new issue, with the line "Split out of
 #N at the owner's direction". It gets no `follow-up` label and is not follow-up lineage
 (its own build may defer follow-ups); it joins the source issue's epic and gets native
-blocked-by links per `relation` and `blocks`. It is filed once (keyed by source issue and
+blocked-by links per `relation` and `blocks` (a link to the source already made in
+either direction is never redone). It is filed once (keyed by source issue and
 title; an unclear create is found by its marker before any retry), posts no comment of its
 own: the stage's normal comment (triage, plan, blocked or Ready report) lists it under
 **Split out**. Splits are not Ready report checkboxes and not subject to the depth limit.

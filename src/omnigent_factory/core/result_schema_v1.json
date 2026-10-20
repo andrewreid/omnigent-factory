@@ -916,13 +916,17 @@
           "maxLength": 300
         },
         "relation": {
+          "description": "The new issue to the source issue: after_source = blocked by the source, before_source = blocks the source (legacy blocks/blocked_by read as after_source).",
           "enum": [
             "none",
+            "after_source",
+            "before_source",
             "blocks",
             "blocked_by"
           ]
         },
         "blocks": {
+          "description": "Issues the new issue blocks.",
           "type": "array",
           "maxItems": 20,
           "items": {

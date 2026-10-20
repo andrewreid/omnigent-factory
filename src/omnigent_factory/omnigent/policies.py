@@ -165,8 +165,9 @@ CEL_REASON = (
 ISSUE_CREATE_REASON = (
     "Denied by factory policy: the factory files issues itself, so they carry provenance "
     "and are never filed twice. Work the owner directed be filed as its own issue goes in "
-    "your result's `split_out` field (title, body, reason, relation none|blocks|blocked_by, "
-    "optional blocks); a review finding you defer goes in `deferred` (severity, path, "
+    "your result's `split_out` field (title, body, reason, relation none|after_source|"
+    "before_source (after_source: the new issue waits for this one), optional blocks: "
+    "issues the new issue blocks); a review finding you defer goes in `deferred` (severity, path, "
     "title, thread_url, reason, outcome follow_up or advisory, optional blocks). Reply to "
     "a review thread with its outcome and resolve it. If this matched text inside a "
     "message or file content, write that text to a file and pass it by path (e.g. "

@@ -849,6 +849,38 @@ CREATE TABLE split_issues (
 );
 """
 
+# Split relations name their subject: ``after_source`` (the new issue is blocked by the
+# source) and ``before_source`` (it blocks the source). SQLite cannot alter a CHECK, so the
+# table is rebuilt; rows keep their values (legacy ``blocks``/``blocked_by`` read as
+# ``after_source``) and their ``done_json``.
+V19_SQL = """
+CREATE TABLE split_issues_v19 (
+    repo_id TEXT NOT NULL,
+    source_issue INTEGER NOT NULL,
+    item_key TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    relation TEXT NOT NULL DEFAULT 'none' CHECK (relation IN ('none', 'after_source',
+        'before_source', 'blocks', 'blocked_by')),
+    blocks_json TEXT NOT NULL DEFAULT '[]',
+    issue_number INTEGER,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'creating', 'created')),
+    done_json TEXT NOT NULL DEFAULT '[]',
+    attempt_at_us INTEGER NOT NULL DEFAULT 0,
+    created_at_us INTEGER NOT NULL,
+    updated_at_us INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, source_issue, item_key)
+);
+INSERT INTO split_issues_v19 SELECT repo_id, source_issue, item_key, seq, session_id, title,
+    body, reason, relation, blocks_json, issue_number, state, done_json, attempt_at_us,
+    created_at_us, updated_at_us FROM split_issues;
+DROP TABLE split_issues;
+ALTER TABLE split_issues_v19 RENAME TO split_issues;
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -868,4 +900,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(16, "follow-ups", V16_SQL),
     Migration(17, "follow-up-discipline", V17_SQL),
     Migration(18, "owner-directed-splits", V18_SQL),
+    Migration(19, "split-relation-direction", V19_SQL),
 )

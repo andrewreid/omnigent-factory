@@ -35,7 +35,7 @@ def test_migration_17_upgrades_a_database_with_follow_ups_and_keeps_them(tmp_pat
 
     store = SqliteStore.open(path, FakeClock())
     try:
-        assert store.schema_version() == LATEST == 18
+        assert store.schema_version() == LATEST == 19
         row = store.follow_up(REPO_ID, 904)
         assert row is not None and row.source_issue == 747 and row.blocks == (882,)
         assert store.epic_follow_up_builds(REPO_ID, 878) == (True, 5)
@@ -84,7 +84,7 @@ def test_migration_18_adds_splits_to_a_v17_database_and_keeps_its_rows(tmp_path:
     v17.close()
     store = SqliteStore.open(path, FakeClock())
     try:
-        assert store.schema_version() == 18
+        assert store.schema_version() == LATEST
         assert [i.item_key for i in ds.deferred_items(store, repo_id=REPO_ID, source_issue=7)] == [
             "k1"
         ]
@@ -98,7 +98,47 @@ def test_migration_18_adds_splits_to_a_v17_database_and_keeps_its_rows(tmp_path:
             == 0
         )
         [row] = ds.splits(store, repo_id=REPO_ID, source_issue=7)
-        assert row.pending_links() == ("parent", "blocks:5", "blocks:7")
+        # A legacy "blocks" relation reads as after_source: the new issue waits on #7.
+        assert row.pending_links() == ("parent", "blocks:5", "blocked_by:7")
+    finally:
+        store.close()
+
+
+def test_migration_19_widens_split_relations_and_keeps_legacy_rows_and_done_steps(
+    tmp_path: Path,
+):
+    from omnigent_factory.store import discipline as ds
+
+    path = tmp_path / "state.sqlite3"
+    v18 = SqliteStore.open(
+        path, FakeClock(), migrations=tuple(m for m in MIGRATIONS if m.version < 19)
+    )
+    v18.ensure_repository(config())
+    legacy = [
+        ds.NewSplit("a", "t", "b", "r", "blocks"),
+        ds.NewSplit("b", "u", "b", "r", "blocked_by"),
+    ]
+    ds.record_splits(v18, repo_id=REPO_ID, source_issue=7, session_id="x", items=legacy)
+    ds.mark_split_done(v18, repo_id=REPO_ID, source_issue=7, item_key="a", action="blocks:7")
+    assert v18.schema_version() == 18
+    v18.close()
+    store = SqliteStore.open(path, FakeClock())
+    try:
+        assert store.schema_version() == 19
+        rows = {row.item_key: row for row in ds.splits(store, repo_id=REPO_ID, source_issue=7)}
+        assert (rows["a"].relation, rows["a"].done) == ("blocks", frozenset({"blocks:7"}))
+        assert rows["a"].pending_links() == ("parent",)  # linked under the old reading
+        assert rows["b"].pending_links() == ("parent", "blocked_by:7")
+        new = [
+            ds.NewSplit("c", "v", "b", "r", "after_source"),
+            ds.NewSplit("d", "w", "b", "r", "before_source"),
+        ]
+        assert (
+            ds.record_splits(store, repo_id=REPO_ID, source_issue=7, session_id="y", items=new) == 2
+        )
+        rows = {row.item_key: row for row in ds.splits(store, repo_id=REPO_ID, source_issue=7)}
+        assert rows["c"].pending_links() == ("parent", "blocked_by:7")
+        assert rows["d"].pending_links() == ("parent", "blocks:7")
     finally:
         store.close()
 
