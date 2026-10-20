@@ -132,6 +132,19 @@ class AutoBuildStatus(enum.StrEnum):
     STARTED = "started"
 
 
+class ReplanStatus(enum.StrEnum):
+    """What came of a build run's ``replan_required`` (``ReplanRequest``)."""
+
+    #: Waiting for the owner's reply to a question still open: the replan starts on it.
+    HELD = "held"
+    #: The factory started the plan run (exactly once).
+    STARTED = "started"
+    #: Not started: the automatic replans since the owner's last plan are used up.
+    LIMITED = "limited"
+    #: Not started: the issue was stopped, closed, assigned or the run replaced first.
+    CANCELLED = "cancelled"
+
+
 #: The board's "Auto-build" single-select option names (``auto_build_options`` keys).
 AUTO_BUILD_QUEUED = "Queued"
 AUTO_BUILD_STARTED = "Started"
@@ -214,6 +227,9 @@ class Hold(enum.StrEnum):
     #: progress, nudged too often, or busy with nothing moving): Needs you. Cleared by
     #: real progress, a result, an owner comment or a new stage (``StallWatch``).
     STALLED = "stalled"
+    #: A build run asked for a replan after the automatic replans were used up
+    #: (``auto_replan_limit``): Needs you until an owner control (``/replan``).
+    REPLAN_LIMIT = "replan_limit"
 
 
 class InboxHoldReason(enum.StrEnum):
@@ -257,6 +273,7 @@ NEEDS_YOU_HOLDS = frozenset(
         Hold.NO_PROJECT_ITEM,
         Hold.APPROVAL_VOIDED,
         Hold.STALLED,
+        Hold.REPLAN_LIMIT,
     }
 )
 #: ``EXTERNAL_ACTIVITY`` is in neither set: it clears by itself once the issue session is
@@ -283,6 +300,7 @@ CONTROL_CLEARED_HOLDS = frozenset(
         Hold.COMPLETED,
         Hold.BLOCKERS,
         Hold.STALLED,
+        Hold.REPLAN_LIMIT,
     }
 )
 
@@ -777,6 +795,28 @@ class HeldWake:
 
 
 @dataclass(frozen=True, slots=True)
+class ReplanRequest:
+    """A build run reported that the owner's direction goes beyond the approved plan
+    (a ``blocked`` result with ``replan_required``): the factory replans by itself.
+
+    Kept after the replan starts: the plan run's first message and ``factory_get_plan``
+    carry ``reason`` and ``changes``, and approving the revised plan continues as a
+    rework of the same branch and PR.
+    """
+
+    session_id: str
+    #: The approval the build ran under (superseded once the replan starts).
+    approval_id: str | None
+    source_event_id: str
+    requested_at_us: int
+    reason: str
+    changes: tuple[str, ...]
+    status: ReplanStatus
+    #: The plan authorization the factory started for it ("" until started).
+    plan_authorization_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class AutoBuildMark:
     """An owner set the card's "Auto-build" field to Queued: approval of one posted plan.
 
@@ -1058,6 +1098,12 @@ class Parcel:
     autopilot_gates: tuple[AutopilotGate, ...] = ()
     #: Epic autopilot drives this sub-issue (None: never claimed).
     autopilot_claim: AutopilotClaim | None = None
+    #: The latest ``replan_required`` of a build run (None: none since the owner's last
+    #: plan control).
+    replan_request: ReplanRequest | None = None
+    #: Replans the factory started by itself since the owner's last plan control (loop
+    #: guard: at most ``auto_replan_limit``).
+    auto_replans: int = 0
     applied_event_ids: frozenset[str] = frozenset()
 
     def session(self, session_id: str | None) -> StageSession | None:
@@ -1220,6 +1266,9 @@ class TrustedConfig:
     #: Builds started from an owner's auto-build mark that may run at once (within
     #: ``max_building``; manually approved builds are always admitted first).
     auto_build_concurrency: int = 1
+    #: Replans the factory starts by itself on a build's ``replan_required`` before the
+    #: owner must replan (``/replan``); counted from the owner's last plan control.
+    auto_replan_limit: int = 1
 
     def block_us(self, size: Size) -> int:
         return self.block_hours[size] * MICROS_PER_HOUR

@@ -563,7 +563,7 @@ async def test_the_admitted_rework_is_briefed_with_exactly_the_ticked_items(
         assert "Retry leaks" not in snapshot["brief"]  # FU_A was not ticked
         # A rework from an ordinary owner comment keeps the ordinary template.
         directory.rework_brief = None
-        assert (await directory._make_snapshot(parcel, run))["template"] == ("build-rework-v10.txt")
+        assert (await directory._make_snapshot(parcel, run))["template"] == ("build-rework-v11.txt")
 
 
 async def test_a_crash_before_the_follow_up_issue_update_is_finished_after_restart(

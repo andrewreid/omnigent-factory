@@ -125,6 +125,8 @@ from omnigent_factory.core.types import (
     QueueStatus,
     Readiness,
     RelatedMark,
+    ReplanRequest,
+    ReplanStatus,
     Reservation,
     ReservationKind,
     SessionKind,
@@ -883,6 +885,9 @@ def _safety(ctx: _Ctx, reason: str, *, fence: FenceKind = FenceKind.SAFETY) -> N
     ctx.hold(Hold.STOPPED if fence == FenceKind.STOPPED else Hold.SAFETY)
     ctx.unhold(Hold.AWAITING_OWNER)
     _end_blocker_wait(ctx)  # a stopped issue never resumes by itself
+    request = ctx.p.replan_request
+    if request is not None and request.status == ReplanStatus.HELD:
+        ctx.update(replan_request=replace(request, status=ReplanStatus.CANCELLED))
     _ = reason
 
 
@@ -1090,7 +1095,10 @@ def _start_stage(ctx: _Ctx, kind: SessionKind, duration_us: int) -> None:
         ctx.emit(EffectKind.ENSURE_PROJECT_ITEM, dedupe=f"ensure-item:{auth.authorization_id}")
 
 
-def _start_plan(ctx: _Ctx, via: Via | None) -> None:
+def _start_plan(ctx: _Ctx, via: Via | None, *, auto: bool = False) -> None:
+    """A plan run of a new revision. ``auto``: the factory's own replan on a build's
+    ``replan_required``; any other start is the owner's, which resets the loop guard and
+    takes over a replan request that has not started (its changes reach this run)."""
     ctx.unhold(*CONTROL_CLEARED_HOLDS)
     ctx.update(
         revision=ctx.p.revision + 1,
@@ -1102,6 +1110,12 @@ def _start_plan(ctx: _Ctx, via: Via | None) -> None:
     _move(ctx, Stage.SCOPED, via)
     duration = ctx.config.block_us(ctx.p.size or Size.M)
     _start_stage(ctx, SessionKind.PLAN, duration)
+    if auto:
+        return
+    ctx.update(auto_replans=0)
+    request = ctx.p.replan_request
+    if request is not None and request.status in (ReplanStatus.HELD, ReplanStatus.LIMITED):
+        _replan_started(ctx, request)
 
 
 def _try_activate_pending(ctx: _Ctx) -> None:
@@ -1312,6 +1326,8 @@ def _enqueue_build(
     conflict: bool = False,
 ) -> None:
     auth = _new_authorization(ctx, SessionKind.BUILD, duration_us, approval.approval_id)
+    if not rework and _replan_rework(ctx, approval):
+        rework = True  # the revised plan continues the work on the same branch and PR
     if rework:
         ctx.put_authorization(replace(auth, rework=True, conflict=conflict))
     seq = ctx.admission.next_sequence
@@ -2436,6 +2452,129 @@ def _h_request_replan(ctx: _Ctx, body: ev.RequestReplan) -> None:
     _plan_control(ctx, body.via)
 
 
+#: Card notes of a build's ``replan_required`` (see ``_replan_required``).
+REPLANNING_NOTE = "Replanning: approved plan superseded by owner direction"
+REPLAN_HELD_NOTE = "Replan pending: starts when you answer the open question"
+REPLAN_LIMIT_NOTE = "Needs you: the plan must change again; /replan revises it"
+
+
+def _auto_replan_refusal(ctx: _Ctx, s: StageSession) -> str | None:
+    """Why the factory may not replan by itself for build run ``s`` now (None: it may).
+
+    Stops, closures, assignment to a person and epics win: nothing replans those.
+    """
+    p = ctx.p
+    if p.holds & {Hold.STOPPED, Hold.SAFETY} or not eligible(p) or _completed(ctx):
+        return "stopped"
+    if _is_epic(p):
+        return "epic"
+    if (
+        s.session_id != p.current_session_id
+        or s.kind != SessionKind.BUILD
+        or s.fences
+        or s.execution_closed
+    ):
+        return "run-replaced"
+    return None
+
+
+def _replan_required(ctx: _Ctx, s: StageSession, body: ev.ResultCandidate) -> bool:
+    """A build's ``blocked`` result says the owner's direction goes beyond the approved
+    plan: the factory replans by itself in the same issue session, no owner command
+    needed (returns False when it may not: the result is an ordinary block).
+
+    With an owner question still open the replan waits for the owner's reply and starts
+    on it. Past ``auto_replan_limit`` replans since the owner's last plan control, the
+    card goes to Needs you with a comment instead (the owner replans with ``/replan``).
+    """
+    assert body.replan_reason is not None  # noqa: S101 - the caller checks it
+    if _auto_replan_refusal(ctx, s) is not None:
+        return False
+    a = ctx.p.current_approval
+    request = ReplanRequest(
+        session_id=s.session_id,
+        approval_id=a.approval_id if a is not None else None,
+        source_event_id=ctx.event.event_id,
+        requested_at_us=ctx.now,
+        reason=body.replan_reason,
+        changes=body.replan_changes,
+        status=ReplanStatus.HELD,
+    )
+    if ctx.p.auto_replans >= ctx.config.auto_replan_limit:
+        ctx.update(replan_request=replace(request, status=ReplanStatus.LIMITED))
+        ctx.hold(Hold.REPLAN_LIMIT)
+        ctx.emit(
+            EffectKind.PUBLISH_REPORT,
+            args={"report": "blocked", "session_id": s.session_id, "replan_limit": True},
+        )
+        ctx.note(REPLAN_LIMIT_NOTE)
+        return True
+    ctx.update(replan_request=request)
+    if ctx.p.open_decisions:
+        ctx.note(REPLAN_HELD_NOTE)  # the owner's reply starts it (``_held_replan``)
+        return True
+    _auto_replan(ctx)
+    return True
+
+
+def _auto_replan(ctx: _Ctx) -> None:
+    """Start the replan of the recorded request, exactly once (the request's status is
+    durable with the plan authorization it starts). The build run is revoked and drained
+    as by ``/replan`` (its branch, worktree and PR are left as they are); the approved
+    plan is superseded but kept on record."""
+    request = ctx.p.replan_request
+    assert request is not None and request.status == ReplanStatus.HELD  # noqa: S101
+    _void_approval(ctx, "replan-required")
+    c = ctx.p.current_contract
+    if c is not None and c.published and not c.superseded:
+        ctx.put_contract(replace(c, superseded=True))
+    _start_plan(ctx, None, auto=True)
+    ctx.update(auto_replans=ctx.p.auto_replans + 1)
+    _replan_started(ctx, request)
+    ctx.note(REPLANNING_NOTE)
+
+
+def _replan_started(ctx: _Ctx, request: ReplanRequest) -> None:
+    """The plan run just authorised carries ``request`` (its first message and
+    ``factory_get_plan`` show the reason and changes)."""
+    ctx.update(
+        replan_request=replace(
+            request,
+            status=ReplanStatus.STARTED,
+            plan_authorization_id=ctx.p.pending_authorization_id or "",
+        )
+    )
+
+
+def _held_replan(ctx: _Ctx) -> bool:
+    """The owner replied while a replan waits on that reply: start it now (the reply is
+    folded into the plan run, which reads it with ``factory_get_feedback``)."""
+    request = ctx.p.replan_request
+    if request is None or request.status != ReplanStatus.HELD:
+        return False
+    s = ctx.p.session(request.session_id)
+    if s is None or _auto_replan_refusal(ctx, s) is not None:
+        ctx.update(replan_request=replace(request, status=ReplanStatus.CANCELLED))
+        return False
+    _fold_answers(ctx)
+    _auto_replan(ctx)
+    return True
+
+
+def _replan_rework(ctx: _Ctx, approval: Approval) -> bool:
+    """The build of a plan revised for a ``replan_required`` continues the work on the
+    parcel's branch and open PR as a rework."""
+    request = ctx.p.replan_request
+    return (
+        request is not None
+        and request.status == ReplanStatus.STARTED
+        and approval.kind == ApprovalKind.PLAN
+        and approval.approval_id != request.approval_id
+        and ctx.p.pr_number is not None
+        and ctx.p.pr_number in ctx.admission.open_bot_prs
+    )
+
+
 def _h_plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
     """A plain owner comment (not a command): the owner steering the current stage.
 
@@ -2461,6 +2600,8 @@ def _steer(ctx: _Ctx, body: ev.PlanFeedback) -> None:
     answered = _answer_questions(ctx)
     if not answered:
         _epic_plan_revision(ctx)
+    if stage == Stage.BUILDING and _held_replan(ctx):
+        return
     if stage == Stage.BUILDING:
         _build_feedback(ctx, body, answered=answered)
     elif stage == Stage.READY and _feedback_rework(ctx):
@@ -2780,7 +2921,8 @@ def _relay_comment(ctx: _Ctx, s: StageSession, digest: str = "", *, midturn: boo
     the coalescing window has passed or its tree has been seen idle again, so a burst of
     comments becomes one message. ``midturn``: the run is busy (it reads the feedback
     and steers its in-flight work instead of re-submitting)."""
-    ctx.unhold(Hold.AGENT_BLOCKED, Hold.RESULT_INVALID, Hold.BLOCKERS)  # the owner's steer
+    # The owner's steer.
+    ctx.unhold(Hold.AGENT_BLOCKED, Hold.RESULT_INVALID, Hold.BLOCKERS, Hold.REPLAN_LIMIT)
     s = ctx.put_session(
         replace(s, quiescent=False, comment_pending=False, feedback_relayed_us=ctx.now)
     )
@@ -2923,6 +3065,9 @@ _REWORK_NOTE = "Rework: owner feedback"
 _ITEMS_REWORK_NOTE = "Rework: Ready report items ticked"
 
 
+NOTHING_TO_APPROVE_NOTE = "Nothing new to approve: this plan is already approved"
+
+
 def _h_approve_plan(ctx: _Ctx, body: ev.ApprovePlan) -> None:
     rollback = Stage.SCOPED if body.via == Via.DRAG else None
     _control(ctx)
@@ -2941,6 +3086,9 @@ def _h_approve_plan(ctx: _Ctx, body: ev.ApprovePlan) -> None:
         and a.full_hash == latest.full_hash
         and _approval_active(ctx)
     ):
+        if body.via == Via.COMMAND:
+            # Re-approving the plan its build already runs under would change nothing.
+            raise Rejected("nothing-new-to-approve", explain=True, note=NOTHING_TO_APPROVE_NOTE)
         ctx.note("Approved: build starts when capacity allows")
         return
     if _build_blocked_by_live(ctx) or ctx.origin_stage not in (Stage.SCOPED, Stage.BUILDING):
@@ -3025,6 +3173,8 @@ def _h_decide(ctx: _Ctx, body: ev.Decide) -> None:
     )
     ctx.put_decision(d)
     s = _session(ctx, d.session_id)
+    if _held_replan(ctx):
+        return
     within = body.within_contract and d.impact == DecisionImpact.WITHIN_CONTRACT
     if s.kind == SessionKind.BUILD and not within:
         # Answer may change the contract: revoke the build and carry it into a replan.
@@ -5080,7 +5230,17 @@ def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
         s = ctx.put_session(replace(s, comment_pending=False))
     _reset_stall(ctx)  # a result: the run is not stalled
     s = _session(ctx, s.session_id)
+    request = ctx.p.replan_request
+    if request is not None and request.status == ReplanStatus.HELD:
+        # A newer result of the run supersedes its replan still waiting on the owner.
+        ctx.update(replan_request=replace(request, status=ReplanStatus.CANCELLED))
     if body.result_kind == ev.ResultKind.BLOCKED:
+        if (
+            body.replan_reason is not None
+            and s.kind == SessionKind.BUILD
+            and _replan_required(ctx, s, body)
+        ):
+            return
         # Honest "could not finish": Blocked with the agent's reason; nothing inferred.
         ctx.hold(Hold.AGENT_BLOCKED)
         # Only other issues stop it: it waits instead once each is an open native blocker.

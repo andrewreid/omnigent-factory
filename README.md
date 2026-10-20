@@ -39,7 +39,7 @@ otherwise S for triage and M for the rest).
 |---|---|---|
 | `/triage` | Inbox; any column but Ready after a stop | Moves the card to Triage and starts a triage run. In Triage, re-run triage with a plain comment instead; a repeat while the same triage is still starting or running is ignored (😕, no note). |
 | `/plan`, `/replan` | Inbox, Triage, Planning, Building; not Ready | Starts a plan run; in Planning, `/plan` while the same plan is still unpublished is ignored (😕, no note). In Building, or with a build approved, it revokes the build and replans. |
-| `/approve [hash] [for <N>h]` | Planning or Building | Approves the latest published plan and queues the build. `hash` is a prefix (≥ 12 lowercase hex) that must identify the latest plan; without it, the plan must have been posted before the command. Refused while a question is open, a revision is pending or another build holds the parcel. Re-approving a running approval only notes `Approved: build starts when capacity allows`. |
+| `/approve [hash] [for <N>h]` | Planning or Building | Approves the latest published plan and queues the build. `hash` is a prefix (≥ 12 lowercase hex) that must identify the latest plan; without it, the plan must have been posted before the command. Refused while a question is open, a revision is pending or another build holds the parcel. `/approve` of the plan whose build is already queued or running is refused (😕, `Nothing new to approve: this plan is already approved`); a drag to Building of it only notes `Approved: build starts when capacity allows`. |
 | `/continue [for <N>h]` | A card at `Bot: Checkpoint` | Grants another time block to the paused run. Refused when the run is not at a checkpoint, is stopped or revoked, or a question is still open. |
 | `/stop` | Any column | Stops all work: drains every run, drops any queued build and pending start. Note `Stopped: /stop`. Resume with a new control (`/triage`, `/plan`, a drag, or a plain comment in Triage or Planning); a comment never starts a rework on a stopped card. |
 | `/decide <id> <answer>` | A card with an open question | Answers the open question `<id>` with `<answer>`. On a build, `/decide` revokes the build and replans (a plain reply is taken within the approval). The id is not shown in the question comment, so a plain reply is the normal answer. |
@@ -124,6 +124,7 @@ by column:
 | Planning | Revises the plan; voids any approval of the previous version. |
 | Building | Guidance to the build within its approval: relayed at once, to an idle run, one waiting on checks, or a busy one (its turn or its workers still running), at most one message per 2 minutes; the run must also read it before it can submit. On a finished build, or at `Needs you` with no fix attempt left, it starts a rework. |
 | Ready | Starts a rework (back to Building, `Rework: owner feedback`). |
+| Building, replan waiting on your answer | Answers the question and starts the replan (see [Steering by comment](#steering-by-comment)). |
 | Any, at `Bot: Checkpoint` | Recorded only; the run needs `/continue` before it reads it. |
 
 On the parcel's PR, an owner conversation comment, or a review that requests changes,
@@ -493,7 +494,7 @@ waits up to 90 s for it instead of failing.
 | `sessions prune [--dry-run]` | Delete (or list) the factory sessions session retention would remove now (through the daemon). |
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, `review_rounds_default`, `follow_up_max_depth`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `session_retention_days` and the health sweep settings; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, `review_rounds_default`, `follow_up_max_depth`, `auto_replan_limit`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `session_retention_days` and the health sweep settings; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.
@@ -519,6 +520,7 @@ parallel_field_node_id = ""      # the epic "Parallel" NUMBER field (restart)
 review_rounds_field_node_id = "" # the "Review rounds" NUMBER field (restart)
 review_rounds_default = 2        # review-bot rounds of an issue whose field is empty
 follow_up_max_depth = 1          # follow-up generations that may defer follow-ups
+auto_replan_limit = 1            # replans the factory starts on a build's replan_required
 ranking = false                  # idle-time ranking of the Triage and Planning columns
 ranking_min_new_triages = 5      # new/changed triage results that start a ranking
 ranking_status_update = true     # short project status update per ranking
@@ -705,7 +707,22 @@ feedback` and starts a new build run under the same approval: it is admitted lik
 build (`Bot: Queued` while no build slot is free), runs in the same issue session (or a
 fresh one with a summary), changes the same branch and PR, and gets a fresh time block and
 a fresh fix budget. Feedback beyond the approved plan is asked back with
-`factory_ask_owner`; to replan, drag the card to Planning. A Building card left at Needs you
+`factory_ask_owner`; to replan, drag the card to Planning.
+
+**Automatic replan.** When your direction goes beyond the approved plan, the build (or
+rework) run reports `blocked` with `replan_required` (why, and what the plan must change)
+and the factory replans by itself, no command needed: it revokes the build run (as
+`/replan` does; the branch, worktree and PR stay), supersedes the approved plan (kept on
+record), moves the card to Planning with the note `Replanning: approved plan superseded by
+owner direction` and starts a plan run in the same issue session, which reads all your
+comments plus the build's list of changes. If a question of the run is still open, the
+replan waits for your reply (`Replan pending: ...`) and starts on it. The revised plan
+still needs your approval (`/approve` or a drag to Building); its build continues the
+same branch and PR as a rework. The factory replans by itself at most
+`auto_replan_limit` times (default 1) since your last plan control (`/plan`, `/replan`, a
+drag to Planning): a further `replan_required` puts the card at `Needs you` with one
+comment instead; `/replan` then replans with the build's changes, a plain reply goes to
+the build. A stopped, closed, human-assigned or epic issue is never replanned by itself. A Building card left at Needs you
 with no fix attempt left (its run closed, or idle and waiting, which is then retired) is
 reworked the same way by an owner comment. Ready is then re-evaluated as usual and a new Ready report is posted.
 Not after `/stop` or once the PR is merged. A burst of feedback is one rework: later

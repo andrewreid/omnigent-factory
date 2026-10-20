@@ -701,9 +701,14 @@ def test_C03_duplicate_semantic_approval_acknowledged_once():
     h.plan_published()
     h.approve()
     seq = h.admission.next_sequence
-    r = h.send(P, ev.ApprovePlan(via=Via.COMMAND))
+    r = h.send(P, ev.ApprovePlan(via=Via.DRAG))
     assert r.audit.accepted and EffectKind.POST_COMMENT not in kinds(r)
     assert h.p().note == "Approved: build starts when capacity allows"
+    assert h.admission.next_sequence == seq and len(h.p().approvals) == 1
+    # A /approve command for it is refused visibly (nothing new to approve).
+    r = h.send(P, ev.ApprovePlan(via=Via.COMMAND))
+    assert not r.audit.accepted and r.audit.reason == "nothing-new-to-approve"
+    assert h.p().note == "Nothing new to approve: this plan is already approved"
     assert h.admission.next_sequence == seq and len(h.p().approvals) == 1
 
 

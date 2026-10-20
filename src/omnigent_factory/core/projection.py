@@ -203,6 +203,7 @@ _HOLD_TEXT = {
     Hold.NO_PROJECT_ITEM: "not on the board",
     Hold.APPROVAL_VOIDED: "approval voided",
     Hold.STALLED: "run stalled",
+    Hold.REPLAN_LIMIT: "plan must change again: /replan",
     Hold.EXTERNAL_ACTIVITY: "external session activity",
 }
 

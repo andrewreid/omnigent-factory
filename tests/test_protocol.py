@@ -271,3 +271,43 @@ def test_schema_file_declares_related():
         "blocks",
         "supersedes",
     ]
+
+
+REPLAN = {"reason": "the owner's direction reverses part of the plan", "changes": ["x"]}
+
+
+def blocked_result(**over) -> dict:
+    return {"kind": "blocked", "reason": "plan must change", "done": [], **over}
+
+
+def test_build_blocked_result_may_require_a_replan():
+    build = Correlation("P1", "S1", "N1", 3, "build")
+    parsed = validate_result(blocked_result(replan_required=REPLAN), build)
+    assert parsed.result.result.replan_required.changes == ["x"]
+    assert validate_result(blocked_result(), build).result.result.replan_required is None
+    for bad in ({"reason": "r", "changes": []}, {"reason": "r"}, {**REPLAN, "extra": 1}):
+        with pytest.raises(ResultError):
+            validate_result(blocked_result(replan_required=bad), build)
+
+
+@pytest.mark.parametrize(
+    "corr",
+    [
+        CORR,
+        Correlation("P1", "S1", "N1", 3, "triage"),
+        Correlation("P1", "S1", "N1", 3, "build", in_checkpoint=True),
+    ],
+)
+def test_only_a_build_outside_a_checkpoint_requires_a_replan(corr):
+    with pytest.raises(ResultError, match="replan_required: only a build run"):
+        validate_result(blocked_result(replan_required=REPLAN), corr)
+
+
+def test_schema_file_declares_replan_required():
+    schema = json.loads(
+        (Path(core_pkg.__file__).parent / "result_schema_v1.json").read_text("utf-8")
+    )
+    blocked = schema["$defs"]["blocked"]
+    assert "replan_required" not in blocked["required"]
+    replan = blocked["properties"]["replan_required"]
+    assert replan["required"] == ["reason", "changes"] and replan["additionalProperties"] is False

@@ -118,9 +118,13 @@ def test_approval_acknowledged_is_a_note():
     h = Harness()
     h.plan_published()
     h.approve()
-    r = h.send(P, ev.ApprovePlan(via=Via.COMMAND))
+    r = h.send(P, ev.ApprovePlan(via=Via.DRAG))
     assert r.audit.accepted and EffectKind.POST_COMMENT not in kinds(r)
     assert notes(r) == ["Approved: build starts when capacity allows"]
+    # /approve of the plan already approved is refused with the reason, still no comment.
+    r = h.send(P, ev.ApprovePlan(via=Via.COMMAND))
+    assert not r.audit.accepted and EffectKind.POST_COMMENT not in kinds(r)
+    assert notes(r) == ["Nothing new to approve: this plan is already approved"]
 
 
 def test_rework_is_a_note_not_a_comment():

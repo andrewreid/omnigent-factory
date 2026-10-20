@@ -71,6 +71,7 @@ from omnigent_factory.core.types import (
     Lifecycle,
     LinkedIssue,
     Parcel,
+    ReplanStatus,
     SessionKind,
     Size,
     StageSession,
@@ -83,6 +84,7 @@ from omnigent_factory.service.directory import (
     approved_epic_plan,
     new_boundary,
     omnigent_link,
+    replan_request_for,
     untrusted_block,
 )
 from omnigent_factory.service.runtime import FactoryService
@@ -559,6 +561,7 @@ class FactoryTools:
             run_id = run.session_id
             await self.service.db.call(lambda store: store.record_plan_read(run_id, plan_hash))
         boundary = self._boundary(run)
+        request = replan_request_for(parcel, run) if run is not None else None
         return {
             **self._header(caller),
             "approved": approved,
@@ -569,6 +572,10 @@ class FactoryTools:
                 "pending": parcel.revision_pending,
                 "latest_unapproved_proposal": proposal,
                 "owner_feedback": [self._comment(c, boundary) for c in feedback],
+                # This plan run replans for a build that said the plan must change.
+                "replan_request": None
+                if request is None
+                else {"reason": request.reason, "changes": list(request.changes)},
             },
             "note": (
                 "Echo plan_hash in factory_submit_result for build_ready."
@@ -931,7 +938,7 @@ class FactoryTools:
                 "slot": slot,
                 "stage": after.stage.value if after.stage else None,
                 "bot": after.bot.value,
-                "next": _after_submit(kind, in_checkpoint),
+                "next": _replan_next(after, run.session_id) or _after_submit(kind, in_checkpoint),
             }
             if parsed.contract_canonical is not None and kind == "plan":
                 out["plan_hash"] = hashlib.sha256(parsed.contract_canonical).hexdigest()
@@ -1324,10 +1331,13 @@ def _candidate(run: StageSession, parsed: ParsedResult) -> ev.ResultCandidate:
         )
     if r.kind == "checkpoint":
         return ev.ResultCandidate(**base, result_kind=ev.ResultKind.CHECKPOINT)  # type: ignore[arg-type]
+    replan = r.replan_required if isinstance(r, BlockedResult) else None
     return ev.ResultCandidate(
         **base,  # type: ignore[arg-type]
         result_kind=ev.ResultKind.BLOCKED,
         blocked_on=blocked_on(r) if isinstance(r, BlockedResult) else (),
+        replan_reason=replan.reason if replan is not None else None,
+        replan_changes=tuple(replan.changes) if replan is not None else (),
     )
 
 
@@ -1344,6 +1354,20 @@ def _checkpoint_from_blocked(payload: Mapping[str, Any], run: StageSession) -> d
         "worktree_state": "see done/remaining",
         "elicitation_id": None,
     }
+
+
+def _replan_next(parcel: Parcel, run_id: str) -> str:
+    """What follows this run's ``replan_required`` ("" when it asked none)."""
+    request = parcel.replan_request
+    if request is None or request.session_id != run_id:
+        return ""
+    return {
+        ReplanStatus.STARTED: "End your turn; the factory replans with your changes and the "
+        "owner approves the revised plan.",
+        ReplanStatus.HELD: "End your turn; the factory replans once the owner answers your "
+        "question.",
+        ReplanStatus.LIMITED: "End your turn; the owner has been told the plan must change again.",
+    }.get(request.status, "")
 
 
 def _after_submit(kind: str, in_checkpoint: bool) -> str:

@@ -78,6 +78,7 @@ HOT_RELOAD_KEYS = frozenset(
         "omnigent_breaker_minutes",
         "review_rounds_default",
         "follow_up_max_depth",
+        "auto_replan_limit",
     }
 )
 
@@ -249,6 +250,10 @@ class ServiceConfig(BaseModel):
     #: Follow-up lineage depth at which a run may no longer defer findings as follow-ups
     #: (1: a follow-up issue's own build fixes or marks advisory everything it finds).
     follow_up_max_depth: int = Field(default=1, ge=0, le=10)
+    #: Replans the factory starts by itself when a build reports that the owner's
+    #: direction goes beyond the approved plan (``replan_required``), counted from the
+    #: owner's last plan control; past it the card goes to Needs you (0 = never).
+    auto_replan_limit: int = Field(default=1, ge=0, le=5)
     #: Triage ranking: while the factory is idle, one read-only session orders the Triage
     #: and Planning columns on one scale (the ``Rank`` field). ``omnigent-factory ranking
     #: on|off`` overrides it until it changes here.
@@ -475,6 +480,7 @@ class ServiceConfig(BaseModel):
             red_confirm_us=int(self.red_check_confirm_seconds * 1_000_000),
             triage_concurrency=self.triage_concurrency,
             auto_build_concurrency=self.auto_build_concurrency,
+            auto_replan_limit=self.auto_replan_limit,
         )
 
     def prepare_private_directories(self) -> None:

@@ -35,6 +35,8 @@ from omnigent_factory.core.types import (
     EpicAutopilot,
     IssueSnapshot,
     Parcel,
+    ReplanRequest,
+    ReplanStatus,
     SessionKind,
     StageSession,
     issue_session_title,
@@ -115,10 +117,15 @@ class ServiceDispatchDirectory:
         elif session.kind == SessionKind.TRIAGE and self.latest_triage(parcel) is not None:
             template_name = _RETRIAGE_TEMPLATE  # a re-run on owner feedback
         claim = parcel.autopilot_claim
-        if session.kind == SessionKind.PLAN and claim is not None and claim.active:
-            template_name = _AUTOPILOT_PLAN_TEMPLATE  # a sub-issue epic autopilot drives
         auth = parcel.authorization(session.authorization_id)
         brief = ""
+        if session.kind == SessionKind.PLAN and claim is not None and claim.active:
+            template_name = _AUTOPILOT_PLAN_TEMPLATE  # a sub-issue epic autopilot drives
+        elif session.kind == SessionKind.PLAN:
+            request = replan_request_for(parcel, session)
+            if request is not None:
+                template_name = _REPLAN_TEMPLATE  # a build reported the plan must change
+                brief = replan_brief(request)
         if session.kind == SessionKind.BUILD and auth is not None and auth.rework:
             # Owner feedback on the built work, or a merge conflict with the base branch.
             template_name = _CONFLICT_TEMPLATE if auth.conflict else _REWORK_TEMPLATE
@@ -716,6 +723,8 @@ class PublicationRenderer:
             if body is None:
                 return None
             text = _public_result(body, agent_display_name(self.config))
+            if effect.args.get("replan_limit") is True:
+                text += "\n\n" + _REPLAN_LIMIT_TEXT
             sid = str(effect.args.get("session_id") or effect.preconditions.session_id or "")
             return _safe_publication(text, self.config) + await self._splits(parcel, sid)
         elif effect.kind == EffectKind.POST_COMMENT and effect.args.get("template") == "decision":
@@ -1007,6 +1016,14 @@ _STATUS_TEXT = {
 }
 
 
+#: After a blocked report whose ``replan_required`` came once the automatic replans were
+#: used up (``auto_replan_limit``).
+_REPLAN_LIMIT_TEXT = (
+    "The factory has already replanned this by itself, so this needs you: `/replan` revises "
+    "the plan with these changes, or reply to keep to the approved plan."
+)
+
+
 def agent_display_name(config: ServiceConfig) -> str:
     """The factory agent's name for owner-facing text (config ``omnigent_agent_name``)."""
     name = " ".join(config.omnigent_agent_name.split())
@@ -1091,6 +1108,10 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
         done = _bullets(result.get("done"))
         if done:
             lines += ["", "**Done so far:**", done]
+        replan = result.get("replan_required")
+        changes = _bullets(replan.get("changes")) if isinstance(replan, dict) else ""
+        if changes:
+            lines += ["", "**The plan has to change:**", changes]
         return "\n".join(lines)
     if kind == "checkpoint":
         lines = ["### Checkpoint"]
@@ -1367,7 +1388,7 @@ def _new_boundary() -> str:
 _FIRST_TEMPLATES = {
     SessionKind.TRIAGE: "triage-v10.txt",
     SessionKind.PLAN: "plan-v10.txt",
-    SessionKind.BUILD: "build-v13.txt",
+    SessionKind.BUILD: "build-v14.txt",
 }
 _RETRIAGE_TEMPLATE = "triage-feedback-v7.txt"
 #: The triage of an epic (an issue with sub-issues), first run and re-runs alike.
@@ -1376,15 +1397,38 @@ _EPIC_TRIAGE_TEMPLATE = "epic-triage-v4.txt"
 _EPIC_PLAN_TEMPLATE = "epic-plan-v3.txt"
 #: A plan run of a sub-issue epic autopilot drives (keeps to its part of the epic plan).
 _AUTOPILOT_PLAN_TEMPLATE = "plan-autopilot-v3.txt"
-_REWORK_TEMPLATE = "build-rework-v10.txt"
+#: The plan run the factory started on a build's ``replan_required`` (its brief: what the
+#: build said must change).
+_REPLAN_TEMPLATE = "plan-replan-v1.txt"
+_REWORK_TEMPLATE = "build-rework-v11.txt"
 #: A rework the owner started by ticking Ready report items: its brief is those items.
 _ITEMS_REWORK_TEMPLATE = "build-rework-items-v2.txt"
 #: Readiness wakes of a waiting build run (red checks and other gaps; findings only).
-_READINESS_WAKE_TEMPLATE = "readiness-wake-v10.txt"
+_READINESS_WAKE_TEMPLATE = "readiness-wake-v11.txt"
 _FINDINGS_WAKE_TEMPLATE = "readiness-findings-wake-v3.txt"
 #: A rework run, or a wake of the waiting build run, for a merge conflict with the base.
 _CONFLICT_TEMPLATE = "build-conflict-v2.txt"
 _CONFLICT_WAKE_TEMPLATE = "readiness-conflict-wake-v1.txt"
+
+
+def replan_request_for(parcel: Parcel, session: StageSession) -> ReplanRequest | None:
+    """The build's ``replan_required`` the plan run ``session`` was started for (None:
+    an ordinary plan run)."""
+    request = parcel.replan_request
+    if (
+        request is None
+        or request.status != ReplanStatus.STARTED
+        or request.plan_authorization_id != session.authorization_id
+    ):
+        return None
+    return request
+
+
+def replan_brief(request: ReplanRequest) -> str:
+    """The build's reason and requested plan changes, as the plan run's brief."""
+    lines = [f"Reason: {request.reason.strip()}", "Changes:"]
+    lines += [f"- {change.strip()}" for change in request.changes]
+    return "\n".join(lines)
 
 
 def rounds_line(used: int, budget: int) -> str:

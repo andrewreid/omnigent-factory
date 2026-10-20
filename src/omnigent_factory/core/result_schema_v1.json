@@ -837,6 +837,27 @@
           "items": {
             "$ref": "#/$defs/split_out"
           }
+        },
+        "replan_required": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "reason",
+            "changes"
+          ],
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/text"
+            },
+            "changes": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 30,
+              "items": {
+                "$ref": "#/$defs/text"
+              }
+            }
+          }
         }
       }
     },

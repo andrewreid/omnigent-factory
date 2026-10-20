@@ -997,6 +997,10 @@ class ResultCandidate(_Body):
     #: ``depends_on``): those issues. The run waits instead of showing Blocked while each
     #: is an open native blocker of this issue.
     blocked_on: tuple[int, ...] = ()
+    #: A build's ``blocked`` result with ``replan_required``: why the approved plan no
+    #: longer holds and what the revised plan must change (None: no replan asked).
+    replan_reason: str | None = None
+    replan_changes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

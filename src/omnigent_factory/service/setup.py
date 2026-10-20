@@ -121,6 +121,7 @@ ranking_status_update = true   # short project status update per ranking
 session_retention_days = 30    # delete factory sessions archived this long (0 = never)
 review_rounds_default = 2      # review-bot rounds per issue when its field is empty
 follow_up_max_depth = 1        # a follow-up's own build files no further follow-ups
+auto_replan_limit = 1          # replans started by itself on a build's replan_required
 # triage_guidance = "Classify work with the repo's area:* labels."
 # engineering_guidance = "Engineering conventions live in AGENTS.md."
 

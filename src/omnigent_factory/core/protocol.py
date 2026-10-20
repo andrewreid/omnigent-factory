@@ -294,10 +294,21 @@ class CheckpointResult(_Strict):
     elicitation_id: Annotated[str, StringConstraints(min_length=1)] | None
 
 
+class ReplanRequired(_Strict):
+    """A build's report that the owner's direction goes beyond the approved plan: the
+    factory replans (the owner approves the revised plan)."""
+
+    reason: Text
+    #: What the revised plan must change.
+    changes: Annotated[list[Text], Field(min_length=1, max_length=30)]
+
+
 class BlockedResult(_Strict):
     """The agent could not finish (a tool, credential or permission refused) and says so.
 
     Honest failure instead of invented values: the daemon shows Blocked with ``reason``.
+    A build whose owner direction goes beyond the approved plan says so in
+    ``replan_required``: the factory then replans instead.
     """
 
     kind: Literal["blocked"]
@@ -307,6 +318,7 @@ class BlockedResult(_Strict):
     follow_ups: FollowUps = []
     deferred: DeferredList = []
     split_out: SplitOuts = []
+    replan_required: ReplanRequired | None = None
 
 
 def blocked_on(r: BlockedResult) -> tuple[int, ...]:
@@ -391,7 +403,8 @@ RESULT_SHAPES: dict[str, str] = {
     "blocked": '{"kind":"blocked","reason":str,"done":[str],"related"?:[{"issue":int,'
     '"relation":"depends_on|blocks|...","note":str}],"deferred"?:[{"severity":'
     '"P0|P1|P2|P3","path"?:str,"title":str,"thread_url"?:str,"reason":str,'
-    '"outcome"?:"follow_up|advisory","blocks"?:[int]}],' + _SPLIT_SHAPE,
+    '"outcome"?:"follow_up|advisory","blocks"?:[int]}],"replan_required"?:{"reason":str,'
+    '"changes":[str](build only: the plan must change)},' + _SPLIT_SHAPE,
 }
 
 
@@ -579,7 +592,9 @@ def validate_result(result: Mapping[str, object], expected: Correlation) -> Pars
     _check_split_out(getattr(r, "split_out", []), expected.issue_number)
     contract_bytes: bytes | None = None
     if isinstance(r, BlockedResult):
-        pass  # any stage may report that it could not finish
+        # Any stage may report that it could not finish; only a build asks for a replan.
+        if r.replan_required is not None and (expected.stage != "build" or expected.in_checkpoint):
+            raise ResultError("replan_required: only a build run reports it (not at a checkpoint)")
     elif isinstance(r, CheckpointResult):
         if not expected.in_checkpoint:
             raise ResultError("checkpoint result outside checkpoint")
