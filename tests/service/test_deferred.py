@@ -265,7 +265,8 @@ async def test_one_consolidated_issue_per_pr_filed_by_the_factory_and_linked(
         await r.deferred.drain()
         assert r.repo.creates == 1
         issue = r.repo.issues[100]
-        assert issue["title"] == "Follow-ups from #7"
+        assert issue["title"] == "Follow-ups: Add export button (#1)"
+        assert "PR #7" in issue["body"]
         assert set(rl.checked(issue["body"], rl.ITEM)) == {
             i.item_key for i in await items(r) if i.outcome == "follow_up"
         }
@@ -290,14 +291,18 @@ async def test_one_consolidated_issue_per_pr_filed_by_the_factory_and_linked(
         assert r.repo.creates == 1 and len(r.repo.writes) == writes
 
 
+@pytest.mark.parametrize("existing_title", ["Follow-ups from #7", "Owner renamed this issue"])
 async def test_an_unclear_create_is_found_by_its_marker_never_created_twice(
     service_config: ServiceConfig,
+    existing_title: str,
 ):
     async with rig(service_config) as r:
         parcel = await r.parcel()
         r.repo.lose_create = True
         await r.deferred.record_result(parcel, "s1", result(FU_A))
         assert r.repo.creates == 1  # it landed, but the factory does not know its number
+        assert r.repo.issues[100]["title"] == "Follow-ups: Add export button (#1)"
+        r.repo.issues[100]["title"] = existing_title
         rows = await r.service.db.call(
             partial(ds.consolidated, repo_id=r.service.config.repo_id, source_issue=1)
         )
@@ -309,6 +314,54 @@ async def test_an_unclear_create_is_found_by_its_marker_never_created_twice(
         )
         assert [(row.state, row.issue_number) for row in rows] == [("created", 100)]
         assert all(i.listed for i in await items(r))
+        assert r.repo.issues[100]["title"] == existing_title
+
+
+@pytest.mark.parametrize(
+    ("source_title", "expected"),
+    [
+        ("  Admin\n broadcasts\t on GET /me  ", "Follow-ups: Admin broadcasts on GET /me (#1)"),
+        ("feat(api)!: Admin broadcasts", "Follow-ups: Admin broadcasts (#1)"),
+        ("fix: Retry exports", "Follow-ups: Retry exports (#1)"),
+        ("RFC: Export design", "Follow-ups: RFC: Export design (#1)"),
+        ("fix:", "Follow-ups: fix: (#1)"),
+        ("x" * 103, "Follow-ups: " + "x" * 103 + " (#1)"),
+        ("x" * 104, "Follow-ups: " + "x" * 102 + "… (#1)"),
+        ("界" * 200, "Follow-ups: " + "界" * 102 + "… (#1)"),
+        ("", None),
+        (" \t\n ", None),
+        (None, None),  # older stored parcels have no title field
+    ],
+)
+@pytest.mark.parametrize("pr_number", [0, 7])
+async def test_consolidated_title_uses_stored_source_title(
+    service_config: ServiceConfig, monkeypatch, source_title, expected, pr_number
+):
+    async with rig(service_config) as r:
+        await r.service.db.call(
+            lambda store: store.query(
+                "UPDATE parcels SET aggregate_json = "
+                + (
+                    "json_remove(aggregate_json, '$.parcel.issue_title')"
+                    if source_title is None
+                    else "json_set(aggregate_json, '$.parcel.issue_title', ?)"
+                )
+                + " WHERE parcel_id = ?",
+                (P,) if source_title is None else (source_title, P),
+            )
+        )
+        get_json = r.repo.get_json
+
+        async def no_source_read(path: str):
+            assert path != f"{REPO}/issues/1", "The title must come from the stored parcel"
+            return await get_json(path)
+
+        monkeypatch.setattr(r.repo, "get_json", no_source_read)
+        # A fresh Deferrals instance has only persisted state to work from.
+        await r.restarted().record_result(await r.parcel(), "s1", result(FU_A, pr_number=pr_number))
+        title = r.repo.issues[100]["title"]
+        assert title == (expected or f"Follow-ups from #{pr_number or 1}")
+        assert len(title) <= 120
 
 
 async def test_the_report_lists_each_item_with_a_hidden_action_marker(

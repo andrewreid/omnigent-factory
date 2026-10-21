@@ -7,7 +7,7 @@ and the Ready report's Deferred checkboxes the owner ticks to have items done no
   per source issue under a stable key, so a re-submission or restart records nothing
   twice (``store.discipline``).
 * **Filed.** The ``follow_up`` items of one PR go into ONE issue the factory opens itself,
-  ``Follow-ups from #<PR>``: a checklist, one line per item, with a hidden marker per item
+  ``Follow-ups: <source title> (#<source>)``: a checklist, with a hidden marker per item
   and one for the issue (``<!-- factory-follow-ups source=S pr=P -->``). It is labelled
   ``follow-up``, joins the source issue's epic and gets the native blocked-by links the
   items name, through ``service.follow_ups`` (each once, never undone). The row is set to
@@ -43,6 +43,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import datetime
 from functools import partial
@@ -282,7 +283,7 @@ class Deferrals:
                 )
             )
             body = self._issue_body(source, pr_number, items)
-            number = await self._create(pr_number or source, body)
+            number = await self._create(source, pr_number, body)
             LOG.info(
                 "consolidated follow-up issue created issue=#%s source=#%s pr=#%s items=%s",
                 number,
@@ -352,12 +353,34 @@ class Deferrals:
             f"{lines}\n\n{issue_marker(source, pr_number)}"
         )
 
-    async def _create(self, origin: int, body: str) -> int:
-        """Open the consolidated issue, titled after its PR (or, with none, its issue)."""
+    async def _create(self, source: int, pr_number: int, body: str) -> int:
+        """Open the consolidated issue using the source title already stored locally."""
+        rows = await self._db(
+            lambda store: store.query(
+                "SELECT aggregate_json FROM parcels WHERE repo_id = ? AND issue_number = ?",
+                (self._repo_id, source),
+            )
+        )
+        source_title = parcel_from_json(str(rows[0][0])).issue_title if rows else ""
+        source_title = " ".join(source_title.split())
+        # Only strip familiar conventional prefixes with a nonempty description.
+        source_title = re.sub(
+            r"^(?:feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)"
+            r"(?:\([\w./-]+\))?!?: (?=\S)",
+            "",
+            source_title,
+        )
+        title = f"Follow-ups from #{pr_number or source}"
+        if source_title:
+            prefix, suffix = "Follow-ups: ", f" (#{source})"
+            limit = 120 - len(prefix) - len(suffix)
+            if len(source_title) > limit:
+                source_title = source_title[: limit - 1].rstrip() + "…"
+            title = f"{prefix}{source_title}{suffix}"
         response = await self.client.request(
             "POST",
             f"/repos/{self._repo}/issues",
-            json_body={"title": f"Follow-ups from #{origin}", "body": body},
+            json_body={"title": title, "body": body},
             expected=frozenset({201}),
         )
         data = response.json()
