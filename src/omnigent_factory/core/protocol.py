@@ -39,6 +39,12 @@ Sha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 SizeLit = Literal["S", "M", "L"]
 Label = Annotated[str, StringConstraints(min_length=1, max_length=100)]
+#: An http(s) URL with no whitespace, quotes, brackets, angle brackets or ``@`` (no
+#: userinfo; it is rendered as a bare link in the Ready report).
+DEV_ENVIRONMENT_URL_PATTERN = r"""^https?://[^\s<>"'`()\[\]@]+$"""
+DevEnvironmentUrl = Annotated[
+    str, StringConstraints(max_length=500, pattern=DEV_ENVIRONMENT_URL_PATTERN)
+]
 
 
 class _Strict(BaseModel):
@@ -281,6 +287,9 @@ class BuildResult(_Strict):
     follow_ups: FollowUps = []
     deferred: DeferredList = []
     split_out: SplitOuts = []
+    #: The dev environment the run started and left running for the owner's review
+    #: (shown in the Ready report); the factory tears it down when the issue is done.
+    dev_environment_url: DevEnvironmentUrl | None = None
 
 
 class CheckpointResult(_Strict):
@@ -397,7 +406,9 @@ RESULT_SHAPES: dict[str, str] = {
     '"severity":str,"disposition":str,"evidence":str}],"remediation_batches_used":0|1,'
     '"targeted_rechecks_used":0|1,"release_readiness":"ready|needs_owner","related"?:[...],'
     '"deferred"?:[{"severity":"P0|P1|P2|P3","path"?:str,"title":str,"thread_url"?:str,'
-    '"reason":str,"outcome"?:"follow_up|advisory","blocks"?:[int]}],' + _SPLIT_SHAPE,
+    '"reason":str,"outcome"?:"follow_up|advisory","blocks"?:[int]}],'
+    '"dev_environment_url"?:str(http/https URL of a dev environment you left running),'
+    + _SPLIT_SHAPE,
     "checkpoint": '{"kind":"checkpoint","grant_id":str,"head_sha":sha40|null,"done":[str],'
     '"remaining":[str],"risks":[str],"worktree_state":str,"elicitation_id":str|null}',
     "blocked": '{"kind":"blocked","reason":str,"done":[str],"related"?:[{"issue":int,'

@@ -346,6 +346,17 @@ class ServiceConfig(BaseModel):
     #: How long the sweep only observes after Omnigent looked unhealthy (3 failed checks
     #: in a row, a failed nudge write or a nudge Omnigent could not start a runner for).
     omnigent_breaker_minutes: float = Field(default=30.0, gt=0)
+    #: The repository's dev-environment teardown command (argv; a relative program path
+    #: resolves in the worktree), run with cwd = the issue worktree before a finished
+    #: parcel's worktree is removed. Empty: no teardown. Exit 0 is success (a repository
+    #: script with nothing to tear down must exit 0); anything else keeps the worktree
+    #: and the cleanup is retried. The factory never starts a dev environment.
+    devenv_teardown: tuple[str, ...] = ()
+    #: Seconds one teardown run may take before it is killed (and counts as failed).
+    devenv_teardown_timeout_seconds: float = Field(default=600.0, gt=0, le=3600)
+    #: Failed teardowns of one worktree before the cleanup stops retrying (the worktree is
+    #: kept; ``cleanup`` by hand runs the teardown again).
+    devenv_teardown_max_attempts: int = Field(default=5, ge=1, le=50)
 
     @field_validator("owners")
     @classmethod
@@ -365,6 +376,13 @@ class ServiceConfig(BaseModel):
     @classmethod
     def blank_omnigent_id_is_unset(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value
+
+    @field_validator("devenv_teardown")
+    @classmethod
+    def devenv_teardown_valid(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if value and (not value[0].strip() or any("\0" in arg for arg in value)):
+            raise ValueError("devenv_teardown must name a program first and hold no NUL bytes")
+        return value
 
     @field_validator("mcp_allowed_hosts")
     @classmethod

@@ -106,20 +106,20 @@ def test_current_stage_templates_carry_the_sync_note_and_old_ones_are_kept() -> 
     assert current == {
         "triage-v10.txt",
         "plan-v10.txt",
-        "build-v14.txt",
+        "build-v15.txt",
         "triage-feedback-v7.txt",
         "epic-triage-v4.txt",
-        "build-rework-v11.txt",
-        "build-rework-items-v2.txt",
-        "build-conflict-v2.txt",
+        "build-rework-v12.txt",
+        "build-rework-items-v3.txt",
+        "build-conflict-v3.txt",
     }
     for name in current:
         assert "{base_note}" in (TEMPLATES / name).read_text("utf-8"), name
     for name in (
-        "build-v14.txt",
-        "build-rework-v11.txt",
-        "build-rework-items-v2.txt",
-        "build-conflict-v2.txt",
+        "build-v15.txt",
+        "build-rework-v12.txt",
+        "build-rework-items-v3.txt",
+        "build-conflict-v3.txt",
     ):
         text = " ".join((TEMPLATES / name).read_text("utf-8").split())
         assert 'no longer fits current {base_ref}, submit "blocked" with the reason' in text

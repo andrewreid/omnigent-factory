@@ -835,6 +835,12 @@ class Workspaces:
                 current, branch = None, None
         return rows
 
+    def admin_dir(self, path: Path) -> Path:
+        """The worktree's own Git directory (``.git/worktrees/<name>`` of the clone): its
+        files are removed with the worktree."""
+        out = self._git(["rev-parse", "--absolute-git-dir"], path)
+        return Path(out).resolve()
+
     def is_clean(self, path: Path) -> bool:
         """No modified tracked files and no untracked (non-ignored) files."""
         return self._git(["status", "--porcelain"], path) == ""

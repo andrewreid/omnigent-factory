@@ -477,7 +477,7 @@ waits up to 90 s for it instead of failing.
 | `retry-effect <effect_id>` | Requeue a failed/unknown `publish_triage`/`publish_report`/`post_comment`; it adopts an existing comment by its marker, so it never duplicates. |
 | `rerender-comment <effect_id>` | Re-render a published comment in place (found by its marker). |
 | `resume <parcel> --message-file note.md` | Re-open the parcel's existing stage session after a stale block and relay one operator note. No authority, approval or time is added. |
-| `cleanup <parcel> [--merged]` | Remove a finished parcel's factory worktree(s) and local `factory/` branch from the factory clone. |
+| `cleanup <parcel> [--merged]` | Tear down the dev environment (`devenv_teardown`) and remove the factory worktree(s) and local `factory/` branch of a finished parcel (PR merged, issue closed or Done; refused for a Ready card) from the factory clone. |
 | `release-delivery <guid>` | Release one parked webhook delivery for processing. |
 | `pause` / `unpause` | Stop / resume admitting new work repository-wide; in-flight parcels and safety events carry on. |
 | `auto-triage status` | Idle-time auto-triage: enabled (and whether config or the CLI decides), today's used/limit/granted, idle or what keeps it busy, triage slots, the next candidate. |
@@ -767,8 +767,9 @@ review_bot_grace_minutes = 10     # used when the bot's 👀 cannot be told (no 
 ```
 
 The Ready report is the agent's summary (what changed, decisions; no CI or review-bot
-status) followed by the factory's lines from the read that decided Ready: PR, CI and
-`Review bot` (e.g. `Codex: 👍 on <sha>`, `Codex: reviewed <sha>, 2 findings, all
+status) followed by the factory's lines from the read that decided Ready: PR, the dev
+environment URL (only when the build's result reported one in `dev_environment_url`), CI
+and `Review bot` (e.g. `Codex: 👍 on <sha>`, `Codex: reviewed <sha>, 2 findings, all
 with outcomes`, or `Codex: no response within the grace window`). While the card stays in
 Ready on that head, a later read that changes those lines (a late verdict, the check
 summary, a red check) edits the report in place (found by its marker; edits do not
@@ -802,11 +803,39 @@ Clean syncs (an owner "Update branch" with no conflict seen) keep the review as 
 
 ### Finished parcels
 
-When a parcel's PR is merged or its issue is closed, the daemon removes its worktree and
+A Ready card keeps its worktree, and any dev environment the agent started in it, so the
+owner can review the work; a rework reuses the same worktree. When a parcel's PR is merged
+or its issue is closed (by webhook or a later read), the daemon removes its worktree and
 local branch once every stage session has retired. Only paths under `worktree_root` are
 touched; a worktree with uncommitted changes is kept unless the PR is merged; the local
 branch is deleted only when the PR is merged or its tip is the verified Ready head.
-Skipped items are logged. `cleanup` runs the same step by hand.
+Skipped items are logged. `cleanup` runs the same step by hand (never for a Ready card).
+
+**Dev environments.** The factory never starts one, and no stage needs one. The build,
+rework and readiness instructions tell the agent: if it started one, keep it running
+through Ready and report its URL in the result's optional `dev_environment_url` (http or
+https, at most 500 characters, no userinfo); the Ready report then shows it as
+`**Dev environment:** <url>`. Before removing a worktree at Done the daemon runs the
+repository's teardown command from host config, with the worktree as working directory
+(a relative program path resolves in the worktree):
+
+```toml
+devenv_teardown = ["scripts/dev-environment.sh", "--teardown"]  # empty/absent: no teardown (restart)
+devenv_teardown_timeout_seconds = 600  # killed (a failure) after this long (restart)
+devenv_teardown_max_attempts = 5       # failed teardowns before retries stop (restart)
+```
+
+Exit 0 is success, so the command must exit 0 when there is nothing to tear down (the
+Timesheets `scripts/dev-environment.sh --teardown` does: with no environment recorded for
+the worktree it prints `nothing to tear down` and exits 0; a refusal exits 1, a usage
+error 2). Any other exit, a timeout or a command that cannot start keeps the worktree and
+its branch, logs a warning with the reason (exit code and last stderr line) and retries
+the cleanup every 5 minutes, up to `devenv_teardown_max_attempts` failures counted in the
+worktree's own Git directory (so a restart neither loses nor resets them); then it gives
+up with a warning and `cleanup` by hand runs the teardown again. A successful teardown is
+marked there too, so a restart between the teardown and the removal does not run it
+twice; the effect and `cleanup` never run at once. The card's Done state never waits
+for any of this.
 
 ### Reconciliation and observation load
 

@@ -911,6 +911,11 @@ def _apply_evidence(ctx: _Ctx) -> None:
         _safety(ctx, "project-item-missing")
     if not snap.open and Hold.COMPLETED not in ctx.p.holds:
         _complete(ctx)  # a fresh read of a closed issue is terminal even if the webhook was lost
+        ctx.emit(
+            EffectKind.CLEANUP_WORKSPACE,
+            args={"merged": False},
+            dedupe=f"cleanup:{ctx.p.parcel_id}:closed:{ctx.event.event_id}",
+        )
     # Safety before control: the column in any fresh read (control envelopes included)
     # is reconciled first; a leftward observation advances the barrier, so the control
     # that carried it is then rejected as not fresh. Explicit move events carry their

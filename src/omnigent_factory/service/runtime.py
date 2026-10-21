@@ -40,10 +40,10 @@ from omnigent_factory.core.types import (
     Parcel,
     QueueStatus,
     ReservationKind,
-    Stage,
 )
 from omnigent_factory.ports.adapter import EffectAdapter
 from omnigent_factory.ports.clock import Clock, SystemClock
+from omnigent_factory.service.cleanup import finished as cleanup_finished
 from omnigent_factory.service.config import HOT_RELOAD_KEYS, ServiceConfig, load_config
 from omnigent_factory.service.db import StoreWorker
 from omnigent_factory.service.executor import (
@@ -1337,8 +1337,9 @@ class FactoryService:
             parcel = await self.db.call(partial(_load_parcel, parcel_id=parcel_id))
             if parcel is None:
                 raise ValueError("unknown parcel")
-            if parcel.eligible and parcel.stage not in (Stage.READY, Stage.DONE):
-                raise ValueError("parcel is not finished (Ready/Done or closed)")
+            if not cleanup_finished(parcel):
+                # Ready keeps its worktree (and any dev environment) for the owner's review.
+                raise ValueError("parcel is not finished (merged, closed or Done)")
             if self.workspace_cleaner is None:
                 raise ValueError("workspace cleanup is not wired")
             detail = await self.workspace_cleaner.cleanup(

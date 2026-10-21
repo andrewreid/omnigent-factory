@@ -500,7 +500,13 @@ async def build_production(
         observer.parked_interval_seconds = new.parked_observation_interval_seconds
 
     service.config_listeners.append(adopt_reloaded)
-    cleaner = WorkspaceCleaner(directory, workspaces, config.worktree_root)
+    cleaner = WorkspaceCleaner(
+        directory,
+        workspaces,
+        config.worktree_root,
+        teardown=config.devenv_teardown,
+        teardown_timeout_seconds=config.devenv_teardown_timeout_seconds,
+    )
     service.workspace_cleaner = cleaner
     processor = GitHubDeliveryProcessor(service, normalizer, github, clock)
 
@@ -513,7 +519,12 @@ async def build_production(
     processor.follow_ups = follow_ups
     processor.deferred = deferred
     service.bind_integrations(
-        adapters=(github, recording_omnigent, broker, CleanupAdapter(cleaner)),
+        adapters=(
+            github,
+            recording_omnigent,
+            broker,
+            CleanupAdapter(cleaner, max_teardown_attempts=config.devenv_teardown_max_attempts),
+        ),
         delivery_processor=processor,
         managed=(runtime, sweep),
     )

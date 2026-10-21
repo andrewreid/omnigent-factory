@@ -26,7 +26,11 @@ from omnigent_factory.core.effects import (
     ExecutionContext,
 )
 from omnigent_factory.core.events import EventKind
-from omnigent_factory.core.protocol import ParsedResult, epic_plan_hash
+from omnigent_factory.core.protocol import (
+    DEV_ENVIRONMENT_URL_PATTERN,
+    ParsedResult,
+    epic_plan_hash,
+)
 from omnigent_factory.core.types import (
     MICROS_PER_MINUTE,
     ApprovalKind,
@@ -854,6 +858,8 @@ def _decision_text(args: Mapping[str, Any]) -> str:
 
 
 _OMNIGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+#: A stored result was validated at submit; re-checked before it is posted.
+_DEV_URL = re.compile(DEV_ENVIRONMENT_URL_PATTERN)
 
 
 def omnigent_link(base_url: str, session_id: str | None) -> str | None:
@@ -891,6 +897,10 @@ def _ready_text(
     if result is not None and result.get("head_sha") == head and result.get("summary"):
         lines += [str(result["summary"]).strip(), ""]  # the agent's Markdown, as written
     lines.append(f"**PR:** {url} (head `{head[:12]}`)")
+    dev_url = result.get("dev_environment_url") if result is not None else None
+    if isinstance(dev_url, str) and len(dev_url) <= 500 and _DEV_URL.fullmatch(dev_url):
+        # Only when the agent reported one: the factory never starts an environment.
+        lines.append(f"**Dev environment:** {dev_url}")
     summary = str(args.get("checks_summary") or checks_summary)
     lines.append(f"**CI:** {summary or 'required checks green'}")
     bot = str(args.get("review_bot") or "")
@@ -1388,7 +1398,7 @@ def _new_boundary() -> str:
 _FIRST_TEMPLATES = {
     SessionKind.TRIAGE: "triage-v10.txt",
     SessionKind.PLAN: "plan-v10.txt",
-    SessionKind.BUILD: "build-v14.txt",
+    SessionKind.BUILD: "build-v15.txt",
 }
 _RETRIAGE_TEMPLATE = "triage-feedback-v7.txt"
 #: The triage of an epic (an issue with sub-issues), first run and re-runs alike.
@@ -1400,14 +1410,14 @@ _AUTOPILOT_PLAN_TEMPLATE = "plan-autopilot-v3.txt"
 #: The plan run the factory started on a build's ``replan_required`` (its brief: what the
 #: build said must change).
 _REPLAN_TEMPLATE = "plan-replan-v1.txt"
-_REWORK_TEMPLATE = "build-rework-v11.txt"
+_REWORK_TEMPLATE = "build-rework-v12.txt"
 #: A rework the owner started by ticking Ready report items: its brief is those items.
-_ITEMS_REWORK_TEMPLATE = "build-rework-items-v2.txt"
+_ITEMS_REWORK_TEMPLATE = "build-rework-items-v3.txt"
 #: Readiness wakes of a waiting build run (red checks and other gaps; findings only).
-_READINESS_WAKE_TEMPLATE = "readiness-wake-v11.txt"
-_FINDINGS_WAKE_TEMPLATE = "readiness-findings-wake-v3.txt"
+_READINESS_WAKE_TEMPLATE = "readiness-wake-v12.txt"
+_FINDINGS_WAKE_TEMPLATE = "readiness-findings-wake-v4.txt"
 #: A rework run, or a wake of the waiting build run, for a merge conflict with the base.
-_CONFLICT_TEMPLATE = "build-conflict-v2.txt"
+_CONFLICT_TEMPLATE = "build-conflict-v3.txt"
 _CONFLICT_WAKE_TEMPLATE = "readiness-conflict-wake-v1.txt"
 
 

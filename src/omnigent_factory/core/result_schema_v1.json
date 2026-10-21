@@ -738,6 +738,11 @@
           "items": {
             "$ref": "#/$defs/split_out"
           }
+        },
+        "dev_environment_url": {
+          "type": "string",
+          "maxLength": 500,
+          "pattern": "^https?://[^\\s<>\"'`()\\[\\]@]+$"
         }
       }
     },

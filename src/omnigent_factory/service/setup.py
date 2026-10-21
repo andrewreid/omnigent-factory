@@ -122,6 +122,11 @@ session_retention_days = 30    # delete factory sessions archived this long (0 =
 review_rounds_default = 2      # review-bot rounds per issue when its field is empty
 follow_up_max_depth = 1        # a follow-up's own build files no further follow-ups
 auto_replan_limit = 1          # replans started by itself on a build's replan_required
+# Dev environment teardown (restart): run in the issue worktree before it is removed at
+# Done (PR merged or issue closed); exit 0 = done, else kept and retried. Empty = none.
+# devenv_teardown = ["scripts/dev-environment.sh", "--teardown"]
+devenv_teardown_timeout_seconds = 600
+devenv_teardown_max_attempts = 5
 # triage_guidance = "Classify work with the repo's area:* labels."
 # engineering_guidance = "Engineering conventions live in AGENTS.md."
 

@@ -1,0 +1,37 @@
+Factory rework run {run_id} for {repository} issue #{issue_number} on branch {branch}: the
+owner reviewed the built work (PR #{pr_number}) and gave feedback. Your Omnigent session
+id is {session_id}: pass it as session_id to every factory tool.
+{handoff}
+{base_note}
+Read factory_get_feedback: owner issue and PR comments and reviews, `new` ones first
+(an owner reply to your question answers it). Change the same branch and PR within the
+approved plan (factory_get_plan, hash {plan_hash}; echo it as plan_hash); beyond it, ask
+with factory_ask_owner.
+If the approved plan no longer fits current {base_ref}, submit "blocked" with the reason;
+never widen the scope to make it fit. If the owner's direction goes beyond the approved
+plan, submit "blocked" with replan_required (reason, changes: what the plan must change);
+the factory replans.
+Use only the factory git credential helper and gh wrapper {gh_wrapper} (capability handle
+{capability_file}). Never merge.
+Every review finding gets exactly one outcome: fix in this PR (a real defect in the plan's
+area with a small, local fix), follow-up (a real defect with real-world impact outside the
+plan or too large for this PR) or advisory (no realistic trigger here, style, threats not
+in play). Reply on the thread, then resolve it. Never open issues: list follow-ups and
+advisories in the result's deferred field; the factory files them. A follow-up issue
+defers nothing as a follow-up. Review rounds count across runs (factory_get_status
+review_rounds): from strict_from_round only real-impact P1s must be fixed, and once the
+budget is used up, do not ask the review bot again.
+Owner-directed separate work ("file the rest as an issue") goes in split_out (relation
+after_source if it comes after this issue, before_source if it must land first);
+the factory files it.
+Flaky CI: `gh run rerun <id> --failed`; never push an empty commit to retrigger CI.
+Finish with factory_submit_result (kind "build_ready", or "blocked"); if CI or bots are
+pending, submit current evidence and end the turn: you are woken. Dependencies: related
+depends_on/blocks; the factory links them on GitHub (never ask the owner).
+Summary: what changed, decisions; no CI or review-bot status and no deferred list (the
+factory reports both). Text is posted for a human: GitHub Markdown, short paragraphs, no
+internal labels or IDs (de_..., ef_...).
+Dev environment (never required): if you started one, keep it running through Ready and
+report its URL in dev_environment_url; do not tear it down when the PR opens: the factory
+tears it down when the issue is done.
+Active-time budget: {granted_minutes} minutes.

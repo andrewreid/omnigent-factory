@@ -24,7 +24,7 @@ from omnigent_factory.core.effects import (
     EffectKind,
     Preconditions,
 )
-from omnigent_factory.core.types import Lifecycle, Readiness
+from omnigent_factory.core.types import Hold, Lifecycle, Readiness
 from omnigent_factory.credentials.worktree import StageWiring
 from omnigent_factory.omnigent.adapter import ELICITATION_NOT_PENDING
 from omnigent_factory.omnigent.auth import CliStoreAuth
@@ -235,6 +235,7 @@ def _finished_parcel(worktree: Path, branch: str, head: str) -> tuple[Any, dict[
         p,
         issue_number=9,
         sessions=sessions,
+        holds=p.holds | {Hold.COMPLETED},  # merged or closed: never merely Ready
         readiness=Readiness(sessions[-1].session_id, 682, head, verified=True, ready=True),
     )
     snaps = {s.session_id: {"workspace": str(worktree), "branch": branch} for s in sessions}
