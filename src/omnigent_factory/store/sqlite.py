@@ -94,7 +94,8 @@ class FollowUpRow:
     origin: str
     #: Issues it must precede (each becomes "M blocked by this issue").
     blocks: tuple[int, ...]
-    #: Link actions done once: ``label``, ``parent``, ``blocks:<M>``.
+    #: Link actions done once: ``label``, ``parent``, ``blocks:<M>``; ``gave-up:parent``
+    #: also when GitHub refused the parent for good (``parent`` is then done too).
     done: frozenset[str]
     #: ``held`` (autopilot leaves it) or ``released`` (an owner removed the label).
     hold: str

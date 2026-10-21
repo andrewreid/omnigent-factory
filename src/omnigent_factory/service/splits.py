@@ -34,7 +34,7 @@ from functools import partial
 from typing import Any, TypeVar
 
 from omnigent_factory.core.types import Parcel
-from omnigent_factory.github.client import GitHubAPIError
+from omnigent_factory.github.client import GitHubAPIError, GraphQLErrors
 from omnigent_factory.github.links import add_sub_issue, read_target
 from omnigent_factory.service.deferred import find_marked_issue
 from omnigent_factory.service.links import NativeLinks
@@ -255,7 +255,7 @@ class Splits:
             _deprecated(source, split.relation)
         for action in pending:
             if action == "parent":
-                ok = await self._parent(number, source)
+                ok = await self._parent(split, number, source)
             elif action.startswith("blocks:"):
                 blocked = int(action.partition(":")[2])
                 ok = await self.links.link_status(blocked, number, source=source) != "failed"
@@ -273,8 +273,9 @@ class Splits:
                     )
                 )
 
-    async def _parent(self, number: int, source: int) -> bool:
-        """Join the source issue's epic (a parent already set is kept)."""
+    async def _parent(self, split: ds.SplitIssue, number: int, source: int) -> bool:
+        """Join the source issue's epic (a parent already set is kept). A parent GitHub
+        refuses for good (permanent GraphQL error) is given up once: ``gave-up:parent``."""
         owner, name = self._repo.partition("/")[::2]
         client = self.links.client
         repo_id = self._repo_id
@@ -289,6 +290,21 @@ class Splits:
             if epic is None:
                 return True
             await add_sub_issue(client, epic.node_id, target.node_id)
+        except GraphQLErrors as exc:
+            if not exc.permanent:
+                LOG.warning("split issue parent failed issue=#%s reason=%s", number, exc)
+                return False
+            LOG.warning("split issue parent given up issue=#%s reason=%s", number, exc)
+            await self._db(
+                partial(
+                    ds.mark_split_done,
+                    repo_id=repo_id,
+                    source_issue=source,
+                    item_key=split.item_key,
+                    action="gave-up:parent",
+                )
+            )
+            return True
         except GitHubAPIError as exc:
             LOG.warning("split issue parent failed issue=#%s reason=%s", number, exc)
             return False

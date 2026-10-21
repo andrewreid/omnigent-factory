@@ -42,6 +42,47 @@ class RateLimited(GitHubAPIError):
         return f"GitHub rate limit reached; retry in {self.retry_after_us}us"
 
 
+#: GraphQL error types worth retrying after a wait; any other error is permanent.
+_TRANSIENT_GRAPHQL_TYPES = frozenset({"RATE_LIMITED", "INTERNAL", "SERVICE_UNAVAILABLE", "TIMEOUT"})
+#: Message fragments of GitHub's untyped transient errors ("Something went wrong while
+#: executing your query. This may be the result of a timeout, ...").
+_TRANSIENT_GRAPHQL_MESSAGES = ("something went wrong", "timeout", "timed out", "rate limit")
+#: Characters kept per error message (a log line, not a body dump).
+_GRAPHQL_MESSAGE_MAX = 300
+
+
+@dataclass(frozen=True, slots=True)
+class GraphQLErrors(GitHubAPIError):
+    """A GraphQL response with ``errors``: (type, message) of each (type None: untyped)."""
+
+    errors: tuple[tuple[str | None, str], ...]
+
+    @property
+    def permanent(self) -> bool:
+        """Waiting will not help: no error is a rate limit, timeout or server failure."""
+        return not any(
+            kind in _TRANSIENT_GRAPHQL_TYPES
+            or any(part in message.lower() for part in _TRANSIENT_GRAPHQL_MESSAGES)
+            for kind, message in self.errors
+        )
+
+    def __str__(self) -> str:
+        details = "; ".join(
+            f"{kind}: {message}" if kind else message for kind, message in self.errors
+        )
+        return f"GitHub GraphQL request returned errors: {details or '?'}"
+
+
+def _graphql_errors(errors: object) -> GraphQLErrors:
+    found: list[tuple[str | None, str]] = []
+    for item in errors if isinstance(errors, list) else [errors]:
+        kind = item.get("type") if isinstance(item, dict) else None
+        message = item.get("message") if isinstance(item, dict) else item
+        text = " ".join(str(message or "").split())[:_GRAPHQL_MESSAGE_MAX]
+        found.append((str(kind) if isinstance(kind, str) else None, text))
+    return GraphQLErrors(tuple(found))
+
+
 @dataclass(frozen=True, slots=True)
 class RecoveredDelivery:
     """Recovered webhook metadata.
@@ -172,8 +213,10 @@ class GitHubClient:
             json_body={"query": query, "variables": dict(variables)},
         )
         data: Any = response.json()
-        if not isinstance(data, dict) or data.get("errors"):
-            raise GitHubAPIError("GitHub GraphQL request returned errors")
+        if not isinstance(data, dict):
+            raise GitHubAPIError("GitHub GraphQL response was not an object")
+        if data.get("errors"):
+            raise _graphql_errors(data["errors"])
         result = data.get("data")
         if not isinstance(result, dict):
             raise GitHubAPIError("GitHub GraphQL response omitted data")

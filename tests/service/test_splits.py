@@ -175,6 +175,29 @@ async def test_one_issue_per_split_with_provenance_epic_and_links_and_no_follow_
         assert await splits.section(parcel, "other-run") == ""
 
 
+async def test_a_split_parent_github_refuses_for_good_is_given_up_once(
+    service_config: ServiceConfig, caplog: pytest.LogCaptureFixture
+):
+    from tests.service.test_follow_ups import EPIC_FULL
+
+    caplog.set_level("INFO")
+    async with rig(service_config) as r:
+        r.repo.refuse["addSubIssue"] = EPIC_FULL
+        splits = splitter(r)
+        parcel = await r.parcel()  # issue #1, a sub-issue of epic #40
+        filed = await splits.record_result(parcel, "s1", result({**SPLIT, "relation": "none"}))
+        assert [s.issue_number for s in filed] == [100]
+        assert r.repo.refused == 1
+        stored = await r.service.db.call(
+            lambda s: ds.splits(s, repo_id=r.service.config.repo_id, source_issue=1)
+        )
+        assert {"parent", "gave-up:parent"} <= stored[0].done
+        assert stored[0].pending_links() == ()
+        assert "Parent cannot have more than 100 sub-issues" in caplog.text
+        await splits.retry_pending()
+        assert r.repo.refused == 1
+
+
 def links(r: Any) -> list[tuple[int, int]]:
     """The blocked-by links written: (blocked issue, blocking issue)."""
     return [w[1] for w in r.repo.writes if w[0] == "addBlockedBy"]

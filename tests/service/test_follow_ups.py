@@ -4,6 +4,7 @@ autopilot's hold with the owner's per-issue and per-epic overrides."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,7 +17,7 @@ from omnigent_factory.core.effects import RetryableReadFailure
 from omnigent_factory.core.events import EventKind
 from omnigent_factory.core.protocol import Correlation, ResultError, validate_result
 from omnigent_factory.core.types import IssueLinks, LinkedIssue
-from omnigent_factory.github.client import GitHubAPIError, GitHubRejected
+from omnigent_factory.github.client import GitHubAPIError, GitHubRejected, GraphQLErrors
 from omnigent_factory.ports.github import IssueRef, LabelEvent
 from omnigent_factory.service.config import ServiceConfig
 from omnigent_factory.service.follow_ups import (
@@ -116,6 +117,9 @@ class FakeGitHubClient:
     repo_labels: set[str] = field(default_factory=set)
     writes: list[tuple[str, Any]] = field(default_factory=list)
     fail: set[str] = field(default_factory=set)
+    #: Mutation name -> the error GitHub answers it with (counted in ``refused``).
+    refuse: dict[str, GitHubAPIError] = field(default_factory=dict)
+    refused: int = 0
 
     def _by_id(self, node: object) -> dict[str, Any]:
         return next(i for i in self.issues.values() if i["id"] == node)
@@ -125,6 +129,9 @@ class FakeGitHubClient:
             name = "addSubIssue" if "addSubIssue" in query else "addBlockedBy"
             if name in self.fail:
                 raise GitHubAPIError(f"{name} failed")
+            if name in self.refuse:
+                self.refused += 1
+                raise self.refuse[name]
             if name == "addSubIssue":
                 parent, sub = self._by_id(variables["parent"]), self._by_id(variables["sub"])
                 sub["parent"] = parent["number"]
@@ -283,6 +290,81 @@ async def test_linking_survives_a_failure_and_restart_without_redoing_or_undoing
         client.issues[905] = gh_issue(905, parent=999)
         await restarted.record_reported(747, result_with({"issue": 905}))
         assert ("addSubIssue", (878, 905)) not in client.writes
+
+
+#: GitHub's answer to ``addSubIssue`` on an epic already at its 100 sub-issues.
+EPIC_FULL = GraphQLErrors((("UNPROCESSABLE", "Parent cannot have more than 100 sub-issues"),))
+
+
+async def test_a_parent_github_refuses_for_good_is_given_up_once_and_stays_given_up(
+    service_config: ServiceConfig, caplog: pytest.LogCaptureFixture
+):
+    # timesheets #1113/#1115/#1118/#1123: epic #878 was full; the factory retried each
+    # parent forever, logging only "GitHub GraphQL request returned errors".
+    caplog.set_level("INFO")
+    async with rig(on(service_config), history()) as r:
+        client = FakeGitHubClient(
+            {878: gh_issue(878), 1020: gh_issue(1020, parent=878), 1113: gh_issue(1113)},
+            repo_labels={FOLLOW_UP_LABEL},
+            refuse={"addSubIssue": EPIC_FULL},
+        )
+        follow = tracker(r.service, client)
+        await follow.record_reported(1020, result_with({"issue": 1113}))
+        assert client.refused == 1
+        stored = await row(r.service, 1113)
+        assert stored is not None and stored.pending() == ()
+        assert {"parent", "gave-up:parent"} <= stored.done
+        given_up = [m for m in caplog.messages if "follow-up parent given up" in m]
+        assert given_up == [
+            "follow-up parent given up issue=#1113 epic=#878 source=#1020 reason=GitHub "
+            "GraphQL request returned errors: UNPROCESSABLE: Parent cannot have more than "
+            "100 sub-issues"
+        ]
+        # Retries and a restart never ask again.
+        assert await follow.retry_pending() == 0
+        assert await tracker(r.service, client).retry_pending() == 0
+        assert client.refused == 1
+        assert not [m for m in caplog.messages if "follow-up parent failed" in m]
+
+
+async def test_a_transient_parent_error_is_retried_with_a_bounded_backoff(
+    service_config: ServiceConfig, caplog: pytest.LogCaptureFixture, monkeypatch: Any
+):
+    caplog.set_level("INFO")
+    now = [1000.0]
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    async with rig(on(service_config), history()) as r:
+        client = FakeGitHubClient(
+            {878: gh_issue(878), 747: gh_issue(747, parent=878), 904: gh_issue(904)},
+            repo_labels={FOLLOW_UP_LABEL},
+            refuse={
+                "addSubIssue": GraphQLErrors(
+                    ((None, "Something went wrong while executing your query."),)
+                )
+            },
+        )
+        follow = tracker(r.service, client)
+        await follow.record_reported(747, result_with({"issue": 904}))
+        assert client.refused == 1
+        assert "Something went wrong" in caplog.text  # the message, not just "errors"
+        await follow.retry_pending()  # inside the first minute: not asked again
+        assert client.refused == 1
+        delays = []
+        for _ in range(9):
+            due = follow._backoff[904][0]
+            delays.append(due - now[0])
+            now[0] = due
+            await follow.retry_pending()
+        assert delays == [60, 120, 240, 480, 960, 1920, 3600, 3600, 3600]
+        assert client.refused == 10
+        stored = await row(r.service, 904)
+        assert stored is not None and stored.pending() == ("parent",)
+        client.refuse.clear()
+        now[0] = follow._backoff[904][0]
+        assert await follow.retry_pending() == 1
+        assert 904 not in follow._backoff
+        assert ("addSubIssue", (878, 904)) in client.writes
 
 
 async def test_a_follow_up_of_an_issue_outside_any_epic_is_labelled_only(

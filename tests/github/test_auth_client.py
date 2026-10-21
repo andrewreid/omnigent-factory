@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from omnigent_factory.core.effects import CredentialProfile
 from omnigent_factory.github.auth import AppAuthenticator, InstallationTokenService
-from omnigent_factory.github.client import GitHubClient, RateLimited
+from omnigent_factory.github.client import GitHubClient, GraphQLErrors, RateLimited
 from omnigent_factory.ports.credentials import TokenGrant, TokenRefusal
 
 
@@ -229,6 +229,51 @@ async def test_pagination_follows_every_link_and_authenticates():
     assert all(
         request.headers["authorization"] == "Bearer installation-token" for request in requests
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("errors", "permanent", "shown"),
+    [
+        (
+            [{"type": "UNPROCESSABLE", "message": "Parent cannot have more than 100 sub-issues"}],
+            True,
+            "UNPROCESSABLE: Parent cannot have more than 100 sub-issues",
+        ),
+        ([{"type": "NOT_FOUND", "message": "Could not resolve"}], True, "NOT_FOUND: Could"),
+        ([{"message": "Sub issue may only have one parent"}], True, "may only have one parent"),
+        ([{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}], False, "RATE_LIMITED"),
+        (
+            [{"message": "Something went wrong while executing your query. Timeout."}],
+            False,
+            "Something went wrong",
+        ),
+        ([{"type": "FORBIDDEN", "message": "x"}, {"type": "INTERNAL", "message": "y"}], False, "x"),
+    ],
+)
+async def test_graphql_errors_carry_githubs_message_and_whether_waiting_helps(
+    errors, permanent, shown
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": None, "errors": errors})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        with pytest.raises(GraphQLErrors) as raised:
+            await GitHubClient(http, "token").graphql("mutation { x }", {})
+    assert raised.value.permanent is permanent
+    assert str(raised.value).startswith("GitHub GraphQL request returned errors: ")
+    assert shown in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_a_graphql_error_message_is_bounded():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"errors": [{"message": "a\n" + "b" * 5000}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        with pytest.raises(GraphQLErrors) as raised:
+            await GitHubClient(http, "token").graphql("query { x }", {})
+    assert raised.value.errors == ((None, "a " + "b" * 298),)
 
 
 @pytest.mark.asyncio

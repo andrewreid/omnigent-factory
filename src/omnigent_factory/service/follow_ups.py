@@ -7,7 +7,10 @@ dependencies it names, and wait for the owner before epic autopilot builds them.
   the native link "M blocked by F"; F gets the repository label ``follow-up`` (created when
   absent); and when the source issue S has a parent epic and F has none, F becomes a
   sub-issue of that epic. Each action is done once and logged; one that failed is retried
-  after each board diff and at start. An owner's later undo (label removed, parent or
+  after board diffs and at start, backing off per issue (1 minute doubling to 1 hour). A
+  parent GitHub refuses for good (a permanent GraphQL error, e.g. an epic already at its
+  sub-issue limit) is given up: logged once with GitHub's message and recorded
+  (``gave-up:parent``), never retried. An owner's later undo (label removed, parent or
   link changed) is never redone.
 * **Detected (backstop).** An issue opened by the factory bot (the agent's gh wrapper runs
   as the bot) while some issue's run is open, whose body names that issue, is recorded as
@@ -40,7 +43,7 @@ from omnigent_factory.core.codec import parcel_from_json
 from omnigent_factory.core.effects import RetryableReadFailure
 from omnigent_factory.core.predicates import run_closed
 from omnigent_factory.core.types import MICROS_PER_SECOND, Parcel
-from omnigent_factory.github.client import GitHubAPIError
+from omnigent_factory.github.client import GitHubAPIError, GraphQLErrors
 from omnigent_factory.github.links import (
     LinkTarget,
     add_label,
@@ -60,6 +63,11 @@ T = TypeVar("T")
 FOLLOW_UP_LABEL = "follow-up"
 BUILD_FOLLOW_UPS_LABEL = "factory:build-follow-ups"
 _LABEL_DESCRIPTION = "Filed by the factory during another issue's run"
+#: Retry delay after a failed link (doubling per failure up to the cap), in seconds.
+RETRY_BASE_SECONDS = 60.0
+RETRY_MAX_SECONDS = 3600.0
+#: Done-set marker of an action given up for good (its action is marked done too).
+GAVE_UP = "gave-up:"
 #: Hidden markers the factory writes into issues it creates itself (human gates, ...).
 FACTORY_MARKER = "<!-- factory-"
 
@@ -146,6 +154,8 @@ class FollowUps:
         self._locks: dict[int, asyncio.Lock] = {}
         #: Card labels last checked per parcel (the same labels need no second read).
         self._settled: dict[str, tuple[str, ...]] = {}
+        #: Issue -> (loop time of its next retry, failures in a row) after a failed link.
+        self._backoff: dict[int, tuple[float, int]] = {}
 
     @property
     def _repo(self) -> str:
@@ -210,10 +220,22 @@ class FollowUps:
         repo_id = self.service.config.repo_id
         rows: list[FollowUpRow] = await self._db(lambda store: store.follow_ups(repo_id))
         complete = 0
+        now = asyncio.get_running_loop().time()
         for row in rows:
-            if row.pending():
+            due = self._backoff.get(row.issue_number)
+            if row.pending() and (due is None or due[0] <= now):
                 complete += int(await self.link(row.issue_number))
         return complete
+
+    def _after(self, number: int, ok: bool) -> bool:
+        """Note a link attempt's outcome for :meth:`retry_pending`'s backoff."""
+        if ok:
+            self._backoff.pop(number, None)
+            return True
+        failures = self._backoff.get(number, (0.0, 0))[1] + 1
+        delay = min(RETRY_BASE_SECONDS * 2 ** (failures - 1), RETRY_MAX_SECONDS)
+        self._backoff[number] = (asyncio.get_running_loop().time() + delay, failures)
+        return False
 
     async def link(self, number: int) -> bool:
         """Do the follow-up's pending link actions (blocks, label, parent), each once.
@@ -231,7 +253,7 @@ class FollowUps:
                 target = await read_target(client, owner, name, number, repo_id)
             except GitHubAPIError as exc:
                 LOG.warning("follow-up read failed issue=#%s reason=%s", number, exc)
-                return False
+                return self._after(number, False)
             left = 0
             for action in row.pending():
                 if target is None:
@@ -262,7 +284,7 @@ class FollowUps:
                     )
                 else:
                     left += 1
-            return left == 0
+            return self._after(number, left == 0)
 
     async def _label(self, row: FollowUpRow, target: LinkTarget) -> bool:
         number = row.issue_number
@@ -292,6 +314,7 @@ class FollowUps:
         owner, name = self._repo.partition("/")[::2]
         client = self.links.client
         repo_id = self.service.config.repo_id
+        epic_number: int | None = None
         try:
             origin = await read_target(client, owner, name, source, repo_id)
             if origin is None or origin.parent is None:
@@ -299,10 +322,31 @@ class FollowUps:
                     "follow-up parent: source has no epic issue=#%s source=#%s", number, source
                 )
                 return True
-            epic = await read_target(client, owner, name, origin.parent, repo_id)
+            epic_number = origin.parent
+            epic = await read_target(client, owner, name, epic_number, repo_id)
             if epic is None:
                 return True
             await add_sub_issue(client, epic.node_id, target.node_id)
+        except GraphQLErrors as exc:
+            if not exc.permanent:
+                LOG.warning("follow-up parent failed issue=#%s reason=%s", number, exc)
+                return False
+            LOG.warning(
+                "follow-up parent given up issue=#%s epic=#%s source=#%s reason=%s",
+                number,
+                epic_number or "?",
+                source,
+                exc,
+            )
+            await self._db(
+                partial(
+                    SqliteStore.mark_follow_up_done,
+                    repo_id=repo_id,
+                    issue_number=number,
+                    action=f"{GAVE_UP}parent",
+                )
+            )
+            return True
         except GitHubAPIError as exc:
             LOG.warning("follow-up parent failed issue=#%s reason=%s", number, exc)
             return False
@@ -539,6 +583,7 @@ def _time_us(value: object) -> int:
 __all__ = [
     "BUILD_FOLLOW_UPS_LABEL",
     "FOLLOW_UP_LABEL",
+    "GAVE_UP",
     "FollowUps",
     "epic_override",
     "follow_up_hold",
