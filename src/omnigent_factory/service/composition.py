@@ -79,6 +79,7 @@ from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.service.session_retention import SessionRetention
 from omnigent_factory.service.splits import Splits
 from omnigent_factory.service.tokens import DaemonTokenProvider
+from omnigent_factory.service.worktree_gc import WorktreeGC, github_issue_states
 
 LOG = logging.getLogger(__name__)
 
@@ -506,8 +507,17 @@ async def build_production(
         config.worktree_root,
         teardown=config.devenv_teardown,
         teardown_timeout_seconds=config.devenv_teardown_timeout_seconds,
+        base_branch=config.default_branch,
     )
     service.workspace_cleaner = cleaner
+    worktree_gc = WorktreeGC(
+        service,
+        cleaner,
+        workspaces,
+        partial(github_issue_states, github.client, config.repository),
+    )
+    service.worktree_gc = worktree_gc
+    service.config_listeners.append(worktree_gc.reloaded)
     processor = GitHubDeliveryProcessor(service, normalizer, github, clock)
 
     async def note_owner_field(body: bytes) -> None:
@@ -526,7 +536,7 @@ async def build_production(
             CleanupAdapter(cleaner, max_teardown_attempts=config.devenv_teardown_max_attempts),
         ),
         delivery_processor=processor,
-        managed=(runtime, sweep),
+        managed=(runtime, sweep, worktree_gc),
     )
     return ProductionComposition(
         service,

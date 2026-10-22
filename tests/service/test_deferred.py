@@ -611,12 +611,12 @@ async def test_the_admitted_rework_is_briefed_with_exactly_the_ticked_items(
         directory = ServiceDispatchDirectory(r.service.db, r.service.config)
         directory.rework_brief = r.deferred.rework_brief
         snapshot = await directory._make_snapshot(parcel, run)
-        assert snapshot["template"] == "build-rework-items-v3.txt"
+        assert snapshot["template"] == "build-rework-items-v4.txt"
         assert snapshot["brief"].startswith("- Fix the P1 finding in `api/src/retry.ts`")
         assert "Retry leaks" not in snapshot["brief"]  # FU_A was not ticked
         # A rework from an ordinary owner comment keeps the ordinary template.
         directory.rework_brief = None
-        assert (await directory._make_snapshot(parcel, run))["template"] == ("build-rework-v12.txt")
+        assert (await directory._make_snapshot(parcel, run))["template"] == ("build-rework-v13.txt")
 
 
 async def test_a_crash_before_the_follow_up_issue_update_is_finished_after_restart(

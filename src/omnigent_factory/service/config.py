@@ -79,6 +79,9 @@ HOT_RELOAD_KEYS = frozenset(
         "review_rounds_default",
         "follow_up_max_depth",
         "auto_replan_limit",
+        "worktree_sweep_interval_hours",
+        "idle_worktree_days",
+        "clone_gc_interval_days",
     }
 )
 
@@ -357,6 +360,15 @@ class ServiceConfig(BaseModel):
     #: Failed teardowns of one worktree before the cleanup stops retrying (the worktree is
     #: kept; ``cleanup`` by hand runs the teardown again).
     devenv_teardown_max_attempts: int = Field(default=5, ge=1, le=50)
+    #: Worktree housekeeping (``service.worktree_gc``): hours between sweeps of the
+    #: worktrees under ``worktree_root`` (closed issues cleaned up, idle early-stage
+    #: worktrees removed). 0: no sweep.
+    worktree_sweep_interval_hours: float = Field(default=24.0, ge=0, le=24 * 365)
+    #: An Inbox/Triage/Planning worktree untouched this long, with no work of its own, is
+    #: removed by the sweep (the next stage run recreates it). 0: never.
+    idle_worktree_days: float = Field(default=7.0, ge=0, le=365)
+    #: Days between ``git worktree prune`` + ``git gc --auto`` on the source clone. 0: never.
+    clone_gc_interval_days: float = Field(default=7.0, ge=0, le=365)
 
     @field_validator("owners")
     @classmethod

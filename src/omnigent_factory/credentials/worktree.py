@@ -205,6 +205,7 @@ def _run(
     check: bool = True,
     git: str = "git",
     env: Mapping[str, str] | None = None,
+    timeout: float = 120,
 ) -> subprocess.CompletedProcess[str]:
     for delay in (*LOCK_RETRY_DELAYS_S, None):
         proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
@@ -213,7 +214,7 @@ def _run(
             env=dict(env) if env is not None else git_env(),
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=timeout,
             check=False,
         )
         if proc.returncode == 0 or delay is None or not git_lock_busy(proc.stderr):
@@ -864,10 +865,42 @@ class Workspaces:
         args = ["worktree", "remove", *(["--force"] if force else []), str(resolved)]
         self._git(args, self.source_clone)
 
+    def commits_ahead(self, path: Path, base_branch: str = "main") -> int:
+        """Commits on HEAD that the last fetched ``origin/<base>`` lacks (no fetch)."""
+        out = self._git(["rev-list", "--count", f"refs/remotes/origin/{base_branch}..HEAD"], path)
+        return int(out or 0)
+
+    def last_touched(self, path: Path) -> float:
+        """Newest mtime (epoch seconds) of the worktree directory and its own Git index,
+        HEAD and HEAD reflog: when anything last checked out, committed or staged there.
+        Read before any ``git status`` (which may rewrite the index)."""
+        admin = self.admin_dir(path)
+        times = []
+        for item in (path, admin / "index", admin / "HEAD", admin / "logs" / "HEAD"):
+            try:
+                times.append(item.stat().st_mtime)
+            except OSError:
+                continue
+        return max(times, default=0.0)
+
     @_clone_write
-    def delete_branch(self, branch: str) -> None:
-        """Delete a local factory branch of the dedicated clone that no worktree uses."""
-        if not branch.startswith("factory/"):
+    def maintain_clone(self, *, timeout: float = 1800) -> None:
+        """``git worktree prune`` and ``git gc --auto`` on the dedicated clone (under
+        :data:`CLONE_LOCK`, so no worktree is created meanwhile)."""
+        self._git(["worktree", "prune"], self.source_clone)
+        _run(
+            ["gc", "--auto", "--quiet"],
+            self.source_clone,
+            git=self.git,
+            env=self.inspection_env,
+            timeout=timeout,
+        )
+
+    @_clone_write
+    def delete_branch(self, branch: str, *, any_branch: bool = False) -> None:
+        """Delete a local factory branch of the dedicated clone that no worktree uses
+        (``any_branch``: any local branch, for one a removed extra worktree used)."""
+        if not any_branch and not branch.startswith("factory/"):
             raise WorktreeError("only factory branches may be deleted")
         if any(b == branch for _, b in self.worktrees()):
             raise WorktreeError("branch is checked out in a worktree")

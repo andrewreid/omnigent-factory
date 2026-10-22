@@ -470,14 +470,14 @@ waits up to 90 s for it instead of failing.
 
 | Command | What it does |
 |---|---|
-| `status` | Readiness, pause state, building count/cap with the running and parked builds, queue, pending/unknown effects, parked deliveries, and the [health sweep](#health-sweep-and-stalled-runs): Omnigent state, breaker, nudges last sweep and each open run's state and stall episode. |
-| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. It also reads the configured agent's bundle (through its newest session, or the `--live` probe) and fails naming any factory MCP tool the agent's `tools:` allowlist for the factory server leaves out (a warning when the bundle cannot be read). It warns when the App installation is not subscribed to `push` (tick Push in the App settings) or to `sub_issues`/`issue_dependencies` (Sub issues, Issue dependencies), when the subscribed events can be read, and when the repository has no `Epic` issue type (epics are then not typed). It fails when Omnigent's own `/health` is not ok and warns when the configured host is offline. |
+| `status` | Readiness, pause state, building count/cap with the running and parked builds, queue, pending/unknown effects, parked deliveries, the [health sweep](#health-sweep-and-stalled-runs): Omnigent state, breaker, nudges last sweep and each open run's state and stall episode, and [worktree housekeeping](#worktree-housekeeping): worktree count, settings, last sweep (with its result) and last gc. |
+| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. It also reads the configured agent's bundle (through its newest session, or the `--live` probe) and fails naming any factory MCP tool the agent's `tools:` allowlist for the factory server leaves out (a warning when the bundle cannot be read). It warns when the App installation is not subscribed to `push` (tick Push in the App settings) or to `sub_issues`/`issue_dependencies` (Sub issues, Issue dependencies), when the subscribed events can be read, and when the repository has no `Epic` issue type (epics are then not typed). It fails when Omnigent's own `/health` is not ok and warns when the configured host is offline. It shows the worktree count under `worktree_root` and the last worktree sweep and clone gc times. |
 | `explain <parcel>` | The parcel's persisted state: stage, bot, sessions, holds, effects, the current run's stall episode (`stall`) and what the last health sweep made of it. |
 | `recovery` | Failed/unknown effects and parked webhook deliveries. |
 | `retry-effect <effect_id>` | Requeue a failed/unknown `publish_triage`/`publish_report`/`post_comment`; it adopts an existing comment by its marker, so it never duplicates. |
 | `rerender-comment <effect_id>` | Re-render a published comment in place (found by its marker). |
 | `resume <parcel> --message-file note.md` | Re-open the parcel's existing stage session after a stale block and relay one operator note. No authority, approval or time is added. |
-| `cleanup <parcel> [--merged]` | Tear down the dev environment (`devenv_teardown`) and remove the factory worktree(s) and local `factory/` branch of a finished parcel (PR merged, issue closed or Done; refused for a Ready card) from the factory clone. |
+| `cleanup <parcel> [--merged]` | Tear down the dev environment (`devenv_teardown`) and remove the factory worktree(s) (its own and its `factory-issue-<N>-*` extras) and local branches of a finished parcel (PR merged, issue closed or Done; refused for a Ready card) from the factory clone. |
 | `release-delivery <guid>` | Release one parked webhook delivery for processing. |
 | `pause` / `unpause` | Stop / resume admitting new work repository-wide; in-flight parcels and safety events carry on. |
 | `auto-triage status` | Idle-time auto-triage: enabled (and whether config or the CLI decides), today's used/limit/granted, idle or what keeps it busy, triage slots, the next candidate. |
@@ -494,7 +494,7 @@ waits up to 90 s for it instead of failing.
 | `sessions prune [--dry-run]` | Delete (or list) the factory sessions session retention would remove now (through the daemon). |
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, `review_rounds_default`, `follow_up_max_depth`, `auto_replan_limit`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `session_retention_days` and the health sweep settings; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, `review_rounds_default`, `follow_up_max_depth`, `auto_replan_limit`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `session_retention_days`, the health sweep settings and `worktree_sweep_interval_hours`, `idle_worktree_days`, `clone_gc_interval_days`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.
@@ -806,10 +806,14 @@ Clean syncs (an owner "Update branch" with no conflict seen) keep the review as 
 A Ready card keeps its worktree, and any dev environment the agent started in it, so the
 owner can review the work; a rework reuses the same worktree. When a parcel's PR is merged
 or its issue is closed (by webhook or a later read), the daemon removes its worktree and
-local branch once every stage session has retired. Only paths under `worktree_root` are
-touched; a worktree with uncommitted changes is kept unless the PR is merged; the local
-branch is deleted only when the PR is merged or its tip is the verified Ready head.
-Skipped items are logged. `cleanup` runs the same step by hand (never for a Ready card).
+local branch once every stage session has retired, together with every extra worktree
+under `worktree_root` named `factory-issue-<N>-<suffix>` (the build and rework
+instructions tell the agent that extra worktrees for parallel subtasks go there, under
+that name, never in `/tmp`) and the extra's local branch unless another worktree has it
+checked out. Only paths under `worktree_root` are touched; a worktree with uncommitted
+changes is kept unless the PR is merged; the issue's own branch is deleted only when the
+PR is merged or its tip is the verified Ready head. Each removal is logged at INFO with
+its path and reason; skipped items are logged. `cleanup` runs the same step by hand (never for a Ready card).
 
 **Dev environments.** The factory never starts one, and no stage needs one. The build,
 rework and readiness instructions tell the agent: if it started one, keep it running
@@ -836,6 +840,45 @@ up with a warning and `cleanup` by hand runs the teardown again. A successful te
 marked there too, so a restart between the teardown and the removal does not run it
 twice; the effect and `cleanup` never run at once. The card's Done state never waits
 for any of this.
+
+### Worktree housekeeping
+
+Worktrees the Done cleanup cannot see (issues closed before it existed, or while the
+daemon was down) and idle early-stage worktrees are swept periodically; the factory
+recreates a missing worktree before it creates or prepares a stage session, so removing
+an idle one only costs the next stage a `git worktree add`.
+
+```toml
+worktree_sweep_interval_hours = 24  # sweep of worktrees under worktree_root (0 = off)
+idle_worktree_days = 7              # idle Inbox/Triage/Planning worktree removal (0 = never)
+clone_gc_interval_days = 7          # git worktree prune + gc --auto on the clone (0 = never)
+```
+
+All three are hot-reloadable. The sweep lists the clone's registered worktrees under
+`worktree_root` and takes the issue number from the directory name (`factory-issue-<N>`
+or `factory-issue-<N>-<suffix>`); a worktree without one is logged and kept. One batched
+GitHub read (100 issues per query) gives each issue's state:
+
+* **Closed issue:** the Done cleanup above (teardown first; a failed teardown keeps the
+  worktree until a later sweep). A dirty worktree is force-removed only when the factory
+  recorded the PR as merged; otherwise it is kept and logged.
+* **Open issue, card in Inbox, Triage or Planning:** a worktree nothing has touched for
+  `idle_worktree_days` (newest mtime of the directory and its Git index, HEAD and HEAD
+  reflog) is removed with its branch after the teardown, but only when it is clean and its
+  branch has no commits beyond `origin/main`; otherwise it is kept and logged.
+
+An issue with a starting, running or draining stage session, a stage run about to start,
+an effect of unknown outcome, or a Ready card the factory has not yet seen finished is
+never touched. Each removal re-checks the issue's record while holding the clone lock,
+so a stage run that starts during a teardown keeps its worktree. If the GitHub read
+fails, closed issues wait for the next sweep (idle removal still runs).
+
+Every `clone_gc_interval_days` the daemon runs `git worktree prune` and `git gc --auto` on
+the source clone, holding the same clone lock as worktree creation. The last sweep and
+gc times are stored in the clone (`.git/omnigent-factory-maintenance.json`), so a restart
+does not re-run them early; a missing file means both run soon after startup. `status`
+shows the worktree count, the settings, the last sweep and its result and the last gc;
+`doctor` shows the count and both times.
 
 ### Reconciliation and observation load
 

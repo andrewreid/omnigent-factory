@@ -127,6 +127,9 @@ auto_replan_limit = 1          # replans started by itself on a build's replan_r
 # devenv_teardown = ["scripts/dev-environment.sh", "--teardown"]
 devenv_teardown_timeout_seconds = 600
 devenv_teardown_max_attempts = 5
+worktree_sweep_interval_hours = 24  # closed-issue and idle worktree sweep (0 = off)
+idle_worktree_days = 7         # remove untouched Inbox/Triage/Planning worktrees (0 = never)
+clone_gc_interval_days = 7     # git worktree prune + gc --auto on the clone (0 = never)
 # triage_guidance = "Classify work with the repo's area:* labels."
 # engineering_guidance = "Engineering conventions live in AGENTS.md."
 

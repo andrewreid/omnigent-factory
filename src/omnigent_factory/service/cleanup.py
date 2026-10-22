@@ -16,6 +16,13 @@ outbox effect, so a restart keeps it) until ``devenv_teardown_max_attempts`` fai
 counted in the worktree's own Git directory. A marker there records a teardown that
 succeeded, so a restart between the teardown and the removal does not run it again;
 both files go with the worktree.
+
+The issue's worktrees are its recorded one and every registered worktree under
+``worktree_root`` named ``factory-issue-<N>`` or ``factory-issue-<N>-<suffix>`` (extra
+worktrees the agent made for parallel subtasks); an extra one's local branch is deleted
+with it unless another worktree has it checked out. The housekeeping sweep
+(``service.worktree_gc``) runs the same cleanup for closed issues and removes idle
+early-stage worktrees through :meth:`WorkspaceCleaner.remove_idle`.
 """
 
 from __future__ import annotations
@@ -24,10 +31,11 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import signal
 import subprocess
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +49,7 @@ from omnigent_factory.core.effects import (
     RetryableReadFailure,
 )
 from omnigent_factory.core.types import Hold, Lifecycle, Parcel, Stage
-from omnigent_factory.credentials.worktree import Workspaces, WorktreeError
+from omnigent_factory.credentials.worktree import CLONE_LOCK, Workspaces, WorktreeError
 from omnigent_factory.ports.workspace import WORKSPACE_EFFECT_KINDS
 from omnigent_factory.service.directory import ServiceDispatchDirectory
 
@@ -55,6 +63,17 @@ TEARDOWN_FAILURES = "omnigent-factory-devenv-teardown-failures"
 #: A failed teardown's cleanup is retried after this long.
 TEARDOWN_RETRY_US = 300_000_000
 _REASON_CHARS = 200
+#: The directory name of an issue's own worktree or one of its extra worktrees.
+_ISSUE_NAME = re.compile(r"factory-issue-(\d+)(?:-.+)?")
+
+#: Called under the clone lock right before a removal: None to go ahead, else why not.
+Guard = Callable[[], str | None]
+
+
+def issue_of(name: str) -> int | None:
+    """The issue number in a factory worktree directory name (None: not one)."""
+    match = _ISSUE_NAME.fullmatch(name)
+    return int(match.group(1)) if match else None
 
 
 class NotSettled(RuntimeError):
@@ -79,12 +98,14 @@ class WorkspaceCleaner:
         *,
         teardown: Sequence[str] = (),
         teardown_timeout_seconds: float = 600.0,
+        base_branch: str = "main",
     ) -> None:
         self.directory = directory
         self.workspaces = workspaces
         self.worktree_root = worktree_root.resolve()
         self.teardown = tuple(teardown)
         self.teardown_timeout_seconds = teardown_timeout_seconds
+        self.base_branch = base_branch
         # The effect and the operator's ``cleanup`` never tear one worktree down at once.
         self._lock = threading.Lock()
 
@@ -101,6 +122,9 @@ class WorkspaceCleaner:
     def _locked_cleanup(self, parcel: Parcel, merged: bool) -> dict[str, JsonValue]:
         with self._lock:
             return self._cleanup(parcel, merged)
+
+    def under_root(self, path: Path) -> bool:
+        return self.worktree_root in path.parents
 
     def _candidates(self, parcel: Parcel) -> tuple[set[Path], set[str]]:
         paths: set[Path] = set()
@@ -119,23 +143,69 @@ class WorkspaceCleaner:
 
     def _cleanup(self, parcel: Parcel, merged: bool) -> dict[str, JsonValue]:
         paths, branches = self._candidates(parcel)
+        ready_head = parcel.readiness.head_sha if parcel.readiness is not None else None
+        return self._clean(
+            parcel.issue_number,
+            paths,
+            branches,
+            merged=merged,
+            ready_head=ready_head,
+            label=f"parcel={parcel.parcel_id}",
+            reason="done",
+        )
+
+    def clean_closed(
+        self, issue: int, parcel: Parcel | None, *, merged: bool, guard: Guard | None = None
+    ) -> dict[str, JsonValue]:
+        """The Done cleanup for a closed issue the sweep found (with or without a record)."""
+        with self._lock:
+            if parcel is not None:
+                paths, branches = self._candidates(parcel)
+                ready = parcel.readiness.head_sha if parcel.readiness is not None else None
+            else:
+                paths, branches, ready = set(), {f"factory/issue-{issue}"}, None
+            return self._clean(
+                issue,
+                paths,
+                branches,
+                merged=merged,
+                ready_head=ready,
+                label=f"issue=#{issue}",
+                reason="issue closed",
+                guard=guard,
+            )
+
+    def _clean(
+        self,
+        issue: int | None,
+        paths: set[Path],
+        branches: set[str],
+        *,
+        merged: bool,
+        ready_head: str | None,
+        label: str,
+        reason: str,
+        guard: Guard | None = None,
+    ) -> dict[str, JsonValue]:
         removed: list[JsonValue] = []
         skipped: list[JsonValue] = []
         deleted: list[JsonValue] = []
         pending: list[JsonValue] = []
+        extra_branches: set[str] = set()
         failures = 0
         for path, branch in self.workspaces.worktrees():
-            if path not in paths and branch not in branches:
+            named = issue is not None and self.under_root(path) and issue_of(path.name) == issue
+            if path not in paths and branch not in branches and not named:
                 continue
-            if self.worktree_root not in path.parents:
+            if not self.under_root(path):
                 skipped.append(f"{path}: outside worktree_root")
                 continue
             failed = self._teardown(path)
             if failed is not None:
-                count, reason = failed
+                count, why = failed
                 failures = max(failures, count)
                 pending.append(str(path))
-                skipped.append(f"{path}: dev environment teardown failed: {reason}")
+                skipped.append(f"{path}: dev environment teardown failed: {why}")
                 if branch is not None:
                     branches.discard(branch)  # still checked out; the retry deletes it
                 continue
@@ -144,14 +214,22 @@ class WorkspaceCleaner:
                 self._forget_teardown(path)  # kept: a later cleanup tears down again
                 skipped.append(f"{path}: uncommitted changes")
                 continue
-            try:
-                self.workspaces.remove_worktree(path, force=merged or not clean)
-            except WorktreeError as exc:
-                self._forget_teardown(path)
-                skipped.append(f"{path}: {exc}")
-                continue
+            with CLONE_LOCK:
+                why_not = guard() if guard is not None else None
+                if why_not is not None:
+                    self._forget_teardown(path)
+                    skipped.append(f"{path}: {why_not}")
+                    continue
+                try:
+                    self.workspaces.remove_worktree(path, force=merged or not clean)
+                except WorktreeError as exc:
+                    self._forget_teardown(path)
+                    skipped.append(f"{path}: {exc}")
+                    continue
+            LOG.info("worktree removed path=%s reason=%s %s", path, reason, label)
             removed.append(str(path))
-        ready_head = parcel.readiness.head_sha if parcel.readiness is not None else None
+            if branch is not None and branch not in branches:
+                extra_branches.add(branch)
         for branch in sorted(branches):
             tip = self.workspaces.branch_tip(branch)
             if tip is None:
@@ -159,15 +237,14 @@ class WorkspaceCleaner:
             if not (merged or (ready_head is not None and tip == ready_head)):
                 skipped.append(f"{branch}: not merged and not the verified Ready head")
                 continue
-            try:
-                self.workspaces.delete_branch(branch)
-            except WorktreeError as exc:
-                skipped.append(f"{branch}: {exc}")
-                continue
-            deleted.append(branch)
+            if self._delete_branch(branch, reason, label, skipped, any_branch=False):
+                deleted.append(branch)
+        for branch in sorted(extra_branches - {self.base_branch}):
+            if self._delete_branch(branch, f"{reason} (extra worktree)", label, skipped):
+                deleted.append(branch)
         LOG.info(
-            "parcel cleanup parcel=%s merged=%s removed=%s branches=%s skipped=%s",
-            parcel.parcel_id,
+            "parcel cleanup %s merged=%s removed=%s branches=%s skipped=%s",
+            label,
             merged,
             removed,
             deleted,
@@ -182,6 +259,67 @@ class WorkspaceCleaner:
             detail["teardown_pending"] = pending
             detail["teardown_failures"] = failures
         return detail
+
+    def _delete_branch(
+        self,
+        branch: str,
+        reason: str,
+        label: str,
+        skipped: list[JsonValue],
+        *,
+        any_branch: bool = True,
+    ) -> bool:
+        try:
+            self.workspaces.delete_branch(branch, any_branch=any_branch)
+        except WorktreeError as exc:
+            skipped.append(f"{branch}: {exc}")
+            return False
+        LOG.info("branch deleted branch=%s reason=%s %s", branch, reason, label)
+        return True
+
+    def remove_idle(self, path: Path, branch: str | None, *, guard: Guard | None = None) -> str:
+        """Remove an idle early-stage worktree (and its branch) that holds no work of its
+        own: clean, and no commits beyond the last fetched base. Returns what happened;
+        anything else keeps it (logged). The next stage run recreates it."""
+        with self._lock:
+            if not self.under_root(path):
+                return "kept: outside worktree_root"
+            kept = self._own_work(path)
+            if kept is not None:
+                LOG.info("idle worktree kept path=%s reason=%s", path, kept)
+                return f"kept: {kept}"
+            failed = self._teardown(path)
+            if failed is not None:
+                return f"kept: dev environment teardown failed: {failed[1]}"
+            with CLONE_LOCK:
+                why_not = (guard() if guard is not None else None) or self._own_work(path)
+                if why_not is not None:
+                    self._forget_teardown(path)
+                    LOG.info("idle worktree kept path=%s reason=%s", path, why_not)
+                    return f"kept: {why_not}"
+                try:
+                    self.workspaces.remove_worktree(path, force=False)
+                except WorktreeError as exc:
+                    self._forget_teardown(path)
+                    return f"kept: {exc}"
+                LOG.info("worktree removed path=%s reason=idle", path)
+                if branch is not None and branch != self.base_branch:
+                    skipped: list[JsonValue] = []
+                    if not self._delete_branch(branch, "idle", f"path={path}", skipped):
+                        return f"removed; branch kept: {skipped[0]}"
+            return "removed"
+
+    def _own_work(self, path: Path) -> str | None:
+        """Why the worktree holds work of its own (None: it holds none)."""
+        try:
+            if not self.workspaces.is_clean(path):
+                return "uncommitted changes"
+            ahead = self.workspaces.commits_ahead(path, self.base_branch)
+        except WorktreeError as exc:
+            return str(exc)[:_REASON_CHARS]
+        if ahead:
+            return f"{ahead} commits beyond origin/{self.base_branch}"
+        return None
 
     def _teardown(self, path: Path) -> tuple[int, str] | None:
         """Run the dev-environment teardown in ``path``: None when done (or none is

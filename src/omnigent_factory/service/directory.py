@@ -1398,7 +1398,7 @@ def _new_boundary() -> str:
 _FIRST_TEMPLATES = {
     SessionKind.TRIAGE: "triage-v10.txt",
     SessionKind.PLAN: "plan-v10.txt",
-    SessionKind.BUILD: "build-v15.txt",
+    SessionKind.BUILD: "build-v16.txt",
 }
 _RETRIAGE_TEMPLATE = "triage-feedback-v7.txt"
 #: The triage of an epic (an issue with sub-issues), first run and re-runs alike.
@@ -1410,14 +1410,14 @@ _AUTOPILOT_PLAN_TEMPLATE = "plan-autopilot-v3.txt"
 #: The plan run the factory started on a build's ``replan_required`` (its brief: what the
 #: build said must change).
 _REPLAN_TEMPLATE = "plan-replan-v1.txt"
-_REWORK_TEMPLATE = "build-rework-v12.txt"
+_REWORK_TEMPLATE = "build-rework-v13.txt"
 #: A rework the owner started by ticking Ready report items: its brief is those items.
-_ITEMS_REWORK_TEMPLATE = "build-rework-items-v3.txt"
+_ITEMS_REWORK_TEMPLATE = "build-rework-items-v4.txt"
 #: Readiness wakes of a waiting build run (red checks and other gaps; findings only).
 _READINESS_WAKE_TEMPLATE = "readiness-wake-v12.txt"
 _FINDINGS_WAKE_TEMPLATE = "readiness-findings-wake-v4.txt"
 #: A rework run, or a wake of the waiting build run, for a merge conflict with the base.
-_CONFLICT_TEMPLATE = "build-conflict-v3.txt"
+_CONFLICT_TEMPLATE = "build-conflict-v4.txt"
 _CONFLICT_WAKE_TEMPLATE = "readiness-conflict-wake-v1.txt"
 
 

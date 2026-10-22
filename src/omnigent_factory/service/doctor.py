@@ -32,6 +32,7 @@ from omnigent_factory.service.composition import _private_file
 from omnigent_factory.service.config import ServiceConfig
 from omnigent_factory.service.mcp import TOOL_NAMES, configured_host_authorities
 from omnigent_factory.service.omnigent_auth import expiry, expiry_message, omnigent_auth
+from omnigent_factory.service.worktree_gc import iso, read_state
 
 
 @dataclass(slots=True)
@@ -132,6 +133,7 @@ async def run_doctor(
 
     _check_login_expiry(config, report)
     await asyncio.to_thread(_check_clone, config, report)
+    await asyncio.to_thread(_check_worktrees, config, report)
     _check_socket(config, report)
     await asyncio.to_thread(_check_bind, config, report)
     _check_mcp_token(config, report)
@@ -975,6 +977,35 @@ def _check_clone(config: ServiceConfig, report: DoctorReport) -> None:
         report.fail("build_clone", "origin differs or clone is dirty")
     else:
         report.pass_check("build_clone", f"clean on {outputs[2] or '(detached)'}")
+
+
+def _check_worktrees(config: ServiceConfig, report: DoctorReport) -> None:
+    """Worktrees under ``worktree_root`` and the housekeeping times (informational)."""
+    if not (config.source_clone / ".git").is_dir():
+        return  # build_clone already failed
+    proc = subprocess.run(  # noqa: S603 - fixed read-only git argv
+        ("git", "-C", str(config.source_clone), "worktree", "list", "--porcelain"),  # noqa: S607
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
+    )
+    if proc.returncode:
+        report.warn("worktrees", proc.stderr.strip() or "git worktree list failed")
+        return
+    root = config.worktree_root.resolve()
+    count = sum(
+        root in Path(line[len("worktree ") :]).resolve().parents
+        for line in proc.stdout.splitlines()
+        if line.startswith("worktree ")
+    )
+    state = read_state(config.source_clone)
+    report.pass_check(
+        "worktrees",
+        f"{count} under {root}; last sweep {iso(state.get('sweep_at_us')) or 'never'}; "
+        f"last gc {iso(state.get('gc_at_us')) or 'never'}",
+    )
 
 
 def _check_socket(config: ServiceConfig, report: DoctorReport) -> None:

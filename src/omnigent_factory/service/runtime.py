@@ -154,6 +154,8 @@ class FactoryService:
         self.comment_rerenderer: Callable[[EffectIntent], Awaitable[AdapterOutcome]] | None = None
         #: Operator ``cleanup``: finished-parcel worktree/branch removal (composition).
         self.workspace_cleaner: Any = None
+        #: Worktree housekeeping (``service.worktree_gc.WorktreeGC``). None: not wired.
+        self.worktree_gc: Any = None
         #: Busy node IDs of a root's latest tree scan, for the drain-timeout warning
         #: (composition).
         self.busy_nodes: Callable[[str], tuple[str, ...]] | None = None
@@ -1458,6 +1460,9 @@ class FactoryService:
             "parked_deliveries": len(parked),
             "boot_id": self.executor.boot_id,
             "health_sweep": (self.health_sweep.status() if self.health_sweep is not None else None),
+            "worktrees": (
+                await self.worktree_gc.status() if self.worktree_gc is not None else None
+            ),
         }
 
     async def _explain(self, parcel_id: str) -> dict[str, object]:
