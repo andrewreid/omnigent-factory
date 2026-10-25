@@ -134,6 +134,7 @@ from omnigent_factory.omnigent.tree import (
     begin_scan,
     close_over_index,
     finish_scan,
+    root_prompts,
     scan_tree,
 )
 from omnigent_factory.ports.clock import Clock
@@ -393,6 +394,11 @@ class OmnigentExecutionAdapter:
             self._record_scan(root_id, obs)
             results.append(obs)
         return results
+
+    async def pending_prompts(self, root_id: str) -> dict[str, tuple[str, Mapping[str, Any]]]:
+        """Open prompts anywhere in ``root_id``'s tree from one root snapshot read (the
+        observer's prompt probe); never evidence that a prompt is gone."""
+        return root_prompts(root_id, await self.rest.get_json(f"/v1/sessions/{root_id}"))
 
     def _record_scan(self, root_id: str, obs: TreeObservation) -> None:
         known = self._known_nodes.setdefault(root_id, {root_id})

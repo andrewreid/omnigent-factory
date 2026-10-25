@@ -68,6 +68,7 @@ HOT_RELOAD_KEYS = frozenset(
         "delivery_row_retention_days",
         "idle_fallback_seconds",
         "parked_observation_interval_seconds",
+        "permission_prompt_grace_seconds",
         "health_sweep",
         "health_sweep_interval_minutes",
         "stall_nudge_minutes",
@@ -332,6 +333,10 @@ class ServiceConfig(BaseModel):
     #: plan approval): only watched for external activity. The factory relaying an
     #: owner's move changes its state, which puts it back on the active cadence.
     parked_observation_interval_seconds: float = Field(default=300.0, gt=0)
+    #: A worker's harness permission prompt (a Claude/Codex/... tool gate) is commented
+    #: on only once it has been open this long (most clear within seconds); it shows as
+    #: Needs you on the card meanwhile. 0 = comment as soon as it is seen.
+    permission_prompt_grace_seconds: float = Field(default=60.0, ge=0, le=24 * 3600)
     #: Hours between full reads of the archive-inclusive Omnigent session inventory (tree
     #: scans otherwise read only sessions created since the last read).
     session_inventory_resync_hours: float = Field(default=6.0, gt=0)

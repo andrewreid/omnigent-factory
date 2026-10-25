@@ -5071,7 +5071,17 @@ def _h_elicitation_opened(ctx: _Ctx, body: ev.ElicitationOpened) -> None:
         impact=body.impact,
         status=DecisionStatus.OPEN,
         checkpoint_prompt=body.cost_ask,
+        opened_at_us=ctx.now,
     )
+    if body.permission and not body.cost_ask:
+        # Most clear within seconds: Needs you now, the comment once still open after the
+        # grace (PermissionPromptDue).
+        decision = replace(
+            decision,
+            comment_deferred=True,
+            summary=body.summary[:300],
+            detail=body.detail[:600],
+        )
     live = s.session_id == ctx.p.current_session_id and not s.fences and not settled(s)
     if not live:
         ctx.update(decisions=(*ctx.p.decisions, replace(decision, status=DecisionStatus.ORPHANED)))
@@ -5085,6 +5095,8 @@ def _h_elicitation_opened(ctx: _Ctx, body: ev.ElicitationOpened) -> None:
         s = ctx.put_session(
             replace(s, lifecycle=Lifecycle.WAITING, wait_reason=WaitReason.DECISION)
         )
+    if decision.comment_deferred:
+        return
     ctx.comment(
         "decision",
         decision_id=decision.decision_id,
@@ -5093,6 +5105,28 @@ def _h_elicitation_opened(ctx: _Ctx, body: ev.ElicitationOpened) -> None:
         summary=body.summary[:300],
         node_id=body.node_id,
         root_id=s.root_id,
+    )
+
+
+def _h_permission_prompt_due(ctx: _Ctx, body: ev.PermissionPromptDue) -> None:
+    """A permission prompt still open after the grace: now it is worth a comment."""
+    d = _find_decision(ctx, body.session_id, body.elicitation_id)
+    if not d.comment_deferred:
+        raise Rejected("comment-not-deferred")
+    if d.status != DecisionStatus.OPEN:
+        raise Rejected("decision-not-open")
+    ctx.put_decision(replace(d, comment_deferred=False))
+    s = ctx.p.session(d.session_id)
+    ctx.comment(
+        "decision",
+        decision_id=d.decision_id,
+        impact=d.impact.value,
+        contract_hash=ctx.p.current_contract.full_hash if ctx.p.current_contract else None,
+        summary=d.summary,
+        detail=d.detail,
+        permission=True,
+        node_id=None,
+        root_id=s.root_id if s is not None else None,
     )
 
 
@@ -5939,6 +5973,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.ELICITATION_OPENED: _h_elicitation_opened,
     EventKind.ELICITATION_RESOLVED: _h_elicitation_resolved,
     EventKind.ELICITATION_GONE: _h_elicitation_gone,
+    EventKind.PERMISSION_PROMPT_DUE: _h_permission_prompt_due,
     EventKind.OWNER_QUESTION: _h_owner_question,
     EventKind.FEEDBACK_READ: _h_feedback_read,
     EventKind.POLICIES_VERIFIED: _h_policies_verified,

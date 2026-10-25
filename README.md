@@ -665,6 +665,18 @@ at Needs you with no fix attempt left the reply instead starts a rework (below),
 reads the answer with the comment. `/decide <id> <answer>` also works, but the id is not
 shown on GitHub; replying in the Omnigent session does not answer the question.
 
+**Permission prompts.** A worker's harness asking to run a tool (a Claude, Codex, Cursor,
+... native permission card, recognised by the prompt's policy name or hook phase, never
+by its text; `AskUserQuestion` stays a question) is answered in Omnigent, not on GitHub.
+The card shows `Needs you` (and the status comment the ask) while it is open, but the
+comment waits until the prompt has been open for `permission_prompt_grace_seconds`
+(default `60`, hot-reloadable; `0` comments as soon as it is seen): most clear within
+seconds and then post nothing. The comment is one readable line and the command or file
+it touches, redacted and with mentions broken, e.g. ``A worker is asking permission to
+run a Bash command that touches `src/scripts/reference-seed.ts`. Approve or deny it in
+Omnigent.`` The decision records that its comment is still owed and when the prompt was
+first seen, so a restart neither posts it twice nor loses it.
+
 ### Issue sessions and the factory MCP endpoint
 
 Each issue gets one Omnigent session (the configured `omnigent_agent_id`, default
@@ -957,6 +969,14 @@ parked tree a scan sees busy counts as running again. All trees due in one
 pass share one archive-inclusive inventory read (taken after every tree's child walk); its
 full resync runs every `session_inventory_resync_hours` (default `6`, hot-reloadable). A
 failed read still makes every scan of the pass incomplete, never idle.
+
+A pass scans every due tree, node by node, before it applies anything, so one slow tree
+(a 15 s read timeout per stale node, as on #1394) delays every prompt behind it. Between
+passes, every run on the active cadence (or holding
+a permission prompt inside its grace) has only its root snapshot read every 15 s for open
+prompts, its own and those Omnigent mirrors from every descendant: one request per such
+tree. That probe opens prompts and posts due permission comments; only a full scan
+decides that a prompt is gone.
 
 ### Health sweep and stalled runs
 

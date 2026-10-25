@@ -732,7 +732,7 @@ class PublicationRenderer:
             sid = str(effect.args.get("session_id") or effect.preconditions.session_id or "")
             return _safe_publication(text, self.config) + await self._splits(parcel, sid)
         elif effect.kind == EffectKind.POST_COMMENT and effect.args.get("template") == "decision":
-            text = _decision_text(effect.args)
+            text = _decision_text(effect.args, self.config.omnigent_base_url)
         elif effect.kind == EffectKind.POST_COMMENT and effect.args.get("template") == (
             "ready-blocked"
         ):
@@ -848,12 +848,21 @@ def _plain_code(text: str) -> str:
     return text.replace("`", "'")
 
 
-def _decision_text(args: Mapping[str, Any]) -> str:
+def _decision_text(args: Mapping[str, Any], omnigent_base_url: str = "") -> str:
     """The agent's question as its own reply: the owner answers by replying to it.
 
-    Answering in Omnigent or with ``/decide`` still works, but is never advertised.
+    Answering in Omnigent or with ``/decide`` still works, but is never advertised. A
+    harness permission prompt is answered in Omnigent: its one-line ask (built from the
+    prompt's fields at observation, already redacted), what it runs, and where.
     """
     summary = str(args.get("summary") or "").strip()
+    if args.get("permission"):
+        link = omnigent_link(omnigent_base_url, str(args.get("root_id") or "")) or ""
+        where = f"[Omnigent]({link})" if link else "Omnigent"
+        text = f"{summary or 'A worker is asking permission to use a tool.'} "
+        text += f"Approve or deny it in {where}."
+        lines = [line.strip() for line in str(args.get("detail") or "").splitlines()]
+        return "\n\n".join([text, *(line for line in lines if line)])
     return summary or "I have a question before I can go on."
 
 

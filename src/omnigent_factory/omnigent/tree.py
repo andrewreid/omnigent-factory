@@ -245,6 +245,18 @@ def node_from_snapshot(
     )
 
 
+def root_prompts(root_id: str, snap: Mapping[str, Any]) -> dict[str, tuple[str, Mapping[str, Any]]]:
+    """``elicitation_id -> (owner node, event)`` from the root's snapshot alone: its own
+    prompts and those Omnigent mirrors from every descendant (``target_session_id``)."""
+    node = node_from_snapshot(root_id, None, snap)
+    out: dict[str, tuple[str, Mapping[str, Any]]] = {}
+    for event in (*node.elicitations, *node.mirrored):
+        eid = event.get("elicitation_id")
+        if isinstance(eid, str) and eid not in out:
+            out[eid] = (target_session_of(event) or root_id, event)
+    return out
+
+
 def _epoch_us(value: object) -> int:
     """An Omnigent timestamp (epoch seconds, possibly fractional, or ISO 8601) in UTC
     microseconds; 0 when absent or unreadable."""

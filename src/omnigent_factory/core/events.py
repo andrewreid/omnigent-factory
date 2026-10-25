@@ -105,6 +105,7 @@ class EventKind(enum.StrEnum):
     ELICITATION_OPENED = "ElicitationOpened"
     ELICITATION_RESOLVED = "ElicitationResolved"
     ELICITATION_GONE = "ElicitationGone"
+    PERMISSION_PROMPT_DUE = "PermissionPromptDue"
     OWNER_QUESTION = "OwnerQuestion"
     FEEDBACK_READ = "FeedbackRead"
     POLICIES_VERIFIED = "PoliciesVerified"
@@ -821,6 +822,21 @@ class ElicitationOpened(_Body):
     summary: str = ""
     #: Omnigent session (root or child) that holds the pending prompt.
     node_id: str | None = None
+    #: A harness permission prompt (a worker asking to run a tool): ``summary`` is then
+    #: the readable one-line ask and ``detail`` the tool's target; its comment waits for
+    #: :class:`PermissionPromptDue` (most clear within seconds).
+    permission: bool = False
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionPromptDue(_Body):
+    """A permission prompt is still open after ``permission_prompt_grace_seconds``."""
+
+    KIND: ClassVar[EventKind] = EventKind.PERMISSION_PROMPT_DUE
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    session_id: str = ""
+    elicitation_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1205,6 +1221,7 @@ EventBody = (
     | ElicitationOpened
     | ElicitationResolved
     | ElicitationGone
+    | PermissionPromptDue
     | OwnerQuestion
     | FeedbackRead
     | PoliciesVerified
@@ -1290,6 +1307,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         ElicitationOpened,
         ElicitationResolved,
         ElicitationGone,
+        PermissionPromptDue,
         OwnerQuestion,
         FeedbackRead,
         PoliciesVerified,
@@ -1424,6 +1442,7 @@ __all__ = [
     "OwnerQuestion",
     "PRObserved",
     "Pause",
+    "PermissionPromptDue",
     "PlanFeedback",
     "PoliciesVerified",
     "PolicyGuardFailed",

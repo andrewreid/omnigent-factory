@@ -893,6 +893,10 @@ class StatusComments:
                 else ""
             )
             return Question(summary or "I have a question before I can go on.", url)
+        for d in parcel.decisions:
+            # A permission prompt inside its grace has no comment yet: its ask, unlinked.
+            if d.decision_id in open_ids and d.comment_deferred and d.summary:
+                return Question(self.publish_text(d.summary))
         return Question("I have a question before I can go on.")
 
     async def _splits(self, source: int) -> tuple[str, ...]:

@@ -18,10 +18,12 @@ Missing prompts: a persisted open prompt absent from a *complete* scan is
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.types import DecisionImpact
@@ -76,6 +78,150 @@ def elicitation_summary(params: Mapping[str, Any]) -> str:
     return text
 
 
+# ------------------------------------------------------------ harness permission prompts
+
+#: Harness permission cards by policy name: ``<vendor>_native_permission`` (Claude,
+#: Cursor, Antigravity, Kiro... hooks), ``native_permission`` (generic hook),
+#: ``<harness>_sdk_permission`` (SDK executors), Codex's approval requests.
+_PERMISSION_POLICY = re.compile(
+    r"(?:^|_)(?:native|sdk)_permissions?(?:_approval)?$"
+    r"|^codex_native_(?:command|file_change|apply_patch)_approval$"
+)
+#: Hook phase of a harness's own tool gate (policy-engine ASKs use the agent phases).
+_PERMISSION_PHASE = "pre_tool_use"
+#: Gated tools that are really a question for the owner, not a permission.
+_QUESTION_TOOLS = frozenset({"AskUserQuestion"})
+_SHELL_TOOLS = frozenset({"bash", "shell", "run_shell_command", "exec_command", "execute"})
+_TOOL_NAME = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+_BOLD_TOOL = re.compile(r"\*\*([A-Za-z0-9_.:-]{1,64})\*\*")
+#: A string field of a (possibly truncated) JSON tool input.
+_JSON_FIELD = r'"{}"\s*:\s*"((?:[^"\\]|\\.)*)'
+#: A relative or absolute file path with an extension, e.g. ``src/scripts/seed.ts``.
+_PATH = re.compile(
+    r"(?<![\w/.~-])((?:\.{1,2}/|/)?(?:[\w.-]+/)+[\w.-]*\w\.[A-Za-z0-9]{1,8})(?![\w/])"
+)
+_TARGET_CHARS = 120
+_DETAIL_CHARS = 300
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionAsk:
+    """A harness permission prompt, readable: one line, plus what it touches."""
+
+    tool: str
+    #: "A worker is asking permission to ...". (no trailing call to action)
+    summary: str
+    #: A short, safe detail line ("" = none).
+    detail: str = ""
+
+
+def _safe(text: str, limit: int) -> str:
+    """One line, credentials redacted, bounded; safe inside a code span."""
+    text = _SECRETISH.sub("[redacted]", " ".join(text.split())).replace("`", "'")
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _tool_input(tool: str, preview: object) -> dict[str, Any]:
+    """The tool input from a ``Tool({...json...})`` preview; truncated JSON (the preview
+    is capped) still yields its leading string fields."""
+    if not isinstance(preview, str):
+        return {}
+    body = preview.removeprefix(f"{tool}(") if tool else preview
+    body = body.removesuffix(")")
+    try:
+        value = json.loads(body)
+    except ValueError:
+        value = None
+    if isinstance(value, dict):
+        return value
+    out: dict[str, Any] = {}
+    for key in ("command", "file_path", "notebook_path", "path", "url", "description"):
+        match = re.search(_JSON_FIELD.format(key), body)
+        if match is not None:
+            try:
+                out[key] = json.loads(f'"{match.group(1)}"')
+            except ValueError:
+                out[key] = match.group(1)
+    return out
+
+
+def _tool_name(params: Mapping[str, Any]) -> str:
+    tool = params.get("tool_name")
+    if isinstance(tool, str) and _TOOL_NAME.fullmatch(tool):
+        return tool
+    message = params.get("message")
+    match = _BOLD_TOOL.search(message) if isinstance(message, str) else None
+    if match is not None:
+        return match.group(1)
+    preview = params.get("content_preview")
+    head = preview.split("(", 1)[0] if isinstance(preview, str) and "(" in preview else ""
+    return head if _TOOL_NAME.fullmatch(head) else ""
+
+
+def is_permission_prompt(params: Mapping[str, Any]) -> bool:
+    """A harness asks to run a tool (Claude/Codex/Cursor/... native permission card)."""
+    policy = params.get("policy_name")
+    harness = (isinstance(policy, str) and _PERMISSION_POLICY.search(policy) is not None) or (
+        params.get("phase") == _PERMISSION_PHASE
+    )
+    return harness and not is_cost_ask(policy) and _tool_name(params) not in _QUESTION_TOOLS
+
+
+def permission_ask(params: Mapping[str, Any]) -> PermissionAsk | None:
+    """The readable form of a harness permission prompt (None: not one)."""
+    if not is_permission_prompt(params):
+        return None
+    policy = str(params.get("policy_name") or "")
+    tool = _tool_name(params)
+    data = _tool_input(tool, params.get("content_preview"))
+    why = params.get("reason") if isinstance(params.get("reason"), str) else None
+    why = why or (data.get("description") if isinstance(data.get("description"), str) else None)
+    command = params.get("command") if policy.startswith("codex_") else data.get("command")
+    files = [str(f) for f in params.get("files") or () if isinstance(f, str)]
+    grant_root = params.get("grant_root")
+    target = next(
+        (
+            data[key]
+            for key in ("file_path", "notebook_path", "path")
+            if isinstance(data.get(key), str) and data[key]
+        ),
+        None,
+    )
+    detail = ""
+    if isinstance(command, str) and command.strip():
+        lines = command.strip().splitlines()
+        shell = "a Bash command" if tool.lower() == "bash" else "a command"
+        touched = _PATH.search(command)
+        what = f"run {shell}"
+        if touched is not None:
+            what += f" that touches `{_safe(touched.group(1), _TARGET_CHARS)}`"
+        more = " (first line of several)" if len(lines) > 1 else ""
+        detail = f"Command: `{_safe(lines[0], _TARGET_CHARS)}`{more}"
+    elif policy == "codex_native_apply_patch_approval" or files:
+        named = ", ".join(f"`{_safe(f, 80)}`" for f in files[:3])
+        what = "apply a patch" + (f" to {named}" if named else "")
+        if len(files) > 3:
+            what += f" and {len(files) - 3} more files"
+    elif policy == "codex_native_file_change_approval":
+        what = "change files" + (
+            f" under `{_safe(grant_root, _TARGET_CHARS)}`" if isinstance(grant_root, str) else ""
+        )
+    elif policy == "codex_native_permissions_approval":
+        what = "take additional permissions"
+    elif target is not None:
+        what = f"use {_safe(tool, 64) or 'a tool'} on `{_safe(target, _TARGET_CHARS)}`"
+    elif isinstance(data.get("url"), str) and data["url"]:
+        host = urlsplit(data["url"]).hostname or data["url"]
+        what = f"use {_safe(tool, 64) or 'a tool'} on `{_safe(host, _TARGET_CHARS)}`"
+    else:
+        what = f"use {_safe(tool, 64)}" if tool else "use a tool"
+    if why:
+        reason = f"Why: {_safe(why, _DETAIL_CHARS)}"
+        detail = f"{detail}\n{reason}" if detail else reason
+    summary = f"A worker is asking permission to {what}."
+    return PermissionAsk(tool=tool, summary=summary, detail=detail)
+
+
 @dataclass
 class StreamNormalizer:
     """Normalizes one stage tree's stream/snapshot observations.
@@ -100,14 +246,17 @@ class StreamNormalizer:
         if elicitation_id in self.seen_elicitations:
             return []
         self.seen_elicitations.add(elicitation_id)
+        ask = permission_ask(params)
         return [
             ev.ElicitationOpened(
                 session_id=self.session_id,
                 elicitation_id=elicitation_id,
                 impact=DecisionImpact.UNKNOWN,
                 cost_ask=is_cost_ask(params.get("policy_name")),
-                summary=elicitation_summary(params),
+                summary=elicitation_summary(params) if ask is None else ask.summary,
                 node_id=node_id,
+                permission=ask is not None,
+                detail="" if ask is None else ask.detail,
             )
         ]
 

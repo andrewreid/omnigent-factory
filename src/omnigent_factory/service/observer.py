@@ -19,6 +19,7 @@ from omnigent_factory.core.predicates import run_closed, settled
 from omnigent_factory.core.types import (
     BotState,
     DecisionSource,
+    DecisionStatus,
     Hold,
     Lifecycle,
     Parcel,
@@ -45,6 +46,10 @@ ACTIVE_TIME_STEP_US = 5 * 60 * 1_000_000
 #: A changed cost total is persisted at most this often per run (audit only: the cost
 #: backstop is the Omnigent policy, not these samples).
 COST_SAMPLE_INTERVAL_US = 5 * 60 * 1_000_000
+#: Between full passes, each tree on the active cadence has its root snapshot read this
+#: often for new prompts (Omnigent mirrors every descendant's pending prompt into it):
+#: one request per active tree, so a slow pass never hides a prompt for minutes.
+PROMPT_PROBE_INTERVAL_SECONDS = 15.0
 
 
 def persisted_active_us(
@@ -100,6 +105,7 @@ class OmnigentObserver:
         interval_seconds: float,
         settled_interval_seconds: float | None = None,
         parked_interval_seconds: float = 300.0,
+        prompt_probe_interval_seconds: float = PROMPT_PROBE_INTERVAL_SECONDS,
     ) -> None:
         self.service = service
         self.adapter = adapter
@@ -112,6 +118,10 @@ class OmnigentObserver:
         #: A parked run, or one waiting on the owner, CI or the review bot with its tree
         #: last seen idle (:meth:`_parked`), is read at this cadence (hot-reloadable).
         self.parked_interval_seconds = parked_interval_seconds
+        self.prompt_probe_interval_seconds = prompt_probe_interval_seconds
+        self._probe_task: asyncio.Task[None] | None = None
+        #: When the current full pass started reading (UTC us; None: no pass yet).
+        self._pass_started_us: int | None = None
         self._settled_read_at: dict[str, int] = {}
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -139,14 +149,16 @@ class OmnigentObserver:
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="omnigent-observer")
+        self._probe_task = asyncio.create_task(self._probe(), name="omnigent-prompt-probe")
 
     async def close(self) -> None:
         self._stop.set()
         was_running = self._task is not None
-        if self._task is not None:
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
-            self._task = None
+        for task in (self._task, self._probe_task):
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self._task = self._probe_task = None
         if not was_running:
             return
         for parcel in await self._parcels():
@@ -157,6 +169,56 @@ class OmnigentObserver:
 
     def healthy(self) -> bool:
         return self._task is None or not self._task.done()
+
+    async def _probe(self) -> None:
+        """Best effort: a failed probe waits for the next one (the full pass is the truth)."""
+        while not self._stop.is_set():
+            try:
+                await self.probe_prompts_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.debug("prompt probe failed", exc_info=True)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), self.prompt_probe_interval_seconds)
+
+    async def probe_prompts_once(self) -> frozenset[str]:
+        """Read the root snapshot of every tree on the active cadence (or holding a
+        permission prompt inside its grace) for open prompts.
+
+        A full pass scans every due tree, node by node, before it applies anything, so
+        one slow tree (a 15 s read timeout per stale node) delays every prompt behind it.
+        The probe opens new prompts and posts due permission prompts in between; only a
+        full scan may decide that a prompt is gone. Returns the runs it read.
+        """
+        probed: set[str] = set()
+        for parcel in await self._parcels():
+            session = parcel.current_session
+            if session is None or session.root_id is None or run_closed(parcel, session):
+                continue
+            deferred = any(
+                d.comment_deferred and d.session_id == session.session_id
+                for d in parcel.open_decisions
+            )
+            if not deferred and (self._parked(parcel, session) or settled(session)):
+                continue  # a deferred permission prompt is watched for its grace
+            try:
+                prompts = await self.adapter.pending_prompts(session.root_id)
+            except (OmnigentReadError, OSError, ValueError):
+                continue
+            fresh = await self._load_parcel(parcel.parcel_id)
+            current = fresh.current_session if fresh is not None else None
+            if (
+                fresh is None
+                or current is None
+                or current.session_id != session.session_id
+                or current.root_id != session.root_id
+                or current.execution_closed
+            ):
+                continue
+            await self._prompts(fresh, prompts, complete=False)
+            probed.add(session.session_id)
+        return frozenset(probed)
 
     async def _run(self) -> None:
         failures = 0
@@ -208,6 +270,7 @@ class OmnigentObserver:
                 due.append((parcel, session, session.root_id))
         if not due:
             return frozenset()
+        self._pass_started_us = self.clock.now_utc_us()
         results = await self.adapter.observe_trees([root for _, _, root in due])
         observed: set[str] = set()
         for (parcel, session, _root), result in zip(due, results, strict=True):
@@ -286,7 +349,9 @@ class OmnigentObserver:
             )
             self._last_cost[session.session_id] = microdollars
             self._last_cost_at[session.session_id] = mono
-        await self._prompts(parcel, observation.owned_elicitations())
+        await self._prompts(
+            parcel, observation.owned_elicitations(), scanned_at_us=self._pass_started_us
+        )
         if (
             observation.root is not None
             and observation.root.status == "failed"
@@ -364,8 +429,16 @@ class OmnigentObserver:
         self._last_activity[sample.grant_id] = value
 
     async def _prompts(
-        self, parcel: Parcel, prompts: Mapping[str, tuple[str, Mapping[str, Any]]]
+        self,
+        parcel: Parcel,
+        prompts: Mapping[str, tuple[str, Mapping[str, Any]]],
+        *,
+        complete: bool = True,
+        scanned_at_us: int | None = None,
     ) -> None:
+        """Open new prompts, post due permission prompts and (``complete``: a full tree
+        scan) close the decisions whose prompt is gone. A prompt first seen (by the probe)
+        after the scan started is newer than the scan: never gone by it."""
         session = parcel.current_session
         if session is None or session.root_id is None:
             return
@@ -379,17 +452,50 @@ class OmnigentObserver:
             ),
         )
         present = set(prompts)
+        opened = False
         for eid, (_owner, raw) in prompts.items():
             for body in normalizer.on_event(session.root_id, raw):
                 await self._apply(parcel, body, f"elicitation:{session.session_id}:{eid}:open")
+                opened = True
+        if opened or any(d.comment_deferred for d in parcel.open_decisions):
+            await self._due_permission_prompts(parcel.parcel_id, session.session_id, present)
+        if not complete:
+            return
         for decision in parcel.decisions:
             if decision.source != DecisionSource.ELICITATION:
                 continue  # factory_ask_owner questions have no native prompt to vanish
+            if scanned_at_us is not None and decision.opened_at_us > scanned_at_us:
+                continue
             if decision.session_id == session.session_id and decision.elicitation_id not in present:
                 await self._apply(
                     parcel,
                     ev.ElicitationGone(session.session_id, decision.elicitation_id),
                     f"elicitation:{session.session_id}:{decision.elicitation_id}:gone",
+                )
+
+    async def _due_permission_prompts(
+        self, parcel_id: str, session_id: str, present: set[str]
+    ) -> None:
+        """Comment on each permission prompt still open after the grace (read live, so
+        ``reload`` applies it). Restart-safe: the decision records whether it was posted
+        and when it was first seen, and the event ID is stable."""
+        parcel = await self._load_parcel(parcel_id)
+        if parcel is None:
+            return
+        grace_us = int(self.service.config.permission_prompt_grace_seconds * 1_000_000)
+        now = self.clock.now_utc_us()
+        for d in parcel.decisions:
+            if (
+                d.session_id == session_id
+                and d.comment_deferred
+                and d.status == DecisionStatus.OPEN
+                and d.elicitation_id in present
+                and now - d.opened_at_us >= grace_us
+            ):
+                await self._apply(
+                    parcel,
+                    ev.PermissionPromptDue(session_id, d.elicitation_id),
+                    f"elicitation:{session_id}:{d.elicitation_id}:due",
                 )
 
     async def _apply(self, parcel: Parcel, body: ev.EventBody, event_id: str) -> None:

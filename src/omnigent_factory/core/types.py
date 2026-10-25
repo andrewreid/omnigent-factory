@@ -669,6 +669,14 @@ class Decision:
     externally_resolved: bool = False
     prompt_lost: bool = False
     source: DecisionSource = DecisionSource.ELICITATION
+    #: A harness permission prompt whose comment waits until it has been open for the
+    #: grace (``PermissionPromptDue``); false once posted, and for every other prompt.
+    comment_deferred: bool = False
+    #: When the prompt was first observed (UTC us; 0 = not recorded, older records).
+    opened_at_us: int = 0
+    #: A deferred permission prompt's readable ask and target, for its comment.
+    summary: str = ""
+    detail: str = ""
 
 
 @dataclass(frozen=True, slots=True)

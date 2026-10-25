@@ -129,6 +129,7 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.ELICITATION_OPENED: Admission(_ADAPTER),
     EventKind.ELICITATION_RESOLVED: Admission(_ADAPTER),
     EventKind.ELICITATION_GONE: Admission(_ADAPTER),
+    EventKind.PERMISSION_PROMPT_DUE: Admission(_ADAPTER),
     # factory tool calls, resolved to the current run by the service (never by arguments)
     EventKind.RESULT_CANDIDATE: Admission(_MCP),
     EventKind.OWNER_QUESTION: Admission(_MCP),
