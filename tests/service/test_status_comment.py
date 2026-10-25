@@ -62,7 +62,7 @@ from omnigent_factory.service.status_comment import (
 )
 from omnigent_factory.store import discipline as ds
 from omnigent_factory.store import status as st
-from omnigent_factory.testing.builders import OWNER_ID, snapshot
+from omnigent_factory.testing.builders import OWNER_ID, EventFactory, snapshot
 from omnigent_factory.testing.fakes import (
     FakeClock,
     FakeCredentialBroker,
@@ -70,7 +70,10 @@ from omnigent_factory.testing.fakes import (
     FakeOmnigent,
 )
 from omnigent_factory.testing.harness import HEAD, Harness
+from tests.service.test_epic_autopilot import history as autopilot_history
 from tests.service.test_epic_autopilot import seed
+from tests.test_epic_autopilot_reducer import EPIC as EPIC_1
+from tests.test_epic_autopilot_reducer import epic_links
 from tests.test_rework import ready
 
 pytestmark = pytest.mark.asyncio
@@ -786,3 +789,155 @@ async def test_the_reconcile_tick_writes_pending_status_comments(service_config:
         await r.service._reconcile_tick()
         [edit] = r.server.patches()
         assert "changed meanwhile" in edit
+
+
+# ------------------------------------------------------------------ epics (lazy backfill)
+
+EPIC_P = "I_epic"
+
+
+def epic_history(*, closed: bool = False) -> Harness:
+    """Issue #1 (Ready with PR #7) is a sub-issue (stored parent link) of the epic #2,
+    which never ran a stage and is not on autopilot; both last changed before status
+    comments started."""
+    h = ready()
+    f = h.f(EPIC_P)  # issue #2
+    links = IssueLinks(
+        sub_issues=(LinkedIssue(1, True, "Export button"), LinkedIssue(50, True, "Docs page")),
+        sub_total=2,
+    )
+    h.apply(f.make(ev.GitHubSnapshot(), evidence=snapshot(read_at_us=f.now, links=links)))
+    sub = h.f(P)
+    h.apply(
+        sub.make(
+            ev.GitHubSnapshot(),
+            evidence=snapshot(
+                read_at_us=sub.now, stage=Stage.READY, links=IssueLinks(parent=LinkedIssue(2, True))
+            ),
+        )
+    )
+    if closed:
+        f.tick()
+        h.apply(
+            f.make(
+                ev.GitHubSnapshot(),
+                evidence=snapshot(read_at_us=f.now, open=False, stage=Stage.DONE, links=links),
+            )
+        )
+    return h
+
+
+def epic_autopilot_history() -> Harness:
+    """The epic #1 on autopilot Full (plan approved) with sub-issues #2 and #3, Triaged."""
+    h = autopilot_history()
+    f = h.f(EPIC_1)
+    f.tick()
+    h.apply(
+        f.make(
+            ev.GitHubSnapshot(),
+            evidence=snapshot(read_at_us=f.now, stage=Stage.TRIAGED, links=epic_links()),
+        )
+    )
+    return h
+
+
+async def blocked_sub(r: Rig) -> None:
+    """A fresh read of the sub-issue #1 showing an open blocker (the epic is untouched)."""
+    factory = EventFactory(P, start_us=r.clock.now_utc_us(), issue_number=ISSUE)
+    links = IssueLinks(parent=LinkedIssue(2, True), blocked_by=(LinkedIssue(9, True),))
+    now = r.clock.now_utc_us()
+    result = await r.service.apply_event(
+        factory.make(
+            ev.GitHubSnapshot(),
+            evidence=snapshot(read_at_us=now, stage=Stage.READY, links=links),
+            event_id=f"blocked-read:{now}",
+            entropy=f"blocked-read:{now}",
+        )
+    )
+    assert result.accepted, result.reason
+
+
+async def event_count(r: Rig) -> int:
+    [(count,)] = await r.service.db.call(lambda store: store.query("SELECT count(*) FROM events"))
+    return int(count)
+
+
+async def test_an_open_epic_unchanged_since_the_baseline_gets_its_status_at_the_first_tick(
+    service_config: ServiceConfig,
+):
+    async with rig(service_config, epic_history()) as r:
+        epic_before = await r.service.db.call(lambda store: store.load_parcel(EPIC_P))
+        events_before = await event_count(r)
+        # The epic only: the sub-issue (a normal issue, unchanged) stays lazy.
+        assert await r.status.tick() == 1
+        [comment] = r.server.status(2)
+        assert comment["body"].startswith("### Epic · 0/2 done · 0 building · autopilot off")
+        assert "- #1 Export button — Ready · PR #7 · idle" in comment["body"]
+        assert r.server.status(ISSUE) == [] and len(r.server.posts()) == 1
+        # Rendering only: no event, the epic's parcel untouched.
+        assert await event_count(r) == events_before
+        assert await r.service.db.call(lambda store: store.load_parcel(EPIC_P)) == epic_before
+        # Unchanged: nothing more is written.
+        r.clock.advance(200 * S)
+        assert await r.status.tick() == 0
+        assert len(r.server.posts()) == 1 and r.server.patches() == []
+
+
+async def test_a_closed_epic_unchanged_since_the_baseline_gets_no_status(
+    service_config: ServiceConfig,
+):
+    async with rig(service_config, epic_history(closed=True)) as r:
+        assert await r.status.tick() == 0
+        assert r.server.posts() == []
+
+
+async def test_a_sub_issue_change_re_renders_the_epic_and_an_unchanged_render_writes_nothing(
+    service_config: ServiceConfig,
+):
+    async with rig(service_config, epic_history()) as r:
+        assert await r.status.tick() == 1
+        r.clock.advance(200 * S)
+        await blocked_sub(r)
+        # The sub-issue's own status comment is created at its change, the epic edited.
+        assert await r.status.tick() == 2
+        [edit] = r.server.patches()
+        assert "- #1 Export button — waits on #9 (outside this epic)" in edit
+        assert edit.startswith("### Epic")
+        r.clock.advance(200 * S)
+        assert await r.status.tick() == 0 and len(r.server.patches()) == 1
+
+
+async def test_a_finished_epic_is_re_rendered_when_a_sub_issue_changes(
+    service_config: ServiceConfig,
+):
+    async with rig(service_config, epic_history(closed=True)) as r:
+        # Shown before it finished (created then; the baseline does not apply).
+        assert (await r.status.publish(EPIC_P)).ok
+        r.clock.advance(200 * S)
+        assert await r.status.tick() == 0  # finished, shown and unchanged
+        await blocked_sub(r)
+        await r.status.tick()
+        [edit] = [p for p in r.server.patches() if status_marker(2) in p]
+        assert "- #1 Export button — waits on #9 (outside this epic)" in edit
+        r.clock.advance(200 * S)
+        patches = len(r.server.patches())
+        assert await r.status.tick() == 0 and len(r.server.patches()) == patches
+
+
+async def test_an_epic_on_autopilot_before_the_baseline_like_1207(service_config: ServiceConfig):
+    """#1207's shape: Triaged, autopilot Full, its plan approved, sub-issues seen by the
+    factory, nothing of its own changed since status comments started."""
+    h = epic_autopilot_history()
+    async with rig(service_config, h) as r:
+        epic_before = await r.service.db.call(lambda store: store.load_parcel(EPIC_1))
+        assert epic_before is not None and epic_before.autopilot is not None
+        assert epic_before.autopilot.approved and epic_before.stage == Stage.TRIAGED
+        events_before = await event_count(r)
+        assert await r.status.tick() == 1
+        [comment] = r.server.status(1)
+        assert comment["body"].startswith("### Epic · 0/2 done · 0 building · autopilot full")
+        epic_after = await r.service.db.call(lambda store: store.load_parcel(EPIC_1))
+        assert epic_after == epic_before  # autopilot, plan approval, note: unchanged
+        assert await event_count(r) == events_before
+        # The sub-issues (normal issues, unchanged) stay lazy.
+        assert r.server.status(2) == [] and r.server.status(3) == []

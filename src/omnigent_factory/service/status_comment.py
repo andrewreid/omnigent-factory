@@ -2,14 +2,17 @@
 
 * **Created** the first time a parcel the factory handles has something to show (its first
   stage run, or epic autopilot), or, for a parcel that existed before status comments, at
-  its first change after that (never a bulk sweep: ``status_settings.baseline_us``). One
+  its first change after that (never a bulk sweep: ``status_settings.baseline_us``),
+  except an open epic, which gets one at once (its sub-issues' work never changes it). One
   per issue, found by its hidden marker (``status_marker``): the row is ``creating``
   before the create, and a retry or restart searches for the marker before creating
   again, so an unclear create is adopted, never duplicated.
 * **Edited** in place only when the rendered text changes, at most once per
   ``status_comment_edit_seconds`` per issue (a burst is coalesced into the next edit; the
   reconcile loop writes what is pending). The comment is re-read before every write and
-  the owner's checkbox ticks are kept (``core.report_lines.keep_ticks``). A stage result
+  the owner's checkbox ticks are kept (``core.report_lines.keep_ticks``). An epic is
+  rendered again when one of its sub-issues changes (stored links), even when finished.
+  A stage result
   that used to be its own comment (triage, the checkpoint report) and the Ready line are
   written at once (``publish``): the owner never gets a link to a stale dashboard.
 * **Pinned** once after it is created (``pinIssueComment``, issues only, never a pull
@@ -430,6 +433,9 @@ class StatusComments:
     #: The Deferred checkboxes (``service.deferred.Deferrals.report_section``); None: none.
     deferred_section: Callable[[Parcel], Awaitable[str]] | None = None
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    #: Per epic, the sub-issue stamp (``_epic_stamps``) last rendered by ``tick`` (in
+    #: memory: after a restart each finished epic is rendered once more).
+    _shown_stamps: dict[str, object] = field(default_factory=dict)
 
     @property
     def _repo_id(self) -> str:
@@ -476,33 +482,72 @@ class StatusComments:
         rows = {
             r.parcel_id: r for r in await self._db(partial(st.status_rows, repo_id=self._repo_id))
         }
-        candidates = await self._db(
-            lambda store: store.query(
-                "SELECT parcel_id, version, updated_at_us, stage FROM parcels "
-                "WHERE repo_id = ? AND issue_number IS NOT NULL ORDER BY issue_number",
-                (self._repo_id,),
+        candidates = [
+            _Candidate.of(r)
+            for r in await self._db(
+                lambda store: store.query(
+                    # One extract: each further path parses the aggregate again.
+                    "SELECT parcel_id, version, updated_at_us, stage, issue_number, holds_json, "
+                    "json_extract(aggregate_json, '$.parcel.links') "
+                    "FROM parcels WHERE repo_id = ? AND issue_number IS NOT NULL "
+                    "ORDER BY issue_number",
+                    (self._repo_id,),
+                )
             )
-        )
+        ]
+        stamps = await self._epic_stamps(candidates)
         written = 0
-        for parcel_id, version, updated_at_us, stage in candidates:
-            row = rows.get(str(parcel_id))
-            if row is None and int(updated_at_us) <= settings.baseline_us:
-                continue  # unchanged since status comments started: no backfill sweep
+        for c in candidates:
+            row = rows.get(c.parcel_id)
+            if row is None and c.updated_at_us <= settings.baseline_us and not c.open_epic:
+                # Unchanged since status comments started: no backfill sweep. An open
+                # epic is the exception (its sub-issues' work never changes it).
+                continue
             if (
                 row is not None
                 and not row.pending
                 and row.state == "posted"
-                and row.seen_version == int(version)
-                and stage == Stage.DONE.value
+                and row.seen_version == c.version
+                and c.stage == Stage.DONE.value
+                and self._shown_stamps.get(c.parcel_id) == stamps.get(c.parcel_id)
             ):
-                continue  # finished and shown
+                continue  # finished and shown (an epic: its sub-issues unchanged too)
             try:
-                outcome = await self.refresh(str(parcel_id))
+                outcome = await self.refresh(c.parcel_id)
             except Exception:
-                LOG.warning("status comment failed parcel=%s", parcel_id, exc_info=True)
+                LOG.warning("status comment failed parcel=%s", c.parcel_id, exc_info=True)
                 continue
+            if c.parcel_id in stamps:
+                self._shown_stamps[c.parcel_id] = stamps[c.parcel_id]
             written += int(outcome.written)
         return written
+
+    async def _epic_stamps(self, candidates: Sequence[_Candidate]) -> dict[str, object]:
+        """Per epic: what of its sub-issues its status shows depends on (each sub-issue's
+        parcel version and held follow-ups), from the epic's stored sub-issue list and the
+        sub-issues' stored parent links. A change marks the epic for a re-render."""
+        epics = [c for c in candidates if c.epic]
+        if not epics:
+            return {}
+        by_number = {c.issue_number: c for c in candidates}
+        children: dict[int, set[int]] = {}
+        for c in candidates:
+            if c.parent is not None:
+                children.setdefault(c.parent, set()).add(c.issue_number)
+        follow_ups = await self._db(lambda store: store.follow_ups(self._repo_id))
+        held = {f.issue_number for f in follow_ups if f.hold == "held"}
+        stamps: dict[str, object] = {}
+        for e in epics:
+            numbers = sorted(set(e.sub_numbers) | children.get(e.issue_number, set()))
+            stamps[e.parcel_id] = tuple(
+                (
+                    n,
+                    by_number[n].version if n in by_number else None,
+                    n in held,
+                )
+                for n in numbers
+            )
+        return stamps
 
     async def refresh(self, parcel_id: str, *, urgent: bool = False) -> StatusWrite:
         """Render the parcel's status and write it when it changed (create, adopt by
@@ -516,7 +561,8 @@ class StatusComments:
             return StatusWrite(ok=False, reason="no issue")
         row = await self._db(partial(st.status_row, repo_id=self._repo_id, parcel_id=parcel_id))
         if row is None:
-            if not urgent and (not _handled(parcel) or Hold.COMPLETED in parcel.holds):
+            shows = _handled(parcel) or _open_epic(parcel)
+            if not urgent and (not shows or Hold.COMPLETED in parcel.holds):
                 return StatusWrite(ok=True, reason="nothing to show")
             row = st.StatusRow(parcel_id, parcel.issue_number, state="creating")
         headline, render = await self._render(parcel)
@@ -987,6 +1033,59 @@ def _epic_body(view: EpicView, headline: str, history: Sequence[tuple[int, str]]
 def _handled(parcel: Parcel) -> bool:
     """The factory has something to show: a stage run started, or epic autopilot."""
     return bool(parcel.sessions) or parcel.autopilot is not None
+
+
+def _open_epic(parcel: Parcel) -> bool:
+    """An epic (stored links) neither Done nor closed: its sub-issues are worth showing."""
+    return (
+        parcel.links is not None
+        and parcel.links.epic
+        and parcel.stage != Stage.DONE
+        and Hold.COMPLETED not in parcel.holds
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _Candidate:
+    """One parcel as ``tick`` sees it (columns and stored links, no aggregate decode)."""
+
+    parcel_id: str
+    version: int
+    updated_at_us: int
+    stage: str | None
+    issue_number: int
+    epic: bool
+    open_epic: bool
+    #: The parent issue in this repository (stored links), if any.
+    parent: int | None
+    sub_numbers: tuple[int, ...]
+
+    @classmethod
+    def of(cls, r: Sequence[Any]) -> _Candidate:
+        parcel_id, version, updated, stage, number, holds_json, links_json = r
+        links = json.loads(str(links_json)) if links_json else None
+        links = links if isinstance(links, dict) else {}
+        subs = links.get("sub_issues") or []
+        sub_numbers = tuple(
+            int(s["number"])
+            for s in subs
+            if isinstance(s, dict) and not s.get("repo") and isinstance(s.get("number"), int)
+        )
+        epic = int(links.get("sub_total") or 0) > 0 or bool(subs)
+        up = links.get("parent")
+        parent = up.get("number") if isinstance(up, dict) and not up.get("repo") else None
+        completed = Hold.COMPLETED.value in json.loads(str(holds_json or "[]"))
+        return cls(
+            parcel_id=str(parcel_id),
+            version=int(version),
+            updated_at_us=int(updated),
+            stage=None if stage is None else str(stage),
+            issue_number=int(number),
+            epic=epic,
+            open_epic=epic and stage != Stage.DONE.value and not completed,
+            parent=parent if isinstance(parent, int) else None,
+            sub_numbers=sub_numbers,
+        )
 
 
 def _checks(parcel: Parcel) -> str:
