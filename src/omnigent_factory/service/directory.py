@@ -936,6 +936,17 @@ def _ready_text(
     return "\n".join(lines)
 
 
+def ready_text(
+    args: Mapping[str, Any],
+    result: dict[str, Any] | None,
+    checks_summary: str,
+    repository: str,
+    bot_name: str = "Review bot",
+) -> str:
+    """The Ready report's text (``_ready_text``): the status comment's PR section."""
+    return _ready_text(args, result, checks_summary, repository, bot_name)
+
+
 def _authority(parcel: Parcel) -> tuple[str, str]:
     approval = parcel.current_approval
     if approval is not None and approval.kind == ApprovalKind.SKIP:
@@ -1137,6 +1148,12 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
             f"release readiness: {result.get('release_readiness')}."
         )
     return "Report recorded."
+
+
+def stage_result_text(result: dict[str, Any], agent: str = "The factory agent") -> str:
+    """A stage result as its comment shows it (``_public_result``): the status comment
+    shows the triage result and the last checkpoint report this way."""
+    return _public_result(result, agent)
 
 
 def _epic_triage_text(result: Mapping[str, Any]) -> str:

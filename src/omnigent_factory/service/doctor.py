@@ -8,6 +8,7 @@ import io
 import ipaddress
 import os
 import socket
+import sqlite3
 import stat
 import subprocess
 import tarfile
@@ -32,6 +33,7 @@ from omnigent_factory.service.composition import _private_file
 from omnigent_factory.service.config import ServiceConfig
 from omnigent_factory.service.mcp import TOOL_NAMES, configured_host_authorities
 from omnigent_factory.service.omnigent_auth import expiry, expiry_message, omnigent_auth
+from omnigent_factory.service.status_comment import pin_status
 from omnigent_factory.service.worktree_gc import iso, read_state
 
 
@@ -134,6 +136,7 @@ async def run_doctor(
     _check_login_expiry(config, report)
     await asyncio.to_thread(_check_clone, config, report)
     await asyncio.to_thread(_check_worktrees, config, report)
+    await asyncio.to_thread(_check_status_pin, config, report)
     _check_socket(config, report)
     await asyncio.to_thread(_check_bind, config, report)
     _check_mcp_token(config, report)
@@ -1006,6 +1009,31 @@ def _check_worktrees(config: ServiceConfig, report: DoctorReport) -> None:
         f"{count} under {root}; last sweep {iso(state.get('sweep_at_us')) or 'never'}; "
         f"last gc {iso(state.get('gc_at_us')) or 'never'}",
     )
+
+
+def _check_status_pin(config: ServiceConfig, report: DoctorReport) -> None:
+    """Whether status comments get pinned (as the daemon recorded it; informational)."""
+    path = config.database_path
+    settings: dict[str, object] | None = None
+    if path.exists():
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+            try:
+                row = conn.execute(
+                    "SELECT pin_state, pin_message FROM status_settings WHERE repo_id = ?",
+                    (config.repo_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            row = None  # no such table yet (an older database): nothing tried
+        if row is not None:
+            settings = {"pin_state": row[0], "pin_message": row[1]}
+    detail = pin_status(settings)
+    if settings is not None and settings.get("pin_state") == "unsupported":
+        report.warn("status_comment_pin", detail)
+    else:
+        report.pass_check("status_comment_pin", detail)
 
 
 def _check_socket(config: ServiceConfig, report: DoctorReport) -> None:

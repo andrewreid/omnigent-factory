@@ -130,6 +130,11 @@ async def test_production_composition_binds_every_external_effect_and_real_verif
         assert production.service.splits is not None
         github_adapter = adapters[EffectKind.FETCH_PR_EVIDENCE]
         assert getattr(github_adapter, "review_rounds", None) is not None
+        # Status comments: written by the reconcile loop, folded publications, ticks.
+        status = production.service.status_comments
+        assert status is not None
+        assert getattr(github_adapter, "status_comments", None) is status
+        assert deferred.status is status
         assert production.verifier.secret_file == config.resolved_webhook_secret_file
         assert production.service.config.max_building == 2
         assert production.service.config.checkpoint_block_hours == {"S": 3, "M": 5, "L": 7}

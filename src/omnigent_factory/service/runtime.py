@@ -210,6 +210,9 @@ class FactoryService:
         #: Owner-directed split issues (composition; ``service.splits.Splits``). None: not
         #: wired.
         self.splits: Any = None
+        #: The issues' status comments, written on each reconcile tick (composition;
+        #: ``service.status_comment.StatusComments``). None: not wired.
+        self.status_comments: Any = None
         self._fatal_exit = fatal_exit
         self._fatal_reason: str | None = None
         self._delivery_failures: dict[str, int] = {}
@@ -871,6 +874,12 @@ class FactoryService:
             if loop_now >= due:
                 self._reconcile_due[parcel_id] = (loop_now + period, period)
                 await self._reconcile(parcel_id)
+        if self.status_comments is not None:
+            try:
+                # Changed status comments (and edits the rate limit held back).
+                await self.status_comments.tick()
+            except Exception:
+                LOG.warning("status comments failed", exc_info=True)
 
     async def _board_diff_tick(self, loop_now: float, live: frozenset[str]) -> None:
         if self._next_board_diff_at is not None and loop_now < self._next_board_diff_at:

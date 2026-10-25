@@ -77,6 +77,7 @@ HOT_RELOAD_KEYS = frozenset(
         "max_nudges_per_sweep",
         "omnigent_breaker_minutes",
         "review_rounds_default",
+        "status_comment_edit_seconds",
         "follow_up_max_depth",
         "auto_replan_limit",
         "worktree_sweep_interval_hours",
@@ -250,6 +251,9 @@ class ServiceConfig(BaseModel):
     review_rounds_field_node_id: str = ""
     #: Review-bot rounds of an issue whose field is empty (or not owner-set).
     review_rounds_default: int = Field(default=2, ge=1, le=20)
+    #: Shortest spacing of two edits of one issue's status comment: changes within it are
+    #: coalesced into the next edit (0 = edit on every change).
+    status_comment_edit_seconds: float = Field(default=180.0, ge=0)
     #: Follow-up lineage depth at which a run may no longer defer findings as follow-ups
     #: (1: a follow-up issue's own build fixes or marks advisory everything it finds).
     follow_up_max_depth: int = Field(default=1, ge=0, le=10)

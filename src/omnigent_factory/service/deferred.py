@@ -58,6 +58,7 @@ from omnigent_factory.github.client import GitHubAPIError, GitHubClient
 from omnigent_factory.service.follow_ups import FollowUps
 from omnigent_factory.service.review_rounds import ReviewRounds
 from omnigent_factory.service.runtime import FactoryService
+from omnigent_factory.service.status_comment import status_marker
 from omnigent_factory.store import discipline as ds
 from omnigent_factory.store.sqlite import SqliteStore
 
@@ -117,6 +118,9 @@ class Deferrals:
         self.publish = publish
         self._tasks: set[asyncio.Task[object]] = set()
         self._locks: dict[str, asyncio.Lock] = {}
+        #: The issues' status comments (``service.status_comment.StatusComments``), which
+        #: carry the Deferred checkboxes; None: only Ready reports carry them.
+        self.status: Any = None
 
     @property
     def _repo_id(self) -> str:
@@ -767,6 +771,12 @@ class Deferrals:
             status = _status(action, round_line=action.action_id.startswith(ROUND_PREFIX))
             by_comment.setdefault(action.comment_id, {})[action.action_id] = status
         for comment_id, states in sorted(by_comment.items()):
+            if self.status is not None and await self.status.owns(parcel_id, comment_id):
+                # The status comment renders each line's status itself (re-read and
+                # owner ticks kept); its edit answers the owner's tick, so it is not
+                # held back by the edit rate limit.
+                await self.status.refresh(parcel_id, urgent=True)
+                continue
             try:
                 comment: Any = await self.client.get_json(
                     f"/repos/{self._repo}/issues/comments/{comment_id}"
@@ -801,20 +811,27 @@ class Deferrals:
         for row in rows:
             parcel = parcel_from_json(str(row[0]))
             r = parcel.readiness
-            if parcel.issue_number is None or r is None or not r.report_effect_id:
+            if parcel.issue_number is None or r is None:
                 continue
-            if not await self.report_section(parcel):
-                continue  # no checkboxes in its report: nothing to read
-            try:
-                recovered += await self._catch_up_report(parcel, r.report_effect_id)
-            except GitHubAPIError as exc:
-                LOG.warning(
-                    "ready report catch-up failed issue=#%s reason=%s", parcel.issue_number, exc
-                )
+            markers = []
+            if r.report_effect_id:  # a Ready report posted before status comments
+                markers.append(f"<!-- omnigent-factory effect={r.report_effect_id} -->")
+            if self.status is not None:
+                markers.append(status_marker(parcel.issue_number))
+            if not markers or not await self.report_section(parcel):
+                continue  # no checkboxes in its comments: nothing to read
+            for marker in markers:
+                try:
+                    recovered += await self._catch_up_report(parcel, marker)
+                except GitHubAPIError as exc:
+                    LOG.warning(
+                        "ready report catch-up failed issue=#%s reason=%s",
+                        parcel.issue_number,
+                        exc,
+                    )
         return recovered
 
-    async def _catch_up_report(self, parcel: Parcel, effect_id: str) -> int:
-        marker = f"<!-- omnigent-factory effect={effect_id} -->"
+    async def _catch_up_report(self, parcel: Parcel, marker: str) -> int:
         bot = self.service.config.github_bot_user_id
         comments = await self.client.paginate(
             f"/repos/{self._repo}/issues/{parcel.issue_number}/comments?per_page=100"

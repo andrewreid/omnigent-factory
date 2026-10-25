@@ -162,10 +162,46 @@ is left for a later diff. A required check read red on a PR head first seen less
 running until a second read (scheduled for the window's end) confirms it or the window
 ends: a just-pushed head's check rollup can read red for a moment.
 
+### Status comment
+
+Each issue the factory works on gets one factory-owned **status comment**, its dashboard,
+edited in place instead of new comments. It is created when the first stage starts (an
+issue the factory handled before status comments got one at its first change since; there
+is no bulk sweep), found again by its hidden marker after a retry or restart (never a
+second one), and pinned once after it is created. If GitHub refuses the pin (e.g. the App
+installation may not pin comments) the factory logs GitHub's message once, records that
+pinning is unsupported and never tries again; `doctor` shows the pin status
+(`status_comment_pin`). Comments on pull requests are never pinned.
+
+It shows a headline with the stage and state (`Building · PR #1148 · checks running ·
+Codex round 1/2`, or `Waiting on you: <the question>`), the **Triage** result (with its
+**Related** list), the **Plan** (a link to the plan comment, the approved hash, a newer
+revision waiting for approval), the **Pull request** (link, checks, review rounds, the
+agent's summary, findings and the **Deferred** checkboxes, see
+[Follow-ups](#follow-ups)), the last checkpoint report, split-out issues and a collapsed
+**History** of stage events (the last 30). An epic's status shows done/total, how many
+sub-issues are building, the autopilot mode and the next item; who it is waiting on
+(human gates and open questions on sub-issues, grouped by assignee), what is in progress,
+blocked (with what it waits on, outside the epic too), up next and done (collapsed, with
+PR links), held follow-ups and nested epics as one line each. Everything comes from what
+the factory already stored: no extra GitHub reads.
+
+Edits do not notify. The comment is edited only when its text changes, at most once per
+`status_comment_edit_seconds` per issue (default 180, hot-reloadable; changes in between
+are coalesced into the next edit); a stage result that used to be its own comment and the
+Ready notification update it at once. The factory re-reads it before every write and
+keeps your ticks. These still notify as new comments: questions to you, `Needs you` / not
+ready, the checkpoint (one comment), the agent being blocked, plan comments (unchanged,
+approval works as before) and a one-line Ready notification (`PR #N is ready for review —
+<link to the status comment>`). The triage result, the full Ready report and the
+checkpoint report are no longer comments of their own (triage still sets labels,
+Priority, Size and related notes as before); Ready reports posted before are left as they
+are.
+
 ### Related issues
 
 Triage checks the other open issues on the board (`factory_list_issues`) for duplicates,
-overlaps and contradictions. The triage comment then ends with a short **Related** list
+overlaps and contradictions. The triage result (in the status comment) ends with a short **Related** list
 (`- Overlaps #12: <how the scope is split>`); a duplicate gets a keep/close recommendation
 (you close it), an overlap a proposed scope split, a genuine contradiction a question to
 you (`Needs you`), and a clash with Building or Ready work is flagged. Each related issue
@@ -378,7 +414,8 @@ review nor wakes the run for findings on heads beyond the budget, and the card g
 Ready when otherwise ready, with the note `Codex round 2/2`. `factory_get_status` shows
 `review_rounds` (used, budget, strict_from_round).
 
-**Ready report checkboxes.** The Ready report ends with a **Deferred** list: one line per
+**Ready report checkboxes.** The status comment's Pull request section (the Ready report
+before status comments) ends with a **Deferred** list: one line per
 deferred item and advisory (``- [ ] Fix now: P2 `path` title (in #<issue>)`` or
 `(advisory: reason)`), plus `- [ ] One more Codex review round` once the rounds are used up. Tick lines
 to have them done: only your ticks count (the comment's `edited` webhook from an owner,
@@ -471,7 +508,7 @@ waits up to 90 s for it instead of failing.
 | Command | What it does |
 |---|---|
 | `status` | Readiness, pause state, building count/cap with the running and parked builds, queue, pending/unknown effects, parked deliveries, the [health sweep](#health-sweep-and-stalled-runs): Omnigent state, breaker, nudges last sweep and each open run's state and stall episode, and [worktree housekeeping](#worktree-housekeeping): worktree count, settings, last sweep (with its result) and last gc. |
-| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. It also reads the configured agent's bundle (through its newest session, or the `--live` probe) and fails naming any factory MCP tool the agent's `tools:` allowlist for the factory server leaves out (a warning when the bundle cannot be read). It warns when the App installation is not subscribed to `push` (tick Push in the App settings) or to `sub_issues`/`issue_dependencies` (Sub issues, Issue dependencies), when the subscribed events can be read, and when the repository has no `Epic` issue type (epics are then not typed). It fails when Omnigent's own `/health` is not ok and warns when the configured host is offline. It shows the worktree count under `worktree_root` and the last worktree sweep and clone gc times. |
+| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. It also reads the configured agent's bundle (through its newest session, or the `--live` probe) and fails naming any factory MCP tool the agent's `tools:` allowlist for the factory server leaves out (a warning when the bundle cannot be read). It warns when the App installation is not subscribed to `push` (tick Push in the App settings) or to `sub_issues`/`issue_dependencies` (Sub issues, Issue dependencies), when the subscribed events can be read, and when the repository has no `Epic` issue type (epics are then not typed). It fails when Omnigent's own `/health` is not ok and warns when the configured host is offline. It shows the worktree count under `worktree_root` and the last worktree sweep and clone gc times, and whether status comments are pinned (a warning, with GitHub's message, once pinning was refused). |
 | `explain <parcel>` | The parcel's persisted state: stage, bot, sessions, holds, effects, the current run's stall episode (`stall`) and what the last health sweep made of it. |
 | `recovery` | Failed/unknown effects and parked webhook deliveries. |
 | `retry-effect <effect_id>` | Requeue a failed/unknown `publish_triage`/`publish_report`/`post_comment`; it adopts an existing comment by its marker, so it never duplicates. |
@@ -494,7 +531,7 @@ waits up to 90 s for it instead of failing.
 | `sessions prune [--dry-run]` | Delete (or list) the factory sessions session retention would remove now (through the daemon). |
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, `review_rounds_default`, `follow_up_max_depth`, `auto_replan_limit`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `session_retention_days`, the health sweep settings and `worktree_sweep_interval_hours`, `idle_worktree_days`, `clone_gc_interval_days`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, `review_rounds_default`, `status_comment_edit_seconds`, `follow_up_max_depth`, `auto_replan_limit`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `session_retention_days`, the health sweep settings and `worktree_sweep_interval_hours`, `idle_worktree_days`, `clone_gc_interval_days`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.
@@ -519,6 +556,7 @@ autopilot_options = { Full = "", Delayed = "", "Plan only" = "" }  # its options
 parallel_field_node_id = ""      # the epic "Parallel" NUMBER field (restart)
 review_rounds_field_node_id = "" # the "Review rounds" NUMBER field (restart)
 review_rounds_default = 2        # review-bot rounds of an issue whose field is empty
+status_comment_edit_seconds = 180  # shortest spacing of two status comment edits per issue
 follow_up_max_depth = 1          # follow-up generations that may defer follow-ups
 auto_replan_limit = 1            # replans the factory starts on a build's replan_required
 ranking = false                  # idle-time ranking of the Triage and Planning columns
@@ -554,9 +592,9 @@ A triage/report/status publication that failed definitively leaves the card at
 
 ### Card status vs. comments
 
-Bot comments notify the owner, so the factory comments only when he must read or act:
-triage, plan, Ready report (again after a rework), agent questions, checkpoint
-(`/continue`) and blocks that need owner action (agent blocked, restart exhausted, create
+Bot comments notify the owner, so the factory comments only when he must read or act
+(everything else is in the [status comment](#status-comment)): plan, the one-line Ready
+notification (again after a rework), agent questions, checkpoint (`/continue`) and blocks that need owner action (agent blocked, restart exhausted, create
 refused, stop unverified, ambiguous adoption, PR not Ready with no fix attempt left, a
 stalled run). Everything else (queued, stopped,
 approval acknowledged/invalidated, Ready withdrawn, rework, PR closed unmerged, refused

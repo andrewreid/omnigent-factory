@@ -78,6 +78,7 @@ from omnigent_factory.service.review_rounds import ReviewRounds, read_item_numbe
 from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.service.session_retention import SessionRetention
 from omnigent_factory.service.splits import Splits
+from omnigent_factory.service.status_comment import StatusComments
 from omnigent_factory.service.tokens import DaemonTokenProvider
 from omnigent_factory.service.worktree_gc import WorktreeGC, github_issue_states
 
@@ -456,6 +457,16 @@ async def build_production(
     publications.split_section = splits.section
     directory.rework_brief = deferred.rework_brief
     publications.deferred_section = deferred.report_section
+    status_comments = StatusComments(
+        service,
+        github.client,
+        directory,
+        lambda text: safe_publication(text, service.config),
+        deferred_section=deferred.report_section,
+    )
+    service.status_comments = status_comments
+    github.status_comments = status_comments
+    deferred.status = status_comments
 
     def write_links(issue: int, result: Mapping[str, Any]) -> None:
         native_links.schedule_result(issue, result)

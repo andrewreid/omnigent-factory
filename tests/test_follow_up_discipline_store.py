@@ -35,7 +35,7 @@ def test_migration_17_upgrades_a_database_with_follow_ups_and_keeps_them(tmp_pat
 
     store = SqliteStore.open(path, FakeClock())
     try:
-        assert store.schema_version() == LATEST == 19
+        assert store.schema_version() == LATEST == 20
         row = store.follow_up(REPO_ID, 904)
         assert row is not None and row.source_issue == 747 and row.blocks == (882,)
         assert store.epic_follow_up_builds(REPO_ID, 878) == (True, 5)
@@ -124,7 +124,7 @@ def test_migration_19_widens_split_relations_and_keeps_legacy_rows_and_done_step
     v18.close()
     store = SqliteStore.open(path, FakeClock())
     try:
-        assert store.schema_version() == 19
+        assert store.schema_version() == LATEST
         rows = {row.item_key: row for row in ds.splits(store, repo_id=REPO_ID, source_issue=7)}
         assert (rows["a"].relation, rows["a"].done) == ("blocks", frozenset({"blocks:7"}))
         assert rows["a"].pending_links() == ("parent",)  # linked under the old reading

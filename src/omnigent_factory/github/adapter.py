@@ -10,7 +10,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 
 from omnigent_factory.core.contract_view import extract_contract_section, marker_hash
 from omnigent_factory.core.effects import (
@@ -108,6 +108,31 @@ class TriageFields:
 
 ParcelResolver = Callable[[str], Awaitable[ParcelBinding | None]]
 TriageFieldSource = Callable[[EffectIntent], Awaitable[TriageFields | None]]
+
+
+@dataclass(frozen=True, slots=True)
+class StatusWrite:
+    """The outcome of bringing an issue's status comment up to date."""
+
+    ok: bool
+    comment_id: int | None = None
+    url: str = ""
+    #: The comment was created or edited (not just found current).
+    written: bool = False
+    reason: str = ""
+    #: GitHub refused the write for good (a 4xx): retrying will not help.
+    definitive: bool = False
+    retry_after_us: int | None = None
+
+
+class StatusPublisher(Protocol):
+    """The issue's status comment (``service.status_comment.StatusComments``)."""
+
+    async def folded(self, effect: EffectIntent) -> bool: ...
+
+    async def publish(self, parcel_id: str) -> StatusWrite: ...
+
+    async def refresh(self, parcel_id: str, *, urgent: bool = False) -> StatusWrite: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +238,11 @@ class GitHubAPIAdapter:
         #: Told (without waiting) once a triage comment exists, to mark the issues the
         #: triage names as related (``service.related.RelatedMarker.schedule``).
         self.related_marker: Callable[[EffectIntent], None] | None = None
+        #: The issue's status comment: a triage result and a checkpoint report are shown
+        #: there instead of in comments of their own, the Ready report is one line linking
+        #: to it, and Ready report edits update it. None (not wired): every publication is
+        #: its own comment.
+        self.status_comments: StatusPublisher | None = None
 
     @property
     def handled_kinds(self) -> frozenset[EffectKind]:
@@ -1422,6 +1452,11 @@ class GitHubAPIAdapter:
             }:
                 return await self._post_comment(effect)
             if effect.kind == EffectKind.EDIT_REPORT:
+                if self.status_comments is not None and effect.parcel_id is not None:
+                    # The PR section of the status comment (rate limited like any edit);
+                    # a Ready report posted before status comments is left as it is.
+                    write = await self.status_comments.refresh(effect.parcel_id)
+                    return Ack(None, {"edited": write.written, "status_comment": True})
                 return await self._edit_report(effect)
             if effect.kind in {EffectKind.MOVE_CARD, EffectKind.SET_BOT}:
                 return await self._write_board(effect)
@@ -1512,12 +1547,19 @@ class GitHubAPIAdapter:
 
     async def _post_comment(self, effect: EffectIntent) -> AdapterOutcome:
         ref = await self._issue_ref(effect, require_parcel=False)
+        status = self.status_comments if effect.parcel_id is not None else None
+        folded = status is not None and await status.folded(effect)
+        ready_line = (
+            status is not None
+            and effect.kind == EffectKind.PUBLISH_REPORT
+            and effect.args.get("report") == "ready"
+        )
         text = effect.args.get("body")
-        if text is None:
+        if text is None and not folded and not ready_line:
             text = await self._render_publication(effect)
         if ref is None:
             return DefinitiveFailure("comment effect could not resolve the parcel issue")
-        if not isinstance(text, str):
+        if not isinstance(text, str) and not folded and not ready_line:
             return DefinitiveFailure("comment effect could not render its body")
         issue_number = ref.issue_number
         adopted = await self._find_marked_comment(ref, effect.effect_id)
@@ -1528,7 +1570,11 @@ class GitHubAPIAdapter:
                 publication = await self.find_contract_publication(ref, effect.effect_id)
                 if isinstance(publication, RetryableReadFailure):
                     return publication
-                if publication is None or not _publication_matches(effect, publication, text):
+                if (
+                    publication is None
+                    or not isinstance(text, str)
+                    or not _publication_matches(effect, publication, text)
+                ):
                     return AmbiguousWrite("contract comment exists but exact bytes are unverified")
                 return Ack(
                     adopted,
@@ -1539,6 +1585,21 @@ class GitHubAPIAdapter:
                     },
                 )
             return await self._after_comment(effect, ref, adopted, {"adopted": True})
+        if status is not None and (folded or ready_line):
+            # Shown in the status comment (written first, so the owner never sees a link
+            # to a stale one); a folded publication posts nothing else.
+            write = await status.publish(str(effect.parcel_id))
+            if not write.ok or write.comment_id is None:
+                if write.definitive:
+                    return DefinitiveFailure(f"status comment: {write.reason}")
+                return RetryableReadFailure(f"status comment: {write.reason}", write.retry_after_us)
+            if folded:
+                return await self._after_comment(
+                    effect, ref, str(write.comment_id), {"status_comment": True}
+                )
+            text = f"PR #{effect.args.get('pr_number')} is ready for review — {write.url}"
+        if not isinstance(text, str):
+            return DefinitiveFailure("comment effect could not render its body")
         body = f"{text}\n\n{self._effect_marker(effect.effect_id)}"
         try:
             response = await self.client.request(

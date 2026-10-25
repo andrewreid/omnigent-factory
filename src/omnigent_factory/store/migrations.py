@@ -881,6 +881,47 @@ DROP TABLE split_issues;
 ALTER TABLE split_issues_v19 RENAME TO split_issues;
 """
 
+# Status comments (``service.status_comment``): one factory-owned dashboard comment per
+# issue, edited in place and found again by its hidden marker.
+#
+# * status_comments: per parcel, the comment (``creating`` while a create may have landed:
+#   its marker is searched for before any second create), the digest of the body last
+#   written and when (the per-issue edit rate limit), ``pending`` (a changed body waiting
+#   for that limit), the pin attempt's outcome (tried at most once per comment), the
+#   parcel version last rendered, the headline and the bounded stage history it shows.
+# * status_settings: per repository, when status comments started (a parcel unchanged
+#   since gets none until it changes: no bulk sweep) and whether the installation may pin
+#   comments (``unsupported`` is recorded once, with GitHub's message, and never retried).
+V20_SQL = """
+CREATE TABLE status_comments (
+    repo_id TEXT NOT NULL,
+    parcel_id TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    comment_id INTEGER,
+    node_id TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL CHECK (state IN ('creating', 'posted')),
+    digest TEXT NOT NULL DEFAULT '',
+    written_at_us INTEGER NOT NULL DEFAULT 0,
+    pending INTEGER NOT NULL DEFAULT 0 CHECK (pending IN (0, 1)),
+    pin TEXT NOT NULL DEFAULT '' CHECK (pin IN ('', 'pinned', 'failed', 'skipped')),
+    seen_version INTEGER NOT NULL DEFAULT 0,
+    headline TEXT NOT NULL DEFAULT '',
+    history_json TEXT NOT NULL DEFAULT '[]',
+    created_at_us INTEGER NOT NULL,
+    updated_at_us INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, parcel_id)
+);
+CREATE TABLE status_settings (
+    repo_id TEXT PRIMARY KEY,
+    baseline_us INTEGER NOT NULL,
+    pin_state TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (pin_state IN ('unknown', 'supported', 'unsupported')),
+    pin_message TEXT NOT NULL DEFAULT '',
+    updated_at_us INTEGER NOT NULL
+);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -901,4 +942,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(17, "follow-up-discipline", V17_SQL),
     Migration(18, "owner-directed-splits", V18_SQL),
     Migration(19, "split-relation-direction", V19_SQL),
+    Migration(20, "status-comments", V20_SQL),
 )
