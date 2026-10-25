@@ -107,6 +107,31 @@ def board_pending(p: Parcel) -> bool:
     return bool(p.pending_moves) or p.queued_move is not None
 
 
+def never_worked(p: Parcel) -> bool:
+    """The factory never acted on this issue: no stage authority (pending or recorded),
+    approval, run, decision, board write or ambiguous effect."""
+    return not (
+        p.authorizations
+        or p.pending_authorization_id is not None
+        or p.approvals
+        or p.sessions
+        or p.decisions
+        or board_pending(p)
+        or p.unknown_effects
+    )
+
+
+def stale_safety_hold(p: Parcel) -> bool:
+    """The only hold is a safety hold on an issue the factory never worked on.
+
+    Such a hold fences nothing (there is no run, authority or write to stop). It was set
+    by the Status write that adds a card to the board (``from`` absent, read as a move
+    to Inbox) before that write became an observation, or by another safety fact on an
+    untouched card. Auto-triage and an owner stage control may proceed past it.
+    """
+    return p.holds == frozenset({Hold.SAFETY}) and not p.inbox_holds and never_worked(p)
+
+
 def all_settled(p: Parcel, *, except_id: str | None = None) -> bool:
     """Q: every other tree settled and no ambiguous external write outstanding.
 

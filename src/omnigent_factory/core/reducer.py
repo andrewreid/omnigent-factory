@@ -58,6 +58,7 @@ from omnigent_factory.core.predicates import (
     only_checkpoint_fenced,
     plan_ok,
     settled,
+    stale_safety_hold,
     uncertain,
     work_allowed,
 )
@@ -1537,10 +1538,11 @@ def _h_auto_triage(ctx: _Ctx, body: ev.AutoTriage) -> None:
         raise Rejected("parcel-not-dispatchable")
     if ctx.origin_stage not in _TRIAGE_STAGES or p.stage != Stage.INBOX:
         raise Rejected("auto-triage-not-in-inbox")
+    stale = stale_safety_hold(p)
     if (
         p.authorizations
         or p.sessions
-        or p.holds
+        or (p.holds and not stale)
         or p.decisions
         or board_pending(p)
         or p.unknown_effects
@@ -1551,8 +1553,21 @@ def _h_auto_triage(ctx: _Ctx, body: ev.AutoTriage) -> None:
         raise Rejected("auto-triage-factory-busy")
     if not _triage_slot_free(ctx):
         raise Rejected("auto-triage-slot-busy")
+    if stale:
+        ctx.unhold(Hold.SAFETY)  # it fenced nothing: there was never work to stop
     _move(ctx, Stage.TRIAGED)
     _start_stage(ctx, SessionKind.TRIAGE, ctx.config.block_us(p.size or Size.S))
+
+
+def _h_stale_hold_cleared(ctx: _Ctx, body: ev.StaleHoldCleared) -> None:
+    """Startup repair: drop the safety hold of an untouched Inbox issue (it fenced
+    nothing). Anything the factory ever worked on keeps its hold."""
+    _ = body
+    if ctx.p.stage != Stage.INBOX:
+        raise Rejected("stale-hold-not-in-inbox")
+    if not stale_safety_hold(ctx.p):
+        raise Rejected("stale-hold-not-stale")
+    ctx.unhold(Hold.SAFETY)
 
 
 #: Related marks kept per card (newest win); the note shows what fits on one line.
@@ -3297,6 +3312,13 @@ def _h_leftward(ctx: _Ctx, body: ev.LeftwardMove) -> None:
     ):
         return
     from_stage = body.from_stage or ctx.p.stage
+    if from_stage is None:
+        # No column before, on the board or here: the card was just added (e.g. by the
+        # project's auto-add workflow setting Inbox). An observation, never a stop.
+        if body.to_stage is None:
+            raise Rejected("not-a-leftward-move")
+        _observe_stage(ctx, body.to_stage)
+        return
     if not is_leftward(from_stage, body.to_stage):
         raise Rejected("not-a-leftward-move")
     # Negative half, any actor: fence, and for Building->Scoped revoke/void/revise.
@@ -5889,6 +5911,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.BASE_PUSHED: _h_base_pushed,
     EventKind.OPERATOR_RESUME: _h_operator_resume,
     EventKind.AUTO_TRIAGE: _h_auto_triage,
+    EventKind.STALE_HOLD_CLEARED: _h_stale_hold_cleared,
     EventKind.AUTO_BUILD_MARKED: _h_auto_build_marked,
     EventKind.AUTO_BUILD: _h_auto_build,
     EventKind.AUTOPILOT_MARKED: _h_autopilot_marked,

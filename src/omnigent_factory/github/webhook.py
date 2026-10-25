@@ -471,6 +471,12 @@ class DeliveryNormalizer:
         to_stage = stage_for_option(new.get("id") if isinstance(new, dict) else None, options)
         if actor_id == self.identity.bot_user_id:
             return (ev.ColumnObserved(stage=to_stage),)
+        if old is None or (from_stage is not None and from_stage == to_stage):
+            # No prior column (the card was just added to the board, e.g. by the
+            # project's auto-add workflow setting Inbox) or a write of the column it is
+            # already in: an observation, never a move. The reducer still compares it
+            # with the persisted column, so a card it knows elsewhere stops as before.
+            return (ev.ColumnObserved(stage=to_stage),)
         if is_leftward(from_stage, to_stage):
             return (ev.LeftwardMove(from_stage=from_stage, to_stage=to_stage),)
         if actor_id not in self.identity.owner_ids or actor_id in self.identity.automation_user_ids:

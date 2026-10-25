@@ -75,7 +75,10 @@ with the reason in the note. A drag is judged by its own from and to columns: a 
 read that sees the new column before the drag's webhook arrives changes nothing about
 it. A card moved right with no owner drag behind it (a non-owner, or a drag whose webhook
 never came) gets no authority and the note `Moved to <column> without an owner command
-seen: drag it again or add a factory: label`.
+seen: drag it again or add a factory: label`. A Status write with no column before it (a
+card added to the board, e.g. by the project's auto-add workflow setting Inbox) or to the
+column the card is already in is an observation, never a drag or a stop; a card the
+factory knows in another column still stops.
 
 | Drag | Effect |
 |---|---|
@@ -262,7 +265,10 @@ again.
 Eligible: an open issue (not a pull request or draft) of the configured repository in the
 Inbox column, assigned to nobody, without the `factory:skip` label, created more than
 `auto_triage_min_age_hours` ago, that the factory has never worked on (no run, request or
-hold, no parked delivery). It is checked about every `reconcile_interval_seconds`, at most
+hold, no parked delivery; a lone safety hold on an issue it never worked on does not
+count, and startup clears it). `auto-triage status` counts the Inbox issues left out by
+reason (`excluded_inbox`: assigned, skip label, too new, known to the factory, refused
+today or parked). It is checked about every `reconcile_interval_seconds`, at most
 `auto_triage_daily_limit` per local day (`auto-triage grant <n>` adds more for today). The
 audit records each start as an `AutoTriage` event from the trusted clock (the operator's
 standing authorisation), never as an owner control.
@@ -517,7 +523,7 @@ waits up to 90 s for it instead of failing.
 | `cleanup <parcel> [--merged]` | Tear down the dev environment (`devenv_teardown`) and remove the factory worktree(s) (its own and its `factory-issue-<N>-*` extras) and local branches of a finished parcel (PR merged, issue closed or Done; refused for a Ready card) from the factory clone. |
 | `release-delivery <guid>` | Release one parked webhook delivery for processing. |
 | `pause` / `unpause` | Stop / resume admitting new work repository-wide; in-flight parcels and safety events carry on. |
-| `auto-triage status` | Idle-time auto-triage: enabled (and whether config or the CLI decides), today's used/limit/granted, idle or what keeps it busy, triage slots, the next candidate. |
+| `auto-triage status` | Idle-time auto-triage: enabled (and whether config or the CLI decides), today's used/limit/granted, idle or what keeps it busy, triage slots, the next candidate, the eligible count and why the other Inbox issues are left out (`excluded_inbox`). |
 | `auto-triage on` / `off` | Turn auto-triage on/off at runtime. Stored in the state database, so it survives restarts, until `auto_triage` in the config file changes: then the config value applies again (the newer intent wins). |
 | `auto-triage grant <n>` | Add `<n>` (1-1000) auto-triages to today's budget (local day; it does not carry over). |
 | `auto-build status` | Auto-build: enabled (and whether config or the CLI decides), the concurrency cap, auto-builds running and waiting for a slot, today's used/limit/granted, what the next start waits on (`waiting_on`), and the queue in start order with each card's rank, `eligible` and `blocker`. |

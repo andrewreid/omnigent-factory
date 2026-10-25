@@ -353,6 +353,12 @@ class FactoryService:
                     await self.splits.retry_pending()
                 except Exception:
                     LOG.warning("split issues failed", exc_info=True)
+            if self.auto_triager is not None:
+                # One-off repair (idempotent): safety holds that fence nothing.
+                try:
+                    await self.auto_triager.repair_stale_holds()
+                except Exception:
+                    LOG.warning("stale safety hold repair failed", exc_info=True)
             await self.operator.start()
             self.accepting_admission = True
             if self.config_path is not None:

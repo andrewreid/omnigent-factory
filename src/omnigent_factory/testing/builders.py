@@ -149,6 +149,7 @@ class EventFactory:
                 | ev.RetryDue
                 | ev.ReconcileDue
                 | ev.AutoTriage
+                | ev.StaleHoldCleared
                 | ev.AutoBuild
                 | ev.AutopilotPlan
                 | ev.AutopilotQueue

@@ -61,6 +61,7 @@ class EventKind(enum.StrEnum):
     UNPAUSE = "Unpause"
     OPERATOR_RESUME = "OperatorResume"
     AUTO_TRIAGE = "AutoTriage"
+    STALE_HOLD_CLEARED = "StaleHoldCleared"
     AUTO_BUILD_MARKED = "AutoBuildMarked"
     AUTO_BUILD = "AutoBuild"
     AUTOPILOT_MARKED = "AutopilotMarked"
@@ -325,6 +326,19 @@ class AutoTriage(_Body):
     """
 
     KIND: ClassVar[EventKind] = EventKind.AUTO_TRIAGE
+    CLASS: ClassVar[EventClass] = EventClass.CONTROL
+
+
+@dataclass(frozen=True, slots=True)
+class StaleHoldCleared(_Body):
+    """Startup repair (the trusted clock): drop a safety hold that fenced nothing.
+
+    Only for an Inbox issue whose one hold is ``safety`` and that the factory never
+    worked on (``predicates.stale_safety_hold``): the hold the board's own "item added"
+    Status write once set. Restores no authority; any other parcel is refused.
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.STALE_HOLD_CLEARED
     CLASS: ClassVar[EventClass] = EventClass.CONTROL
 
 
@@ -1151,6 +1165,7 @@ EventBody = (
     | OperatorResume
     | Unpause
     | AutoTriage
+    | StaleHoldCleared
     | AutoBuildMarked
     | AutoBuild
     | AutopilotMarked
@@ -1235,6 +1250,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         OperatorResume,
         Unpause,
         AutoTriage,
+        StaleHoldCleared,
         AutoBuildMarked,
         AutoBuild,
         AutopilotMarked,
@@ -1432,6 +1448,7 @@ __all__ = [
     "SessionCreated",
     "SessionKind",
     "Size",
+    "StaleHoldCleared",
     "StallAction",
     "StallObserved",
     "Stop",

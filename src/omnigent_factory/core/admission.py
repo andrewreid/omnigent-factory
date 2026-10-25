@@ -79,6 +79,8 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.OPERATOR_RESUME: Admission(_OPERATOR),
     # standing operator authorisation, acted on by the trusted clock (no actor)
     EventKind.AUTO_TRIAGE: Admission(_SCHEDULER),
+    # startup repair of a safety hold that fenced nothing (restores no authority)
+    EventKind.STALE_HOLD_CLEARED: Admission(_SCHEDULER),
     # an owner's auto-build mark started when a build slot is free (the mark is the
     # owner's approval; the clock only picks the time)
     EventKind.AUTO_BUILD: Admission(_SCHEDULER),

@@ -25,11 +25,13 @@ from omnigent_factory.core import events as ev
 from omnigent_factory.core.codec import parcel_from_json
 from omnigent_factory.core.effects import RetryableReadFailure
 from omnigent_factory.core.events import Event, EventKind, Provenance
+from omnigent_factory.core.predicates import stale_safety_hold
 from omnigent_factory.core.projection import project_bot, startable_build
 from omnigent_factory.core.types import (
     MICROS_PER_HOUR,
     AdmissionSnapshot,
     BotState,
+    Hold,
     IssueSnapshot,
     Lifecycle,
     Parcel,
@@ -82,14 +84,55 @@ def local_day(now_us: int) -> tuple[str, int, int]:
 
 
 def known_to_factory(parcel: Parcel | None) -> bool:
-    """The factory has worked on (or holds) this issue: it is no auto-triage candidate."""
-    return parcel is not None and bool(
-        parcel.authorizations
-        or parcel.sessions
-        or parcel.holds
-        or parcel.decisions
-        or parcel.pending_authorization_id
+    """The factory has worked on (or holds) this issue: it is no auto-triage candidate.
+
+    A stale safety hold alone (``stale_safety_hold``: the only hold, on an issue the
+    factory never worked on) does not count: it fenced nothing.
+    """
+    return (
+        parcel is not None
+        and not stale_safety_hold(parcel)
+        and bool(
+            parcel.authorizations
+            or parcel.sessions
+            or parcel.holds
+            or parcel.decisions
+            or parcel.pending_authorization_id
+        )
     )
+
+
+#: Why an Inbox issue is not an auto-triage candidate, in the order they are checked
+#: (each issue counts once, under the first that applies).
+EXCLUSIONS = (
+    "assigned",
+    "skip_label",
+    "too_new",
+    "known_to_factory",
+    "refused_or_parked",
+)
+
+
+def exclusion(
+    issue: BoardIssue,
+    parcel: Parcel | None,
+    *,
+    now_us: int,
+    min_age_us: int,
+    blocked: Callable[[str], bool] = lambda _node_id: False,
+) -> str | None:
+    """Why auto-triage may not take this Inbox issue (one of ``EXCLUSIONS``), or None."""
+    if issue.assigned:
+        return "assigned"
+    if any(label.casefold() == SKIP_LABEL for label in issue.labels):
+        return "skip_label"
+    if issue.created_at_us <= 0 or now_us - issue.created_at_us < min_age_us:
+        return "too_new"  # an unknown age is never taken either
+    if known_to_factory(parcel):
+        return "known_to_factory"
+    if blocked(issue.node_id):
+        return "refused_or_parked"
+    return None
 
 
 def eligible_candidates(
@@ -99,24 +142,30 @@ def eligible_candidates(
     now_us: int,
     min_age_us: int,
     blocked: Callable[[str], bool] = lambda _node_id: False,
+    excluded: dict[str, int] | None = None,
 ) -> list[BoardIssue]:
     """Inbox issues auto-triage may take, oldest first.
 
     Open repository issues only (the board read lists no pull requests or drafts), in the
     Inbox column, nobody assigned, no ``factory:skip`` label, older than the grace period,
-    never worked on by the factory and not held by a parked delivery.
+    never worked on by the factory and not held by a parked delivery (or refused today).
+    ``excluded``, when given, receives a count per reason of the Inbox issues left out.
     """
-    chosen = [
-        issue
-        for issue in issues
-        if issue.stage == Stage.INBOX
-        and not issue.assigned
-        and all(label.casefold() != SKIP_LABEL for label in issue.labels)
-        and issue.created_at_us > 0
-        and now_us - issue.created_at_us >= min_age_us
-        and not known_to_factory(parcels.get(issue.node_id))
-        and not blocked(issue.node_id)
-    ]
+    chosen: list[BoardIssue] = []
+    for issue in issues:
+        if issue.stage != Stage.INBOX:
+            continue
+        reason = exclusion(
+            issue,
+            parcels.get(issue.node_id),
+            now_us=now_us,
+            min_age_us=min_age_us,
+            blocked=blocked,
+        )
+        if reason is None:
+            chosen.append(issue)
+        elif excluded is not None:
+            excluded[reason] = excluded.get(reason, 0) + 1
     return sorted(chosen, key=lambda issue: (issue.created_at_us, issue.number))
 
 
@@ -222,8 +271,9 @@ class AutoTriager:
             return "a triage ranking is running"
         return await stage_busy(self.service, admission)
 
-    async def candidates(self) -> list[BoardIssue]:
-        """Eligible Inbox issues, oldest first (raises ``BoardUnavailable``)."""
+    async def candidates(self, excluded: dict[str, int] | None = None) -> list[BoardIssue]:
+        """Eligible Inbox issues, oldest first (raises ``BoardUnavailable``); ``excluded``
+        receives the count of Inbox issues left out per reason."""
         issues = [i for i in await self.board.issues() if i.stage == Stage.INBOX]
         ids = [i.node_id for i in issues]
         parcels = await self.service.db.call(partial(_parcels_by_id, parcel_ids=ids))
@@ -237,6 +287,7 @@ class AutoTriager:
             now_us=self.service.clock.now_utc_us(),
             min_age_us=int(config.auto_triage_min_age_hours * MICROS_PER_HOUR),
             blocked=lambda node_id: node_id in skip or self.service.parked.blocks(node_id),
+            excluded=excluded,
         )
 
     # --------------------------------------------------------------- pass
@@ -310,6 +361,54 @@ class AutoTriager:
         refused.add(node_id)
         self._refused = (today, refused)
 
+    # --------------------------------------------------------------- repair
+
+    async def repair_stale_holds(self) -> int:
+        """Startup repair: drop the safety hold of each Inbox issue the factory never
+        worked on (``stale_safety_hold``), through the reducer. Before the fix, the
+        board's own "item added" Status write (``from`` absent, to Inbox) read as a
+        leftward move and held every new issue for good, out of auto-triage's reach.
+
+        Idempotent: a repaired parcel has no hold left to match. Returns the count.
+        """
+        repo_id = self.service.config.repo_id
+        rows = await self.service.db.call(
+            lambda store: store.query(
+                "SELECT aggregate_json FROM parcels WHERE repo_id = ? AND stage = ? "
+                "AND holds_json LIKE ?",
+                (repo_id, Stage.INBOX.value, f"%{Hold.SAFETY.value}%"),
+            )
+        )
+        stale = [
+            parcel
+            for parcel in (parcel_from_json(str(row[0])) for row in rows)
+            if parcel.stage == Stage.INBOX and stale_safety_hold(parcel)
+        ]
+        cleared = 0
+        for parcel in stale:
+            now = self.service.clock.now_utc_us()
+            result = await self.service.apply_event(
+                Event(
+                    event_id=f"stale-hold:{parcel.parcel_id}:{now}",
+                    repo_id=repo_id,
+                    parcel_id=parcel.parcel_id,
+                    source_time_us=now,
+                    provenance=Provenance.SCHEDULER,
+                    body=ev.StaleHoldCleared(),
+                    issue_number=parcel.issue_number,
+                )
+            )
+            if result.accepted:
+                cleared += 1
+            else:
+                LOG.info(
+                    "stale safety hold kept issue=#%s reason=%s",
+                    parcel.issue_number,
+                    result.reason,
+                )
+        LOG.info("stale safety holds cleared count=%d candidates=%d", cleared, len(stale))
+        return cleared
+
     # --------------------------------------------------------------- operator
 
     async def command(self, args: Mapping[str, object]) -> dict[str, object]:
@@ -356,13 +455,16 @@ class AutoTriager:
             "idle": busy is None,
             "busy": busy,
         }
+        excluded = dict.fromkeys(EXCLUSIONS, 0)
         try:
-            candidates = await self.candidates()
+            candidates = await self.candidates(excluded)
         except BoardUnavailable as exc:
             out["next_candidate"] = None
             out["next_candidate_error"] = f"board unavailable: {exc}"
         else:
             out["eligible_inbox"] = len(candidates)
+            # Why the other Inbox issues are left out: a silent stall shows here.
+            out["excluded_inbox"] = excluded
             out["next_candidate"] = (
                 {"issue": candidates[0].number, "title": candidates[0].title[:120]}
                 if candidates
@@ -412,11 +514,13 @@ def _active_parcels(store: SqliteStore, *, repo_id: str) -> list[Parcel]:
 
 
 __all__ = [
+    "EXCLUSIONS",
     "SKIP_LABEL",
     "AutoTriager",
     "Budget",
     "busy_reason",
     "eligible_candidates",
+    "exclusion",
     "known_to_factory",
     "local_day",
     "stage_busy",
