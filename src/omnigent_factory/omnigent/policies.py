@@ -387,17 +387,22 @@ def _command_matches(regex: str) -> str:
     has_args = f"has({args}) && type({args}) == map"
     pattern = _cel_string(regex)
     command_key = " || ".join(f'k == "{key}"' for key in _COMMAND_KEYS)
-    # celpy evaluates a nested ``exists`` target eagerly even behind ``&&``: a list
-    # comprehension over a non-list argument raises, the pinned cel_policy then abstains
-    # and the call would be ALLOWED. Keep string and list forms in separate guarded
-    # clauses (list form keyed by ``has()``), so no argument type can make this fail open.
+    # celpy evaluates both operands of ``&&`` and ``||`` (only ``?:`` is lazy), and
+    # ``exists`` visits every element. A list comprehension over a non-list argument
+    # raises (the pinned cel_policy then abstains and the call would be ALLOWED) and one
+    # over a string visits each character: a ``matches`` per character, which made a
+    # 10 KB heredoc take tens of seconds (#1394). So every ``matches`` and every list
+    # ``exists`` sits behind a ``?:`` whose guard proves its operand type; no argument
+    # type can make this fail open or scan more than the command text itself.
     string_form = (
         f"({has_args} && {args}.exists(k, ({command_key})"
-        f" && type({args}[k]) == string && {args}[k].matches({pattern})))"
+        f" ? (type({args}[k]) == string ? {args}[k].matches({pattern}) : false)"
+        f" : false))"
     )
     list_forms = [
         f"({has_args} && has({args}.{key}) && type({args}.{key}) == list"
-        f" && {args}.{key}.exists(x, type(x) == string && x.matches({pattern})))"
+        f" ? {args}.{key}.exists(x, type(x) == string ? x.matches({pattern}) : false)"
+        f" : false)"
         for key in _COMMAND_KEYS
     ]
     return "(" + " || ".join([string_form, *list_forms]) + ")"
