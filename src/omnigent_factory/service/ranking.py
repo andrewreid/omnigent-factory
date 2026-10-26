@@ -96,6 +96,8 @@ class Submission:
     summary: str
     #: Final rank of every Triage issue (pinned ones at their pin).
     ranks: Mapping[int, float]
+    #: Bundles proposed with the ranking (validated by ``service.bundles``).
+    bundles: tuple[Any, ...] = ()
 
 
 def one_line(text: object, limit: int) -> str:
@@ -373,6 +375,9 @@ class Ranker:
         self._repaired = False
         #: The Priority field's node ID (resolved from the first board read).
         self.priority_field_id: str | None = None
+        #: Issue bundling (``service.bundles.Bundles``): bundled members are not ranked and
+        #: the ranking may propose bundles; None: not wired.
+        self.bundles: Any = None
 
     @property
     def repo_id(self) -> str:
@@ -798,16 +803,35 @@ class Ranker:
             return await self._fail(run, "the session ended its turn without a ranking")
         return "running"
 
+    async def _held(self) -> frozenset[int]:
+        """Bundle members (built as part of their bundle issue): never ranked."""
+        if self.bundles is None:
+            return frozenset()
+        held: frozenset[int] = await self.bundles.held_numbers()
+        return held
+
+    async def _bundle_text(self) -> tuple[str, str]:
+        """The start message's bundle paragraph and its submit field ("" while off)."""
+        if self.bundles is None:
+            return "", ""
+        text: tuple[str, str] = await self.bundles.ranking_text()
+        return text
+
     async def _start_message(self, run: rs.RankingRun) -> str:
         config = self.service.config
         cards = await self.cards()
         pinned, _sticky = await self.owner_choices(cards)
-        ranked = sorted((c for c in cards if c.stage in RANKED_STAGES), key=lambda c: c.number)
+        held = await self._held()
+        ranked = sorted(
+            (c for c in cards if c.stage in RANKED_STAGES and c.number not in held),
+            key=lambda c: c.number,
+        )
+        bundles, bundles_field = await self._bundle_text()
         pins = ", ".join(
             f"#{c.number} at {rank_text(pinned[c.node_id])}" for c in ranked if c.node_id in pinned
         )
         return (
-            _template("ranking-v2.txt")
+            _template("ranking-v3.txt")
             .format(
                 run_id=run.run_id,
                 repository=config.repository,
@@ -818,6 +842,8 @@ class Ranker:
                 planning_count=sum(c.stage == Stage.SCOPED for c in ranked),
                 count=len(ranked),
                 pinned=f"pinned: {pins}" if pins else "none are pinned now",
+                bundles=bundles,
+                bundles_field=bundles_field,
             )
             .strip()
         )
@@ -905,13 +931,17 @@ class Ranker:
                 raise RankingToolError(problem)
             cards = await self.cards()
             pinned_nodes, sticky_nodes = await self.owner_choices(cards)
-            triage = {c.number: c for c in cards if c.stage in RANKED_STAGES}
+            held = await self._held()
+            triage = {
+                c.number: c for c in cards if c.stage in RANKED_STAGES and c.number not in held
+            }
             by_node = {c.node_id: c for c in cards}
             pinned = {by_node[n].number: v for n, v in pinned_nodes.items() if n in by_node}
             sticky = {by_node[n].number for n in sticky_nodes if n in by_node}
             submission = validate_submission(
                 raw, triage, {n: v for n, v in pinned.items() if n in triage}, sticky
             )
+            submission = await self._with_bundles(raw, submission, cards)
             writes = self._writes(run, submission, triage)
             receipt = {
                 "accepted": True,
@@ -919,6 +949,7 @@ class Ranker:
                 "ranked": len(submission.ranks),
                 "rank_changes": sum(w.kind == "rank" for w in writes),
                 "priority_changes": len(submission.priority_changes),
+                "bundles_proposed": len(submission.bundles),
                 "next": "End your turn; the factory writes the ranking to the board.",
             }
             stored_submission = {
@@ -936,6 +967,8 @@ class Ranker:
             )
             if not accepted:
                 raise RankingToolError("this ranking run is closed")
+            if submission.bundles and self.bundles is not None:
+                await self.bundles.record_proposals(run.run_id, submission.bundles)
             LOG.info(
                 "ranking submitted run=%s ranked=%s rank_changes=%s priority_changes=%s",
                 run.run_id,
@@ -945,6 +978,25 @@ class Ranker:
             )
         # Apply in the background of the next pass; the agent's reply does not wait for it.
         return receipt
+
+    async def _with_bundles(
+        self, raw: Mapping[str, Any], submission: Submission, cards: Sequence[RankingCard]
+    ) -> Submission:
+        """The submission's ``bundles``, validated (raises with every problem)."""
+        bundles = raw.get("bundles")
+        if not bundles:
+            return submission
+        if self.bundles is None:
+            raise RankingToolError(
+                "invalid ranking (fix these and resend):\n- bundles: not available"
+            )
+        priorities = {c.number: c.priority for c in cards}
+        proposals, errors = await self.bundles.check_proposals(bundles, priorities)
+        if errors:
+            raise RankingToolError(
+                "invalid ranking (fix these and resend):\n" + "\n".join(f"- {e}" for e in errors)
+            )
+        return replace(submission, bundles=tuple(proposals))
 
     def _writes(
         self, run: rs.RankingRun, submission: Submission, triage: Mapping[int, RankingCard]
@@ -1224,6 +1276,12 @@ def _status_text(submission: Submission, triage: Mapping[int, RankingCard], now_
         lines += [
             f"- #{c.issue} {c.old or 'unset'} -> {c.new}: {c.reason}"
             for c in submission.priority_changes
+        ]
+    if submission.bundles:
+        lines += ["", "**Bundles proposed** (tick the box on the first issue to confirm):"]
+        lines += [
+            "- " + ", ".join(f"#{n}" for n in sorted(set(b.members))) + f": {one_line(b.theme, 80)}"
+            for b in submission.bundles
         ]
     lines += ["", one_line(submission.summary, SUMMARY_MAX)]
     return "\n".join(lines)

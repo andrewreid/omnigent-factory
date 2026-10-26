@@ -213,6 +213,9 @@ class FactoryService:
         #: The issues' status comments, written on each reconcile tick (composition;
         #: ``service.status_comment.StatusComments``). None: not wired.
         self.status_comments: Any = None
+        #: Issue bundling and its ``bundles`` operator command (composition;
+        #: ``service.bundles.Bundles``). None: not wired.
+        self.bundles: Any = None
         self._fatal_exit = fatal_exit
         self._fatal_reason: str | None = None
         self._delivery_failures: dict[str, int] = {}
@@ -860,6 +863,12 @@ class FactoryService:
                 await self.deferred.tick()
             except Exception:
                 LOG.warning("ready report ticks failed", exc_info=True)
+        if self.bundles is not None:
+            try:
+                # New proposals posted, confirmed bundles advanced, members' Bot mirrored.
+                await self.bundles.tick()
+            except Exception:
+                LOG.warning("bundles failed", exc_info=True)
         live, idle = await self.live_parcel_ids()
         if self.board_diff is not None:
             await self._board_diff_tick(loop_now, live)
@@ -931,6 +940,12 @@ class FactoryService:
                 await self.splits.retry_pending()
             except Exception:
                 LOG.warning("split issues failed", exc_info=True)
+        if self.bundles is not None:
+            try:
+                # Lost proposal ticks, stale proposals, bundles merged or cancelled.
+                await self.bundles.catch_up()
+            except Exception:
+                LOG.warning("bundle catch-up failed", exc_info=True)
 
     async def reread(self, parcel_id: str) -> None:
         """A per-issue read now (e.g. a native link of the issue changed)."""
@@ -1310,6 +1325,11 @@ class FactoryService:
                 raise ValueError("epic autopilot is not wired")
             piloted: dict[str, object] = await self.epic_autopilot.command(args)
             return piloted
+        if command == "bundles":
+            if self.bundles is None:
+                raise ValueError("bundling is not wired")
+            bundled: dict[str, object] = await self.bundles.command(args)
+            return bundled
         if command == "ranking":
             if self.ranker is None:
                 raise ValueError("ranking is not wired")

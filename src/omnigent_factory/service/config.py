@@ -62,6 +62,9 @@ HOT_RELOAD_KEYS = frozenset(
         "ranking_min_new_triages",
         "ranking_status_update",
         "rank_field_node_id",
+        "bundling",
+        "bundle_max_members",
+        "bundle_max_points",
         "session_retention_days",
         "board_diff_interval_minutes",
         "session_inventory_resync_hours",
@@ -273,6 +276,15 @@ class ServiceConfig(BaseModel):
     ranking_status_update: bool = True
     #: Projects v2 NUMBER field "Rank" ("" = not set up: ranking runs do not start).
     rank_field_node_id: str = ""
+    #: Issue bundling: the ranking may propose up to ``bundle_max_members`` related small
+    #: issues to build as one PR, and an owner tick (or ``/bundle``) confirms one.
+    #: ``omnigent-factory bundles on|off`` overrides it until it changes here.
+    bundling: bool = False
+    #: Members of one bundle at most (2 at least; never more than 5).
+    bundle_max_members: int = Field(default=3, ge=2, le=5)
+    #: Size points of one bundle at most (S = 1, M = 3; an L or unsized issue is never
+    #: bundled).
+    bundle_max_points: int = Field(default=4, ge=2, le=15)
     #: Days a factory-created Omnigent session stays archived before retention deletes it
     #: (only sessions of finished issues and ranking runs; 0 = never delete).
     session_retention_days: float = Field(default=30.0, ge=0)

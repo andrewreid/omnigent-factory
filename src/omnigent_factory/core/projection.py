@@ -79,6 +79,8 @@ def project_bot(p: Parcel, *, queued: bool = False) -> BotState:
         return BotState.CHECKPOINT
     if p.open_decisions or p.holds & NEEDS_YOU_HOLDS:
         return BotState.NEEDS_YOU
+    if Hold.BUNDLED in p.holds and p.bundle_bot in _BOT_VALUES:
+        return BotState(p.bundle_bot)  # a bundle member mirrors its bundle issue
     if queued:
         return BotState.QUEUED
     if Hold.BLOCKERS in p.holds and (cur is None or cur.quiescent):
@@ -86,6 +88,31 @@ def project_bot(p: Parcel, *, queued: bool = False) -> BotState:
     if _running(p):
         return BotState.WORKING
     return BotState.IDLE
+
+
+_BOT_VALUES = frozenset(b.value for b in BotState)
+
+
+def bundle_note(bundle: int) -> str:
+    return f"In bundle #{bundle}"
+
+
+def bundle_member_refusal(p: Parcel, *, queued: bool = False) -> str | None:
+    """Why ``p`` cannot be held in a bundle now (None: it can): only an open, unassigned
+    issue in Triage or Planning with no stage work running, queued or marked."""
+    if not p.eligible:
+        return "closed, assigned or unverified"
+    if p.stage not in (Stage.TRIAGED, Stage.SCOPED):
+        return "not in Triage or Planning"
+    if p.pending_authorization_id is not None or queued or _running(p):
+        return "work on it is running or queued"
+    if p.auto_build is not None:
+        return "it has an auto-build mark"
+    if p.autopilot_claim is not None and p.autopilot_claim.active:
+        return "epic autopilot drives it"
+    if p.open_decisions or p.holds & (NEEDS_YOU_HOLDS | BLOCKING_HOLDS):
+        return "it needs you"
+    return None
 
 
 def _running(p: Parcel) -> bool:
@@ -244,6 +271,8 @@ def project_note(p: Parcel, bot: BotState) -> str:
     elif bot == BotState.IDLE and unexplained_move(p):
         assert p.stage is not None  # noqa: S101 - unexplained_move checks it
         text = unexplained_move_note(p.stage)
+    elif Hold.BUNDLED in p.holds and p.bundled_into:
+        text = bundle_note(p.bundled_into)
     elif waiting_on_note(p):
         text = waiting_on_note(p)
     else:

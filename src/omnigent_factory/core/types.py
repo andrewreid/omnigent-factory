@@ -230,6 +230,10 @@ class Hold(enum.StrEnum):
     #: A build run asked for a replan after the automatic replans were used up
     #: (``auto_replan_limit``): Needs you until an owner control (``/replan``).
     REPLAN_LIMIT = "replan_limit"
+    #: A member of an owner-confirmed issue bundle (``Parcel.bundled_into``): built as part
+    #: of the bundle issue's PR, never on its own. Not cleared by owner controls: removed
+    #: only when the member is ejected or the bundle is released (``BundleHold``).
+    BUNDLED = "bundled"
 
 
 class InboxHoldReason(enum.StrEnum):
@@ -1112,6 +1116,10 @@ class Parcel:
     #: Replans the factory started by itself since the owner's last plan control (loop
     #: guard: at most ``auto_replan_limit``).
     auto_replans: int = 0
+    #: The bundle issue this issue is a member of (0 = none; with ``Hold.BUNDLED``).
+    bundled_into: int = 0
+    #: The bundle issue's Bot value, mirrored on this member's card ("" = not mirrored).
+    bundle_bot: str = ""
     applied_event_ids: frozenset[str] = frozenset()
 
     def session(self, session_id: str | None) -> StageSession | None:

@@ -82,6 +82,9 @@ class Splits:
         self.publish = publish
         self._tasks: set[asyncio.Task[object]] = set()
         self._locks: dict[int, asyncio.Lock] = {}
+        #: A bundle issue's members (``service.bundles.Bundles``): a bundle run's item
+        #: naming a ``member`` is filed as that member's split; None: not wired.
+        self.bundles: Any = None
 
     @property
     def _repo_id(self) -> str:
@@ -120,40 +123,53 @@ class Splits:
     async def record_result(
         self, parcel: Parcel, session_id: str, result: Mapping[str, Any]
     ) -> list[ds.SplitIssue]:
-        source = parcel.issue_number
         raw = result.get("split_out")
-        if source is None or not isinstance(raw, list) or not raw:
+        if parcel.issue_number is None or not isinstance(raw, list) or not raw:
             return []
-        items = [
-            ds.NewSplit(
-                item_key=split_key(str(item.get("title") or "")),
-                title=str(item.get("title") or ""),
-                body=str(item.get("body") or ""),
-                reason=str(item.get("reason") or ""),
-                relation=_relation(source, str(item.get("relation") or "none")),
-                blocks=tuple(
-                    n
-                    for n in item.get("blocks") or []
-                    if isinstance(n, int) and not isinstance(n, bool) and n != source
-                ),
+        by_source: dict[int, list[ds.NewSplit]] = {}
+        for item in raw:
+            if not isinstance(item, dict) or not item.get("title"):
+                continue
+            # A bundle run's piece of one member is split out of that member.
+            source = await self._source(parcel, item.get("member"))
+            by_source.setdefault(source, []).append(
+                ds.NewSplit(
+                    item_key=split_key(str(item.get("title") or "")),
+                    title=str(item.get("title") or ""),
+                    body=str(item.get("body") or ""),
+                    reason=str(item.get("reason") or ""),
+                    relation=_relation(source, str(item.get("relation") or "none")),
+                    blocks=tuple(
+                        n
+                        for n in item.get("blocks") or []
+                        if isinstance(n, int) and not isinstance(n, bool) and n != source
+                    ),
+                )
             )
-            for item in raw
-            if isinstance(item, dict) and item.get("title")
-        ]
-        added = await self._db(
-            partial(
-                ds.record_splits,
-                repo_id=self._repo_id,
-                source_issue=source,
-                session_id=session_id,
-                items=items,
+        found: list[ds.SplitIssue] = []
+        for source, items in sorted(by_source.items()):
+            added = await self._db(
+                partial(
+                    ds.record_splits,
+                    repo_id=self._repo_id,
+                    source_issue=source,
+                    session_id=session_id,
+                    items=items,
+                )
             )
-        )
-        if added:
-            LOG.info("owner-directed splits recorded issue=#%s items=%s", source, added)
-        await self.sync(source)
-        keys = {i.item_key for i in items}
-        return [s for s in await self._splits(source) if s.item_key in keys]
+            if added:
+                LOG.info("owner-directed splits recorded issue=#%s items=%s", source, added)
+            await self.sync(source)
+            keys = {i.item_key for i in items}
+            found += [s for s in await self._splits(source) if s.item_key in keys]
+        return found
+
+    async def _source(self, parcel: Parcel, member: object) -> int:
+        assert parcel.issue_number is not None  # noqa: S101 - callers check
+        if self.bundles is None or not isinstance(member, int) or isinstance(member, bool):
+            return parcel.issue_number
+        found = await self.bundles.source_for(parcel, member)
+        return int(found) if isinstance(found, int) else parcel.issue_number
 
     async def _splits(self, source: int | None = None) -> list[ds.SplitIssue]:
         return await self._db(partial(ds.splits, repo_id=self._repo_id, source_issue=source))
@@ -319,12 +335,20 @@ class Splits:
         source = parcel.issue_number
         if source is None or not session_id:
             return ""
-        mine = [s for s in await self._splits(source) if s.session_id == session_id]
+        sources = [source]
+        if self.bundles is not None:
+            sources += [n for n in await self.bundles.member_sources(parcel) if n != source]
+
+        async def of_run() -> list[ds.SplitIssue]:
+            return [s for n in sources for s in await self._splits(n) if s.session_id == session_id]
+
+        mine = await of_run()
         if not mine:
             return ""
         if any(s.issue_number is None for s in mine):
-            await self.sync(source)
-            mine = [s for s in await self._splits(source) if s.session_id == session_id]
+            for n in sorted({s.source_issue for s in mine if s.issue_number is None}):
+                await self.sync(n)
+            mine = await of_run()
         lines = []
         for s in mine:
             title = " ".join(self.publish(s.title).split())[:200]

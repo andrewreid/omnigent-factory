@@ -572,6 +572,7 @@ class EffectExecutor:
                 pr_open=detail.get("open") is not False,
                 merged=detail.get("merged") is True,
                 closes_issue=detail.get("closes_issue") is not False,
+                missing_closes=_issue_refs(detail.get("missing_closes")),
                 review_bot_pending_since_us=_optional_int(
                     detail.get("review_bot_pending_since_us")
                 ),
@@ -666,6 +667,14 @@ def _mergeable_state(value: object) -> str:
     """A read's mergeability ("" for anything not a known value: never a conflict)."""
     known = (ev.MERGE_CLEAN, ev.MERGE_CONFLICT, ev.MERGE_UNKNOWN)
     return str(value) if value in known else ""
+
+
+def _issue_refs(value: object) -> str:
+    """A bundle PR's missing closing references as "#12, #13" (bounded)."""
+    if not isinstance(value, list):
+        return ""
+    numbers = [n for n in value[:20] if isinstance(n, int) and not isinstance(n, bool)]
+    return ", ".join(f"#{n}" for n in numbers)
 
 
 def _check_refs(value: object) -> tuple[ev.CheckRef, ...]:

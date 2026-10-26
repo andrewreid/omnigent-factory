@@ -45,6 +45,7 @@ from omnigent_factory.core.projection import (
 from omnigent_factory.core.types import (
     AdmissionSnapshot,
     AutoBuildStatus,
+    Hold,
     IssueSnapshot,
     Parcel,
     QueueStatus,
@@ -130,6 +131,8 @@ def mark_blocker(parcel: Parcel, *, parked: bool = False, now_us: int = 0) -> st
         return "a plan revision is in progress"
     if parcel.stage != Stage.SCOPED:
         return "not in Planning"
+    if Hold.BUNDLED in parcel.holds:
+        return f"in bundle #{parcel.bundled_into}: built with it"
     if not dispatchable(parcel):
         return "the issue is closed, assigned or not on the board"
     if parked:

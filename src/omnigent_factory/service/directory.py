@@ -823,7 +823,9 @@ def _needs_you_gaps(args: Mapping[str, Any], bot_name: str, threads: int, checks
             parts.append("required checks are failing")
     if args.get("review_missing"):
         parts.append("no cross-vendor review covers this head yet")
-    if args.get("closes_issue") is False:
+    if args.get("closes_issue") is False and args.get("missing_closes"):
+        parts.append(f"the PR doesn't close {args.get('missing_closes')}")
+    elif args.get("closes_issue") is False:
         issue = args.get("issue")
         parts.append(
             f"the PR doesn't close #{issue}" if issue else "the PR doesn't close the issue"
@@ -1423,8 +1425,8 @@ def _new_boundary() -> str:
 #: First-message template of each stage run (the dispatch snapshot pins name and bytes).
 _FIRST_TEMPLATES = {
     SessionKind.TRIAGE: "triage-v10.txt",
-    SessionKind.PLAN: "plan-v10.txt",
-    SessionKind.BUILD: "build-v16.txt",
+    SessionKind.PLAN: "plan-v11.txt",
+    SessionKind.BUILD: "build-v17.txt",
 }
 _RETRIAGE_TEMPLATE = "triage-feedback-v7.txt"
 #: The triage of an epic (an issue with sub-issues), first run and re-runs alike.

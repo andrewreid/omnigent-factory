@@ -238,6 +238,10 @@ class GitHubAPIAdapter:
         #: Told (without waiting) once a triage comment exists, to mark the issues the
         #: triage names as related (``service.related.RelatedMarker.schedule``).
         self.related_marker: Callable[[EffectIntent], None] | None = None
+        #: A bundle parcel's members still in it, as (issue number, node id): its PR must
+        #: close each of them too (``service.bundles.Bundles.required_closes``); None:
+        #: not wired.
+        self.bundle_members: Callable[[str], Awaitable[tuple[tuple[int, str], ...]]] | None = None
         #: The issue's status comment: a triage result and a checkpoint report are shown
         #: there instead of in comments of their own, the Ready report is one line linking
         #: to it, and Ready report edits update it. None (not wired): every publication is
@@ -771,6 +775,16 @@ class GitHubAPIAdapter:
                 review_accepted = self._review_accepted(reviews, head_sha)
             findings_dispositioned = await self._bot_threads_settled(pr_number)
             closes_issue = await self._closes_issue(pr_number, ref.parcel_id)
+            missing: tuple[int, ...] = ()
+            required = (
+                await self.bundle_members(ref.parcel_id) if self.bundle_members is not None else ()
+            )
+            if required:
+                # A bundle PR closes the bundle issue AND every member still in it.
+                missing = await self._missing_closes(pr_number, required)
+                if not closes_issue:
+                    missing = (ref.issue_number, *missing)
+                closes_issue = closes_issue and not missing
             review_bot_since = await self._review_bot_pending_since(pr, pr_number, head_sha)
             rounds = await self._review_rounds(ref, pr_number, head_sha, base_sync)
             if rounds is not None and rounds.over_budget:
@@ -792,6 +806,7 @@ class GitHubAPIAdapter:
                 bot_authored=isinstance(author, dict) and author.get("id") == self.bot_user_id,
                 parcel_branch=branch.startswith(self.parcel_branch_prefix),
                 closes_issue=closes_issue,
+                missing_closes=missing,
                 checks=checks,
                 review_accepted=review_accepted,
                 findings_dispositioned=findings_dispositioned,
@@ -1083,6 +1098,18 @@ class GitHubAPIAdapter:
         produce), matched by issue node ID, so a PR closing some other issue - or text
         naming the right number in another repository - never satisfies the linkage.
         """
+        return issue_node_id in await self._closing_refs(pr_number)
+
+    async def _missing_closes(
+        self, pr_number: int, required: Sequence[tuple[int, str]]
+    ) -> tuple[int, ...]:
+        """The (number, node id) issues a bundle PR must also close that its closing
+        references lack."""
+        refs = await self._closing_refs(pr_number)
+        return tuple(number for number, node_id in required if node_id not in refs)
+
+    async def _closing_refs(self, pr_number: int) -> frozenset[str]:
+        """Node IDs of this repository's issues in the PR's ``closingIssuesReferences``."""
         owner, _, name = self.repository.partition("/")
         query = """
         query($owner: String!, $name: String!, $number: Int!, $after: String) {
@@ -1098,6 +1125,7 @@ class GitHubAPIAdapter:
           }
         }
         """
+        found: set[str] = set()
         after: str | None = None
         while True:
             data = await self.client.graphql(
@@ -1116,14 +1144,14 @@ class GitHubAPIAdapter:
             for node in nodes:
                 if (
                     isinstance(node, dict)
-                    and node.get("id") == issue_node_id
+                    and isinstance(node.get("id"), str)
                     and isinstance(node.get("repository"), dict)
                     and node["repository"].get("id") == self.repository_node_id
                 ):
-                    return True
+                    found.add(node["id"])
             page = refs.get("pageInfo") if isinstance(refs, dict) else None
             if not isinstance(page, dict) or not page.get("hasNextPage"):
-                return False
+                return frozenset(found)
             cursor = page.get("endCursor")
             if not isinstance(cursor, str):
                 raise GitHubAPIError("closing references pagination cursor was missing")

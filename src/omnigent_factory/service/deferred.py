@@ -121,6 +121,9 @@ class Deferrals:
         #: The issues' status comments (``service.status_comment.StatusComments``), which
         #: carry the Deferred checkboxes; None: only Ready reports carry them.
         self.status: Any = None
+        #: A bundle issue's members (``service.bundles.Bundles``): its run may attribute a
+        #: finding to one (``member``), filed under that member; None: not wired.
+        self.bundles: Any = None
 
     @property
     def _repo_id(self) -> str:
@@ -176,30 +179,74 @@ class Deferrals:
             return []
         pr = result.get("pr_number")
         pr_number = pr if isinstance(pr, int) else (parcel.pr_number or 0)
-        items = [*_deferred(result.get("deferred")), *_legacy(result.get("follow_ups"))]
+        raw = result.get("deferred")
+        by_source: dict[int, list[ds.NewDeferred]] = {}
+        for item, member in zip(_deferred(raw), _members(raw), strict=True):
+            # A bundle run's finding of one member is that member's follow-up.
+            owner = await self._source(parcel, member)
+            by_source.setdefault(owner, []).append(item)
+        legacy = _legacy(result.get("follow_ups"))
+        if legacy:
+            by_source.setdefault(source, []).extend(legacy)
         recorded: list[ds.DeferredItem] = []
-        if items:
-            recorded = await self._db(
+        for owner, items in sorted(by_source.items()):
+            rows = await self._db(
                 partial(
                     ds.record_deferred,
                     repo_id=self._repo_id,
-                    source_issue=source,
+                    source_issue=owner,
                     pr_number=pr_number,
                     session_id=session_id,
                     items=items,
                 )
             )
+            recorded += rows
             LOG.info(
                 "deferred findings recorded issue=#%s pr=#%s items=%s",
-                source,
+                owner,
                 pr_number,
-                len(recorded),
+                len(rows),
             )
         head = result.get("head_sha")
         if result.get("kind") == "build_ready" and isinstance(head, str):
             await self._finish_rework(parcel, session_id, head)
-        await self.sync(source)
+        for owner in sorted({source, *by_source}):
+            await self.sync(owner)
         return recorded
+
+    async def _source(self, parcel: Parcel, member: int | None) -> int:
+        assert parcel.issue_number is not None  # noqa: S101 - callers check
+        if member is None or self.bundles is None:
+            return parcel.issue_number
+        found = await self.bundles.source_for(parcel, member)
+        return int(found) if isinstance(found, int) else parcel.issue_number
+
+    async def _parcel_items(
+        self, parcel: Parcel
+    ) -> tuple[list[ds.DeferredItem], dict[tuple[int, int], int]]:
+        """The parcel's deferred items (a bundle issue's: also those of this PR attributed
+        to its members) and their consolidated issues by (source issue, PR)."""
+        source = parcel.issue_number
+        if source is None:
+            return [], {}
+        sources = [source]
+        if self.bundles is not None:
+            sources += [n for n in await self.bundles.member_sources(parcel) if n != source]
+        items: list[ds.DeferredItem] = []
+        issues: dict[tuple[int, int], int] = {}
+        for owner in sources:
+            found = await self._db(
+                partial(ds.deferred_items, repo_id=self._repo_id, source_issue=owner)
+            )
+            if owner != source:
+                found = [i for i in found if parcel.pr_number and i.pr_number == parcel.pr_number]
+            items += found
+            for r in await self._db(
+                partial(ds.consolidated, repo_id=self._repo_id, source_issue=owner)
+            ):
+                if r.issue_number is not None:
+                    issues[(owner, r.pr_number)] = r.issue_number
+        return items, issues
 
     async def _finish_rework(self, parcel: Parcel, session_id: str, head: str) -> None:
         """The build_ready of a rework that ticked boxes started: its items are fixed."""
@@ -418,27 +465,25 @@ class Deferrals:
     async def _close_out(self, parcel: Parcel, batch: ds.ActionBatch, head: str) -> bool:
         """Tick the fixed follow-up items in their consolidated issue (re-read first).
         Returns whether any item was still to tick."""
-        source = parcel.issue_number
-        if source is None:
+        if parcel.issue_number is None:
             return False
         repo_id = self._repo_id
-        items = await self._db(partial(ds.deferred_items, repo_id=repo_id, source_issue=source))
-        rows = await self._db(partial(ds.consolidated, repo_id=repo_id, source_issue=source))
-        issues = {r.pr_number: r.issue_number for r in rows if r.issue_number is not None}
+        items, issues = await self._parcel_items(parcel)
         fixed = [
             i
             for i in items
             if i.action_id in batch.actions
             and i.outcome == "follow_up"
             and not i.closed_out
-            and i.pr_number in issues
+            and (i.source_issue, i.pr_number) in issues
         ]
         if not fixed:
             return False
         pr = parcel.pr_number
         status = f"fixed in #{pr} (`{head[:7]}`)" if pr else f"fixed in `{head[:7]}`"
-        for number in sorted({issues[i.pr_number] for i in fixed}):
-            keys = [i.item_key for i in fixed if issues.get(i.pr_number) == number]
+        for number in sorted({issues[(i.source_issue, i.pr_number)] for i in fixed}):
+            mine = [i for i in fixed if issues.get((i.source_issue, i.pr_number)) == number]
+            keys = [i.item_key for i in mine]
             try:
                 body = await self._issue_text(number)
                 new = rl.with_status(body, dict.fromkeys(keys, status), rl.ITEM)
@@ -447,15 +492,16 @@ class Deferrals:
             except GitHubAPIError as exc:
                 LOG.warning("consolidated issue update failed issue=#%s reason=%s", number, exc)
                 continue
-            await self._db(
-                partial(
-                    ds.mark_items,
-                    repo_id=repo_id,
-                    source_issue=source,
-                    keys=keys,
-                    column="closed_out",
+            for owner in sorted({i.source_issue for i in mine}):
+                await self._db(
+                    partial(
+                        ds.mark_items,
+                        repo_id=repo_id,
+                        source_issue=owner,
+                        keys=[i.item_key for i in mine if i.source_issue == owner],
+                        column="closed_out",
+                    )
                 )
-            )
             LOG.info("consolidated follow-up items ticked issue=#%s items=%s", number, len(keys))
         return True
 
@@ -463,16 +509,13 @@ class Deferrals:
 
     async def report_section(self, parcel: Parcel) -> str:
         """The Ready report's Deferred section ("" when there is nothing to list)."""
-        source = parcel.issue_number
-        if source is None:
+        if parcel.issue_number is None:
             return ""
         repo_id = self._repo_id
-        items = await self._db(partial(ds.deferred_items, repo_id=repo_id, source_issue=source))
-        rows = await self._db(partial(ds.consolidated, repo_id=repo_id, source_issue=source))
+        items, issues = await self._parcel_items(parcel)
         actions = await self._db(
             partial(ds.report_actions, repo_id=repo_id, parcel_id=parcel.parcel_id)
         )
-        issues = {r.pr_number: r.issue_number for r in rows if r.issue_number is not None}
         lines = [
             rl.line(
                 rl.ACTION,
@@ -504,7 +547,7 @@ class Deferrals:
             return ""
         return "\n\n**Deferred** (tick an item to have it done in this PR):\n" + "\n".join(lines)
 
-    def _report_text(self, item: ds.DeferredItem, issues: Mapping[int, int | None]) -> str:
+    def _report_text(self, item: ds.DeferredItem, issues: Mapping[tuple[int, int], int]) -> str:
         if item.outcome == "filed":
             return f"Fix now: #{item.issue_number} (filed during the run)"
         path = f" `{_one_line(item.path, 200).replace('`', chr(39))}`" if item.path else ""
@@ -512,7 +555,7 @@ class Deferrals:
         if item.outcome == "advisory":
             where = f"(advisory: {_one_line(item.reason, 200)})"
         else:
-            number = issues.get(item.pr_number)
+            number = issues.get((item.source_issue, item.pr_number))
             where = f"(in #{number})" if number is not None else "(follow-up issue pending)"
         return _one_line(self.publish(f"{text} {where}"), 1000)
 
@@ -635,18 +678,7 @@ class Deferrals:
         return applied
 
     async def _brief(self, parcel: Parcel, action_ids: Sequence[str]) -> str:
-        source = parcel.issue_number
-        items = (
-            await self._db(partial(ds.deferred_items, repo_id=self._repo_id, source_issue=source))
-            if source is not None
-            else []
-        )
-        rows = (
-            await self._db(partial(ds.consolidated, repo_id=self._repo_id, source_issue=source))
-            if source is not None
-            else []
-        )
-        issues = {r.pr_number: r.issue_number for r in rows if r.issue_number is not None}
+        items, issues = await self._parcel_items(parcel)
         by_action = {i.action_id: i for i in items}
         name, mention = self._bot()
         lines: list[str] = []
@@ -663,13 +695,14 @@ class Deferrals:
                 )
         return "\n".join(lines)
 
-    def _brief_line(self, item: ds.DeferredItem, issues: Mapping[int, int | None]) -> str:
+    def _brief_line(self, item: ds.DeferredItem, issues: Mapping[tuple[int, int], int]) -> str:
         if item.outcome == "filed":
             return f"Fix #{item.issue_number} (filed during an earlier run) in this PR."
         path = f" in `{_one_line(item.path, 200).replace('`', chr(39))}`" if item.path else ""
         where = ""
-        if item.outcome == "follow_up" and issues.get(item.pr_number) is not None:
-            where = f" (listed in follow-up issue #{issues[item.pr_number]})"
+        number = issues.get((item.source_issue, item.pr_number))
+        if item.outcome == "follow_up" and number is not None:
+            where = f" (listed in follow-up issue #{number})"
         thread = f" Thread: {item.thread_url}." if item.thread_url.startswith("https://") else ""
         return self.publish(
             f"Fix the {item.severity} finding{path}: {_one_line(item.title)}{where}.{thread} "
@@ -895,44 +928,50 @@ class Deferrals:
         return recovered
 
     async def _edits(self, node_id: str) -> list[tuple[int, int | None, str | None]] | None:
-        """The comment's edit history, oldest first: (time, editor's numeric id, the body
-        after that edit). None when it cannot be read."""
-        query = """
-        query($id: ID!) {
-          node(id: $id) {
-            ... on IssueComment {
-              userContentEdits(first: 100) {
-                nodes {
-                  editedAt
-                  diff
-                  editor { __typename ... on User { databaseId } ... on Bot { databaseId } }
-                }
-              }
+        return await comment_edits(self.client, node_id)
+
+
+async def comment_edits(
+    client: GitHubClient, node_id: str
+) -> list[tuple[int, int | None, str | None]] | None:
+    """The comment's edit history, oldest first: (time, editor's numeric id, the body
+    after that edit). None when it cannot be read."""
+    query = """
+    query($id: ID!) {
+      node(id: $id) {
+        ... on IssueComment {
+          userContentEdits(first: 100) {
+            nodes {
+              editedAt
+              diff
+              editor { __typename ... on User { databaseId } ... on Bot { databaseId } }
             }
           }
         }
-        """
-        data = await self.client.graphql(query, {"id": node_id})
-        node = data.get("node")
-        history = node.get("userContentEdits") if isinstance(node, dict) else None
-        nodes = history.get("nodes") if isinstance(history, dict) else None
-        if not isinstance(nodes, list):
-            return None
-        out: list[tuple[int, int | None, str | None]] = []
-        for item in nodes:
-            if not isinstance(item, dict):
-                continue
-            editor = item.get("editor")
-            editor_id = editor.get("databaseId") if isinstance(editor, dict) else None
-            text = item.get("diff")
-            out.append(
-                (
-                    _time_us(item.get("editedAt")),
-                    editor_id if isinstance(editor_id, int) else None,
-                    text if isinstance(text, str) else None,
-                )
+      }
+    }
+    """
+    data = await client.graphql(query, {"id": node_id})
+    node = data.get("node")
+    history = node.get("userContentEdits") if isinstance(node, dict) else None
+    nodes = history.get("nodes") if isinstance(history, dict) else None
+    if not isinstance(nodes, list):
+        return None
+    out: list[tuple[int, int | None, str | None]] = []
+    for item in nodes:
+        if not isinstance(item, dict):
+            continue
+        editor = item.get("editor")
+        editor_id = editor.get("databaseId") if isinstance(editor, dict) else None
+        text = item.get("diff")
+        out.append(
+            (
+                _time_us(item.get("editedAt")),
+                editor_id if isinstance(editor_id, int) else None,
+                text if isinstance(text, str) else None,
             )
-        return sorted(out, key=lambda e: e[0])
+        )
+    return sorted(out, key=lambda e: e[0])
 
 
 async def find_marked_issue(
@@ -1012,6 +1051,17 @@ def _deferred(raw: object) -> list[ds.NewDeferred]:
     return out
 
 
+def _members(raw: object) -> list[int | None]:
+    """The ``member`` of each ``deferred`` entry ``_deferred`` keeps (None: none named)."""
+    out: list[int | None] = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        member = item.get("member")
+        out.append(member if isinstance(member, int) and not isinstance(member, bool) else None)
+    return out
+
+
 def _legacy(raw: object) -> list[ds.NewDeferred]:
     """``follow_ups`` entries (issues the run opened itself): listed, never re-filed."""
     out: list[ds.NewDeferred] = []
@@ -1034,4 +1084,11 @@ def _legacy(raw: object) -> list[ds.NewDeferred]:
     return out
 
 
-__all__ = ["BATCH_WINDOW_US", "Deferrals", "find_marked_issue", "issue_marker", "item_key"]
+__all__ = [
+    "BATCH_WINDOW_US",
+    "Deferrals",
+    "comment_edits",
+    "find_marked_issue",
+    "issue_marker",
+    "item_key",
+]

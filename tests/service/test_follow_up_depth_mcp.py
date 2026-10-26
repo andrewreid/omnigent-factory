@@ -122,7 +122,7 @@ async def test_every_accepted_stage_result_reaches_the_split_filer(service_confi
         )
         root = await triaged(rig)
         await rig.submit(root, "triage", {**TRIAGE, "split_out": [split]})
-        assert seen == [("triage", [{**split, "relation": "none", "blocks": []}])]
+        assert seen == [("triage", [{**split, "relation": "none", "blocks": [], "member": None}])]
 
 
 async def test_stage_instructions_route_owner_directed_splits_to_split_out():

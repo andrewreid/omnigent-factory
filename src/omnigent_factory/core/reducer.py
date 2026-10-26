@@ -68,6 +68,8 @@ from omnigent_factory.core.projection import (
     admission_key,
     auto_build_capacity_available,
     building_capacity_available,
+    bundle_member_refusal,
+    bundle_note,
     pr_capacity_available,
     project_bot,
     project_note,
@@ -1088,8 +1090,28 @@ def _stage_controllable(p: Parcel) -> bool:
     return not entry_live
 
 
+def _refuse_bundled(ctx: _Ctx) -> None:
+    """A bundle member is triaged, planned and built only as part of its bundle issue."""
+    p = ctx.p
+    if Hold.BUNDLED not in p.holds:
+        return
+    via = getattr(ctx.event.body, "via", None)
+    rollback = (
+        ctx.origin_stage
+        if via == Via.DRAG and p.stage == Stage.BUILDING and ctx.origin_stage != Stage.BUILDING
+        else None
+    )
+    raise Rejected(
+        "bundled",
+        explain=True,
+        rollback_to=rollback,
+        note=f"{bundle_note(p.bundled_into)}: work on the bundle issue, or /unbundle it",
+    )
+
+
 def _start_stage(ctx: _Ctx, kind: SessionKind, duration_us: int) -> None:
     """Record owner stage authority as the pending action; drain the old tree first."""
+    _refuse_bundled(ctx)
     _cancel_pending(ctx)
     auth = _new_authorization(ctx, kind, duration_us)
     ctx.update(pending_authorization_id=auth.authorization_id)
@@ -1331,6 +1353,7 @@ def _enqueue_build(
     rework: bool = False,
     conflict: bool = False,
 ) -> None:
+    _refuse_bundled(ctx)
     auth = _new_authorization(ctx, SessionKind.BUILD, duration_us, approval.approval_id)
     if not rework and _replan_rework(ctx, approval):
         rework = True  # the revised plan continues the work on the same branch and PR
@@ -1597,6 +1620,38 @@ def _h_epic_progress(ctx: _Ctx, body: ev.EpicProgress) -> None:
     ctx.update(epic_note=text)
 
 
+def _h_bundle_hold(ctx: _Ctx, body: ev.BundleHold) -> None:
+    """The bundling service holds this issue in bundle issue ``body.bundle`` (an owner
+    confirmed the bundle), refreshes the mirrored Bot value, or releases it (0)."""
+    p = ctx.p
+    if body.bundle > 0:
+        if body.bundle == p.issue_number:
+            raise Rejected("bundle-is-this-issue")
+        if Hold.BUNDLED in p.holds and p.bundled_into == body.bundle:
+            if body.bot == p.bundle_bot:
+                raise Rejected("bundle-hold-unchanged")
+            ctx.update(bundle_bot=body.bot)
+            return
+        if Hold.BUNDLED in p.holds:
+            raise Rejected("in-another-bundle")
+        queued = ctx.admission.queue_entry(p.parcel_id) is not None
+        refusal = bundle_member_refusal(p, queued=queued)
+        if refusal is not None:
+            raise Rejected(f"bundle-member: {refusal}")
+        ctx.hold(Hold.BUNDLED)
+        ctx.update(bundled_into=body.bundle, bundle_bot=body.bot)
+        ctx.note(bundle_note(body.bundle))
+        return
+    if Hold.BUNDLED not in p.holds:
+        raise Rejected("not-bundled")
+    old = p.bundled_into
+    ctx.unhold(Hold.BUNDLED)
+    ctx.update(bundled_into=0, bundle_bot="")
+    ctx.note((body.note or f"Released from bundle #{old}")[:NOTE_MAX])
+    if body.to_triage and eligible(p) and p.stage == Stage.SCOPED:
+        _emit_move(ctx, Stage.TRIAGED)
+
+
 EPIC_BUILD_NOTE = "Epic: build its sub-issues"
 
 
@@ -1810,6 +1865,8 @@ def _mark_refusal(ctx: _Ctx) -> str | None:
         return "Auto-build cleared: a build is already approved"
     if p.links is not None and p.links.epic:
         return f"Auto-build cleared: {EPIC_BUILD_NOTE}"
+    if Hold.BUNDLED in p.holds:
+        return f"Auto-build cleared: {bundle_note(p.bundled_into)}"
     return None
 
 
@@ -3920,7 +3977,9 @@ def _unfinished_reason(r: Readiness, body: ev.ReadinessEvidence, issue: int | No
     if body.checks is None:
         return "the PR checks could not be read"
     parts = []
-    if not body.closes_issue:
+    if not body.closes_issue and body.missing_closes:
+        parts.append(f"PR #{r.pr_number} lacks Closes lines for {body.missing_closes}")
+    elif not body.closes_issue:
         parts.append(f"PR #{r.pr_number} does not close #{issue}")
     if not body.review_accepted:
         parts.append(f"no accepted cross-vendor review of {r.head_sha[:7]}")
@@ -4461,6 +4520,7 @@ def _needs_you_comment(
         "findings_open": body.findings_open,
         "review_missing": not body.review_accepted,
         "closes_issue": body.closes_issue,
+        **({"missing_closes": body.missing_closes} if body.missing_closes else {}),
         "issue": ctx.p.issue_number,
         "conflict": conflict,
         "run_stopped": s is not None and _ended_without_result(ctx, s),
@@ -4613,7 +4673,13 @@ def _check_gap(body: ev.ReadinessEvidence) -> bool:
 
 def _failure_reason(r: Readiness, body: ev.ReadinessEvidence, issue: int | None) -> str:
     parts = []
-    if not body.closes_issue:
+    if not body.closes_issue and body.missing_closes:
+        lines = ", ".join(f"`Closes {n.strip()}`" for n in body.missing_closes.split(","))
+        parts.append(
+            f"bundle PR #{r.pr_number} does not close {body.missing_closes} (GitHub closing "
+            f"references); its body must include {lines}"
+        )
+    elif not body.closes_issue:
         parts.append(
             f"PR #{r.pr_number} does not close issue #{issue} (GitHub closing references); "
             f"its body must include `Closes #{issue}`"
@@ -5957,6 +6023,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.AUTOPILOT_QUESTION: _h_autopilot_question,
     EventKind.RELATED_MARKED: _h_related_marked,
     EventKind.EPIC_PROGRESS: _h_epic_progress,
+    EventKind.BUNDLE_HOLD: _h_bundle_hold,
     EventKind.AGENT_BLOCKED_ON: _h_agent_blocked_on,
     EventKind.CONTRACT_PUBLISHED: _h_contract_published,
     EventKind.PUBLICATION_ACKED: _h_publication_acked,

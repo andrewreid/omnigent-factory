@@ -42,6 +42,7 @@ from omnigent_factory.service.auto_triage import AutoTriager
 from omnigent_factory.service.autopilot import EpicAutopilotService
 from omnigent_factory.service.board_diff import BoardDiff
 from omnigent_factory.service.board_index import BoardIndex
+from omnigent_factory.service.bundles import Bundles
 from omnigent_factory.service.cleanup import CleanupAdapter, WorkspaceCleaner
 from omnigent_factory.service.config import ConfigError, ServiceConfig
 from omnigent_factory.service.credentials import AppInstallationTokenMinter, StoreExecutionGate
@@ -467,6 +468,20 @@ async def build_production(
     service.status_comments = status_comments
     github.status_comments = status_comments
     deferred.status = status_comments
+    bundles = Bundles(
+        service,
+        github.client,
+        directory,
+        lambda text: safe_publication(text, service.config),
+        snapshot=github.issue_snapshot,
+        cards=lambda: ranking_board.cards(service.config.rank_field_node_id),
+        set_priority=ranking_board.set_priority,
+    )
+    service.bundles = bundles
+    github.bundle_members = bundles.required_closes
+    status_comments.bundle_section = bundles.section
+    deferred.bundles = bundles
+    splits.bundles = bundles
 
     def write_links(issue: int, result: Mapping[str, Any]) -> None:
         native_links.schedule_result(issue, result)
@@ -497,6 +512,7 @@ async def build_production(
         policy_barrier_us=omnigent_adapter.config.policy_barrier_us,
     )
     service.ranker = ranker
+    ranker.bundles = bundles
     service.session_retention = SessionRetention(service, omnigent_adapter)
     service.comment_rerenderer = github.rerender_comment
     service.busy_nodes = omnigent_adapter.busy_nodes
@@ -539,6 +555,7 @@ async def build_production(
     processor.native_links = native_links
     processor.follow_ups = follow_ups
     processor.deferred = deferred
+    processor.bundles = bundles
     service.bind_integrations(
         adapters=(
             github,
@@ -562,6 +579,7 @@ async def build_production(
             result_observer=deferred.schedule_result,
             split_observer=splits.schedule_result,
             review_rounds=rounds,
+            bundles=bundles,
         ),
     )
 

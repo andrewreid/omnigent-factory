@@ -114,6 +114,7 @@ class EventKind(enum.StrEnum):
     ISSUE_SESSION_CLOSED = "IssueSessionClosed"
     RELATED_MARKED = "RelatedMarked"
     EPIC_PROGRESS = "EpicProgress"
+    BUNDLE_HOLD = "BundleHold"
     AGENT_BLOCKED_ON = "AgentBlockedOn"
     AUTOPILOT_STATUS = "AutopilotStatus"
     AUTOPILOT_GATE_CREATED = "AutopilotGateCreated"
@@ -611,6 +612,9 @@ class ReadinessEvidence(_Body):
     merged: bool = False
     #: GitHub's closingIssuesReferences of the PR include the parcel's issue.
     closes_issue: bool = True
+    #: A bundle PR: the issues (bundle issue and members, "#12, #13") its closing
+    #: references lack; ``closes_issue`` is false while any is missing ("" = none).
+    missing_closes: str = ""
     #: The review bot's latest unanswered trigger on this head (source time), 0 = it
     #: already answered this head, None = unknown (older reads or no bot configured).
     review_bot_pending_since_us: int | None = None
@@ -951,6 +955,24 @@ class EpicProgress(_Body):
 
 
 @dataclass(frozen=True, slots=True)
+class BundleHold(_Body):
+    """The bundling service's membership of this issue in bundle issue ``bundle``.
+
+    ``bundle`` > 0 holds the issue in that bundle (an owner confirmed it; the issue is
+    built only as part of the bundle's PR) and mirrors the bundle's ``bot`` value on the
+    card; 0 releases it with ``note`` (ejected or released). ``to_triage``: an ejected
+    member goes back to Triage. Restricts only; never authority to start anything.
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.BUNDLE_HOLD
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    bundle: int = 0
+    bot: str = ""
+    note: str = ""
+    to_triage: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class AgentBlockedOn(_Body):
     """The issues the current build run's stored ``blocked`` result names as its only
     obstacle (``ResultCandidate.blocked_on``), for a result accepted before the reducer
@@ -1230,6 +1252,7 @@ EventBody = (
     | IssueSessionClosed
     | RelatedMarked
     | EpicProgress
+    | BundleHold
     | AgentBlockedOn
     | AutopilotStatus
     | AutopilotGateCreated
@@ -1316,6 +1339,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         IssueSessionClosed,
         RelatedMarked,
         EpicProgress,
+        BundleHold,
         AgentBlockedOn,
         AutopilotStatus,
         AutopilotGateCreated,
@@ -1402,6 +1426,7 @@ __all__ = [
     "BasePushed",
     "BoardFieldsObserved",
     "BotEyes",
+    "BundleHold",
     "CapacityAvailable",
     "CheckRef",
     "ChecksChanged",

@@ -288,6 +288,9 @@ class PullRequestEvidence:
     review_rounds_used: int = 0
     review_rounds_budget: int = 0
     review_rounds_note: str = ""
+    #: A bundle PR: the issues its closing references must also include but do not
+    #: (``closes_issue`` is false while any is missing).
+    missing_closes: tuple[int, ...] = ()
 
     @property
     def verified(self) -> bool:

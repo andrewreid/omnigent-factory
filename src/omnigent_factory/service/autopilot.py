@@ -58,6 +58,7 @@ from omnigent_factory.core.types import (
     AutoBuildStatus,
     BotState,
     EpicAutopilot,
+    Hold,
     IssueLinks,
     IssueSnapshot,
     Parcel,
@@ -412,6 +413,8 @@ class EpicAutopilotService:
             return ""  # assigned to a person, closed or unverified: left alone
         if p.links.epic:
             return ""  # a nested epic only blocks; autopilot never recurses into it
+        if Hold.BUNDLED in p.holds:
+            return ""  # built as part of its bundle issue, never on its own
         if SKIP_LABEL in (await self.labels(p) or []):
             return ""
         blockers = [b.ref for b in _links(sub).open_blockers] + [f"#{n}" for n in sorted(gates)]

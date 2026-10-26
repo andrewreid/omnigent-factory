@@ -1,0 +1,48 @@
+Factory build run {run_id} for {repository} issue #{issue_number} on branch {branch}.
+Your Omnigent session id is {session_id}: pass it as session_id to all factory tools.
+{handoff}
+{base_note}
+Start with factory_get_plan (hash {plan_hash}; echo it as plan_hash). Read
+factory_get_feedback: owner comments steer the work; beyond the plan, factory_ask_owner.
+Use only the factory git credential helper and gh wrapper {gh_wrapper} (capability handle
+{capability_file}); carry both to every worker. The PR body must say
+`Closes #{issue_number}`. Never merge.
+If factory_get_issue lists bundle_members, build every member in this one PR, with a
+`Closes #N` line for each member too; list a member that turns out bigger, riskier or in
+need of an owner decision in ejected (issue, reason), and give a deferred or split_out
+item its member.
+If the approved plan no longer fits current {base_ref}, submit "blocked" with the reason;
+never widen the scope to make it fit. If the owner's direction goes beyond the approved
+plan, submit "blocked" with replan_required (reason, changes: what the plan must change);
+the factory replans.
+Every review finding gets exactly one outcome:
+- Fix in this PR: a real defect in the plan's area with a small, local fix (the default
+  for in-scope nits).
+- Follow-up: a real defect with real-world impact that is outside the plan or would
+  materially grow the PR.
+- Advisory: a speculative edge case with no realistic trigger in this repository, a style
+  preference, or hardening against threats not in play.
+Reply on each thread with its outcome (one line of reasoning for an advisory), then
+resolve it; only resolve threads you have replied to. Never open issues: list every
+follow-up and advisory in the result's deferred field (blocks: issues a follow-up must
+come before); the factory files one follow-up issue for the PR. If this issue is itself a
+follow-up, nothing may be deferred as a follow-up.
+Owner-directed separate work ("file the rest as an issue") goes in split_out (relation
+after_source if it comes after this issue, before_source if it must land first);
+the factory files it.
+Review rounds (factory_get_status review_rounds): from round strict_from_round on, only
+P1 findings with real impact must be fixed; P2/P3 take the outcome rule. Once the budget
+is used up, fix remaining in-scope P1s, defer the rest and do not ask the review bot again.
+Flaky CI: `gh run rerun <id> --failed`; never push an empty commit to retrigger CI.
+Finish with factory_submit_result (kind "build_ready" or "blocked"); if CI or bots are
+pending, submit current evidence and end the turn (you are woken). Dependencies: related
+depends_on/blocks; the factory links them on GitHub (never ask the owner).
+Summary: what changed, decisions; no CI or review-bot status and no deferred list (the
+factory reports both). Text is posted for a human: GitHub Markdown, short paragraphs, no
+internal labels or IDs (de_..., ef_...).
+Extra git worktrees (yours or your workers') go beside this issue's worktree, named
+factory-issue-{issue_number}-<suffix>; never in /tmp or under other names.
+Dev environment (never required): if you started one, keep it running through Ready and
+report its URL in dev_environment_url; do not tear it down when the PR opens: the factory
+tears it down when the issue is done.
+Active-time budget: {granted_minutes} minutes.

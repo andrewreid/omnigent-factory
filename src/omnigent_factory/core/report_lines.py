@@ -1,6 +1,7 @@
 """Checkbox lines the factory writes into GitHub text: the Ready report's Deferred section
 (``- [ ] ... <!-- factory-action:<id> -->``) and the consolidated follow-up issue's
-checklist (``<!-- factory-item:<key> -->``).
+checklist (``<!-- factory-item:<key> -->``) and a bundle proposal's confirmation box
+(``<!-- factory-bundle:<id> -->``).
 
 Pure text helpers. A line is identified by its hidden marker, never by its text, so the
 factory can rewrite a line's status while keeping the owner's ticks: every write merges
@@ -14,10 +15,12 @@ from collections.abc import Iterable, Mapping
 
 ACTION = "action"
 ITEM = "item"
+#: A bundle proposal's "Build these together" checkbox (``service.bundles``).
+BUNDLE = "bundle"
 
 _LINE = re.compile(
     r"^(?P<lead>[ \t]*- \[)(?P<box>[ xX])(?P<mid>\] )(?P<text>.*?)[ \t]*"
-    r"<!-- factory-(?P<kind>action|item):(?P<id>[A-Za-z0-9-]{1,64}) -->[ \t]*$",
+    r"<!-- factory-(?P<kind>action|item|bundle):(?P<id>[A-Za-z0-9-]{1,64}) -->[ \t]*$",
     re.MULTILINE,
 )
 #: The status the factory appended to a line (" → fixing (rework started)").
@@ -106,6 +109,7 @@ def append_lines(body: str, lines: Iterable[str], before: str) -> str:
 
 __all__ = [
     "ACTION",
+    "BUNDLE",
     "ITEM",
     "append_lines",
     "checked",

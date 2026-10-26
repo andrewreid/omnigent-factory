@@ -137,6 +137,7 @@ async def run_doctor(
     await asyncio.to_thread(_check_clone, config, report)
     await asyncio.to_thread(_check_worktrees, config, report)
     await asyncio.to_thread(_check_status_pin, config, report)
+    await asyncio.to_thread(_check_bundling, config, report)
     _check_socket(config, report)
     await asyncio.to_thread(_check_bind, config, report)
     _check_mcp_token(config, report)
@@ -1034,6 +1035,44 @@ def _check_status_pin(config: ServiceConfig, report: DoctorReport) -> None:
         report.warn("status_comment_pin", detail)
     else:
         report.pass_check("status_comment_pin", detail)
+
+
+def _check_bundling(config: ServiceConfig, report: DoctorReport) -> None:
+    """Whether issue bundling is on and how many proposals, bundles and held members the
+    daemon recorded (informational)."""
+    enabled = config.bundling
+    source = "config"
+    counts = (0, 0, 0)
+    path = config.database_path
+    if path.exists():
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+            try:
+                row = conn.execute(
+                    "SELECT enabled_override, override_config FROM bundling WHERE repo_id = ?",
+                    (config.repo_id,),
+                ).fetchone()
+                if row is not None and row[0] is not None and bool(row[1]) == config.bundling:
+                    enabled, source = bool(row[0]), "operator"
+                counts = conn.execute(
+                    "SELECT (SELECT COUNT(*) FROM bundle_proposals WHERE repo_id = ?1 AND state "
+                    "IN ('pending', 'posting', 'posted')), (SELECT COUNT(*) FROM bundles WHERE "
+                    "repo_id = ?1 AND state IN ('creating', 'open')), (SELECT COUNT(*) FROM "
+                    "bundle_members m JOIN bundles b ON b.repo_id = m.repo_id AND b.bundle_key "
+                    "= m.bundle_key WHERE m.repo_id = ?1 AND m.state = 'held' AND b.state IN "
+                    "('creating', 'open'))",
+                    (config.repo_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass  # no such tables yet (an older database): nothing recorded
+    report.pass_check(
+        "bundling",
+        f"{'on' if enabled else 'off'} ({source}); max {config.bundle_max_members} members, "
+        f"{config.bundle_max_points} points; {counts[0]} proposals pending, "
+        f"{counts[1]} active bundles, {counts[2]} members held",
+    )
 
 
 def _check_socket(config: ServiceConfig, report: DoctorReport) -> None:

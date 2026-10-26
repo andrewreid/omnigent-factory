@@ -180,6 +180,10 @@ class GitHubDeliveryProcessor:
         #: Ready report checkboxes (``service.deferred.Deferrals``): the owner's ticks in
         #: an edited report comment. None: not wired.
         self.deferred: Any = None
+        #: Issue bundling (``service.bundles.Bundles``): proposal ticks, ``/bundle`` and
+        #: ``/unbundle``, and bundle issues or members closed, assigned or skipped. None:
+        #: not wired.
+        self.bundles: Any = None
 
     async def process(self, delivery: DeliveryRecord) -> None:
         try:
@@ -221,6 +225,16 @@ class GitHubDeliveryProcessor:
                 LOG.warning(
                     "ready report tick handling failed delivery_guid=%s", delivery.delivery_guid
                 )
+
+        if self.bundles is not None and delivery.event_name in ("issue_comment", "issues"):
+            try:
+                # Authenticated (normalized above); its own durable state, no transition.
+                if delivery.event_name == "issue_comment":
+                    await self.bundles.on_comment_delivery(delivery.body)
+                else:
+                    await self.bundles.on_issues_delivery(delivery.body)
+            except Exception:
+                LOG.warning("bundle handling failed delivery_guid=%s", delivery.delivery_guid)
 
         if self.field_observer is not None and delivery.event_name == "projects_v2_item":
             try:

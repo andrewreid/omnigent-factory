@@ -922,6 +922,83 @@ CREATE TABLE status_settings (
 );
 """
 
+# Issue bundling (``service.bundles``): up to five related issues built as one PR.
+#
+# * bundling: the operator's ``bundles on|off`` override of host config ``bundling`` (same
+#   shape and rule as auto_triage; the grant columns are unused).
+# * bundle_proposals: one row per proposed member set (``proposal_key``: its sorted members),
+#   the ranking run that proposed it, the comment that asks the owner (``posting`` while a
+#   create may have landed: found by its marker first) and its state; ``confirmed_*``: the
+#   owner's tick (once), ``detail``: why it went stale or was refused.
+# * bundles: one row per confirmed bundle (``bundle_key``), the synthetic bundle issue
+#   (``creating`` while a create may have landed: found by its marker first), how it was
+#   confirmed and by whom, and the link actions done once (``done_json``).
+# * bundle_members: each member's state in its bundle (``held`` until ejected, released or
+#   done; at most one ``held`` row per issue, enforced by the service).
+V21_SQL = """
+CREATE TABLE bundling (
+    repo_id TEXT PRIMARY KEY REFERENCES repositories (repo_id),
+    enabled_override INTEGER CHECK (enabled_override IN (0, 1)),
+    override_config INTEGER CHECK (override_config IN (0, 1)),
+    grant_day TEXT,
+    granted INTEGER NOT NULL DEFAULT 0 CHECK (granted >= 0),
+    updated_at_us INTEGER NOT NULL
+);
+CREATE TABLE bundle_proposals (
+    repo_id TEXT NOT NULL,
+    proposal_key TEXT NOT NULL,
+    members_json TEXT NOT NULL,
+    theme TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    shared_area TEXT NOT NULL DEFAULT '',
+    run_id TEXT NOT NULL DEFAULT '',
+    anchor_issue INTEGER NOT NULL,
+    comment_id INTEGER,
+    comment_node_id TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL CHECK (state IN
+        ('pending', 'posting', 'posted', 'stale', 'confirmed', 'refused', 'created')),
+    detail TEXT NOT NULL DEFAULT '',
+    confirmed_by INTEGER,
+    confirmed_via TEXT CHECK (confirmed_via IN ('webhook', 'recovered')),
+    confirmed_at_us INTEGER,
+    attempt_at_us INTEGER NOT NULL DEFAULT 0,
+    created_at_us INTEGER NOT NULL,
+    updated_at_us INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, proposal_key)
+);
+CREATE TABLE bundles (
+    repo_id TEXT NOT NULL,
+    bundle_key TEXT NOT NULL,
+    theme TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL CHECK (source IN ('proposal', 'command')),
+    owner_id INTEGER NOT NULL,
+    via TEXT NOT NULL CHECK (via IN ('webhook', 'recovered')),
+    confirmed_at_us INTEGER NOT NULL,
+    issue_number INTEGER,
+    issue_node_id TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL CHECK (state IN ('creating', 'open', 'cancelled', 'merged')),
+    detail TEXT NOT NULL DEFAULT '',
+    done_json TEXT NOT NULL DEFAULT '[]',
+    attempt_at_us INTEGER NOT NULL DEFAULT 0,
+    created_at_us INTEGER NOT NULL,
+    updated_at_us INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, bundle_key)
+);
+CREATE TABLE bundle_members (
+    repo_id TEXT NOT NULL,
+    bundle_key TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('held', 'ejected', 'released', 'done')),
+    reason TEXT NOT NULL DEFAULT '',
+    applied INTEGER NOT NULL DEFAULT 0 CHECK (applied IN (0, 1)),
+    updated_at_us INTEGER NOT NULL,
+    PRIMARY KEY (repo_id, bundle_key, issue_number)
+);
+CREATE INDEX ix_bundle_members_issue ON bundle_members (repo_id, issue_number, state);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -943,4 +1020,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(18, "owner-directed-splits", V18_SQL),
     Migration(19, "split-relation-direction", V19_SQL),
     Migration(20, "status-comments", V20_SQL),
+    Migration(21, "issue-bundling", V21_SQL),
 )

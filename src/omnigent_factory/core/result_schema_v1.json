@@ -542,6 +542,14 @@
           "items": {
             "$ref": "#/$defs/split_out"
           }
+        },
+        "ejected": {
+          "description": "Bundle runs only: members taken out of the bundle.",
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "$ref": "#/$defs/ejected"
+          }
         }
       }
     },
@@ -743,6 +751,14 @@
           "type": "string",
           "maxLength": 500,
           "pattern": "^https?://[^\\s<>\"'`()\\[\\]@]+$"
+        },
+        "ejected": {
+          "description": "Bundle runs only: members taken out of the bundle.",
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "$ref": "#/$defs/ejected"
+          }
         }
       }
     },
@@ -863,6 +879,14 @@
               }
             }
           }
+        },
+        "ejected": {
+          "description": "Bundle runs only: members taken out of the bundle.",
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "$ref": "#/$defs/ejected"
+          }
         }
       }
     },
@@ -914,6 +938,11 @@
             "type": "integer",
             "minimum": 1
           }
+        },
+        "member": {
+          "description": "Bundle runs only: the member issue it belongs to.",
+          "type": "integer",
+          "minimum": 1
         }
       }
     },
@@ -959,6 +988,30 @@
             "type": "integer",
             "minimum": 1
           }
+        },
+        "member": {
+          "description": "Bundle runs only: the member issue it belongs to.",
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "ejected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issue",
+        "reason"
+      ],
+      "properties": {
+        "issue": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
         }
       }
     }

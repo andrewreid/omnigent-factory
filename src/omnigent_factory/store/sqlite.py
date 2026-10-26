@@ -594,7 +594,7 @@ class SqliteStore:
     # ---------------------------------------------------------- auto-triage / build
 
     #: Tables holding an operator switch + daily grant (same shape; see migrations).
-    _SWITCH_TABLES = frozenset({"auto_triage", "auto_build", "epic_autopilot"})
+    _SWITCH_TABLES = frozenset({"auto_triage", "auto_build", "epic_autopilot", "bundling"})
 
     def auto_triage_state(self, repo_id: str) -> AutoTriageState:
         return self._switch_state("auto_triage", repo_id)
@@ -626,6 +626,13 @@ class SqliteStore:
 
     def set_epic_autopilot_override(self, repo_id: str, enabled: bool, config_value: bool) -> None:
         self._set_switch_override("epic_autopilot", repo_id, enabled, config_value)
+
+    def bundling_state(self, repo_id: str) -> AutoTriageState:
+        """Operator state of issue bundling (same shape and rules as auto-triage's)."""
+        return self._switch_state("bundling", repo_id)
+
+    def set_bundling_override(self, repo_id: str, enabled: bool, config_value: bool) -> None:
+        self._set_switch_override("bundling", repo_id, enabled, config_value)
 
     # ------------------------------------------------------------------ follow-ups
 

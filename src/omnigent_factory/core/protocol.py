@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Annotated, Literal
@@ -92,9 +93,22 @@ class SplitOut(_Strict):
     reason: Annotated[str, StringConstraints(min_length=1, max_length=300)]
     relation: Literal["none", "after_source", "before_source", "blocks", "blocked_by"] = "none"
     blocks: Annotated[list[Annotated[int, Field(ge=1)]], Field(max_length=20)] = []
+    #: A bundle run: the member issue the piece comes from (None: the bundle issue).
+    member: Annotated[int, Field(ge=1)] | None = None
 
 
 SplitOuts = Annotated[list[SplitOut], Field(max_length=10)]
+
+
+class Ejected(_Strict):
+    """A bundle run: a member that turned out bigger, riskier or in need of an owner
+    decision, taken out of the bundle (back to Triage on its own)."""
+
+    issue: Annotated[int, Field(ge=1)]
+    reason: RelatedNote
+
+
+Ejections = Annotated[list[Ejected], Field(max_length=5)]
 
 
 class Related(_Strict):
@@ -210,6 +224,7 @@ class PlanResult(_Strict):
     related: Annotated[list[Related], Field(max_length=20)] = []
     epic_fit: EpicFit | None = None
     split_out: SplitOuts = []
+    ejected: Ejections = []
 
 
 class Verification(_Strict):
@@ -265,6 +280,8 @@ class Deferred(_Strict):
     outcome: Literal["follow_up", "advisory"] = "follow_up"
     #: Issues the follow-up must come before (native blocked-by links).
     blocks: Annotated[list[Annotated[int, Field(ge=1)]], Field(max_length=20)] = []
+    #: A bundle run: the member issue the finding belongs to (None: the bundle issue).
+    member: Annotated[int, Field(ge=1)] | None = None
 
 
 DeferredList = Annotated[list[Deferred], Field(max_length=50)]
@@ -287,6 +304,7 @@ class BuildResult(_Strict):
     follow_ups: FollowUps = []
     deferred: DeferredList = []
     split_out: SplitOuts = []
+    ejected: Ejections = []
     #: The dev environment the run started and left running for the owner's review
     #: (shown in the Ready report); the factory tears it down when the issue is done.
     dev_environment_url: DevEnvironmentUrl | None = None
@@ -328,6 +346,7 @@ class BlockedResult(_Strict):
     deferred: DeferredList = []
     split_out: SplitOuts = []
     replan_required: ReplanRequired | None = None
+    ejected: Ejections = []
 
 
 def blocked_on(r: BlockedResult) -> tuple[int, ...]:
@@ -376,8 +395,12 @@ _RESULT_KINDS = frozenset({"triage", "epic_triage", "plan", "build_ready", "chec
 _SPLIT_SHAPE = (
     '"split_out"?:[{"title":str,"body":str,"reason":str,'
     '"relation"?:"none|after_source(new issue blocked by this one)|before_source(new issue '
-    'blocks this one)","blocks"?:[int(issues the new issue blocks)]}]}'
+    'blocks this one)","blocks"?:[int(issues the new issue blocks)],"member"?:int(bundle '
+    "runs: the member it comes from)}]}"
 )
+#: Bundle runs only: members taken out of the bundle (plan, build_ready, blocked).
+_EJECTED_SHAPE = '"ejected"?:[{"issue":int(a bundle member),"reason":str}],'
+
 
 #: Compact field types per result kind, quoted in tool errors and descriptions.
 RESULT_SHAPES: dict[str, str] = {
@@ -397,7 +420,7 @@ RESULT_SHAPES: dict[str, str] = {
     '"verification":str}],"non_goals":[str],"size":"S|M|L","resolved_decisions":'
     '[{"decision_id":str,"answer":str,"source_event_id":str}]},"open_decision_ids":[str],"related"?:[{"issue":int,'
     '"relation":"depends_on|blocks|duplicate|overlaps|conflicts|supersedes","note":str}],'
-    '"epic_fit"?:{"within":bool,"note":str},' + _SPLIT_SHAPE,
+    '"epic_fit"?:{"within":bool,"note":str},' + _EJECTED_SHAPE + _SPLIT_SHAPE,
     "build_ready": '{"kind":"build_ready","pr_number":int>=1,"branch":str,"head_sha":sha40,'
     '"summary":str,"verification":[{"command":str,"file_set":[str],'
     '"outcome":"passed|failed|not_run","evidence":str}],"review":{"implementation_vendor":str,'
@@ -406,16 +429,19 @@ RESULT_SHAPES: dict[str, str] = {
     '"severity":str,"disposition":str,"evidence":str}],"remediation_batches_used":0|1,'
     '"targeted_rechecks_used":0|1,"release_readiness":"ready|needs_owner","related"?:[...],'
     '"deferred"?:[{"severity":"P0|P1|P2|P3","path"?:str,"title":str,"thread_url"?:str,'
-    '"reason":str,"outcome"?:"follow_up|advisory","blocks"?:[int]}],'
+    '"reason":str,"outcome"?:"follow_up|advisory","blocks"?:[int],"member"?:int}],'
     '"dev_environment_url"?:str(http/https URL of a dev environment you left running),'
+    + _EJECTED_SHAPE
     + _SPLIT_SHAPE,
     "checkpoint": '{"kind":"checkpoint","grant_id":str,"head_sha":sha40|null,"done":[str],'
     '"remaining":[str],"risks":[str],"worktree_state":str,"elicitation_id":str|null}',
     "blocked": '{"kind":"blocked","reason":str,"done":[str],"related"?:[{"issue":int,'
     '"relation":"depends_on|blocks|...","note":str}],"deferred"?:[{"severity":'
     '"P0|P1|P2|P3","path"?:str,"title":str,"thread_url"?:str,"reason":str,'
-    '"outcome"?:"follow_up|advisory","blocks"?:[int]}],"replan_required"?:{"reason":str,'
-    '"changes":[str](build only: the plan must change)},' + _SPLIT_SHAPE,
+    '"outcome"?:"follow_up|advisory","blocks"?:[int],"member"?:int}],"replan_required"?:'
+    '{"reason":str,"changes":[str](build only: the plan must change)},'
+    + _EJECTED_SHAPE
+    + _SPLIT_SHAPE,
 }
 
 
@@ -460,6 +486,10 @@ class Correlation:
     follow_up_depth: int = 0
     follow_up_source: int | None = None
     follow_up_max_depth: int = 1
+    #: A bundle issue: its members still in the bundle (None: not a bundle). Only a
+    #: bundle run may eject members or attribute findings and splits to one, and its
+    #: plan names each member in an acceptance criterion.
+    bundle_members: frozenset[int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -557,6 +587,46 @@ def _check_deferred(r: BuildResult | BlockedResult, expected: Correlation) -> No
         )
 
 
+_MEMBER_REF = re.compile(r"(?<![\w/&#])#(\d+)\b")
+
+
+def _check_bundle(r: object, expected: Correlation) -> None:
+    ejected = [item.issue for item in getattr(r, "ejected", [])]
+    attributed = [
+        item.member
+        for name in ("split_out", "deferred")
+        for item in getattr(r, name, [])
+        if item.member is not None
+    ]
+    members = expected.bundle_members
+    if members is None:
+        if ejected or attributed:
+            raise ResultError("ejected/member: only a bundle issue's run names bundle members")
+        return
+    if len(set(ejected)) != len(ejected):
+        raise ResultError("ejected: each member at most once")
+    unknown = sorted((set(ejected) | set(attributed)) - members)
+    if unknown:
+        raise ResultError(
+            "ejected/member: not members of this bundle: "
+            + ", ".join(f"#{n}" for n in unknown[:10])
+            + " (members: "
+            + ", ".join(f"#{n}" for n in sorted(members))
+            + ")"
+        )
+    if isinstance(r, PlanResult) and expected.stage == "plan":
+        named: set[int] = set()
+        for c in r.contract.acceptance_criteria:
+            named |= {int(n) for n in _MEMBER_REF.findall(f"{c.id} {c.criterion}")}
+        missing = sorted(members - set(ejected) - named)
+        if missing:
+            raise ResultError(
+                "contract.acceptance_criteria: give each bundle member its own acceptance "
+                'criteria naming it (e.g. "#12: ..."); none name '
+                + ", ".join(f"#{n}" for n in missing)
+            )
+
+
 def epic_plan_hash(result: Mapping[str, object]) -> str:
     """sha256 of an epic plan (a validated ``epic_triage`` result as JSON): binds approval."""
     text = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -601,6 +671,7 @@ def validate_result(result: Mapping[str, object], expected: Correlation) -> Pars
     if isinstance(r, BuildResult | BlockedResult):
         _check_deferred(r, expected)
     _check_split_out(getattr(r, "split_out", []), expected.issue_number)
+    _check_bundle(r, expected)
     contract_bytes: bytes | None = None
     if isinstance(r, BlockedResult):
         # Any stage may report that it could not finish; only a build asks for a replan.

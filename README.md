@@ -42,6 +42,8 @@ otherwise S for triage and M for the rest).
 | `/approve [hash] [for <N>h]` | Planning or Building | Approves the latest published plan and queues the build. `hash` is a prefix (≥ 12 lowercase hex) that must identify the latest plan; without it, the plan must have been posted before the command. Refused while a question is open, a revision is pending or another build holds the parcel. `/approve` of the plan whose build is already queued or running is refused (😕, `Nothing new to approve: this plan is already approved`); a drag to Building of it only notes `Approved: build starts when capacity allows`. |
 | `/continue [for <N>h]` | A card at `Bot: Checkpoint` | Grants another time block to the paused run. Refused when the run is not at a checkpoint, is stopped or revoked, or a question is still open. |
 | `/stop` | Any column | Stops all work: drains every run, drops any queued build and pending start. Note `Stopped: /stop`. Resume with a new control (`/triage`, `/plan`, a drag, or a plain comment in Triage or Planning); a comment never starts a rework on a stopped card. |
+| `/bundle #a #b [theme]` | Any issue that is to be a member | With [bundling](#bundling) on: builds the commented issue and the named ones (2-5 in all) as one PR, validated like a ranking's proposal; refused with a reply listing what breaks the rules. |
+| `/unbundle` | A bundle issue, or one of its members | On the bundle issue: releases every member (the bundle issue stays an ordinary issue). On a member: releases only that member. |
 | `/decide <id> <answer>` | A card with an open question | Answers the open question `<id>` with `<answer>`. On a build, `/decide` revokes the build and replans (a plain reply is taken within the approval). The id is not shown in the question comment, so a plain reply is the normal answer. |
 
 ### Labels
@@ -61,6 +63,9 @@ plan for [auto-build](#auto-build).
 `factory:skip` is not a control: it only keeps the issue out of
 [idle-time auto-triage](#idle-time-auto-triage) (anyone may add it; the factory never
 starts anything because of it).
+
+`factory:bundle` marks a synthetic bundle issue the factory opened for a confirmed
+[bundle](#bundling); it is not a control.
 
 `follow-up` marks an issue the factory filed from another issue's run (one per PR, see
 [Follow-ups](#follow-ups)); epic autopilot holds it.
@@ -478,6 +483,75 @@ triage filled in is not yours). The session is archived when the run completes, 
 is abandoned; a failed run backs off (1 h, doubling, at most 24 h).
 Only your own board edit (its `projects_v2_item` webhook) marks a Rank or Priority as yours; any other value the factory did not write is a baseline ranking may change, and owner choices recorded without such a webhook (before this rule) are cleared at startup and logged.
 
+### Bundling
+
+Off by default (`bundling = true` or `bundles on`). Several small related issues (2 to
+`bundle_max_members`, default 3, never more than 5) are built as **one PR**, in one
+worktree and one Rosie session, once you confirm it.
+
+**Proposed.** While bundling is on, the [triage ranking](#triage-ranking) may propose
+bundles (members, a theme, a reason that names the area of code they share). Each is
+checked; one that breaks a rule fails the ranking's submission with the exact problem:
+
+| Rule | A member must |
+|---|---|
+| Size | be triaged S (1 point) or M (3 points), at most `bundle_max_points` (4) in all; L or unsized never |
+| Column | be in Triage or Planning with a triage result, not Building or Ready, nothing running, queued, auto-build-marked or driven by epic autopilot |
+| Epics | not be an epic, not be a sub-issue of an epic on autopilot; members of two different epics are never bundled |
+| Owner | not be assigned, labelled `factory:skip` or `needs-review`, P0, or waiting on you (an open question, `Needs you`) |
+| Dependencies | have no open native blocker and no open `depends_on` issue outside the bundle |
+| Once | not be in another bundle |
+
+Members keep their ranks. Each proposal gets one comment on its lowest-numbered member
+with `- [ ] Build these together as one PR`, and the ranking's status update names it.
+The same member set proposed again is the same proposal (a hidden marker): never a second
+comment. If a member stops meeting the rules before you tick, the comment says the
+proposal is stale and nothing happens.
+
+**Confirmed.** Only your tick counts (the comment's `edited` webhook from an owner; a lost
+webhook is recovered from the comment's edit history only when it shows you made the
+tick), or `/bundle #a #b [theme]` on a member. The factory then opens a **bundle issue**,
+`Bundle: <theme> (#a, #b)`, labelled `factory:bundle`, its body listing the members as
+plain references (never as its sub-issues: that would make it an epic) and saying the PR
+needs a `Closes` line for the bundle issue and each member. It joins the members' epic
+when they all share one, takes their highest Priority, and starts planning (your
+confirmation is the plan control). A hidden marker makes the create restart-safe: never
+two bundle issues. Each member is held (`bundled`): it is never triaged, planned or built
+on its own (a drag, command, label or comment on it is refused with `In bundle #X: work on
+the bundle issue, or /unbundle it`), auto-build, epic autopilot, auto-triage and ranking
+leave it alone, its note says `In bundle #X` and its `Bot` mirrors the bundle issue's.
+
+**Built.** The bundle issue goes plan → approval → build → Ready like any issue.
+`factory_get_issue` and `factory_get_plan` list its `bundle_members` (title, text,
+triage); its plan must give each member acceptance criteria naming it (`#12: ...`). It is
+Ready only when the PR's closing references include the bundle issue **and** every member
+still in it; otherwise the note names the missing `Closes` lines. A plan, build or blocked
+result may eject a member that turned out bigger, riskier or in need of your decision
+(`ejected`): it is released back to Triage with the note `Ejected from bundle #X:
+<reason>`, the bundle issue's body and status comment say so, and the bundle carries on
+(with a single member if need be). A build's deferred findings and `split_out` items may
+name their `member`: the follow-up or split is then that member's (its epic, its title).
+
+**Finished or cancelled.**
+
+| Event | What happens |
+|---|---|
+| The bundle PR merges | The bundle issue completes; GitHub closes the members, which complete too. A member whose close webhook was lost is read again when the bundle completes and on later board diffs. |
+| You close the bundle issue unmerged, assign it to a person, or `/unbundle` it | Every member is released (`Released from bundle #X`), back in the column it was in. |
+| You close, assign or `factory:skip` one member | Only that member is ejected. |
+
+The status comment of the bundle issue lists its members and their state; each member's
+says `Bundled into #X`; an epic's lists a member as `in bundle #X`. `bundles status`
+shows whether it is on (and whether config or the CLI decides), proposals pending, active
+bundles and members held; `bundles list` every proposal and bundle; `bundles
+propose-now` asks for a ranking run. Off: no proposal is made and no bundle created (a
+pending proposal stays inert, its tick ignored); confirmed bundles carry on.
+
+Limitations: the members' work shares one PR, so one red check or finding holds every
+member; a bundle is proposed only by a ranking run (or `/bundle`); `/unbundle` does not
+stop the bundle issue's own run (`/stop` it); a member left open after the bundle PR
+merged (no closing reference) stays held until you close or `/unbundle` it.
+
 ## Development
 
 Requires [uv](https://docs.astral.sh/uv/) and Python 3.13 (pinned in `.python-version`).
@@ -514,7 +588,7 @@ waits up to 90 s for it instead of failing.
 | Command | What it does |
 |---|---|
 | `status` | Readiness, pause state, building count/cap with the running and parked builds, queue, pending/unknown effects, parked deliveries, the [health sweep](#health-sweep-and-stalled-runs): Omnigent state, breaker, nudges last sweep and each open run's state and stall episode, and [worktree housekeeping](#worktree-housekeeping): worktree count, settings, last sweep (with its result) and last gc. |
-| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. It also reads the configured agent's bundle (through its newest session, or the `--live` probe) and fails naming any factory MCP tool the agent's `tools:` allowlist for the factory server leaves out (a warning when the bundle cannot be read). It warns when the App installation is not subscribed to `push` (tick Push in the App settings) or to `sub_issues`/`issue_dependencies` (Sub issues, Issue dependencies), when the subscribed events can be read, and when the repository has no `Epic` issue type (epics are then not typed). It fails when Omnigent's own `/health` is not ok and warns when the configured host is offline. It shows the worktree count under `worktree_root` and the last worktree sweep and clone gc times, and whether status comments are pinned (a warning, with GitHub's message, once pinning was refused). |
+| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. It also reads the configured agent's bundle (through its newest session, or the `--live` probe) and fails naming any factory MCP tool the agent's `tools:` allowlist for the factory server leaves out (a warning when the bundle cannot be read). It warns when the App installation is not subscribed to `push` (tick Push in the App settings) or to `sub_issues`/`issue_dependencies` (Sub issues, Issue dependencies), when the subscribed events can be read, and when the repository has no `Epic` issue type (epics are then not typed). It fails when Omnigent's own `/health` is not ok and warns when the configured host is offline. It shows the worktree count under `worktree_root` and the last worktree sweep and clone gc times, and whether status comments are pinned (a warning, with GitHub's message, once pinning was refused), and whether bundling is on with its proposals pending, active bundles and members held. |
 | `explain <parcel>` | The parcel's persisted state: stage, bot, sessions, holds, effects, the current run's stall episode (`stall`) and what the last health sweep made of it. |
 | `recovery` | Failed/unknown effects and parked webhook deliveries. |
 | `retry-effect <effect_id>` | Requeue a failed/unknown `publish_triage`/`publish_report`/`post_comment`; it adopts an existing comment by its marker, so it never duplicates. |
@@ -533,11 +607,15 @@ waits up to 90 s for it instead of failing.
 | `epic-autopilot on` / `off` | Turn epic autopilot on/off at runtime; stored like `auto-build on`/`off` (the newer intent wins). Queued autopilot starts wait while it is off. |
 | `ranking status` | Triage ranking: enabled (and whether config or the CLI decides), idle or what keeps it busy, new triage results since the last ranking, failures/backoff, recent runs. |
 | `ranking on` / `off` | Turn triage ranking on/off at runtime; stored like `auto-triage on`/`off` (the newer intent wins). |
+| `bundles status` | Issue bundling: enabled (and whether config or the CLI decides), caps, proposals pending, active bundles and members held. |
+| `bundles on` / `off` | Turn bundling on/off at runtime; stored like `auto-triage on`/`off` (the newer intent wins). Off stops new proposals and bundles; confirmed bundles carry on. |
+| `bundles list` | Every proposal (members, state) and bundle (issue, state, each member's state). |
+| `bundles propose-now` | Asks for a ranking run now (`ranking now`), which may propose bundles; refused while bundling is off. |
 | `ranking now` | Run one ranking as soon as no triage or other ranking is running (it does not wait for builds, plans, reworks, queued builds or stage requests), whatever changed (also when ranking is off, or backing off; not while paused). `ranking status` then shows only what it still waits on. |
 | `sessions prune [--dry-run]` | Delete (or list) the factory sessions session retention would remove now (through the daemon). |
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, `review_rounds_default`, `status_comment_edit_seconds`, `follow_up_max_depth`, `auto_replan_limit`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `session_retention_days`, the health sweep settings and `worktree_sweep_interval_hours`, `idle_worktree_days`, `clone_gc_interval_days`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, `review_rounds_default`, `status_comment_edit_seconds`, `follow_up_max_depth`, `auto_replan_limit`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `bundling`, `bundle_max_members`, `bundle_max_points`, `session_retention_days`, the health sweep settings and `worktree_sweep_interval_hours`, `idle_worktree_days`, `clone_gc_interval_days`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.
@@ -569,6 +647,9 @@ ranking = false                  # idle-time ranking of the Triage and Planning 
 ranking_min_new_triages = 5      # new/changed triage results that start a ranking
 ranking_status_update = true     # short project status update per ranking
 rank_field_node_id = ""          # the project's "Rank" NUMBER field (doctor checks it)
+bundling = false                 # ranking may propose bundles; owner ticks confirm them
+bundle_max_members = 3           # members of one bundle (2-5)
+bundle_max_points = 4            # size points of one bundle (S = 1, M = 3)
 session_retention_days = 30      # delete factory sessions archived this long; 0 = never
 ```
 

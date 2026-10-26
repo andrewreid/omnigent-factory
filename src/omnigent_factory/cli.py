@@ -139,6 +139,14 @@ def build_parser() -> argparse.ArgumentParser:
     ranking_sub = ranking.add_subparsers(dest="ranking_command", required=True)
     for name in ("status", "on", "off", "now"):
         _config_arg(ranking_sub.add_parser(name))
+    bundles = sub.add_parser(
+        "bundles",
+        help="issue bundling: status, on/off (overrides the config until it changes), list, "
+        "propose-now (a ranking run that may propose bundles)",
+    )
+    bundles_sub = bundles.add_subparsers(dest="bundles_command", required=True)
+    for name in ("status", "on", "off", "list", "propose-now"):
+        _config_arg(bundles_sub.add_parser(name))
     sessions = sub.add_parser("sessions", help="factory-created Omnigent sessions")
     sessions_sub = sessions.add_subparsers(dest="sessions_command", required=True)
     sessions_prune = sessions_sub.add_parser(
@@ -196,6 +204,7 @@ def _operator(
         "auto-build": 60.0,
         "epic-autopilot": 60.0,
         "ranking": 60.0,
+        "bundles": 120.0,  # status reads issue labels
         "sessions-prune": 600.0,  # snapshot, tree scan and delete per session
     }.get(command, 5.0)
     deadline = time.monotonic() + startup_wait_seconds
@@ -273,6 +282,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _operator(config, "epic-autopilot", {"action": args.autopilot_command})
     if args.command == "ranking":
         return _operator(config, "ranking", {"action": args.ranking_command})
+    if args.command == "bundles":
+        return _operator(config, "bundles", {"action": args.bundles_command})
     if args.command == "sessions" and args.sessions_command == "prune":
         return _operator(config, "sessions-prune", {"dry_run": args.dry_run})
     if args.command == "prune":

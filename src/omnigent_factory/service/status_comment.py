@@ -160,6 +160,8 @@ class IssueView:
     deferred: str = ""
     checkpoint: str = ""
     splits: tuple[str, ...] = ()
+    #: A bundle issue's members, or the bundle a member is built in ("" = neither).
+    bundle: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +184,8 @@ class SubIssue:
     gate: bool = False
     #: A follow-up epic autopilot holds.
     held: bool = False
+    #: The bundle issue it is built in (0: none).
+    bundle: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +248,8 @@ def render_issue(view: IssueView, history: Sequence[tuple[int, str]], headline: 
         lines += ["", "**Question:**", "", view.question.summary.strip()]
         if view.question.url:
             lines += ["", f"([asked here]({view.question.url}))"]
+    if view.bundle:
+        lines += ["", "#### Bundle", "", view.bundle]
     if view.triage:
         lines += ["", "#### Triage", "", view.triage]
     if view.plan is not None:
@@ -359,6 +365,8 @@ def _sub_line(s: SubIssue) -> str:
         parts.append(f"PR #{s.pr_number}")
     if s.bot is not None:
         parts.append(_STATE_TEXT[s.bot])
+    if s.bundle:
+        parts.append(f"in bundle #{s.bundle}")
     return f"- #{s.number} {_one_line(s.title, 120)} — {' · '.join(parts)}"
 
 
@@ -415,7 +423,11 @@ def _up_next(view: EpicView, open_subs: Sequence[SubIssue]) -> list[str]:
     ]
     position = {n: i for i, n in enumerate(view.order)}
     waiting.sort(key=lambda s: (position.get(s.number, len(position)), s.number))
-    return [f"- #{s.number} {_one_line(s.title, 120)}" for s in waiting[:_UP_NEXT]]
+    return [
+        f"- #{s.number} {_one_line(s.title, 120)}"
+        + (f" (in bundle #{s.bundle})" if s.bundle else "")
+        for s in waiting[:_UP_NEXT]
+    ]
 
 
 # ------------------------------------------------------------------ the service
@@ -432,6 +444,8 @@ class StatusComments:
     publish_text: Callable[[str], str]
     #: The Deferred checkboxes (``service.deferred.Deferrals.report_section``); None: none.
     deferred_section: Callable[[Parcel], Awaitable[str]] | None = None
+    #: The Bundle section (``service.bundles.Bundles.section``); None: none.
+    bundle_section: Callable[[Parcel], Awaitable[str]] | None = None
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     #: Per epic, the sub-issue stamp (``_epic_stamps``) last rendered by ``tick`` (in
     #: memory: after a restart each finished epic is rendered once more).
@@ -842,6 +856,7 @@ class StatusComments:
             deferred=deferred,
             checkpoint=checkpoint,
             splits=await self._splits(parcel.issue_number),
+            bundle=await self.bundle_section(parcel) if self.bundle_section is not None else "",
         )
 
     def _plan(self, parcel: Parcel) -> PlanView | None:
@@ -994,6 +1009,7 @@ class StatusComments:
             epic=epic,
             building=stage == Stage.BUILDING,
             started=_handled(sub) and Hold.COMPLETED not in sub.holds,
+            bundle=sub.bundled_into if Hold.BUNDLED in sub.holds else 0,
         )
 
     async def _epic_plan_link(self, parcel: Parcel) -> tuple[str, str]:
