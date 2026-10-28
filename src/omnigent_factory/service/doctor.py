@@ -1069,8 +1069,9 @@ def _check_bundling(config: ServiceConfig, report: DoctorReport) -> None:
             pass  # no such tables yet (an older database): nothing recorded
     report.pass_check(
         "bundling",
-        f"{'on' if enabled else 'off'} ({source}); max {config.bundle_max_members} members, "
-        f"{config.bundle_max_points} points; {counts[0]} proposals pending, "
+        f"{'on' if enabled else 'off'} ({source}); suggested at most "
+        f"{config.bundle_max_members} members, {config.bundle_max_points} points; /bundle at "
+        f"most {config.bundle_command_max_members} members; {counts[0]} proposals pending, "
         f"{counts[1]} active bundles, {counts[2]} members held",
     )
 

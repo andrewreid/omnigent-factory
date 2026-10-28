@@ -393,11 +393,60 @@ def test_parcel_state_rules():
     assert any("needs you" in x for x in check(h, a={"parcel": needs_you}))
 
 
-def test_the_member_ceiling_is_five_whatever_the_config():
+def test_the_member_ceiling_is_twelve_whatever_the_config():
     h = history()
-    found = {n: facts(h, P1, number=n) for n in range(1, 8)}
-    problems = validate_bundle(tuple(found), found, max_members=9, max_points=99)
-    assert "a bundle has 2 to 5 members (7 given)" in problems
+    found = {n: facts(h, P1, number=n) for n in range(1, 14)}
+    problems = validate_bundle(tuple(found), found, max_members=20, max_points=99)
+    assert "a bundle has 2 to 12 members (13 given)" in problems
+    explicit = validate_bundle(tuple(found), found, max_members=20, max_points=99, explicit=True)
+    assert "a bundle has 2 to 12 members (13 given)" in explicit
+
+
+def test_an_owner_bundle_ignores_the_size_rules_only():
+    h = history()
+    sized = {"L": triage("L"), "M": triage("M"), "unsized": triage(size=None)}
+    found = {
+        n: facts(
+            h,
+            P1,
+            number=n,
+            triage=sized[["L", "M", "unsized"][n % 3]],
+            parcel=replace(h.p(P1), size=None),
+        )
+        for n in range(1, 9)
+    }
+    members = tuple(found)
+    # A suggestion: too many members, L and unsized members, too many points.
+    suggested = validate_bundle(members, found, max_members=3, max_points=4)
+    assert "a bundle has 2 to 3 members (8 given)" in suggested
+    assert any("size L or unsized" in p for p in suggested)
+    assert any("size points" in p for p in suggested)
+    # The owner's /bundle: up to its own maximum, any size.
+    assert validate_bundle(members, found, max_members=8, max_points=4, explicit=True) == []
+    over = validate_bundle(members, found, max_members=7, max_points=4, explicit=True)
+    assert over == ["a bundle has 2 to 7 members (8 given)"]
+    assert validate_bundle((1,), found, max_members=8, max_points=4, explicit=True) == [
+        "a bundle has 2 to 8 members (1 given)"
+    ]
+    # Every protective rule still refuses it.
+    p = h.p(P1)
+    for over_facts, expected in (
+        ({"parent": 40, "parent_autopilot": True}, "#1 is a sub-issue of epic #40"),
+        (
+            {"parcel": replace(p, links=IssueLinks(blocked_by=(LinkedIssue(50, True),)))},
+            "#1 is blocked by open #50",
+        ),
+        ({"triage": None}, "#1 is not in Triage or Planning with a triage result"),
+        ({"open_dependencies": (77,)}, "#1 depends on open #77"),
+        ({"priority": "P0"}, "#1 is P0"),
+        ({"labels": frozenset({"factory:skip"})}, "#1 is labelled factory:skip"),
+        ({"bundled": 9}, "#1 is already in bundle #9"),
+        ({"parcel": replace(p, eligible=False)}, "#1 is closed, assigned"),
+        ({"parcel": replace(p, links=IssueLinks(sub_total=2))}, "#1 is an epic"),
+    ):
+        refused = {**found, 1: replace(found[1], **over_facts)}
+        problems = validate_bundle(members, refused, max_members=8, max_points=4, explicit=True)
+        assert any(expected in x for x in problems), (expected, problems)
 
 
 def test_proposal_shape_errors():
@@ -582,11 +631,11 @@ async def test_bundle_command_creates_a_bundle(service_config: ServiceConfig):
 @pytest.mark.asyncio
 async def test_bundle_command_is_refused_with_its_reasons(service_config: ServiceConfig):
     async with rig(on(service_config)) as r:
-        r.directory.triage[3] = triage("L")
+        r.directory.triage[3] = None
         assert await r.bundles.on_comment_delivery(command(1, "/bundle #3")) == 0
         assert await r.state() == [] and (777, "confused") in r.repo.reactions
         [reply] = r.repo.comments_on(1)
-        assert "#3 is size L" in reply["body"]
+        assert "#3 is not in Triage or Planning with a triage result" in reply["body"]
         # Not an owner: nothing at all.
         assert await r.bundles.on_comment_delivery(command(1, "/bundle #2", 778, 4242)) == 0
         assert await r.state() == []
@@ -599,6 +648,74 @@ async def test_a_member_cannot_be_in_two_bundles(service_config: ServiceConfig):
         assert await r.bundles.on_comment_delivery(command(3, "/bundle #2", 778)) == 0
         [reply] = r.repo.comments_on(3)
         assert "#2 is already in bundle #100" in reply["body"]
+
+
+def five_issues() -> Harness:
+    h = Harness()
+    for pid in (P1, P2, P3, "I_m4", "I_m5"):
+        h.triage(pid, size=Size.M)
+    return h
+
+
+@pytest.mark.asyncio
+async def test_bundle_command_takes_any_size_up_to_its_own_maximum(service_config: ServiceConfig):
+    async with rig(on(service_config), five_issues()) as r:
+        for n in (4, 5):
+            r.repo.issues[n] = gh_issue(n, parent=40)
+        r.directory.triage.update({n: triage("M") for n in (1, 2, 4, 5)})
+        r.directory.triage[3] = triage("L")
+        # Five members (above bundle_max_members 3), an L, 12 size points (above 4).
+        assert await r.bundles.on_comment_delivery(command(1, "/bundle #2 #3 #4 #5 Tidy")) == 1
+        [b] = await r.state()
+        assert b.source == "command"
+        assert [m.issue_number for m in b.members] == [1, 2, 3, 4, 5]
+        for n in (1, 2, 3, 4, 5):
+            assert Hold.BUNDLED in (await r.parcel(n)).holds
+        view = await r.bundles.members_view(await r.parcel(100), "B")
+        assert [m["number"] for m in view] == [1, 2, 3, 4, 5]
+        assert view[2]["triage"]["size"] == "L"
+
+
+@pytest.mark.asyncio
+async def test_bundle_command_is_refused_above_its_maximum(service_config: ServiceConfig):
+    config = on(service_config, bundle_command_max_members=4)
+    async with rig(config, five_issues()) as r:
+        for n in (4, 5):
+            r.repo.issues[n] = gh_issue(n, parent=40)
+        assert await r.bundles.on_comment_delivery(command(1, "/bundle #2 #3 #4 #5")) == 0
+        assert await r.state() == []
+        [reply] = r.repo.comments_on(1)
+        assert "a bundle has 2 to 4 members (5 given)" in reply["body"]
+        assert "size" not in reply["body"]
+
+
+@pytest.mark.asyncio
+async def test_proposals_keep_the_suggestion_limits(service_config: ServiceConfig):
+    config = on(service_config, bundle_max_members=2, bundle_command_max_members=12)
+    async with rig(config) as r:
+        _found, problems = await r.bundles.check_proposals([proposal(1, 2, 3)], {})
+        assert any("a bundle has 2 to 2 members (3 given)" in p for p in problems), problems
+        r.directory.triage.update({1: triage("M"), 2: triage("M")})
+        _found, problems = await r.bundles.check_proposals([proposal(1, 2)], {})
+        assert any("6 size points (S = 1, M = 3): at most 4" in p for p in problems), problems
+        r.directory.triage[2] = triage("L")
+        _found, problems = await r.bundles.check_proposals([proposal(1, 2)], {})
+        assert any("#2 is size L or unsized" in p for p in problems), problems
+        text, _field = await r.bundles.ranking_text()
+        assert "bundles of 2 to 2 related small issues" in text and "at most 4 points" in text
+
+
+@pytest.mark.asyncio
+async def test_a_ticked_proposal_keeps_the_suggestion_rules(service_config: ServiceConfig):
+    async with rig(on(service_config)) as r:
+        p = await propose(r, 1, 2)
+        assert p.comment_id is not None
+        r.directory.triage[2] = triage("L")  # it grew before the owner ticked
+        body = r.repo.comments[p.comment_id]["body"]
+        assert await r.bundles.on_comment_delivery(edited(r, p.comment_id, ticked(body))) == 1
+        assert await r.state() == []
+        [refused] = await r.proposals()
+        assert refused.state == "refused" and "#2 is size L or unsized" in refused.detail
 
 
 # ------------------------------------------------------------------ bundle runs
@@ -957,8 +1074,8 @@ async def test_doctor_reports_bundling_and_its_counts(service_config: ServiceCon
     report = DoctorReport()
     _check_bundling(on(service_config), report)
     assert report.checks["bundling"] == (
-        "on (config); max 3 members, 4 points; 1 proposals pending, 1 active bundles, "
-        "2 members held"
+        "on (config); suggested at most 3 members, 4 points; /bundle at most 8 members; "
+        "1 proposals pending, 1 active bundles, 2 members held"
     )
 
 
@@ -983,11 +1100,49 @@ def test_the_switch_and_caps_are_hot_reloadable_and_bounded(service_config: Serv
 
     from omnigent_factory.service.config import HOT_RELOAD_KEYS
 
-    assert {"bundling", "bundle_max_members", "bundle_max_points"} <= HOT_RELOAD_KEYS
+    assert {
+        "bundling",
+        "bundle_max_members",
+        "bundle_command_max_members",
+        "bundle_max_points",
+    } <= HOT_RELOAD_KEYS
     assert (service_config.bundling, service_config.bundle_max_members) == (False, 3)
+    assert service_config.bundle_command_max_members == 8
     assert service_config.bundle_max_points == 4
-    with pytest.raises(ValidationError):
-        service_config.model_validate({**service_config.model_dump(), "bundle_max_members": 6})
+    raw = service_config.model_dump()
+    assert ServiceConfig.model_validate({**raw, "bundle_max_members": 8}).bundle_max_members == 8
+    widest = {**raw, "bundle_max_members": 12, "bundle_command_max_members": 12}
+    assert ServiceConfig.model_validate(widest).bundle_command_max_members == 12
+    with pytest.raises(ValidationError, match="must not exceed bundle_command_max_members"):
+        ServiceConfig.model_validate({**raw, "bundle_max_members": 9})
+    for bad in (
+        {"bundle_command_max_members": 13},
+        {"bundle_command_max_members": 1},
+        {"bundle_max_members": 13},
+        {"bundle_max_members": 1},
+    ):
+        with pytest.raises(ValidationError):
+            ServiceConfig.model_validate({**raw, **bad})
+
+
+def test_the_setup_template_documents_the_bundle_limits(
+    service_config: ServiceConfig, tmp_path: Any
+):
+    import tomllib
+
+    from omnigent_factory.service.setup import OperationsRenderer
+
+    sample = OperationsRenderer(tmp_path / "config.toml").render(service_config)
+    raw = tomllib.loads(sample["config.example.toml"])["service"]
+    keys = ("bundling", "bundle_max_members", "bundle_command_max_members", "bundle_max_points")
+    assert {k: raw[k] for k in keys} == {
+        "bundling": False,
+        "bundle_max_members": 3,
+        "bundle_command_max_members": 8,
+        "bundle_max_points": 4,
+    }
+    parsed = ServiceConfig.model_validate({**service_config.model_dump(), **raw})
+    assert parsed.bundle_command_max_members == 8
 
 
 def test_the_needs_you_comment_names_the_missing_member_closes():

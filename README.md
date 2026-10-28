@@ -42,7 +42,7 @@ otherwise S for triage and M for the rest).
 | `/approve [hash] [for <N>h]` | Planning or Building | Approves the latest published plan and queues the build. `hash` is a prefix (≥ 12 lowercase hex) that must identify the latest plan; without it, the plan must have been posted before the command. Refused while a question is open, a revision is pending or another build holds the parcel. `/approve` of the plan whose build is already queued or running is refused (😕, `Nothing new to approve: this plan is already approved`); a drag to Building of it only notes `Approved: build starts when capacity allows`. |
 | `/continue [for <N>h]` | A card at `Bot: Checkpoint` | Grants another time block to the paused run. Refused when the run is not at a checkpoint, is stopped or revoked, or a question is still open. |
 | `/stop` | Any column | Stops all work: drains every run, drops any queued build and pending start. Note `Stopped: /stop`. Resume with a new control (`/triage`, `/plan`, a drag, or a plain comment in Triage or Planning); a comment never starts a rework on a stopped card. |
-| `/bundle #a #b [theme]` | Any issue that is to be a member | With [bundling](#bundling) on: builds the commented issue and the named ones (2-5 in all) as one PR, validated like a ranking's proposal; refused with a reply listing what breaks the rules. |
+| `/bundle #a #b [theme]` | Any issue that is to be a member | With [bundling](#bundling) on: builds the commented issue and the named ones (2 to `bundle_command_max_members`, default 8, in all) as one PR. Your explicit choice overrides the size rules (L or unsized members, size points), never the protective ones; refused with a reply listing what breaks the rules. |
 | `/unbundle` | A bundle issue, or one of its members | On the bundle issue: releases every member (the bundle issue stays an ordinary issue). On a member: releases only that member. |
 | `/decide <id> <answer>` | A card with an open question | Answers the open question `<id>` with `<answer>`. On a build, `/decide` revokes the build and replans (a plain reply is taken within the approval). The id is not shown in the question comment, so a plain reply is the normal answer. |
 
@@ -485,9 +485,16 @@ Only your own board edit (its `projects_v2_item` webhook) marks a Rank or Priori
 
 ### Bundling
 
-Off by default (`bundling = true` or `bundles on`). Several small related issues (2 to
-`bundle_max_members`, default 3, never more than 5) are built as **one PR**, in one
-worktree and one Rosie session, once you confirm it.
+Off by default (`bundling = true` or `bundles on`). Several related issues are built as
+**one PR**, in one worktree and one Rosie session, once you confirm it. Two limits apply:
+
+* `bundle_max_members` (default 3) and `bundle_max_points` (default 4) bound the bundles
+  the factory **suggests**: a ranking's proposal and your tick of it.
+* `bundle_command_max_members` (default 8) bounds an explicit **`/bundle`**: your choice,
+  so it ignores the size rules (an L or unsized member, the size points) but never the
+  protective ones (every other rule below).
+
+Both are 2 to 12, and `bundle_max_members` may not exceed `bundle_command_max_members`.
 
 **Proposed.** While bundling is on, the [triage ranking](#triage-ranking) may propose
 bundles (members, a theme, a reason that names the area of code they share). Each is
@@ -495,7 +502,7 @@ checked; one that breaks a rule fails the ranking's submission with the exact pr
 
 | Rule | A member must |
 |---|---|
-| Size | be triaged S (1 point) or M (3 points), at most `bundle_max_points` (4) in all; L or unsized never |
+| Size (suggested bundles only) | be triaged S (1 point) or M (3 points), at most `bundle_max_points` (4) in all; L or unsized never |
 | Column | be in Triage or Planning with a triage result, not Building or Ready, nothing running, queued, auto-build-marked or driven by epic autopilot |
 | Epics | not be an epic, not be a sub-issue of an epic on autopilot; members of two different epics are never bundled |
 | Owner | not be assigned, labelled `factory:skip` or `needs-review`, P0, or waiting on you (an open question, `Needs you`) |
@@ -510,8 +517,9 @@ proposal is stale and nothing happens.
 
 **Confirmed.** Only your tick counts (the comment's `edited` webhook from an owner; a lost
 webhook is recovered from the comment's edit history only when it shows you made the
-tick), or `/bundle #a #b [theme]` on a member. The factory then opens a **bundle issue**,
-`Bundle: <theme> (#a, #b)`, labelled `factory:bundle`, its body listing the members as
+tick), or `/bundle #a #b [theme]` on a member (checked by every rule above but Size,
+with up to `bundle_command_max_members` members). The factory then opens a **bundle
+issue**, `Bundle: <theme> (#a, #b)`, labelled `factory:bundle`, its body listing the members as
 plain references (never as its sub-issues: that would make it an epic) and saying the PR
 needs a `Closes` line for the bundle issue and each member. It joins the members' epic
 when they all share one, takes their highest Priority, and starts planning (your
@@ -615,7 +623,7 @@ waits up to 90 s for it instead of failing.
 | `sessions prune [--dry-run]` | Delete (or list) the factory sessions session retention would remove now (through the daemon). |
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, `review_rounds_default`, `status_comment_edit_seconds`, `follow_up_max_depth`, `auto_replan_limit`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `bundling`, `bundle_max_members`, `bundle_max_points`, `session_retention_days`, the health sweep settings and `worktree_sweep_interval_hours`, `idle_worktree_days`, `clone_gc_interval_days`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, `review_rounds_default`, `status_comment_edit_seconds`, `follow_up_max_depth`, `auto_replan_limit`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `bundling`, `bundle_max_members`, `bundle_command_max_members`, `bundle_max_points`, `session_retention_days`, the health sweep settings and `worktree_sweep_interval_hours`, `idle_worktree_days`, `clone_gc_interval_days`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.
@@ -648,8 +656,9 @@ ranking_min_new_triages = 5      # new/changed triage results that start a ranki
 ranking_status_update = true     # short project status update per ranking
 rank_field_node_id = ""          # the project's "Rank" NUMBER field (doctor checks it)
 bundling = false                 # ranking may propose bundles; owner ticks confirm them
-bundle_max_members = 3           # members of one bundle (2-5)
-bundle_max_points = 4            # size points of one bundle (S = 1, M = 3)
+bundle_max_members = 3           # members of a bundle the factory suggests (2-12)
+bundle_command_max_members = 8   # members of an owner's /bundle (sizes ignored; 2-12)
+bundle_max_points = 4            # size points of a suggested bundle (S = 1, M = 3)
 session_retention_days = 30      # delete factory sessions archived this long; 0 = never
 ```
 

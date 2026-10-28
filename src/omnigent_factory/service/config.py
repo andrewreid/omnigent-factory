@@ -64,6 +64,7 @@ HOT_RELOAD_KEYS = frozenset(
         "rank_field_node_id",
         "bundling",
         "bundle_max_members",
+        "bundle_command_max_members",
         "bundle_max_points",
         "session_retention_days",
         "board_diff_interval_minutes",
@@ -280,10 +281,15 @@ class ServiceConfig(BaseModel):
     #: issues to build as one PR, and an owner tick (or ``/bundle``) confirms one.
     #: ``omnigent-factory bundles on|off`` overrides it until it changes here.
     bundling: bool = False
-    #: Members of one bundle at most (2 at least; never more than 5).
-    bundle_max_members: int = Field(default=3, ge=2, le=5)
-    #: Size points of one bundle at most (S = 1, M = 3; an L or unsized issue is never
-    #: bundled).
+    #: Members of one bundle the factory suggests at most (2 at least; never more than
+    #: ``bundle_command_max_members``).
+    bundle_max_members: int = Field(default=3, ge=2, le=12)
+    #: Members of one bundle an owner's explicit ``/bundle`` asks for at most (the issue it
+    #: is on included). ``/bundle`` ignores the size rules (L, unsized, size points), never
+    #: the protective ones.
+    bundle_command_max_members: int = Field(default=8, ge=2, le=12)
+    #: Size points of one suggested bundle at most (S = 1, M = 3; the factory never
+    #: suggests an L or unsized issue).
     bundle_max_points: int = Field(default=4, ge=2, le=15)
     #: Days a factory-created Omnigent session stays archived before retention deletes it
     #: (only sessions of finished issues and ranking runs; 0 = never delete).
@@ -477,6 +483,11 @@ class ServiceConfig(BaseModel):
         blocks = [self.checkpoint_block_hours[key] for key in ("S", "M", "L")]
         if any(not 1 <= value <= 24 for value in blocks) or blocks != sorted(blocks):
             raise ValueError("checkpoint block hours must be 1..24 and ordered S <= M <= L")
+        if self.bundle_max_members > self.bundle_command_max_members:
+            raise ValueError(
+                "bundle_max_members must not exceed bundle_command_max_members "
+                f"({self.bundle_max_members} > {self.bundle_command_max_members})"
+            )
         return self
 
     @property

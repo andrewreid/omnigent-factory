@@ -118,6 +118,10 @@ epic_autopilot_concurrency = 1 # sub-issues per epic in progress at once (Parall
 ranking = false                # idle-time ranking of the Triage and Planning columns
 ranking_min_new_triages = 5    # new/changed triages that start a ranking
 ranking_status_update = true   # short project status update per ranking
+bundling = false               # bundle proposals and /bundle (related issues, one PR)
+bundle_max_members = 3         # members of a bundle the factory suggests (2-12)
+bundle_command_max_members = 8 # members of an owner's /bundle (sizes ignored; 2-12)
+bundle_max_points = 4          # size points of a suggested bundle (S = 1, M = 3)
 session_retention_days = 30    # delete factory sessions archived this long (0 = never)
 review_rounds_default = 2      # review-bot rounds per issue when its field is empty
 follow_up_max_depth = 1        # a follow-up's own build files no further follow-ups

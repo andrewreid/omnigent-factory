@@ -1,5 +1,5 @@
-"""Issue bundling: up to five related small issues built as one PR, in one worktree and one
-Rosie session, on the owner's confirmation. Switched like auto-triage (host config
+"""Issue bundling: related issues built as one PR, in one worktree and one Rosie session,
+on the owner's confirmation. Switched like auto-triage (host config
 ``bundling``, ``omnigent-factory bundles on|off``).
 
 * **Proposed.** While bundling is on, the triage ranking may propose ``bundles`` (members,
@@ -8,17 +8,20 @@ Rosie session, on the owner's confirmation. Switched like auto-triage (host conf
   and recorded once per member set (``store.bundles``): the same set proposed again is the
   same proposal, never a second comment. One bot comment on the lowest-numbered member
   asks the owner with ``- [ ] Build these together as one PR``; the ranking's status
-  update names it. A member that becomes ineligible before the tick makes the proposal
-  stale (its comment says so); nothing else happens.
+  update names it. A proposal (and its tick) keeps the suggestion rules: at most
+  ``bundle_max_members`` small (S or M) issues within ``bundle_max_points``. A member that
+  becomes ineligible before the tick makes the proposal stale (its comment says so);
+  nothing else happens.
 * **Confirmed.** Only an owner's tick counts (the comment's ``edited`` webhook from an
   owner's numeric id, diffed against the previous body; a lost webhook is recovered from
   the comment's ``userContentEdits`` when an owner made that edit), or an owner's
-  ``/bundle #a #b ...`` on a member (validated by the same rules). The factory then opens
-  a synthetic bundle issue (``Bundle: <theme> (#a, #b)``, label ``factory:bundle``, a
-  hidden marker: an unclear create is found by its marker first, so never twice), never
-  linking the members as its sub-issues (that would make it an epic); it joins the
-  members' shared epic (as a sub-issue of it), takes their highest priority and starts
-  planning (the owner's confirmation is the plan control). Each member gets the
+  ``/bundle #a #b ...`` on a member (validated by the same protective rules, but sized by
+  the owner: up to ``bundle_command_max_members``, L or unsized members and any points).
+  The factory then opens a synthetic bundle issue (``Bundle: <theme> (#a, #b)``, label
+  ``factory:bundle``, a hidden marker: an unclear create is found by its marker first, so
+  never twice), never linking the members as its sub-issues (that would make it an
+  epic); it joins the members' shared epic (as a sub-issue of it), takes their highest
+  priority and starts planning (the owner's confirmation is the plan control). Each member gets the
   ``bundled`` hold: it is never triaged, planned or built on its own, auto-build,
   autopilot, auto-triage and ranking leave it alone, its card notes ``In bundle #X`` and
   mirrors the bundle's Bot.
@@ -87,10 +90,10 @@ BUNDLE_LABEL = "factory:bundle"
 _LABEL_DESCRIPTION = "Several issues the factory builds as one pull request"
 SKIP_LABEL = "factory:skip"
 NEEDS_REVIEW_LABEL = "needs-review"
-#: Size points of a member (an L or unsized issue is never bundled).
+#: Size points of a member (the factory never suggests an L or unsized issue).
 POINTS = {"S": 1, "M": 3}
 #: Hard ceiling of members, whatever the config says.
-MAX_MEMBERS = 5
+MAX_MEMBERS = 12
 #: Bundles one ranking may propose.
 MAX_PROPOSALS = 5
 THEME_MAX = 80
@@ -183,8 +186,11 @@ def validate_bundle(
     *,
     max_members: int,
     max_points: int,
+    explicit: bool = False,
 ) -> list[str]:
-    """Every rule a bundle breaks (empty: it may be built as one PR)."""
+    """Every rule a bundle breaks (empty: it may be built as one PR). ``explicit``: an
+    owner's ``/bundle``, which sizes the bundle itself (no L/unsized or points rule; the
+    caller passes its own ``max_members``); every protective rule still applies."""
     errors: list[str] = []
     limit = min(max_members, MAX_MEMBERS)
     numbers = list(members)
@@ -206,10 +212,10 @@ def validate_bundle(
         if p.stage in (Stage.BUILDING, Stage.READY):
             errors.append(f"#{n} is already in {p.stage.value}")
         size = member_points(f)
-        if size is None:
-            errors.append(f"#{n} is size L or unsized: only S and M issues are bundled")
-        else:
+        if size is not None:
             points += size
+        elif not explicit:
+            errors.append(f"#{n} is size L or unsized: only S and M issues are bundled")
         if p.links is not None and p.links.epic:
             errors.append(f"#{n} is an epic")
         if f.parent is not None:
@@ -245,7 +251,7 @@ def validate_bundle(
             refusal = bundle_member_refusal(p, queued=f.queued)
             if refusal in _IN_FLIGHT:
                 errors.append(f"#{n}: {refusal}")
-    if points > max_points:
+    if points > max_points and not explicit:
         errors.append(f"{points} size points (S = 1, M = 3): at most {max_points}")
     if len(parents) > 1:
         errors.append(
@@ -457,14 +463,21 @@ class Bundles:
         priorities: Mapping[int, str | None] | None = None,
         *,
         ignore_key: str | None = None,
+        explicit: bool = False,
     ) -> list[str]:
+        """Every rule ``members`` break. ``explicit``: an owner's ``/bundle`` (up to
+        ``bundle_command_max_members``, no size rules); else a suggestion (a proposal or
+        its tick: ``bundle_max_members`` and ``bundle_max_points``)."""
         config = self.service.config
         facts = await self.facts(members, priorities, ignore_key=ignore_key)
         return validate_bundle(
             members,
             facts,
-            max_members=config.bundle_max_members,
+            max_members=(
+                config.bundle_command_max_members if explicit else config.bundle_max_members
+            ),
             max_points=config.bundle_max_points,
+            explicit=explicit,
         )
 
     # -------------------------------------------------------------- proposals
@@ -793,7 +806,7 @@ class Bundles:
         if not (await self.enabled())[0]:
             problems.append("bundling is off (`omnigent-factory bundles on`)")
         else:
-            problems = await self.validate(members)
+            problems = await self.validate(members, explicit=True)
         if problems:
             await self._react(comment, "confused")
             await self._reply(
@@ -1756,6 +1769,7 @@ class Bundles:
             "enabled": enabled,
             "enabled_source": source,
             "max_members": min(config.bundle_max_members, MAX_MEMBERS),
+            "command_max_members": min(config.bundle_command_max_members, MAX_MEMBERS),
             "max_points": config.bundle_max_points,
             "proposals_pending": len(proposals),
             "active_bundles": len(active),
