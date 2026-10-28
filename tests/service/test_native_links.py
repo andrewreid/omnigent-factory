@@ -54,6 +54,11 @@ class FakeClient:
                     "number": issue["number"],
                     "repository": {"id": issue.get("repo", REPO)},
                     "issueType": {"name": issue["type"]} if issue.get("type") else None,
+                    "parent": (
+                        {"number": issue["parent"], "repository": {"id": REPO}}
+                        if issue.get("parent")
+                        else None
+                    ),
                     "blockedBy": {
                         "totalCount": len(issue["blocked_by"]),
                         "nodes": [
@@ -147,6 +152,20 @@ async def test_a_link_is_created_once_never_duplicated_and_only_within_the_repos
         assert await native.link(824, 999, source=824) is False
         assert len(client.mutations) == 1
         assert not any("remove" in name.lower() for name, _ in client.mutations)
+
+
+@pytest.mark.asyncio
+async def test_a_sub_issue_is_never_blocked_by_its_own_epic(service_config: ServiceConfig):
+    async with rig(service_config, Harness()) as r:
+        # #618's triage named its parent epic #336 in depends_on: that link could never
+        # clear (the epic closes once its sub-issues are done).
+        client = FakeClient({336: issue(336), 618: issue(618, parent=336), 700: issue(700)})
+        native = links(r.service, client)
+        assert await native.link_status(618, 336, source=618) == "skipped"
+        assert client.mutations == []
+        # Another issue may still block it, and the epic may wait on its sub-issue.
+        assert await native.link(618, 700, source=618) is True
+        assert await native.link(336, 618, source=618) is True
 
 
 @pytest.mark.asyncio

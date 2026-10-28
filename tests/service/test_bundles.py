@@ -20,6 +20,7 @@ from omnigent_factory.core import events as ev
 from omnigent_factory.core import report_lines as rl
 from omnigent_factory.core.events import Event, Provenance
 from omnigent_factory.core.types import (
+    AutopilotClaim,
     BotState,
     Decision,
     DecisionImpact,
@@ -431,7 +432,10 @@ def test_an_owner_bundle_ignores_the_size_rules_only():
     # Every protective rule still refuses it.
     p = h.p(P1)
     for over_facts, expected in (
-        ({"parent": 40, "parent_autopilot": True}, "#1 is a sub-issue of epic #40"),
+        (
+            {"parcel": replace(p, autopilot_claim=AutopilotClaim(40, "ep", 1, 1))},
+            "#1: epic autopilot drives it",
+        ),
         (
             {"parcel": replace(p, links=IssueLinks(blocked_by=(LinkedIssue(50, True),)))},
             "#1 is blocked by open #50",
@@ -447,6 +451,33 @@ def test_an_owner_bundle_ignores_the_size_rules_only():
         refused = {**found, 1: replace(found[1], **over_facts)}
         problems = validate_bundle(members, refused, max_members=8, max_points=4, explicit=True)
         assert any(expected in x for x in problems), (expected, problems)
+
+
+def test_an_owner_bundle_may_take_sub_issues_of_an_autopilot_epic_a_proposal_never():
+    h = history()
+    piloted = {"parent": 40, "parent_autopilot": True}
+    found = {NUMBERS[pid]: facts(h, pid, **piloted) for pid in (P1, P2)}
+    assert validate_bundle((1, 2), found, max_members=3, max_points=4, explicit=True) == []
+    suggested = validate_bundle((1, 2), found, max_members=3, max_points=4)
+    assert "#1 is a sub-issue of epic #40, which is on autopilot" in suggested
+    # One autopilot drives right now is refused either way (the reducer would not hold it).
+    driven = replace(h.p(P1), autopilot_claim=AutopilotClaim(40, "ep", 1, 1))
+    found[1] = replace(found[1], parcel=driven)
+    for explicit in (True, False):
+        problems = validate_bundle((1, 2), found, max_members=3, max_points=4, explicit=explicit)
+        assert "#1: epic autopilot drives it" in problems
+    # A claim the owner took over (released) no longer drives it.
+    released = replace(driven, autopilot_claim=AutopilotClaim(40, "ep", 1, 1, released="stop"))
+    found[1] = replace(found[1], parcel=released)
+    assert validate_bundle((1, 2), found, max_members=3, max_points=4, explicit=True) == []
+
+
+def test_a_member_the_reducer_would_not_hold_is_refused():
+    h = history()
+    stuck = replace(h.p(P1), holds=frozenset({Hold.RESULT_INVALID}))
+    assert "#1: it needs you" in check(h, a={"parcel": stuck})
+    # Already refused by another rule: that rule's reason only.
+    assert "#1: it needs you" not in check(h, a={"parcel": stuck, "priority": "P0"})
 
 
 def test_proposal_shape_errors():
@@ -716,6 +747,121 @@ async def test_a_ticked_proposal_keeps_the_suggestion_rules(service_config: Serv
         assert await r.state() == []
         [refused] = await r.proposals()
         assert refused.state == "refused" and "#2 is size L or unsized" in refused.detail
+
+
+def depends_on(*issues: int) -> dict[str, Any]:
+    return triage(related=[{"issue": n, "relation": "depends_on", "note": "x"} for n in issues])
+
+
+@pytest.mark.asyncio
+async def test_a_depends_on_naming_the_members_own_epic_is_no_dependency(
+    service_config: ServiceConfig,
+):
+    async with rig(on(service_config)) as r:
+        # #1's triage listed its parent epic #40 ("Parent tracking epic"): never an open
+        # dependency, on the proposal path and the /bundle path alike.
+        r.directory.triage[1] = depends_on(40)
+        _found, problems = await r.bundles.check_proposals([proposal(1, 2)], {})
+        assert problems == []
+        r.directory.triage[1] = depends_on(40, 77)  # a real open dependency still refuses
+        _found, problems = await r.bundles.check_proposals([proposal(1, 2)], {})
+        assert problems == ["bundles[1] (#1 and #2): #1 depends on open #77"]
+        assert await r.bundles.on_comment_delivery(command(1, "/bundle #2")) == 0
+        [reply] = r.repo.comments_on(1)
+        assert "#1 depends on open #77" in reply["body"] and "#40" not in reply["body"]
+        r.directory.triage[1] = depends_on(40)
+        assert await r.bundles.on_comment_delivery(command(1, "/bundle #2", 778)) == 1
+
+
+def autopilot_epic(*, drive: str | None = None) -> Harness:
+    """Epic #1 on autopilot with sub-issues #2 (S1) and #3 (S2) triaged; ``drive``: the
+    sub-issue autopilot claimed (its plan posted, awaiting approval)."""
+    from tests.test_epic_autopilot_reducer import S1, S2, claimed, on_autopilot
+
+    h = Harness()
+    on_autopilot(h)
+    driven = {"#2": S1, "#3": S2}.get(drive or "")
+    for pid in (S1, S2):
+        if pid == driven:
+            claimed(h, pid)  # planned straight from the inbox, as autopilot does
+        else:
+            h.triage(pid, size=Size.S)
+    return h
+
+
+@pytest.mark.asyncio
+async def test_an_owner_bundle_takes_sub_issues_of_an_autopilot_epic_and_says_so(
+    service_config: ServiceConfig,
+):
+    async with rig(on(service_config), autopilot_epic(), parent=1) as r:
+        # A proposal (and its tick) still refuses them.
+        _found, problems = await r.bundles.check_proposals([proposal(2, 3)], {})
+        assert "bundles[1] (#2 and #3): #2 is a sub-issue of epic #1, which is on autopilot" in (
+            problems
+        )
+        assert await r.bundles.on_comment_delivery(command(2, "/bundle #3 Tidy")) == 1
+        [b] = await r.state()
+        assert b.issue_number == 100 and b.held == (2, 3)
+        for n in (2, 3):
+            assert Hold.BUNDLED in (await r.parcel(n)).holds
+        [reply] = r.repo.comments_on(2)
+        assert reply["body"] == (
+            "Bundled #2 and #3 in bundle #100, built as one pull request.\n\n"
+            "#2 and #3 are sub-issues of epic #1, which is on autopilot: the bundle builds "
+            "them now, not autopilot. Autopilot goes on with the rest of #1; a part that "
+            "depends on them waits until the bundle's pull request closes them."
+        )
+        for bad in ("Factory", "Next:", "/approve", "\n> "):
+            assert bad not in reply["body"]
+
+
+@pytest.mark.asyncio
+async def test_an_owner_bundle_without_autopilot_members_only_reacts(
+    service_config: ServiceConfig,
+):
+    async with rig(on(service_config)) as r:
+        assert await r.bundles.on_comment_delivery(command(1, "/bundle #2")) == 1
+        assert r.repo.comments_on(1) == [] and (777, "+1") in r.repo.reactions
+
+
+@pytest.mark.asyncio
+async def test_an_owner_bundle_refuses_a_sub_issue_autopilot_drives_now(
+    service_config: ServiceConfig,
+):
+    async with rig(on(service_config), autopilot_epic(drive="#2"), parent=1) as r:
+        assert (await r.parcel(2)).autopilot_claim is not None
+        assert await r.bundles.on_comment_delivery(command(2, "/bundle #3")) == 0
+        assert await r.state() == []
+        [reply] = r.repo.comments_on(2)
+        assert "#2: epic autopilot drives it" in reply["body"]
+        assert "which is on autopilot" not in reply["body"]
+
+
+@pytest.mark.asyncio
+async def test_a_tick_of_a_proposal_still_refuses_autopilot_epic_members(
+    service_config: ServiceConfig,
+):
+    async with rig(on(service_config)) as r:
+        p = await propose(r, 1, 2)
+        assert p.comment_id is not None
+        body = r.repo.comments[p.comment_id]["body"]
+        # Epic #40 was put on autopilot before the owner ticked.
+        r.bundles.facts = _piloted(r.bundles.facts)  # type: ignore[method-assign]
+        assert await r.bundles.on_comment_delivery(edited(r, p.comment_id, ticked(body))) == 1
+        assert await r.state() == []
+        [refused] = await r.proposals()
+        assert refused.state == "refused"
+        assert refused.detail == "#1 is a sub-issue of epic #40, which is on autopilot"
+
+
+def _piloted(read: Any) -> Any:
+    """The members' epic #40 is on autopilot (the facts as read, with that one change)."""
+
+    async def facts(*args: Any, **kw: Any) -> dict[int, MemberFacts]:
+        found = await read(*args, **kw)
+        return {n: replace(f, parent_autopilot=f.parent == 40) for n, f in found.items()}
+
+    return facts
 
 
 # ------------------------------------------------------------------ bundle runs

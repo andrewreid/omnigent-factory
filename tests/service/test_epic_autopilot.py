@@ -9,6 +9,7 @@ import os
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,7 @@ from omnigent_factory.service.auto_build import AutoBuilder
 from omnigent_factory.service.autopilot import EpicAutopilotService
 from omnigent_factory.service.config import ServiceConfig
 from omnigent_factory.service.runtime import FactoryService
+from omnigent_factory.store import bundles as bs
 from omnigent_factory.store.sqlite import SqliteStore
 from omnigent_factory.testing.builders import OTHER_USER_ID, OWNER_ID, snapshot
 from omnigent_factory.testing.fakes import (
@@ -904,3 +906,120 @@ async def test_a_cut_epic_list_is_re_read_at_most_every_interval(service_config:
         r.clock.advance(6 * MICROS_PER_MINUTE)
         await r.autopilot.run_once()
         assert await r.count(EventKind.RECONCILE_DUE) == 2
+
+
+# ------------------------------------------------------------------ bundles
+
+
+BUNDLE = "I_bundle"
+
+
+def bundled_history() -> Harness:
+    """Epic #1 with #2 (S1, held in bundle #5), #3 (S2), #4 (S3, blocked by #2) and the
+    bundle issue #5, which joined the epic as a sub-issue (still in the Inbox)."""
+    h = history()
+    for pid in (S3, BUNDLE):  # issue numbers 4, 5
+        h.f(pid)
+    f = h.f(EPIC)
+    links = epic_links((2, True), (3, True), (4, True), (5, True))
+    h.apply(f.make(ev.GitHubSnapshot(), evidence=snapshot(read_at_us=f.now + 2, links=links)))
+    h.triage(S1)
+    blocked = sub_links(blockers=(LinkedIssue(2, True),))
+    for pid, links in ((S1, sub_links()), (S3, blocked), (BUNDLE, sub_links())):
+        f = h.f(pid)
+        h.apply(f.make(ev.GitHubSnapshot(), evidence=snapshot(read_at_us=f.now, links=links)))
+    r = h.send(S1, ev.BundleHold(bundle=5))
+    assert r.audit.accepted, r.audit.reason
+    return h
+
+
+async def bundle_issue(r: Rig, number: int = 5, *, state: str = "open") -> None:
+    """Record bundle issue ``number`` (readable, so autopilot could start it if it tried)."""
+    r.github.snapshots[BUNDLE] = snapshot(read_at_us=r.clock.now_utc_us(), links=sub_links())
+    repo_id = r.config.repo_id
+    await r.service.db.call(
+        partial(
+            bs.create_bundle,
+            repo_id=repo_id,
+            bundle_key="k1",
+            members=[2],
+            theme="t",
+            reason="",
+            source="command",
+            owner_id=OWNER_ID,
+            via="webhook",
+            confirmed_at_us=1,
+        )
+    )
+    await r.service.db.call(
+        partial(bs.set_bundle, repo_id=repo_id, bundle_key="k1", state=state, issue_number=number)
+    )
+
+
+async def read(r: Rig, pid: str, number: int, **kw: Any) -> None:
+    now = r.clock.now_utc_us()
+    result = await r.service.apply_event(
+        Event(
+            event_id=f"test-read:{pid}:{now}",
+            repo_id=r.config.repo_id,
+            parcel_id=pid,
+            source_time_us=now,
+            provenance=Provenance.ADAPTER,
+            body=ev.GitHubSnapshot(),
+            issue_number=number,
+            evidence=snapshot(read_at_us=now, **kw),
+        )
+    )
+    assert result.accepted, result.reason
+    r.clock.advance(1_000_000)
+
+
+async def test_a_bundle_issue_and_its_held_member_are_never_driven_and_dependents_wait(
+    service_config: ServiceConfig,
+):
+    config = on(service_config, epic_autopilot_concurrency=3)
+    plan = plan_dict(order=(2, 3, 4))
+    async with rig(config, bundled_history(), plan=plan) as r:
+        await bundle_issue(r)
+        # #2 is the bundle's, #5 is the bundle issue, #4 waits on #2: only #3 starts.
+        assert await r.autopilot.run_once() == "#1: started #3"
+        assert await r.autopilot.run_once() == "#1: nothing to start"
+        assert await r.count(EventKind.AUTOPILOT_PLAN) == 1
+        for pid in (S1, BUNDLE, S3):
+            assert (await r.parcel(pid)).autopilot_claim is None
+        assert (await r.parcel(EPIC)).epic_note == (
+            "Epic · 0/4 done · autopilot: planning #3, bundle #5 builds #2"
+        )
+        assert not (await r.parcel(EPIC)).autopilot.paused  # type: ignore[union-attr]
+        # The bundle PR merged: GitHub closed #2 (and #5); #4's blocker is closed.
+        done = sub_links(blockers=(LinkedIssue(2, False),))
+        r.github.snapshots[S3] = snapshot(read_at_us=r.clock.now_utc_us(), links=done)
+        await read(r, S1, 2, open=False, links=sub_links())
+        await read(r, BUNDLE, 5, open=False, links=sub_links())
+        await read(r, S3, 4, links=done)
+        closed = epic_links((2, False), (3, True), (4, True), (5, False))
+        await read(r, EPIC, 1, links=closed)
+        assert await r.autopilot.run_once() == "#1: started #4"
+        assert (await r.parcel(EPIC)).epic_note == "Epic · 2/4 done · autopilot: planning #3, #4"
+
+
+async def test_a_released_member_is_autopilots_again_and_a_cancelled_bundle_issue_never(
+    service_config: ServiceConfig,
+):
+    async with rig(on(service_config, epic_autopilot_concurrency=3), bundled_history()) as r:
+        await bundle_issue(r, state="cancelled")  # /unbundle: the bundle issue stays open
+        now = r.clock.now_utc_us()
+        result = await r.service.apply_event(
+            Event(
+                event_id=f"test-release:{now}",
+                repo_id=r.config.repo_id,
+                parcel_id=S1,
+                source_time_us=now,
+                provenance=Provenance.ADAPTER,
+                body=ev.BundleHold(bundle=0, note="Released from bundle #5"),
+                issue_number=2,
+            )
+        )
+        assert result.accepted, result.reason
+        assert await r.autopilot.run_once() == "#1: started #2, #3"
+        assert (await r.parcel(BUNDLE)).autopilot_claim is None

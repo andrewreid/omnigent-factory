@@ -42,7 +42,7 @@ otherwise S for triage and M for the rest).
 | `/approve [hash] [for <N>h]` | Planning or Building | Approves the latest published plan and queues the build. `hash` is a prefix (≥ 12 lowercase hex) that must identify the latest plan; without it, the plan must have been posted before the command. Refused while a question is open, a revision is pending or another build holds the parcel. `/approve` of the plan whose build is already queued or running is refused (😕, `Nothing new to approve: this plan is already approved`); a drag to Building of it only notes `Approved: build starts when capacity allows`. |
 | `/continue [for <N>h]` | A card at `Bot: Checkpoint` | Grants another time block to the paused run. Refused when the run is not at a checkpoint, is stopped or revoked, or a question is still open. |
 | `/stop` | Any column | Stops all work: drains every run, drops any queued build and pending start. Note `Stopped: /stop`. Resume with a new control (`/triage`, `/plan`, a drag, or a plain comment in Triage or Planning); a comment never starts a rework on a stopped card. |
-| `/bundle #a #b [theme]` | Any issue that is to be a member | With [bundling](#bundling) on: builds the commented issue and the named ones (2 to `bundle_command_max_members`, default 8, in all) as one PR. Your explicit choice overrides the size rules (L or unsized members, size points), never the protective ones; refused with a reply listing what breaks the rules. |
+| `/bundle #a #b [theme]` | Any issue that is to be a member | With [bundling](#bundling) on: builds the commented issue and the named ones (2 to `bundle_command_max_members`, default 8, in all) as one PR. Your explicit choice overrides the size rules (L or unsized members, size points) and may take sub-issues of an epic on autopilot (not one autopilot is driving right now), never the other protective ones; refused with a reply listing what breaks the rules. When it takes autopilot-epic sub-issues, a reply says the bundle builds them, not autopilot. |
 | `/unbundle` | A bundle issue, or one of its members | On the bundle issue: releases every member (the bundle issue stays an ordinary issue). On a member: releases only that member. |
 | `/decide <id> <answer>` | A card with an open question | Answers the open question `<id>` with `<answer>`. On a build, `/decide` revokes the build and replans (a plain reply is taken within the approval). The id is not shown in the question comment, so a plain reply is the normal answer. |
 
@@ -234,7 +234,7 @@ blocks #825` to each line.
 | Auto-build and blockers | A queued card with an open blocker does not start: note `Waiting on #823`, `auto-build status` shows `waiting on #823`. It starts by itself once a read shows every blocker closed. A start whose fresh read cannot see every blocker is refused (fails closed; manual builds are not affected). |
 | Manual builds and blockers | A drag, `/approve` or `factory:build` still builds; the note reads `Started despite open blocker #823` (no comment). |
 | Ranking | After Rosie's ranking, a blocker always ranks above what it blocks, and sub-issues of one parent stay together where that rule allows. An owner-pinned Rank is kept even when it forces a violation; that is logged. |
-| Dependency links | Every result Rosie submits (triage, epic triage, plan, build, blocked) may list `related` issues; each `depends_on` or `blocks` entry becomes a native blocked-by link (`addBlockedBy`) once the result is accepted, created by the factory (Rosie needs no write access, and never asks you to add one): only between issues of this repository (an epic may be the blocker), skipped when it exists, never removing one, each logged. Parent/sub-issue links are not created (that would turn an issue into an epic, which changes what may be built), except that a [follow-up](#follow-ups) joins its source issue's epic. |
+| Dependency links | Every result Rosie submits (triage, epic triage, plan, build, blocked) may list `related` issues; each `depends_on` or `blocks` entry becomes a native blocked-by link (`addBlockedBy`) once the result is accepted, created by the factory (Rosie needs no write access, and never asks you to add one): only between issues of this repository (an epic may be the blocker, except of its own sub-issue: that link could never clear), skipped when it exists, never removing one, each logged. Parent/sub-issue links are not created (that would turn an issue into an epic, which changes what may be built), except that a [follow-up](#follow-ups) joins its source issue's epic. |
 
 An issue with at least one sub-issue is an **epic**. It is never built: a drag, `/approve`
 or `factory:build` on it is refused with the note `Epic: build its sub-issues` (a drag is
@@ -346,7 +346,7 @@ sub-issues it comes before (never created twice); closing it unblocks them.
 | `Plan only` | Nothing: approve it as usual (drag, `/approve`, `Auto-build` = Queued). |
 
 Next sub-issue: open, assigned to nobody, not `factory:skip`, not a held
-[follow-up](#follow-ups), not an epic itself (a nested epic only blocks), every blocker closed (a merged PR closes it; blockers outside
+[follow-up](#follow-ups), not held in a [bundle](#bundling) nor a bundle issue, not an epic itself (a nested epic only blocks), every blocker closed (a merged PR closes it; blockers outside
 the epic are waited on, never started), by the plan's build order, then `Rank`, then
 age. It goes straight to planning (no triage), its worktree synced with the base. Its
 plan must say whether it stays within its part of the epic; one that does not is never
@@ -491,8 +491,9 @@ Off by default (`bundling = true` or `bundles on`). Several related issues are b
 * `bundle_max_members` (default 3) and `bundle_max_points` (default 4) bound the bundles
   the factory **suggests**: a ranking's proposal and your tick of it.
 * `bundle_command_max_members` (default 8) bounds an explicit **`/bundle`**: your choice,
-  so it ignores the size rules (an L or unsized member, the size points) but never the
-  protective ones (every other rule below).
+  so it ignores the size rules (an L or unsized member, the size points) and may take
+  sub-issues of an epic on autopilot, but never the other protective ones (every other
+  rule below, including a sub-issue autopilot is driving right now).
 
 Both are 2 to 12, and `bundle_max_members` may not exceed `bundle_command_max_members`.
 
@@ -504,9 +505,9 @@ checked; one that breaks a rule fails the ranking's submission with the exact pr
 |---|---|
 | Size (suggested bundles only) | be triaged S (1 point) or M (3 points), at most `bundle_max_points` (4) in all; L or unsized never |
 | Column | be in Triage or Planning with a triage result, not Building or Ready, nothing running, queued, auto-build-marked or driven by epic autopilot |
-| Epics | not be an epic, not be a sub-issue of an epic on autopilot; members of two different epics are never bundled |
+| Epics | not be an epic, not be a sub-issue of an epic on autopilot (suggested bundles only: `/bundle` may take one autopilot is not driving right now); members of two different epics are never bundled |
 | Owner | not be assigned, labelled `factory:skip` or `needs-review`, P0, or waiting on you (an open question, `Needs you`) |
-| Dependencies | have no open native blocker and no open `depends_on` issue outside the bundle |
+| Dependencies | have no open native blocker and no open `depends_on` issue outside the bundle (a `depends_on` naming the member's own epic is not one: the epic stays open until its sub-issues are done) |
 | Once | not be in another bundle |
 
 Members keep their ranks. Each proposal gets one comment on its lowest-numbered member
@@ -517,8 +518,8 @@ proposal is stale and nothing happens.
 
 **Confirmed.** Only your tick counts (the comment's `edited` webhook from an owner; a lost
 webhook is recovered from the comment's edit history only when it shows you made the
-tick), or `/bundle #a #b [theme]` on a member (checked by every rule above but Size,
-with up to `bundle_command_max_members` members). The factory then opens a **bundle
+tick), or `/bundle #a #b [theme]` on a member (checked by every rule above but Size and
+the autopilot-epic rule, with up to `bundle_command_max_members` members). The factory then opens a **bundle
 issue**, `Bundle: <theme> (#a, #b)`, labelled `factory:bundle`, its body listing the members as
 plain references (never as its sub-issues: that would make it an epic) and saying the PR
 needs a `Closes` line for the bundle issue and each member. It joins the members' epic
@@ -528,6 +529,17 @@ two bundle issues. Each member is held (`bundled`): it is never triaged, planned
 on its own (a drag, command, label or comment on it is refused with `In bundle #X: work on
 the bundle issue, or /unbundle it`), auto-build, epic autopilot, auto-triage and ranking
 leave it alone, its note says `In bundle #X` and its `Bot` mirrors the bundle issue's.
+
+**Bundles in an epic on autopilot.** `/bundle` may take sub-issues of an epic on
+autopilot that autopilot is not driving right now (one it has planned or is building is
+refused: `epic autopilot drives it`); a proposal or its tick never does. The reply on your
+command says plainly that those members are now built by the bundle, not by autopilot.
+Autopilot then never plans, builds, counts or pauses on a held member, and never treats
+the bundle issue (a sub-issue of the epic) as one of its parts, whatever the bundle's
+state; the epic's note says `bundle #X builds #2, #3`. Any part with a blocked-by link to
+a member waits, like on any blocker, until the bundle PR's merge closes that member, then
+goes on; once every member is done the epic plan continues as usual. A member released or
+ejected from the bundle is an ordinary sub-issue again.
 
 **Built.** The bundle issue goes plan → approval → build → Ready like any issue.
 `factory_get_issue` and `factory_get_plan` list its `bundle_members` (title, text,

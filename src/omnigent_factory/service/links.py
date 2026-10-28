@@ -4,7 +4,9 @@ and re-read issues whose links changed.
 * **Writes.** Once a triage comment exists, every ``depends_on``/``blocks`` entry of the
   triage (and every ``links`` entry of an epic triage) becomes a native blocked-by link
   (``addBlockedBy``): only between two issues of the configured repository, skipped when
-  it already exists, never removing one. Each is logged. Best effort, in the background
+  it already exists or would block a sub-issue by its own epic (the epic closes only once
+  its sub-issues are done: that link could never clear), never removing one. Each is
+  logged. Best effort, in the background
   like related-issue marking; a failed write only logs.
 * **Epics.** An issue with at least one sub-issue is an epic. Each board diff pass
   computes every epic's card note, ``Epic · 1/8 done · next: #823`` (next: the
@@ -201,7 +203,8 @@ class NativeLinks:
 
     async def link_status(self, blocked: int, blocking: int, *, source: int) -> str:
         """As :meth:`link`: ``created``, ``exists``, ``skipped`` (not both issues of this
-        repository) or ``failed`` (GitHub refused or failed: worth retrying)."""
+        repository, or ``blocking`` is the epic of ``blocked``) or ``failed`` (GitHub
+        refused or failed: worth retrying)."""
         owner, name = self._owner_name
         repo_node = self.service.config.repo_id
         try:
@@ -210,6 +213,15 @@ class NativeLinks:
             if target is None or other is None:
                 LOG.info(
                     "native link skipped (not an issue of this repository) source=#%s "
+                    "issue=#%s blocked_by=#%s",
+                    source,
+                    blocked,
+                    blocking,
+                )
+                return "skipped"
+            if target.parent == blocking:
+                LOG.info(
+                    "native link skipped (an issue never waits on its own epic) source=#%s "
                     "issue=#%s blocked_by=#%s",
                     source,
                     blocked,

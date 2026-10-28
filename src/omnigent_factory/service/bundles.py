@@ -11,12 +11,16 @@ on the owner's confirmation. Switched like auto-triage (host config
   update names it. A proposal (and its tick) keeps the suggestion rules: at most
   ``bundle_max_members`` small (S or M) issues within ``bundle_max_points``. A member that
   becomes ineligible before the tick makes the proposal stale (its comment says so);
-  nothing else happens.
+  nothing else happens. A triage ``depends_on`` naming the member's own epic (its parent)
+  is never an open dependency: the epic closes only once its sub-issues are done.
 * **Confirmed.** Only an owner's tick counts (the comment's ``edited`` webhook from an
   owner's numeric id, diffed against the previous body; a lost webhook is recovered from
   the comment's ``userContentEdits`` when an owner made that edit), or an owner's
   ``/bundle #a #b ...`` on a member (validated by the same protective rules, but sized by
-  the owner: up to ``bundle_command_max_members``, L or unsized members and any points).
+  the owner: up to ``bundle_command_max_members``, L or unsized members and any points;
+  and it may take sub-issues of an epic on autopilot that autopilot is not driving right
+  now, which a proposal never does: the bundle then builds them, not autopilot, and the
+  reply on the command says so).
   The factory then opens a synthetic bundle issue (``Bundle: <theme> (#a, #b)``, label
   ``factory:bundle``, a hidden marker: an unclear create is found by its marker first, so
   never twice), never linking the members as its sub-issues (that would make it an
@@ -24,7 +28,9 @@ on the owner's confirmation. Switched like auto-triage (host config
   priority and starts planning (the owner's confirmation is the plan control). Each member gets the
   ``bundled`` hold: it is never triaged, planned or built on its own, auto-build,
   autopilot, auto-triage and ranking leave it alone, its card notes ``In bundle #X`` and
-  mirrors the bundle's Bot.
+  mirrors the bundle's Bot. Epic autopilot never drives the bundle issue either; its
+  parts blocked by a member wait until the bundle PR closes that member
+  (``service.autopilot``).
 * **Built.** The bundle issue runs the normal plan -> approval -> build -> Ready flow;
   ``factory_get_issue``/``factory_get_plan`` list ``bundle_members`` (title, text,
   triage). Its plan names every member in its acceptance criteria, and it is Ready only
@@ -102,7 +108,8 @@ AREA_MAX = 200
 CONFIRM_TEXT = "Build these together as one PR"
 _COMMAND = re.compile(r"^/(?P<name>bundle|unbundle)(?:\s+(?P<args>.*))?$", re.DOTALL)
 _REF = re.compile(r"(?<![\w/&])#(\d+)\b")
-#: ``bundle_member_refusal`` reasons the other rules do not already name.
+#: ``bundle_member_refusal`` reasons the other rules do not already name (any other reason
+#: is named only for a member no other rule refuses).
 _IN_FLIGHT = frozenset(
     {
         "work on it is running or queued",
@@ -168,7 +175,8 @@ class MemberFacts:
     queued: bool = False
     #: The active bundle issue it is held in (0: none; -1: a bundle being created).
     bundled: int = 0
-    #: Open issues it depends on outside the proposed members (triage ``depends_on``).
+    #: Open issues it depends on outside the proposed members (triage ``depends_on``; its
+    #: own epic never counts).
     open_dependencies: tuple[int, ...] = ()
 
 
@@ -190,7 +198,10 @@ def validate_bundle(
 ) -> list[str]:
     """Every rule a bundle breaks (empty: it may be built as one PR). ``explicit``: an
     owner's ``/bundle``, which sizes the bundle itself (no L/unsized or points rule; the
-    caller passes its own ``max_members``); every protective rule still applies."""
+    caller passes its own ``max_members``) and may take sub-issues of an epic on autopilot
+    (one autopilot drives now is still refused); every other protective rule applies.
+    A member this accepts is one the reducer's ``BundleHold`` holds
+    (``bundle_member_refusal``)."""
     errors: list[str] = []
     limit = min(max_members, MAX_MEMBERS)
     numbers = list(members)
@@ -207,6 +218,7 @@ def validate_bundle(
         if f is None or p is None:
             errors.append(f"#{n} is not known to the factory (never triaged)")
             continue
+        refused = len(errors)
         if p.stage not in (Stage.TRIAGED, Stage.SCOPED) or f.triage is None:
             errors.append(f"#{n} is not in Triage or Planning with a triage result")
         if p.stage in (Stage.BUILDING, Stage.READY):
@@ -220,7 +232,7 @@ def validate_bundle(
             errors.append(f"#{n} is an epic")
         if f.parent is not None:
             parents.add(f.parent)
-            if f.parent_autopilot:
+            if f.parent_autopilot and not explicit:
                 errors.append(f"#{n} is a sub-issue of epic #{f.parent}, which is on autopilot")
         if not p.eligible:
             errors.append(f"#{n} is closed, assigned to a person or unverified")
@@ -249,7 +261,7 @@ def validate_bundle(
             errors.append(f"#{n} is already in {where}")
         else:
             refusal = bundle_member_refusal(p, queued=f.queued)
-            if refusal in _IN_FLIGHT:
+            if refusal is not None and (refusal in _IN_FLIGHT or len(errors) == refused):
                 errors.append(f"#{n}: {refusal}")
     if points > max_points and not explicit:
         errors.append(f"{points} size points (S = 1, M = 3): at most {max_points}")
@@ -258,6 +270,22 @@ def validate_bundle(
             "members of different epics (" + ", ".join(f"#{e}" for e in sorted(parents)) + ")"
         )
     return list(dict.fromkeys(errors))
+
+
+def autopilot_reply(
+    members: Sequence[int], piloted: Sequence[int], epic: int, bundle: int | None
+) -> str:
+    """The reply to an owner's ``/bundle`` that took sub-issues of an epic on autopilot."""
+    one = len(piloted) == 1
+    them = "it" if one else "them"
+    where = f" in bundle #{bundle}" if bundle else ""
+    return (
+        f"Bundled {_refs(members)}{where}, built as one pull request.\n\n"
+        f"{_refs(piloted)} {'is a sub-issue' if one else 'are sub-issues'} of epic #{epic}, "
+        f"which is on autopilot: the bundle builds {them} now, not autopilot. Autopilot goes "
+        f"on with the rest of #{epic}; a part that depends on {them} waits until the "
+        f"bundle's pull request closes {them}."
+    )
 
 
 def parse_proposals(raw: object) -> tuple[list[bs.NewProposal], list[str]]:
@@ -431,7 +459,12 @@ class Bundles:
                 if not isinstance(item, Mapping) or item.get("relation") != "depends_on":
                     continue
                 dep = item.get("issue")
-                if isinstance(dep, int) and dep not in numbers and await self._open(dep):
+                if (
+                    isinstance(dep, int)
+                    and dep not in numbers
+                    and dep != parent_number  # its own epic: open until its parts are done
+                    and await self._open(dep)
+                ):
                     deps.append(dep)
             priority = (priorities or {}).get(n)
             if priority is None and triage is not None:
@@ -466,11 +499,26 @@ class Bundles:
         explicit: bool = False,
     ) -> list[str]:
         """Every rule ``members`` break. ``explicit``: an owner's ``/bundle`` (up to
-        ``bundle_command_max_members``, no size rules); else a suggestion (a proposal or
-        its tick: ``bundle_max_members`` and ``bundle_max_points``)."""
+        ``bundle_command_max_members``, no size rules, sub-issues of an epic on autopilot
+        allowed); else a suggestion (a proposal or its tick: ``bundle_max_members`` and
+        ``bundle_max_points``)."""
+        problems, _facts = await self._checked(
+            members, priorities, ignore_key=ignore_key, explicit=explicit
+        )
+        return problems
+
+    async def _checked(
+        self,
+        members: Sequence[int],
+        priorities: Mapping[int, str | None] | None = None,
+        *,
+        ignore_key: str | None = None,
+        explicit: bool = False,
+    ) -> tuple[list[str], dict[int, MemberFacts]]:
+        """As :meth:`validate`, with the facts it judged."""
         config = self.service.config
         facts = await self.facts(members, priorities, ignore_key=ignore_key)
-        return validate_bundle(
+        problems = validate_bundle(
             members,
             facts,
             max_members=(
@@ -479,6 +527,7 @@ class Bundles:
             max_points=config.bundle_max_points,
             explicit=explicit,
         )
+        return problems, facts
 
     # -------------------------------------------------------------- proposals
 
@@ -803,10 +852,11 @@ class Bundles:
         if await self._db(partial(bs.bundle, repo_id=self._repo_id, bundle_key=key)) is not None:
             return 0  # the same command again (a redelivery): already acted on
         problems: list[str] = []
+        facts: dict[int, MemberFacts] = {}
         if not (await self.enabled())[0]:
             problems.append("bundling is off (`omnigent-factory bundles on`)")
         else:
-            problems = await self.validate(members, explicit=True)
+            problems, facts = await self._checked(members, explicit=True)
         if problems:
             await self._react(comment, "confused")
             await self._reply(
@@ -852,6 +902,19 @@ class Bundles:
                 )
                 await self._rewrite_proposal(p.proposal_key)
         await self.sync()
+        if created:
+            piloted = [n for n in members if facts.get(n) and facts[n].parent_autopilot]
+            if piloted:
+                b = await self._db(partial(bs.bundle, repo_id=self._repo_id, bundle_key=key))
+                await self._reply(
+                    issue,
+                    autopilot_reply(
+                        members,
+                        piloted,
+                        facts[piloted[0]].parent or 0,
+                        b.issue_number if b else None,
+                    ),
+                )
         return int(created)
 
     # -------------------------------------------------------------- creating bundles
@@ -1813,6 +1876,7 @@ __all__ = [
     "POINTS",
     "Bundles",
     "MemberFacts",
+    "autopilot_reply",
     "bundle_marker",
     "member_points",
     "parse_proposals",

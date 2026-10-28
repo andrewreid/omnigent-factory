@@ -31,6 +31,12 @@ Each pass, per approved epic (one decision per sub-issue; the reducer re-checks 
 * a sub-issue labelled ``follow-up`` (``service.follow_ups``) is held, not started, unless
   it natively blocks another open sub-issue of the epic, the owner removed its label, or
   the owner put ``factory:build-follow-ups`` on the epic; the note counts held ones.
+* bundles (``service.bundles``): a bundle issue that joined the epic is never one of its
+  parts (never started, counted or asked about, whatever the bundle's state), and a
+  sub-issue held in a bundle is never started, claimed, counted in progress or paused on:
+  the bundle builds it. A part natively blocked by such a member waits like on any
+  blocker, until the bundle PR closes the member; the note says ``bundle #X builds #N``.
+  A member released or ejected from its bundle is an ordinary sub-issue again.
 
 The epic card's note (``Epic · 3/9 done · autopilot: planning #882, next #883``) is the
 only status output: no comments except the epic plan and genuine questions.
@@ -67,6 +73,7 @@ from omnigent_factory.core.types import (
 from omnigent_factory.ports.github import IssueRef, RankingCard
 from omnigent_factory.service.follow_ups import is_held
 from omnigent_factory.service.runtime import FactoryService
+from omnigent_factory.store import bundles as bs
 from omnigent_factory.store.sqlite import AutoTriageState, FollowUpRow, SqliteStore
 
 LOG = logging.getLogger(__name__)
@@ -177,6 +184,12 @@ class EpicAutopilotService:
             (repo_id,),
         )
         return sorted(found, key=lambda p: p.issue_number or 0)
+
+    async def _bundle_issues(self) -> set[int]:
+        """Every bundle issue of the repository (in any state): never a part of an epic."""
+        repo_id = self.service.config.repo_id
+        found = await self.service.db.call(partial(bs.bundles_of, repo_id=repo_id))
+        return {b.issue_number for b in found if b.issue_number is not None}
 
     async def _by_number(self, number: int) -> Parcel | None:
         repo_id = self.service.config.repo_id
@@ -315,7 +328,8 @@ class EpicAutopilotService:
             for dep in gate.get("blocks") or []:
                 if isinstance(dep, int):
                     gate_blocks.setdefault(dep, set()).add(gates[str(gate["key"])])
-        subs = await self._subs(epic, cards, order, set(gates.values()))
+        excluded = set(gates.values()) | await self._bundle_issues()
+        subs = await self._subs(epic, cards, order, excluded)
         epoch = ap.source_event_id
         claimed = [
             s
@@ -324,6 +338,7 @@ class EpicAutopilotService:
             and s.parcel.autopilot_claim is not None
             and s.parcel.autopilot_claim.epoch == epoch
             and s.parcel.autopilot_claim.epic == number
+            and not _bundled(s)  # the bundle builds it (a claim it keeps is released)
         ]
         pause = _pause_reason(claimed)
         if pause:
@@ -332,7 +347,7 @@ class EpicAutopilotService:
             await self._queue_builds(epic, ap, claimed)
         in_flight = [s for s in claimed if s.parcel is not None and s.parcel.stage in _IN_PROGRESS]
         claimed_numbers = {s.number for s in claimed}
-        unstarted = [s for s in subs if s.number not in claimed_numbers]
+        unstarted = [s for s in subs if s.number not in claimed_numbers and not _bundled(s)]
         if not order and len(unstarted) > 1 and not _linked_among(subs):
             await self._apply(epic, ev.AutopilotQuestion(key="order"))
             return await self._pause(epic, "no build order for its sub-issues")
@@ -371,7 +386,7 @@ class EpicAutopilotService:
             if await self._start(sub, number, epoch):
                 started.append(sub.number)
         epic = await self._by_number(number) or epic
-        subs = await self._subs(epic, cards, order, set(gates.values()))
+        subs = await self._subs(epic, cards, order, excluded)
         text = _status_text(
             progress,
             subs,
@@ -390,15 +405,15 @@ class EpicAutopilotService:
         epic: Parcel,
         cards: Mapping[int, RankingCard],
         order: Sequence[int],
-        gates: set[int],
+        excluded: set[int],
     ) -> list[Sub]:
-        """The epic's open sub-issues (gates excluded) in start order."""
+        """The epic's open sub-issues (gates and bundle issues excluded) in start order."""
         links = epic.links
         assert links is not None  # noqa: S101 - checked by the caller
         numbers = [s.number for s in links.sub_issues if s.open and not s.repo]
         subs = []
         for n in numbers:
-            if n in gates:
+            if n in excluded:
                 continue
             position = order.index(n) if n in order else len(order)
             subs.append(Sub(n, await self._by_number(n), cards.get(n), position))
@@ -708,6 +723,11 @@ def _pause_reason(claimed: Sequence[Sub]) -> str:
     return ""
 
 
+def _bundled(sub: Sub) -> bool:
+    """Held in a bundle: built by its bundle issue, never by autopilot."""
+    return sub.parcel is not None and Hold.BUNDLED in sub.parcel.holds
+
+
 def _links(sub: Sub) -> IssueLinks:
     """The sub-issue's links from this pass's board read when it saw every blocker,
     else its stored read (the caller checked that one exists)."""
@@ -759,8 +779,12 @@ def _status_text(
     queued: list[int] = []
     building: list[int] = []
     yours: list[int] = []
+    bundled: dict[int, list[int]] = {}
     for sub in subs:
         p = sub.parcel
+        if p is not None and _bundled(sub):
+            bundled.setdefault(p.bundled_into, []).append(sub.number)
+            continue
         claim = p.autopilot_claim if p is not None else None
         if p is None or claim is None or claim.epoch != epoch or claim.epic != epic:
             continue
@@ -790,6 +814,8 @@ def _status_text(
         parts.append(f"next #{nxt[0]}")
     elif not parts and waiting:
         parts.append(waiting[0])
+    for bundle, numbers in sorted(bundled.items()):
+        parts.append(f"bundle #{bundle} builds {', '.join(f'#{n}' for n in numbers)}")
     if held:
         parts.append(f"{held} follow-up{'s' if held != 1 else ''} held")
     if not subs:
