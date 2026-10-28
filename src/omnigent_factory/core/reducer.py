@@ -1313,12 +1313,41 @@ def _enter_checkpoint(ctx: _Ctx, s: StageSession) -> None:
     ctx.comment("checkpoint", grant_id=s.grant.grant_id, deadline_us=deadline)
 
 
+def _activate_plan_revision(ctx: _Ctx, s: StageSession) -> StageSession:
+    """Resume an executable plan under its existing grant after owner input."""
+    busy = s.lifecycle == Lifecycle.ACTIVE and not _idle_run(s)
+    s = ctx.put_session(
+        replace(
+            s,
+            revision=ctx.p.revision,
+            lifecycle=Lifecycle.ACTIVE,
+            wait_reason=None,
+            quiescent=s.quiescent and busy,
+            comment_pending=busy,
+        )
+    )
+    ctx.unhold(Hold.AWAITING_OWNER)
+    if not busy:
+        ctx.unhold(Hold.AGENT_BLOCKED, Hold.RESULT_INVALID)
+    return s
+
+
 def _relay_answers(ctx: _Ctx, s: StageSession) -> None:
     """Relay recorded, still-unrelayed answers for ``s`` when a relay is permitted."""
     if not work_allowed(ctx.p, s) or s.lifecycle not in (Lifecycle.ACTIVE, Lifecycle.WAITING):
         return
     if s.kind == SessionKind.BUILD and not approval_ok(ctx.p):
         return
+    if (
+        s.kind == SessionKind.PLAN
+        and ctx.p.revision_pending
+        and s.lifecycle == Lifecycle.WAITING
+        and any(
+            d.session_id == s.session_id and d.status == DecisionStatus.ANSWERED
+            for d in ctx.p.decisions
+        )
+    ):
+        s = _activate_plan_revision(ctx, s)
     for d in ctx.p.decisions:
         if d.session_id != s.session_id or d.status != DecisionStatus.ANSWERED:
             continue
@@ -2805,21 +2834,9 @@ def _plan_feedback(ctx: _Ctx, body: ev.PlanFeedback) -> None:
     cur = ctx.p.current_session
     if cur is not None and cur.kind == SessionKind.PLAN:
         if executable(ctx.p, cur) and work_allowed(ctx.p, cur):
-            busy = cur.lifecycle == Lifecycle.ACTIVE and not _idle_run(cur)
-            cur = ctx.put_session(
-                replace(
-                    cur,
-                    revision=ctx.p.revision,
-                    lifecycle=Lifecycle.ACTIVE,
-                    wait_reason=None,
-                    quiescent=cur.quiescent and busy,
-                    comment_pending=busy,
-                )
-            )
-            ctx.unhold(Hold.AWAITING_OWNER)
-            if busy:
+            cur = _activate_plan_revision(ctx, cur)
+            if cur.comment_pending:
                 return  # the running turn must read it before it can submit
-            ctx.unhold(Hold.AGENT_BLOCKED, Hold.RESULT_INVALID)
             ctx.emit(
                 EffectKind.SEND_MESSAGE,
                 session=cur,
@@ -3171,7 +3188,19 @@ def _h_approve_plan(ctx: _Ctx, body: ev.ApprovePlan) -> None:
     if _build_blocked_by_live(ctx) or ctx.origin_stage not in (Stage.SCOPED, Stage.BUILDING):
         raise Rejected("approval-stage-invalid", explain=True, rollback_to=rollback)
     if not plan_ok(ctx.p):
-        raise Rejected("plan-not-approvable", explain=True, rollback_to=rollback)
+        if ctx.p.open_decisions:
+            ids = ", ".join(d.decision_id for d in ctx.p.open_decisions)
+            detail = f"an owner question is open ({ids})"
+        elif ctx.p.revision_pending:
+            detail = "the plan is being revised after your answer/feedback"
+        else:
+            detail = "the plan is not current/intact"
+        raise Rejected(
+            "plan-not-approvable",
+            explain=True,
+            rollback_to=rollback,
+            note=f"Cannot approve: {detail}",
+        )
     _refuse_epic_build(ctx, rollback)
     if body.hash_text is not None:
         digests = [c.full_hash for c in ctx.p.contracts if c.published]

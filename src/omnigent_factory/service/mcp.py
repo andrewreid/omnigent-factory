@@ -972,6 +972,12 @@ class FactoryTools:
             if parsed.contract_canonical is not None and kind == "plan":
                 out["plan_hash"] = hashlib.sha256(parsed.contract_canonical).hexdigest()
                 out["revision"] = run.revision
+                if after.open_decisions:
+                    ids = ", ".join(d.decision_id for d in after.open_decisions)
+                    out["warning"] = (
+                        "This plan cannot be approved until the owner answers the open "
+                        f"question(s) on GitHub ({ids}). Do not mark them resolved yourself."
+                    )
             return out
 
         out = await self._mutate(
@@ -1430,6 +1436,11 @@ def _expected_next(parcel: Parcel, run: StageSession | None) -> str:
         return "Checkpoint: wrap up and submit kind blocked with done/remaining."
     if run.lifecycle in (Lifecycle.CHECKPOINT_WAIT, Lifecycle.FENCED, Lifecycle.RETIRED):
         return "Wait: this run is closed."
+    if run.kind == SessionKind.PLAN and parcel.revision_pending:
+        instruction = "Apply the owner's answer/feedback and resubmit kind plan."
+        if parcel.open_decisions:
+            instruction += " Remaining open questions still need the owner's answer on GitHub."
+        return instruction
     if parcel.open_decisions:
         return "Wait for the owner's answer to the open question(s)."
     if run.lifecycle == Lifecycle.WAITING:

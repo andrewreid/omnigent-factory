@@ -625,7 +625,10 @@ def test_B12_invalid_drag_approval_rolls_back_card():
     r = h.send(P, ev.ApprovePlan(via=Via.DRAG))
     assert not r.audit.accepted and r.audit.reason == "plan-not-approvable"
     assert EffectKind.POST_COMMENT not in kinds(r) and h.p().stage == Stage.SCOPED
-    assert h.p().note == "Command refused: plan-not-approvable; card moved back to Scoped"
+    assert h.p().note == (
+        "Cannot approve: "
+        "the plan is being revised after your answer/feedback; card moved back to Scoped"
+    )
     assert h.p().current_approval_id is None and not work(r)
 
 

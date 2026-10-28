@@ -153,7 +153,12 @@ def test_refused_drag_is_a_note_and_rollback_without_comment():
     h.send(P, ev.PlanFeedback(text_digest="x"))  # revision pending
     r = h.send(P, ev.ApprovePlan(via=Via.DRAG))
     assert not r.audit.accepted and EffectKind.POST_COMMENT not in kinds(r)
-    assert notes(r) == ["Command refused: plan-not-approvable; card moved back to Scoped"]
+    assert notes(r) == [
+        (
+            "Cannot approve: "
+            "the plan is being revised after your answer/feedback; card moved back to Scoped"
+        )
+    ]
     assert not reactions(r)  # a drag has no comment to react to
 
 

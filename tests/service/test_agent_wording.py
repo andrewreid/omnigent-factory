@@ -124,7 +124,7 @@ def test_live_result_and_question_prompts_request_eli5_and_keep_old_versions():
         "feedback-v4.txt",
         "operator-v3.txt",
         "blockers-closed-v2.txt",
-        "answer-v2.txt",
+        directory._ANSWER_TEMPLATE,
         "continuation-v3.txt",
     }
     for name in first | stages | messages:

@@ -244,9 +244,8 @@ class ServiceDispatchDirectory:
             answer = await self.decision_answer(decision) if decision is not None else None
             if decision is None or answer is None:
                 return None
-            return _template("answer-v2.txt").format(
-                decision_id=decision.decision_id, answer=answer
-            )
+            name = _ANSWER_TEMPLATE if spec.kind == SessionKind.PLAN else "answer-v2.txt"
+            return _template(name).format(decision_id=decision.decision_id, answer=answer)
         if purpose == "feedback":
             if spec.kind == SessionKind.BUILD:
                 if effect.args.get("midturn") is True:
@@ -1007,6 +1006,8 @@ def render_contract_comment(
     eli5 = _neutralise("\n".join(_eli5_lines(plan or {}))).strip()
     if eli5:
         heading += "\n\n" + eli5
+    if parcel.open_decisions:
+        heading += "\n\nApproval is blocked until the owner answers the open question(s) on GitHub."
     fixed = len(heading) + len(section) + 64
     if fixed > _CANONICAL_PUBLICATION_LIMIT:
         return None
@@ -1463,6 +1464,7 @@ _FIRST_TEMPLATES = {
     SessionKind.PLAN: "plan-v12.txt",
     SessionKind.BUILD: "build-v18.txt",
 }
+_ANSWER_TEMPLATE = "answer-v3.txt"
 _RETRIAGE_TEMPLATE = "triage-feedback-v8.txt"
 #: The triage of an epic (an issue with sub-issues), first run and re-runs alike.
 _EPIC_TRIAGE_TEMPLATE = "epic-triage-v5.txt"
