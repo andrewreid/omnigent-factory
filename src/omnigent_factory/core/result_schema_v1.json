@@ -275,6 +275,16 @@
           "items": {
             "$ref": "#/$defs/split_out"
           }
+        },
+        "eli5": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/text"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -475,6 +485,16 @@
           "items": {
             "$ref": "#/$defs/split_out"
           }
+        },
+        "eli5": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/text"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -550,6 +570,16 @@
           "items": {
             "$ref": "#/$defs/ejected"
           }
+        },
+        "eli5": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/text"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -759,6 +789,16 @@
           "items": {
             "$ref": "#/$defs/ejected"
           }
+        },
+        "eli5": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/text"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },

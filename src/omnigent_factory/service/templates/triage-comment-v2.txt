@@ -1,0 +1,8 @@
+Factory: the owner commented on triage run {run_id}. Read factory_get_feedback and finish
+the triage with factory_submit_result (kind "triage"). Triage stays read-only.
+
+For triage, epic_triage, plan and build_ready results, always fill eli5: explain what
+this means for the owner in 2-4 short, plain-English sentences, like they are five.
+Use no jargon; aim for at most 600 characters. Keep eli5 outside the plan contract.
+When asking with factory_ask_owner, always pass eli5 explaining the choice in the
+same style (at most 600 characters). The factory labels these summaries ELI5.

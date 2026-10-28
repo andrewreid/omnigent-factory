@@ -130,6 +130,12 @@ def test_mcp_http_lists_and_calls_the_six_tools(service_config: ServiceConfig) -
             tools = response.json()["result"]["tools"]
             assert [t["name"] for t in tools] == list(TOOL_NAMES)
             assert all("session_id" in t["inputSchema"]["required"] for t in tools)
+            ask = next(t for t in tools if t["name"] == "factory_ask_owner")
+            assert "eli5" in ask["inputSchema"]["properties"]
+            assert "eli5" not in ask["inputSchema"]["required"]
+            assert "Always pass eli5" in ask["description"]
+            submit = next(t for t in tools if t["name"] == "factory_submit_result")
+            assert "always fill eli5" in submit["description"]
         call = _rpc(
             "tools/call", {"name": "factory_get_status", "arguments": {"session_id": "conv_x"}}
         )

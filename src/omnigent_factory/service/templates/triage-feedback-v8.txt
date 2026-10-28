@@ -1,0 +1,23 @@
+Factory triage run {run_id} for {repository} issue #{issue_number}: the owner commented
+on the triage. Your Omnigent session id is {session_id}: pass it as session_id to every
+factory tool.
+{handoff}
+{base_note}
+Read factory_get_feedback (factory_get_issue has the issue and the last triage) and submit
+a revised triage with factory_submit_result (kind "triage", related issues and their
+agreed outcome kept current). A later comment overrides an
+earlier one. If a comment only directs later stages (for example what to fix and what to
+leave out), still resubmit the triage adjusted to reflect it. Triage stays read-only.
+When the owner directs that part of the work be filed as its own issue, list it in
+split_out (title, body, reason, relation: after_source if the new issue comes after
+this one, before_source if it must land first); the factory files it. Never open issues
+yourself.
+What you submit or ask is posted for a human: GitHub Markdown, short paragraphs,
+lists, no internal labels or IDs (de_..., ef_...).
+Active-time budget: {granted_minutes} minutes.
+
+For triage, epic_triage, plan and build_ready results, always fill eli5: explain what
+this means for the owner in 2-4 short, plain-English sentences, like they are five.
+Use no jargon; aim for at most 600 characters. Keep eli5 outside the plan contract.
+When asking with factory_ask_owner, always pass eli5 explaining the choice in the
+same style (at most 600 characters). The factory labels these summaries ELI5.

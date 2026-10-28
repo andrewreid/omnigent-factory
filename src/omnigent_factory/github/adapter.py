@@ -130,6 +130,8 @@ class StatusPublisher(Protocol):
 
     async def folded(self, effect: EffectIntent) -> bool: ...
 
+    async def publication_eli5(self, effect: EffectIntent) -> str: ...
+
     async def publish(self, parcel_id: str) -> StatusWrite: ...
 
     async def refresh(self, parcel_id: str, *, urgent: bool = False) -> StatusWrite: ...
@@ -1626,6 +1628,9 @@ class GitHubAPIAdapter:
                     effect, ref, str(write.comment_id), {"status_comment": True}
                 )
             text = f"PR #{effect.args.get('pr_number')} is ready for review — {write.url}"
+            eli5 = await status.publication_eli5(effect)
+            if eli5:
+                text += "\n\n" + eli5
         if not isinstance(text, str):
             return DefinitiveFailure("comment effect could not render its body")
         body = f"{text}\n\n{self._effect_marker(effect.effect_id)}"

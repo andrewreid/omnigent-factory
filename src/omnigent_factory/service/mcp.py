@@ -770,6 +770,7 @@ class FactoryTools:
         run_id: str,
         question: str,
         *,
+        eli5: str | None = None,
         options: list[str] | None = None,
         recommendation: str | None = None,
         impact: str = "unknown",
@@ -779,6 +780,10 @@ class FactoryTools:
         question = question.strip() if isinstance(question, str) else ""
         if not question or len(question) > 2000:
             raise FactoryToolError("question: required, at most 2000 characters")
+        if eli5 is not None:
+            if not isinstance(eli5, str) or not eli5.strip() or len(eli5) > 600:
+                raise FactoryToolError("eli5: non-empty, at most 600 characters")
+            eli5 = eli5.strip()
         opts = [" ".join(str(o).split())[:200] for o in (options or []) if str(o).strip()]
         if len(opts) > 6:
             raise FactoryToolError("options: at most 6")
@@ -825,6 +830,7 @@ class FactoryTools:
             session_id=run.session_id,
             question_key=question_key,
             summary=summary,
+            eli5=eli5,
             impact=decision_impact,
         )
 
@@ -1559,16 +1565,19 @@ def build_mcp_server(tools: FactoryTools, config: ServiceConfig) -> FastMCP:
         "and marks the card Needs you; the owner's reply is sent to this session as the "
         "answer. run_id is required (your run, from the start message or "
         "factory_get_status). Asking the same question again while it is open returns the "
-        "original receipt. Then end your turn. "
+        "original receipt. Always pass eli5: 2-4 short, plain-English sentences, no jargon, "
+        "explaining the choice like I am five (at most 600 characters). Then end your turn. "
         'Example: {"session_id": "conv_123", "run_id": "ss_abc", '
         '"question": "Keep the v1 API?", "options": ["keep", "drop"], '
-        '"recommendation": "keep"}',
+        '"recommendation": "keep", "eli5": "Some people still use the old way. '
+        'Keeping it lets them carry on."}',
     )
     async def factory_ask_owner(
         session_id: str,
         run_id: str,
         question: str,
         *,
+        eli5: str | None = None,
         options: list[str] | None = None,
         recommendation: str | None = None,
         impact: Literal["within_contract", "plan_revision", "unknown"] = "unknown",
@@ -1577,6 +1586,7 @@ def build_mcp_server(tools: FactoryTools, config: ServiceConfig) -> FastMCP:
             session_id,
             run_id,
             question,
+            eli5=eli5,
             options=options,
             recommendation=recommendation,
             impact=impact,
@@ -1591,7 +1601,9 @@ def build_mcp_server(tools: FactoryTools, config: ServiceConfig) -> FastMCP:
         "for the kind; build_ready also needs plan_hash from factory_get_plan. Errors list "
         "exactly what to fix. Exact retries return the original receipt. Summaries and "
         "reasons are posted as GitHub Markdown for a human: short paragraphs, lists where "
-        "they help. Example: "
+        "they help. For triage, epic_triage, plan and build_ready, always fill eli5 with "
+        "2-4 short, plain-English sentences, no jargon, explaining it like I am five "
+        "(aim for at most 600 characters). Example: "
         '{"session_id": "conv_123", "run_id": "ss_abc", "kind": "blocked", '
         '"result": {"reason": "tests need a DB", "done": ["wrote migration"]}}',
     )

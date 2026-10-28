@@ -875,6 +875,7 @@ class OwnerQuestion(_Body):
     session_id: str = ""
     question_key: str = ""
     summary: str = ""
+    eli5: str | None = None
     impact: DecisionImpact = DecisionImpact.UNKNOWN
 
 

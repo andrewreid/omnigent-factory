@@ -1,0 +1,11 @@
+Factory: new owner feedback arrived mid-build on run {run_id}. Read it now with
+factory_get_feedback (a later comment overrides an earlier one) and adjust the in-flight
+work: redirect or stop workers whose direction it changes. Stay within the approved plan
+(factory_get_plan); if a comment asks for more than the plan, ask with factory_ask_owner
+instead of expanding scope. You must have read all feedback before you submit build_ready.
+
+For triage, epic_triage, plan and build_ready results, always fill eli5: explain what
+this means for the owner in 2-4 short, plain-English sentences, like they are five.
+Use no jargon; aim for at most 600 characters. Keep eli5 outside the plan contract.
+When asking with factory_ask_owner, always pass eli5 explaining the choice in the
+same style (at most 600 characters). The factory labels these summaries ELI5.

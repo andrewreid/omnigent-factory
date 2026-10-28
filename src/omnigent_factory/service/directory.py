@@ -238,23 +238,23 @@ class ServiceDispatchDirectory:
         if purpose == "checkpoint_cleanup":
             return _template("checkpoint-v2.txt").format(grant_id=spec.grant_id, run_id=sid)
         if purpose == "continuation":
-            return _template("continuation-v2.txt").format(grant_id=spec.grant_id)
+            return _template("continuation-v3.txt").format(grant_id=spec.grant_id)
         if purpose == "answer_relay":
             decision = parcel.decision(str(effect.args.get("decision_id") or ""))
             answer = await self.decision_answer(decision) if decision is not None else None
             if decision is None or answer is None:
                 return None
-            return _template("answer-v1.txt").format(
+            return _template("answer-v2.txt").format(
                 decision_id=decision.decision_id, answer=answer
             )
         if purpose == "feedback":
             if spec.kind == SessionKind.BUILD:
                 if effect.args.get("midturn") is True:
-                    return _template("build-feedback-midturn-v1.txt").format(run_id=sid)
-                return _template("build-feedback-v2.txt").format(run_id=sid)
+                    return _template("build-feedback-midturn-v2.txt").format(run_id=sid)
+                return _template("build-feedback-v3.txt").format(run_id=sid)
             if spec.kind == SessionKind.TRIAGE:
-                return _template("triage-comment-v1.txt").format(run_id=sid)
-            return _template("feedback-v3.txt").format(revision=parcel.revision, run_id=sid)
+                return _template("triage-comment-v2.txt").format(run_id=sid)
+            return _template("feedback-v4.txt").format(revision=parcel.revision, run_id=sid)
         if purpose == "readiness_wake":
             if effect.args.get("wake") == "conflict":
                 return _template(_CONFLICT_WAKE_TEMPLATE).format(
@@ -277,7 +277,7 @@ class ServiceDispatchDirectory:
                 ),
             )
         if purpose == "blockers_closed":
-            return _template("blockers-closed-v1.txt").format(
+            return _template("blockers-closed-v2.txt").format(
                 blockers=str(effect.args.get("blockers") or "the blocking issues"), run_id=sid
             )
         if purpose == "stall_nudge":
@@ -286,7 +286,7 @@ class ServiceDispatchDirectory:
             note = str(effect.args.get("text") or "").strip()
             if not note:
                 return None
-            return _template("operator-v2.txt").format(note=note, run_id=sid)
+            return _template("operator-v3.txt").format(note=note, run_id=sid)
         # The dispatch snapshot pins the first message's template bytes (restart-stable).
         try:
             template = _template(str(snapshot.get("template") or ""))
@@ -865,7 +865,11 @@ def _decision_text(args: Mapping[str, Any], omnigent_base_url: str = "") -> str:
         text += f"Approve or deny it in {where}."
         lines = [line.strip() for line in str(args.get("detail") or "").splitlines()]
         return "\n\n".join([text, *(line for line in lines if line)])
-    return summary or "I have a question before I can go on."
+    summary = summary or "I have a question before I can go on."
+    eli5 = _eli5_lines(args)
+    if eli5:
+        return _neutralise("\n".join([*eli5, summary]))[:4000]
+    return summary
 
 
 _OMNIGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
@@ -905,6 +909,8 @@ def _ready_text(
     url = f"https://github.com/{repository}/pull/{number}"
     red = str(args.get("red_checks") or "")
     lines = [f"### PR #{number} is ready for review", ""]
+    if result is not None and result.get("head_sha") == head:
+        lines += _eli5_lines(result)
     if result is not None and result.get("head_sha") == head and result.get("summary"):
         lines += [str(result["summary"]).strip(), ""]  # the agent's Markdown, as written
     lines.append(f"**PR:** {url} (head `{head[:12]}`)")
@@ -998,6 +1004,9 @@ def render_contract_comment(
     )
     if blocked is not None:
         return blocked
+    eli5 = _neutralise("\n".join(_eli5_lines(plan or {}))).strip()
+    if eli5:
+        heading += "\n\n" + eli5
     fixed = len(heading) + len(section) + 64
     if fixed > _CANONICAL_PUBLICATION_LIMIT:
         return None
@@ -1090,13 +1099,31 @@ def _bullets(items: object) -> str:
     return "\n".join(f"- {item}" for item in items) if isinstance(items, list) and items else ""
 
 
+def _eli5_lines(result: Mapping[str, Any]) -> list[str]:
+    """Keep the short explanation ahead of detail, even when a report is truncated."""
+    value = result.get("eli5")
+    if not isinstance(value, str) or not value.strip():
+        return []
+    text = value.strip()
+    if len(text) > 600:
+        text = text[:599].rstrip() + "…"
+    return ["#### ELI5", "", text, ""]
+
+
+def eli5_text(result: Mapping[str, Any]) -> str:
+    """The explanation for publications and status sections."""
+    return "\n".join(_eli5_lines(result)).strip()
+
+
 def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> str:
     kind = str(result.get("kind") or "result")
+    eli5 = _eli5_lines(result)
     if kind == "triage":
         recommendation = str(result.get("recommendation") or "").replace("_", " ")
         lines = [
             "### Triage",
             "",
+            *eli5,
             str(result.get("summary", "")).strip(),
             "",
             f"**Recommendation:** {recommendation}",
@@ -1123,6 +1150,7 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
         lines = [
             "### Plan",
             "",
+            *eli5,
             f"**Goal:** {contract.get('goal', '')}",
             f"**Approach:** {result.get('approach', '')}",
         ]
@@ -1147,6 +1175,8 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
         return "\n".join(lines)
     if kind == "checkpoint":
         lines = ["### Checkpoint"]
+        if eli5:
+            lines += ["", *eli5[:-1]]
         for title, key in (("Done", "done"), ("Remaining", "remaining"), ("Risks", "risks")):
             section = _bullets(result.get(key))
             if section:
@@ -1154,9 +1184,13 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
         return "\n".join(lines)
     if kind == "build_ready":
         return (
-            f"{str(result.get('summary', '')).strip()}\n\n"
-            f"PR #{result.get('pr_number')} at `{result.get('head_sha')}`; "
-            f"release readiness: {result.get('release_readiness')}."
+            "\n".join(eli5)
+            + ("\n" if eli5 else "")
+            + (
+                f"{str(result.get('summary', '')).strip()}\n\n"
+                f"PR #{result.get('pr_number')} at `{result.get('head_sha')}`; "
+                f"release readiness: {result.get('release_readiness')}."
+            )
         )
     return "Report recorded."
 
@@ -1176,7 +1210,8 @@ def _epic_triage_text(result: Mapping[str, Any]) -> str:
         if isinstance(plan, dict)
         else "### Epic triage"
     )
-    lines = [heading, "", " ".join(str(result.get("summary", "")).split())]
+    lines = [heading, "", *_eli5_lines(result)]
+    lines.append(" ".join(str(result.get("summary", "")).split()))
     order = [
         item
         for item in (result.get("build_order") or [])
@@ -1424,29 +1459,29 @@ def _new_boundary() -> str:
 
 #: First-message template of each stage run (the dispatch snapshot pins name and bytes).
 _FIRST_TEMPLATES = {
-    SessionKind.TRIAGE: "triage-v10.txt",
-    SessionKind.PLAN: "plan-v11.txt",
-    SessionKind.BUILD: "build-v17.txt",
+    SessionKind.TRIAGE: "triage-v11.txt",
+    SessionKind.PLAN: "plan-v12.txt",
+    SessionKind.BUILD: "build-v18.txt",
 }
-_RETRIAGE_TEMPLATE = "triage-feedback-v7.txt"
+_RETRIAGE_TEMPLATE = "triage-feedback-v8.txt"
 #: The triage of an epic (an issue with sub-issues), first run and re-runs alike.
-_EPIC_TRIAGE_TEMPLATE = "epic-triage-v4.txt"
+_EPIC_TRIAGE_TEMPLATE = "epic-triage-v5.txt"
 #: The epic planning pass of an epic on autopilot (the epic triage plus the epic plan).
-_EPIC_PLAN_TEMPLATE = "epic-plan-v3.txt"
+_EPIC_PLAN_TEMPLATE = "epic-plan-v4.txt"
 #: A plan run of a sub-issue epic autopilot drives (keeps to its part of the epic plan).
-_AUTOPILOT_PLAN_TEMPLATE = "plan-autopilot-v3.txt"
+_AUTOPILOT_PLAN_TEMPLATE = "plan-autopilot-v4.txt"
 #: The plan run the factory started on a build's ``replan_required`` (its brief: what the
 #: build said must change).
-_REPLAN_TEMPLATE = "plan-replan-v1.txt"
-_REWORK_TEMPLATE = "build-rework-v13.txt"
+_REPLAN_TEMPLATE = "plan-replan-v2.txt"
+_REWORK_TEMPLATE = "build-rework-v14.txt"
 #: A rework the owner started by ticking Ready report items: its brief is those items.
-_ITEMS_REWORK_TEMPLATE = "build-rework-items-v4.txt"
+_ITEMS_REWORK_TEMPLATE = "build-rework-items-v5.txt"
 #: Readiness wakes of a waiting build run (red checks and other gaps; findings only).
-_READINESS_WAKE_TEMPLATE = "readiness-wake-v12.txt"
-_FINDINGS_WAKE_TEMPLATE = "readiness-findings-wake-v4.txt"
+_READINESS_WAKE_TEMPLATE = "readiness-wake-v13.txt"
+_FINDINGS_WAKE_TEMPLATE = "readiness-findings-wake-v5.txt"
 #: A rework run, or a wake of the waiting build run, for a merge conflict with the base.
-_CONFLICT_TEMPLATE = "build-conflict-v4.txt"
-_CONFLICT_WAKE_TEMPLATE = "readiness-conflict-wake-v1.txt"
+_CONFLICT_TEMPLATE = "build-conflict-v5.txt"
+_CONFLICT_WAKE_TEMPLATE = "readiness-conflict-wake-v2.txt"
 
 
 def replan_request_for(parcel: Parcel, session: StageSession) -> ReplanRequest | None:

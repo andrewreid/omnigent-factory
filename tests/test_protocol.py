@@ -311,3 +311,41 @@ def test_schema_file_declares_replan_required():
     assert "replan_required" not in blocked["required"]
     replan = blocked["properties"]["replan_required"]
     assert replan["required"] == ["reason", "changes"] and replan["additionalProperties"] is False
+
+
+@pytest.mark.parametrize("kind", ["triage", "epic_triage", "plan", "build_ready"])
+def test_eli5_is_optional_and_validated_without_changing_v1(kind):
+    from tests.test_epic_triage_protocol import epic_corr, epic_result
+
+    results = {
+        "triage": (triage_result(), triage_corr()),
+        "epic_triage": (epic_result(), epic_corr()),
+        "plan": (plan_result(), CORR),
+        "build_ready": (build_result(), Correlation("P1", "S1", "N1", 3, "build")),
+    }
+    result, corr = results[kind]
+    old = validate_result(result, corr)
+    assert old.result.version == 1 and old.result.result.eli5 is None
+    for value in (None, "This makes the count right. Your hours will add up."):
+        parsed = validate_result({**result, "eli5": value}, corr)
+        assert parsed.result.result.eli5 == value
+        assert parsed.contract_canonical == old.contract_canonical
+    for value in ("", "x" * 16001, 42):
+        with pytest.raises(ResultError, match="eli5"):
+            validate_result({**result, "eli5": value}, corr)
+
+
+def test_schema_file_declares_optional_eli5_outside_contract():
+    schema = json.loads(
+        (Path(core_pkg.__file__).parent / "result_schema_v1.json").read_text("utf-8")
+    )
+    from omnigent_factory.core.protocol import RESULT_SHAPES
+
+    for kind in ("triage", "epic_triage", "plan", "build"):
+        model = schema["$defs"][kind]
+        assert model["properties"]["eli5"] == {
+            "anyOf": [{"$ref": "#/$defs/text"}, {"type": "null"}]
+        }
+        assert "eli5" not in model["required"]
+        assert '"eli5"?:str|null' in RESULT_SHAPES["build_ready" if kind == "build" else kind]
+    assert "eli5" not in schema["$defs"]["contract"]["properties"]

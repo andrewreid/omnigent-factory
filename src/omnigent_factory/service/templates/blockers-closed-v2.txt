@@ -1,0 +1,10 @@
+Factory: build run {run_id} waited on {blockers}; every blocking issue is now closed. The
+approval stands: re-read the plan (factory_get_plan) and any new owner comments
+(factory_get_feedback), check what the blockers changed, and continue the build. Then submit
+build_ready, or kind "blocked" with the reason if something else still stops you.
+
+For triage, epic_triage, plan and build_ready results, always fill eli5: explain what
+this means for the owner in 2-4 short, plain-English sentences, like they are five.
+Use no jargon; aim for at most 600 characters. Keep eli5 outside the plan contract.
+When asking with factory_ask_owner, always pass eli5 explaining the choice in the
+same style (at most 600 characters). The factory labels these summaries ELI5.

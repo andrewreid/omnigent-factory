@@ -97,3 +97,42 @@ def test_readiness_wake_says_red_checks_outside_the_change_are_build_ready_not_b
     assert "red for a cause outside this change" in wake
     assert "name the check and the cause in a PR comment and in the build_ready summary" in wake
     assert 'Submit kind "blocked" only if a required defect in this change' in wake
+
+
+def test_live_result_and_question_prompts_request_eli5_and_keep_old_versions():
+    from omnigent_factory.service import directory
+
+    root = files("omnigent_factory.service") / "templates"
+    first = set(directory._FIRST_TEMPLATES.values())
+    stages = {
+        directory._RETRIAGE_TEMPLATE,
+        directory._EPIC_TRIAGE_TEMPLATE,
+        directory._EPIC_PLAN_TEMPLATE,
+        directory._AUTOPILOT_PLAN_TEMPLATE,
+        directory._REPLAN_TEMPLATE,
+        directory._REWORK_TEMPLATE,
+        directory._ITEMS_REWORK_TEMPLATE,
+        directory._READINESS_WAKE_TEMPLATE,
+        directory._FINDINGS_WAKE_TEMPLATE,
+        directory._CONFLICT_TEMPLATE,
+        directory._CONFLICT_WAKE_TEMPLATE,
+    }
+    messages = {
+        "build-feedback-midturn-v2.txt",
+        "build-feedback-v3.txt",
+        "triage-comment-v2.txt",
+        "feedback-v4.txt",
+        "operator-v3.txt",
+        "blockers-closed-v2.txt",
+        "answer-v2.txt",
+        "continuation-v3.txt",
+    }
+    for name in first | stages | messages:
+        text = (root / name).read_text("utf-8")
+        flat = " ".join(text.split())
+        assert "always fill eli5" in flat and "2-4 short, plain-English sentences" in flat
+        assert "Use no jargon" in flat and "Keep eli5 outside the plan contract" in flat
+        assert "factory_ask_owner, always pass eli5" in flat
+        prefix, version = name.removesuffix(".txt").rsplit("-v", 1)
+        old = (root / f"{prefix}-v{int(version) - 1}.txt").read_text("utf-8")
+        assert text.startswith(old.rstrip() + "\n")

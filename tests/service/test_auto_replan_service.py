@@ -43,7 +43,7 @@ async def test_a_build_reporting_replan_required_replans_in_the_same_session(
         directory = ServiceDispatchDirectory(rig.service.db, service_config)
         assert await directory.stage_spec(plan.session_id) is not None  # pins the snapshot
         snapshot = directory.dispatch_snapshot(plan.session_id)
-        assert snapshot["template"] == "plan-replan-v1.txt"
+        assert snapshot["template"] == "plan-replan-v2.txt"
         assert "Drop the overtime banner" in snapshot["brief"]
 
         async def first_sent() -> bool:

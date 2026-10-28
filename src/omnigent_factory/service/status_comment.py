@@ -13,7 +13,8 @@
   the owner's checkbox ticks are kept (``core.report_lines.keep_ticks``). An epic is
   rendered again when one of its sub-issues changes (stored links), even when finished.
   A stage result
-  that used to be its own comment (triage, the checkpoint report) and the Ready line are
+  that used to be its own comment (triage, the checkpoint report) and the Ready notification
+  (with ELI5 when supplied, also shown in this dashboard) are
   written at once (``publish``): the owner never gets a link to a stale dashboard.
 * **Pinned** once after it is created (``pinIssueComment``, issues only, never a pull
   request). A refusal is logged once with GitHub's message and recorded for the
@@ -63,6 +64,7 @@ from omnigent_factory.service.directory import (
     ServiceDispatchDirectory,
     agent_display_name,
     approved_epic_plan,
+    eli5_text,
     ready_text,
     review_bot_name,
     stage_result_text,
@@ -124,6 +126,15 @@ class Question:
 
     summary: str
     url: str = ""
+    #: Rendered separately so short headlines never truncate the explanation.
+    eli5: str = ""
+
+    @property
+    def text(self) -> str:
+        """The same ELI5-first, bounded question body as its standalone comment."""
+        if self.eli5:
+            return f"{self.eli5}\n\n{self.summary.strip()}"[:4000]
+        return self.summary.strip()
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,7 +256,7 @@ def render_issue(view: IssueView, history: Sequence[tuple[int, str]], headline: 
     if view.note and not headline.endswith(view.note):
         lines += ["", f"_{_one_line(view.note, 200)}_"]
     if view.question is not None:
-        lines += ["", "**Question:**", "", view.question.summary.strip()]
+        lines += ["", "**Question:**", "", view.question.text]
         if view.question.url:
             lines += ["", f"([asked here]({view.question.url}))"]
     if view.bundle:
@@ -398,6 +409,7 @@ def _waiting(view: EpicView, open_subs: Sequence[SubIssue]) -> list[str]:
         elif s.question is not None:
             groups.setdefault(view.question_assignee, []).append(
                 f"- #{s.number} {_one_line(s.title, 80)}: {_one_line(s.question.summary, 160)}"
+                + (f"\n\n{s.question.eli5}\n" if s.question.eli5 else "")
             )
         elif s.bot == BotState.NEEDS_YOU:
             reason = s.note.removeprefix("Needs you:").strip() or "needs a decision"
@@ -477,6 +489,21 @@ class StatusComments:
         sid = str(effect.args.get("session_id") or effect.preconditions.session_id or "")
         body = self._result(sid)
         return body is not None and body.get("kind") == "triage"
+
+    async def publication_eli5(self, effect: EffectIntent) -> str:
+        """Explain a Ready notification separately from the status comment it links to."""
+        parcel = await self._db(lambda store: store.load_parcel(effect.parcel_id or ""))
+        if parcel is None or parcel.readiness is None:
+            return ""
+        body = self._result(parcel.readiness.session_id)
+        if (
+            body is None
+            or body.get("head_sha") != effect.args.get("head_sha")
+            or body.get("pr_number") != effect.args.get("pr_number")
+        ):
+            return ""
+        text = eli5_text(body)
+        return self.publish_text(text) if text else ""
 
     async def publish(self, parcel_id: str) -> StatusWrite:
         """Bring the status comment up to date now (no rate limit): before a folded
@@ -907,7 +934,12 @@ class StatusComments:
                 if remote_id is not None and str(remote_id).isdigit()
                 else ""
             )
-            return Question(summary or "I have a question before I can go on.", url)
+            explanation = "" if args.get("permission") else eli5_text(args)
+            return Question(
+                summary or "I have a question before I can go on.",
+                url,
+                self.publish_text(explanation) if explanation else "",
+            )
         for d in parcel.decisions:
             # A permission prompt inside its grace has no comment yet: its ask, unlinked.
             if d.decision_id in open_ids and d.comment_deferred and d.summary:

@@ -5229,6 +5229,7 @@ def _h_owner_question(ctx: _Ctx, body: ev.OwnerQuestion) -> None:
         impact=body.impact.value,
         contract_hash=ctx.p.current_contract.full_hash if ctx.p.current_contract else None,
         summary=body.summary[:4000],
+        eli5=body.eli5[:600] if body.eli5 else None,
         node_id=None,
         root_id=s.root_id,
     )

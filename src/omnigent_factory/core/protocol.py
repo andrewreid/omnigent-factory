@@ -121,6 +121,7 @@ class Related(_Strict):
 
 class TriageResult(_Strict):
     kind: Literal["triage"]
+    eli5: Text | None = None
     summary: Text
     priority: Literal["P0", "P1", "P2", "P3"]
     size: SizeLit
@@ -197,6 +198,7 @@ class EpicTriageResult(_Strict):
     ``plan``, the epic plan autopilot follows once the owner approves it."""
 
     kind: Literal["epic_triage"]
+    eli5: Text | None = None
     summary: Text
     coverage: EpicCoverage
     build_order: Annotated[list[EpicOrder], Field(max_length=100)]
@@ -216,6 +218,7 @@ class EpicFit(_Strict):
 
 class PlanResult(_Strict):
     kind: Literal["plan"]
+    eli5: Text | None = None
     publication_kind: Literal["contract", "info"]
     approach: Text
     risks: Texts
@@ -289,6 +292,7 @@ DeferredList = Annotated[list[Deferred], Field(max_length=50)]
 
 class BuildResult(_Strict):
     kind: Literal["build_ready"]
+    eli5: Text | None = None
     pr_number: Annotated[int, Field(ge=1)]
     branch: Text
     head_sha: Sha
@@ -404,24 +408,27 @@ _EJECTED_SHAPE = '"ejected"?:[{"issue":int(a bundle member),"reason":str}],'
 
 #: Compact field types per result kind, quoted in tool errors and descriptions.
 RESULT_SHAPES: dict[str, str] = {
-    "triage": '{"kind":"triage","summary":str,"priority":"P0|P1|P2|P3","size":"S|M|L",'
+    "triage": '{"kind":"triage","eli5"?:str|null,'
+    '"summary":str,"priority":"P0|P1|P2|P3","size":"S|M|L",'
     '"recommendation":"fix|wont_fix|duplicate|needs_info","duplicate_issue":int|null,'
     '"labels":[str],"missing_information":[str],"related"?:[{"issue":int,'
     '"relation":"duplicate|overlaps|conflicts|depends_on|blocks|supersedes","note":str}],'
     + _SPLIT_SHAPE,
-    "epic_triage": '{"kind":"epic_triage","summary":str,"coverage":{"gaps":[str],'
+    "epic_triage": '{"kind":"epic_triage","eli5"?:str|null,"summary":str,"coverage":{"gaps":[str],'
     '"overlaps":[str]},"build_order":[{"issue":int,"reason":str}],"links"?:[{"issue":int,'
     '"blocked_by":int,"reason":str}],"missing_information"?:[str],"related"?:[...],'
     '"plan"?:{"parts":[{"issue":int,"scope":str}],"coordination":[str],"human_gates"?:'
     '[{"key":"slug","title":str,"steps":str,"blocks":[int]}],"external_blockers"?:'
     '[{"issue":int,"note":str}]},' + _SPLIT_SHAPE,
-    "plan": '{"kind":"plan","publication_kind":"contract|info","approach":str,"risks":[str],'
+    "plan": '{"kind":"plan","eli5"?:str|null,'
+    '"publication_kind":"contract|info","approach":str,"risks":[str],'
     '"contract":{"goal":str,"acceptance_criteria":[{"id":str,"criterion":str,'
     '"verification":str}],"non_goals":[str],"size":"S|M|L","resolved_decisions":'
     '[{"decision_id":str,"answer":str,"source_event_id":str}]},"open_decision_ids":[str],"related"?:[{"issue":int,'
     '"relation":"depends_on|blocks|duplicate|overlaps|conflicts|supersedes","note":str}],'
     '"epic_fit"?:{"within":bool,"note":str},' + _EJECTED_SHAPE + _SPLIT_SHAPE,
-    "build_ready": '{"kind":"build_ready","pr_number":int>=1,"branch":str,"head_sha":sha40,'
+    "build_ready": '{"kind":"build_ready","eli5"?:str|null,'
+    '"pr_number":int>=1,"branch":str,"head_sha":sha40,'
     '"summary":str,"verification":[{"command":str,"file_set":[str],'
     '"outcome":"passed|failed|not_run","evidence":str}],"review":{"implementation_vendor":str,'
     '"review_vendor":str,"reviewed_head":sha40,"artifact_reference":str,'

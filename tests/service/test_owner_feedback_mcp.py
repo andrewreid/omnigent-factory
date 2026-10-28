@@ -116,12 +116,12 @@ async def test_A_stage_templates_point_at_owner_feedback():
         "triage-feedback-v4.txt",
         "plan-v6.txt",
         "build-v8.txt",
-        "feedback-v3.txt",
-        "build-feedback-v2.txt",
-        "build-feedback-midturn-v1.txt",
+        "feedback-v4.txt",
+        "build-feedback-v3.txt",
+        "build-feedback-midturn-v2.txt",
         "build-rework-v5.txt",
-        "triage-comment-v1.txt",
-        "continuation-v2.txt",
+        "triage-comment-v2.txt",
+        "continuation-v3.txt",
     ):
         text = (root / name).read_text("utf-8")
         assert "factory_get_feedback" in text, name

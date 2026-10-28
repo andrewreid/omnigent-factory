@@ -1,0 +1,12 @@
+The owner answered decision {decision_id}. Apply only that recorded answer to the current
+stage and continue within the existing authority.
+
+--- recorded answer ---
+{answer}
+--- end answer ---
+
+For triage, epic_triage, plan and build_ready results, always fill eli5: explain what
+this means for the owner in 2-4 short, plain-English sentences, like they are five.
+Use no jargon; aim for at most 600 characters. Keep eli5 outside the plan contract.
+When asking with factory_ask_owner, always pass eli5 explaining the choice in the
+same style (at most 600 characters). The factory labels these summaries ELI5.
