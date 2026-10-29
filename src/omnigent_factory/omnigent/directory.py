@@ -33,6 +33,8 @@ class StageSpec:
     ``bind_worktree`` set means a successor stage binding the verified existing parcel
     worktree (``existing_worktree=true``, no base branch). Otherwise Omnigent creates a
     worktree for ``branch`` from ``base_branch`` in the dedicated source clone.
+    ``workspace_kind=reference`` is a triage-only detached snapshot: no branch or
+    binding; ``reference_workspace`` is its durable identity pinned before POST.
     """
 
     session_id: str
@@ -53,6 +55,8 @@ class StageSpec:
     root_nonce: str | None = None
     #: The repository's default branch: a run's start syncs the issue worktree with it.
     default_branch: str = "main"
+    workspace_kind: str = "issue"
+    reference_workspace: Path | None = None
 
 
 def stale_branch_note(base: str, behind: int) -> str:

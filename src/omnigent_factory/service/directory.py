@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -33,6 +34,7 @@ from omnigent_factory.core.protocol import (
 )
 from omnigent_factory.core.types import (
     MICROS_PER_MINUTE,
+    SETTLED_LIFECYCLES,
     ApprovalKind,
     Contract,
     Decision,
@@ -45,6 +47,7 @@ from omnigent_factory.core.types import (
     StageSession,
     issue_session_title,
 )
+from omnigent_factory.credentials.worktree import VerifiedWorktree, Workspaces, WorktreeError
 from omnigent_factory.github.adapter import ParcelBinding, TriageFields
 from omnigent_factory.omnigent.directory import FormValue, StageSpec, stale_branch_note
 from omnigent_factory.ports.adapter import EffectAdapter
@@ -65,6 +68,7 @@ class ServiceDispatchDirectory:
     """Production ``DispatchDirectory`` backed by projections plus immutable files."""
 
     def __init__(self, db: StoreWorker, config: ServiceConfig) -> None:
+        self.reference_lock = asyncio.Lock()
         self.db = db
         self.config = config
         self.root = config.state_dir / "dispatches"
@@ -107,12 +111,26 @@ class ServiceDispatchDirectory:
             policy_generation=session.grant.policy_generation,
             root_nonce=_root_nonce(parcel, session),
             default_branch=str(existing.get("base_branch") or self.config.default_branch),
+            workspace_kind=str(existing.get("workspace_kind") or "issue"),
+            reference_workspace=(
+                Path(str(existing["workspace"]))
+                if existing.get("workspace_kind") == "reference" and existing.get("workspace")
+                else None
+            ),
         )
 
     async def _make_snapshot(self, parcel: Parcel, session: StageSession) -> dict[str, object]:
         issue = parcel.issue_number or 0
         branch = f"factory/issue-{issue or _safe(parcel.parcel_id)}"
         previous = await self._previous_worktree(parcel, session, branch)
+        reference = (
+            self.config.lazy_issue_worktrees
+            and session.kind == SessionKind.TRIAGE
+            and (previous is None or not Path(previous).is_dir())
+        )
+        if reference:
+            previous = None
+            branch = ""
         template_name = _FIRST_TEMPLATES[session.kind]
         if session.kind == SessionKind.TRIAGE and parcel.links is not None and parcel.links.epic:
             template_name = _EPIC_TRIAGE_TEMPLATE  # an epic: coverage, order and links
@@ -138,6 +156,13 @@ class ServiceDispatchDirectory:
                 brief = await self.rework_brief(parcel, auth.source_event_id) or ""
                 if brief:
                     template_name = _ITEMS_REWORK_TEMPLATE
+        if reference:
+            template_name = _REFERENCE_TEMPLATES[template_name]
+        comment_template = (
+            _REFERENCE_TEMPLATES[_TRIAGE_COMMENT_TEMPLATE]
+            if reference
+            else _TRIAGE_COMMENT_TEMPLATE
+        )
         template = _template(template_name)
         evidence = await self.issue_evidence(parcel)
         return {
@@ -147,12 +172,17 @@ class ServiceDispatchDirectory:
             "nonce": session.nonce,
             "revision": session.revision,
             "branch": branch,
+            "workspace_kind": "reference" if reference else "issue",
             "base_branch": self.config.default_branch,
             "bind_worktree": previous,
             # The issue session's title (Omnigent keeps it for every later run).
             "title": issue_session_title(issue, evidence.title if evidence is not None else ""),
             "template": template_name,
             "template_sha256": hashlib.sha256(template.encode()).hexdigest(),
+            "triage_comment_template": comment_template,
+            "triage_comment_sha256": hashlib.sha256(
+                _template(comment_template).encode()
+            ).hexdigest(),
             "untrusted_boundary": _new_boundary(),
             "brief": brief,
             "guidance": (
@@ -169,18 +199,102 @@ class ServiceDispatchDirectory:
             if old.session_id == session.session_id:
                 continue
             data = self._read(self.root / f"{_safe(old.session_id)}.json")
-            if data and data.get("branch") == branch and isinstance(data.get("workspace"), str):
+            if (
+                data
+                and data.get("workspace_kind", "issue") != "reference"
+                and data.get("branch") == branch
+                and isinstance(data.get("workspace"), str)
+            ):
                 return str(data["workspace"])
         return None
+
+    async def reserve_reference(
+        self,
+        spec: StageSpec,
+        workspaces: Workspaces,
+        now: float,
+        workspace: str | None = None,
+    ) -> VerifiedWorktree:
+        """Select/verify and durably pin before POST, serialized against snapshot GC.
+
+        A reused root supplies its existing path. A failed verification writes no pin,
+        allowing the reducer's replacement create to select a new snapshot.
+        """
+        async with self.reference_lock:
+            path = self.root / f"{_safe(spec.session_id)}.json"
+            data = self._read(path)
+            if data is None or data.get("workspace_kind") != "reference":
+                raise WorktreeError("reference dispatch record missing")
+            # A reused root can become unusable during a retried prepare. Its pin
+            # remains until settlement, while a subsequent create gets its own
+            # write-once identity. Never retarget a workspace already sent in a POST.
+            reuse = workspace is not None and "workspace" not in data
+            pin_key = "reference_reuse_workspace" if reuse else "workspace"
+            sync_key = "reference_reuse_base_sync" if reuse else "base_sync"
+            pinned = data.get(pin_key)
+            if pinned and workspace and pinned != workspace:
+                raise WorktreeError("reference workspace differs from dispatch pin")
+            selected = str(pinned or workspace or "")
+            if selected:
+                verified = await asyncio.to_thread(workspaces.verify_reference, selected)
+            else:
+                verified = await asyncio.to_thread(
+                    workspaces.select_reference,
+                    self.config.worktree_root,
+                    self.config.reference_snapshot_max_age_hours,
+                    now,
+                    spec.default_branch,
+                )
+            data[pin_key] = str(verified.path)
+            data.setdefault(
+                sync_key,
+                {
+                    "status": "reference",
+                    "base": spec.default_branch,
+                    "behind": await asyncio.to_thread(
+                        workspaces.commits_behind, verified.path, spec.default_branch
+                    ),
+                },
+            )
+            _atomic_json(path, data)
+            return verified
+
+    async def reference_pins(self) -> set[Path]:
+        """Called under reference_lock: every non-settled run's durable pin."""
+        parcels = await self.db.call(
+            lambda store: [
+                store.load_parcel(row[0]) for row in store.query("SELECT parcel_id FROM parcels")
+            ]
+        )
+        pins: set[Path] = set()
+        for parcel in parcels:
+            if parcel is None:
+                continue
+            for run in parcel.sessions:
+                if run.lifecycle in SETTLED_LIFECYCLES:
+                    continue
+                data = self.dispatch_snapshot(run.session_id)
+                if data and data.get("workspace_kind") == "reference":
+                    for key in ("workspace", "reference_reuse_workspace"):
+                        if data.get(key):
+                            pins.add(Path(str(data[key])).resolve())
+        return pins
 
     def dispatch_snapshot(self, session_id: str) -> dict[str, Any] | None:
         """The persisted dispatch snapshot (branch, workspace, template) of a session."""
         return self._read(self.root / f"{_safe(session_id)}.json")
 
+    async def record_handoff_reason(self, session_id: str, reason: str) -> None:
+        path = self.root / f"{_safe(session_id)}.json"
+        data = self._read(path)
+        if data is not None and "handoff_reason" not in data:
+            data["handoff_reason"] = reason
+            _atomic_json(path, data)
+
     async def base_sync(self, session_id: str) -> dict[str, Any] | None:
         """How this run's start synced the issue worktree with the base (None: not yet)."""
         data = self._read(self.root / f"{_safe(session_id)}.json")
-        record = data.get("base_sync") if data is not None else None
+        record = (data.get("base_sync") or data.get("reference_reuse_base_sync")) if data else None
         return record if isinstance(record, dict) else None
 
     async def record_base_sync(self, session_id: str, record: Mapping[str, Any]) -> None:
@@ -197,7 +311,7 @@ class ServiceDispatchDirectory:
         data = self._read(self.root / f"{_safe(session_id)}.json")
         if data is None:
             return None
-        for key in ("workspace", "bind_worktree"):
+        for key in ("workspace", "reference_reuse_workspace", "bind_worktree"):
             if isinstance(data.get(key), str) and data[key]:
                 return str(data[key])
         return None
@@ -209,6 +323,8 @@ class ServiceDispatchDirectory:
             return
         workspace = ack.detail.get("workspace")
         branch = ack.detail.get("branch")
+        if data.get("workspace_kind") == "reference":
+            return  # reference identity was pinned before POST; never replace it from an ack
         if isinstance(workspace, str) and workspace:
             data["workspace"] = workspace
         if isinstance(branch, str) and branch:
@@ -252,7 +368,19 @@ class ServiceDispatchDirectory:
                     return _template("build-feedback-midturn-v2.txt").format(run_id=sid)
                 return _template("build-feedback-v3.txt").format(run_id=sid)
             if spec.kind == SessionKind.TRIAGE:
-                return _template("triage-comment-v2.txt").format(run_id=sid)
+                # Old dispatches retain their original feedback template; new ones pin
+                # its bytes just like the first message.
+                name = str(snapshot.get("triage_comment_template") or "triage-comment-v2.txt")
+                try:
+                    feedback = _template(name)
+                except FileNotFoundError:
+                    return None
+                digest = snapshot.get("triage_comment_sha256")
+                if (digest is not None or name != "triage-comment-v2.txt") and (
+                    hashlib.sha256(feedback.encode()).hexdigest() != digest
+                ):
+                    return None
+                return feedback.format(run_id=sid, base_ref=spec.default_branch)
             return _template("feedback-v4.txt").format(revision=parcel.revision, run_id=sid)
         if purpose == "readiness_wake":
             if effect.args.get("wake") == "conflict":
@@ -304,8 +432,21 @@ class ServiceDispatchDirectory:
             "granted_minutes": max(1, spec.granted_us // MICROS_PER_MINUTE),
             "handoff": self._handoff(parcel, sid),
             # Templates before the base sync have no {base_note}: format ignores it.
-            "base_note": base_note(snapshot.get("base_sync"), spec.kind),
+            "base_note": base_note(
+                snapshot.get("base_sync") or snapshot.get("reference_reuse_base_sync"), spec.kind
+            ),
             "brief": str(snapshot.get("brief") or ""),
+            "reference_note": (
+                "This is a shared read-only reference snapshot, not an issue worktree. "
+                "Put scratch files in $TMPDIR. Do not install dependencies, run "
+                "dev-environment.sh, fetch, checkout, reset or clean this snapshot. "
+                "When told it is behind, read current files with git show origin/"
+                f"{spec.default_branch}:path."
+                if spec.workspace_kind == "reference"
+                else ""
+            ),
+            "gh_wrapper": self.config.wrapper_bin_dir / "gh",
+            "capability_file": self.config.capability_dir / f"{_safe(sid)}.cap",
         }
         if spec.kind == SessionKind.BUILD:
             _authority_text, authority_hash = _authority(parcel)
@@ -328,7 +469,13 @@ class ServiceDispatchDirectory:
         issue = parcel.issue_session
         if issue is None or issue.created_by != run_id or issue.generation <= 1:
             return ""
-        lines = ["This is a new issue session replacing an earlier one. Stored summary:"]
+        snapshot = self.dispatch_snapshot(run_id) or {}
+        moved = snapshot.get("handoff_reason") == "issue session has no issue worktree"
+        lines = [
+            "This issue moved to its own worktree. Stored summary:"
+            if moved
+            else "This is a new issue session replacing an earlier one. Stored summary:"
+        ]
         stages = [s.kind.value for s in parcel.sessions if s.session_id != run_id]
         if stages:
             lines.append(f"- earlier runs: {', '.join(stages)}")
@@ -1459,6 +1606,14 @@ def _new_boundary() -> str:
 
 
 #: First-message template of each stage run (the dispatch snapshot pins name and bytes).
+# Only a pinned reference dispatch selects snapshot-specific prompt bytes.
+_REFERENCE_TEMPLATES = {
+    "triage-v11.txt": "triage-v12.txt",
+    "triage-feedback-v8.txt": "triage-feedback-v9.txt",
+    "triage-comment-v2.txt": "triage-comment-v3.txt",
+    "epic-triage-v5.txt": "epic-triage-v6.txt",
+    "epic-plan-v4.txt": "epic-plan-v5.txt",
+}
 _FIRST_TEMPLATES = {
     SessionKind.TRIAGE: "triage-v11.txt",
     SessionKind.PLAN: "plan-v12.txt",
@@ -1466,6 +1621,7 @@ _FIRST_TEMPLATES = {
 }
 _ANSWER_TEMPLATE = "answer-v3.txt"
 _RETRIAGE_TEMPLATE = "triage-feedback-v8.txt"
+_TRIAGE_COMMENT_TEMPLATE = "triage-comment-v2.txt"
 #: The triage of an epic (an issue with sub-issues), first run and re-runs alike.
 _EPIC_TRIAGE_TEMPLATE = "epic-triage-v5.txt"
 #: The epic planning pass of an epic on autopilot (the epic triage plus the epic plan).
@@ -1534,6 +1690,13 @@ def base_note(record: object, kind: SessionKind) -> str:
     status = record.get("status")
     base = str(record.get("base") or "main")
     behind = int(record.get("behind") or 0)
+    if status == "reference":
+        return (
+            f"This reference snapshot is {behind} commits behind origin/{base}. "
+            f"Read current files with git show origin/{base}:path; do not fetch or checkout."
+            if behind
+            else ""
+        )
     if status == "fast_forwarded":
         old, new = str(record.get("old_oid") or ""), str(record.get("new_oid") or "")
         return (

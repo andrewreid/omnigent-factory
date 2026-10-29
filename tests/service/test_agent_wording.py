@@ -103,7 +103,7 @@ def test_live_result_and_question_prompts_request_eli5_and_keep_old_versions():
     from omnigent_factory.service import directory
 
     root = files("omnigent_factory.service") / "templates"
-    first = set(directory._FIRST_TEMPLATES.values())
+    first = set(directory._FIRST_TEMPLATES.values()) | set(directory._REFERENCE_TEMPLATES.values())
     stages = {
         directory._RETRIAGE_TEMPLATE,
         directory._EPIC_TRIAGE_TEMPLATE,
@@ -120,7 +120,7 @@ def test_live_result_and_question_prompts_request_eli5_and_keep_old_versions():
     messages = {
         "build-feedback-midturn-v2.txt",
         "build-feedback-v3.txt",
-        "triage-comment-v2.txt",
+        directory._TRIAGE_COMMENT_TEMPLATE,
         "feedback-v4.txt",
         "operator-v3.txt",
         "blockers-closed-v2.txt",
@@ -135,7 +135,19 @@ def test_live_result_and_question_prompts_request_eli5_and_keep_old_versions():
         assert "factory_ask_owner, always pass eli5" in flat
         prefix, version = name.removesuffix(".txt").rsplit("-v", 1)
         old = (root / f"{prefix}-v{int(version) - 1}.txt").read_text("utf-8")
-        assert text.startswith(old.rstrip() + "\n")
+        if name in {
+            "triage-v12.txt",
+            "triage-feedback-v9.txt",
+            "epic-triage-v6.txt",
+            "epic-plan-v5.txt",
+        }:
+            # Snapshot guidance is inserted near the run identity. The previous
+            # version, including its ELI5 instructions, is otherwise kept verbatim.
+            before, guidance = text.split("{reference_note}\n", 1)
+            _, after = guidance.split("Keep this per-run capability on every gh invocation.\n", 1)
+            assert before + after == old
+        else:
+            assert text.startswith(old.rstrip() + "\n")
 
 
 def test_pr_writing_prompts_ask_for_a_pr_body_eli5_and_keep_old_versions():

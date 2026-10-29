@@ -335,7 +335,9 @@ def _cel_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def factory_cel_expression(default_branch: str = "main", *, read_only: bool = False) -> str:
+def factory_cel_expression(
+    default_branch: str = "main", *, read_only: bool = False, reference: bool = False
+) -> str:
     """Fixed deny rule over the pinned ``PolicyEvent`` shape (policies/schema.py @1c0153aa).
 
     ``tool_call`` events carry ``data = {"name": <tool>, "arguments": {...}}``. The rule
@@ -370,6 +372,40 @@ def factory_cel_expression(default_branch: str = "main", *, read_only: bool = Fa
         f' ? {{"result": "DENY", "reason": {_cel_string(CEL_REASON)}}}'
         ' : {"result": "ALLOW"}'
     )
+    if reference:
+        # A shared snapshot must not acquire dependencies or mutate remote refs.
+        snapshot_pattern = (
+            r"(^|[\s;&|(`\"\'/])(?:"
+            r"(?:pnpm|npm|yarn|bun)"
+            + _GAP
+            + r"(?:[^\n;&|]*"
+            + _GAP
+            + r")?(?:install|i|ci|add)"
+            + _END
+            + r"|yarn([ \t]*($|[\n;&|)`'\"])|"
+            + _GAP
+            + r"-)"
+            + r"|dev-environment\.sh"
+            + _END
+            + r"|git(?:"
+            + _GAP
+            + _GIT_OPTION
+            + r")*"
+            + _GAP
+            + r"(?:fetch|fetch-pack|push|clean|add|rm|mv|update-ref|symbolic-ref"
+            r"|pack-refs|prune|gc|maintenance|reflog|notes|replace|fast-import|receive-pack"
+            r"|branch|tag|remote|config|am|bisect|filter-branch|apply|read-tree|update-index"
+            r"|checkout-index|sparse-checkout|submodule)" + _END + r")"
+        )
+        snapshot_shell = (
+            f"({_command_matches(snapshot_pattern)} || "
+            f"{_command_matches(r'(?i:alias\.[^\s=]+\s*=)')})"
+        )
+        rule = (
+            f"({is_call}) && {snapshot_shell}"
+            f' ? {{"result": "DENY", "reason": "Shared reference snapshot is read-only"}}'
+            f" : ({rule})"
+        )
     if not read_only:
         return rule
     # Checked first so the denial names the read-only cause and how to read other refs.
@@ -466,13 +502,15 @@ def caller_policy(session_id: str) -> PolicySpec:
     return _compiled(CALLER_NAME, caller_cel_expression(session_id), CALLER_REASON)
 
 
-def factory_cel_policy(default_branch: str = "main", *, read_only: bool = False) -> PolicySpec:
+def factory_cel_policy(
+    default_branch: str = "main", *, read_only: bool = False, reference: bool = False
+) -> PolicySpec:
     """The required fixed safety rule, always attached as ``factory-cel``. Not replaceable.
 
     The read-only variant is another version of the same family, so a stage switch on a
     reused root (plan -> build) adds the new rule before removing the old one.
     """
-    expression = factory_cel_expression(default_branch, read_only=read_only)
+    expression = factory_cel_expression(default_branch, read_only=read_only, reference=reference)
     return _compiled(CEL_NAME, expression, CEL_REASON)
 
 

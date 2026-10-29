@@ -103,6 +103,7 @@ from omnigent_factory.credentials.worktree import (
     BotIdentity,
     GitLockBusy,
     OffBranchError,
+    ReferenceFetchError,
     StageWiring,
     VerifiedWorktree,
     Workspaces,
@@ -265,7 +266,12 @@ class OmnigentExecutionAdapter:
         if config.cel_expression is not None:
             operator = (pol.operator_cel_policy(config.cel_expression, config.cel_reason),)
         self._cel = (pol.factory_cel_policy(config.default_branch), *operator)
-        #: Triage, plan and ranking: also no Git command that moves HEAD (#761).
+        #: Shared reference snapshots additionally deny installs, dev setup and Git fetch.
+        self._cel_reference = (
+            pol.factory_cel_policy(config.default_branch, read_only=True, reference=True),
+            *operator,
+        )
+        #: Triage in issue worktrees, plan and ranking retain the read-only Git set (#761).
         self._cel_read_only = (
             pol.factory_cel_policy(config.default_branch, read_only=True),
             *operator,
@@ -451,10 +457,19 @@ class OmnigentExecutionAdapter:
         spec = await self._spec(effect)
         if spec is None or effect.args.get("nonce") != spec.nonce:
             return DefinitiveFailure("stage-spec-mismatch")
-        git: dict[str, Any]
+        git: dict[str, Any] | None = None
         base_oid: str | None = None
         try:
-            if spec.bind_worktree is not None:
+            if spec.workspace_kind == "reference":
+                if spec.kind != SessionKind.TRIAGE or spec.branch or spec.bind_worktree:
+                    return DefinitiveFailure("invalid-reference-dispatch")
+                reserve = getattr(self.directory, "reserve_reference", None)
+                if reserve is None:
+                    return DefinitiveFailure("reference-directory-missing")
+                verified = await reserve(spec, self.workspaces, self.clock.now_utc_us() / 1e6)
+                workspace = str(verified.path)
+                base_oid = verified.head_oid
+            elif spec.bind_worktree is not None:
                 repair = await self._repair_worktree(spec.bind_worktree, spec)
                 if repair is not None:
                     return repair
@@ -481,6 +496,8 @@ class OmnigentExecutionAdapter:
                 git = {"branch_name": spec.branch, "base_branch": f"origin/{base}"}
         except GitLockBusy as exc:  # another Git process held a clone lock (#888)
             return RetryableReadFailure(f"workspace busy: {exc}", GIT_LOCK_RETRY_US)
+        except ReferenceFetchError as exc:
+            return RetryableReadFailure(str(exc))
         except WorktreeError as exc:
             return DefinitiveFailure(f"workspace-rejected: {exc}")
         body: dict[str, Any] = {
@@ -488,7 +505,6 @@ class OmnigentExecutionAdapter:
             "host_type": "external",
             "host_id": self.config.host_id,
             "workspace": workspace,
-            "git": git,
             "title": spec.title,
             "labels": {
                 NONCE_LABEL: spec.nonce,
@@ -499,6 +515,8 @@ class OmnigentExecutionAdapter:
             },
             "initial_items": [],
         }
+        if git is not None:
+            body["git"] = git
         if self.config.project_id is not None:
             body["project_id"] = self.config.project_id
         resp = await self.rest.post_json("/v1/sessions", body)
@@ -558,7 +576,7 @@ class OmnigentExecutionAdapter:
             return "host mismatch"
         if row.get("project_id") != self.config.project_id:
             return "project mismatch"
-        if row.get("git_branch") != spec.branch:
+        if (row.get("git_branch") or "") != spec.branch:
             return "branch mismatch"
         return None
 
@@ -569,6 +587,12 @@ class OmnigentExecutionAdapter:
         if not isinstance(workspace, str):
             return False
         try:
+            if spec.workspace_kind == "reference":
+                verified = self.workspaces.verify_reference(workspace)
+                return (
+                    spec.reference_workspace is not None
+                    and verified.path == spec.reference_workspace.resolve()
+                )
             verified = self.workspaces.verify_worktree(workspace, spec.branch)
         except WorktreeError:
             return False
@@ -593,7 +617,7 @@ class OmnigentExecutionAdapter:
             "verified": len(verified),
             "root_id": str(verified[0]["id"]) if len(found) == 1 and len(verified) == 1 else None,
         }
-        if not found:
+        if not found and spec.branch:
             orphan = await asyncio.to_thread(self.workspaces.find_branch_worktree, spec.branch)
             detail["orphan_worktree"] = str(orphan) if orphan is not None else None
             detail["branch_exists"] = await asyncio.to_thread(
@@ -619,8 +643,19 @@ class OmnigentExecutionAdapter:
             return "conversation items present"
         return None
 
-    def _unusable(self, snap: Mapping[str, Any]) -> str | None:
+    def _unusable(self, snap: Mapping[str, Any], spec: StageSpec) -> str | None:
         """Why a reused issue session cannot host the next run (it is then replaced)."""
+        if (spec.kind != SessionKind.TRIAGE or spec.workspace_kind != "reference") and not snap.get(
+            "git_branch"
+        ):
+            return "issue session has no issue worktree"
+        if spec.workspace_kind == "reference":
+            if snap.get("git_branch"):
+                return "issue session worktree missing; moving triage to reference"
+            try:
+                self.workspaces.verify_reference(str(snap.get("workspace") or ""))
+            except WorktreeError as exc:
+                return f"reference snapshot unusable: {exc}"
         if snap.get("archived") is True:
             return "issue session archived"
         if snap.get("status") == "failed":
@@ -661,9 +696,14 @@ class OmnigentExecutionAdapter:
             if reuse and exc.status == 404:
                 return self._prepared(root, ok=False, unusable=True, reason="issue session gone")
             return RetryableReadFailure(f"root snapshot: {exc.reason}")
+        if spec.kind != SessionKind.TRIAGE and not snap.get("git_branch") and not reuse:
+            return self._prepared(root, ok=False, reason="issue session has no issue worktree")
         if reuse:
-            unusable = self._unusable(snap)
+            unusable = await asyncio.to_thread(self._unusable, snap, spec)
             if unusable is not None:
+                record = getattr(self.directory, "record_handoff_reason", None)
+                if record is not None:
+                    await record(spec.session_id, unusable)
                 return self._prepared(root, ok=False, unusable=True, reason=unusable)
         problem = self._check_root(snap, spec)
         if problem is not None:
@@ -673,43 +713,59 @@ class OmnigentExecutionAdapter:
             return self._prepared(root, ok=True, unexpected=True, reason=turn)
         workspace = str(snap.get("workspace") or "")
         try:
-            if workspace and (
-                spec.bind_worktree is None
-                or Path(workspace).resolve() == spec.bind_worktree.resolve()
-            ):
-                repair = await self._repair_worktree(workspace, spec)
-                if repair is not None:
-                    return repair
-            # A stage may have left the worktree off its branch (#761): switch back when
-            # nothing can be lost, else refuse with an owner-facing note.
-            if (
-                spec.bind_worktree is None
-                or Path(workspace).resolve() == spec.bind_worktree.resolve()
-            ):
-                moved_from = await asyncio.to_thread(
-                    self.workspaces.restore_branch, workspace, spec.branch
+            if spec.workspace_kind == "reference":
+                if spec.kind != SessionKind.TRIAGE or spec.branch or spec.bind_worktree:
+                    return self._prepared(root, ok=False, reason="invalid reference dispatch")
+                reserve = getattr(self.directory, "reserve_reference", None)
+                if reserve is None:
+                    return self._prepared(root, ok=False, reason="reference directory missing")
+                verified = await reserve(
+                    spec, self.workspaces, self.clock.now_utc_us() / 1e6, workspace
                 )
-                if moved_from is not None:
-                    LOG.warning(
-                        "worktree %s was off its branch: switched from %s to %s",
-                        workspace,
-                        moved_from,
-                        spec.branch,
+                capability = await self.provisioner.provision(spec.session_id)
+            else:
+                if workspace and (
+                    spec.bind_worktree is None
+                    or Path(workspace).resolve() == spec.bind_worktree.resolve()
+                ):
+                    repair = await self._repair_worktree(workspace, spec)
+                    if repair is not None:
+                        return repair
+                # A stage may have left the worktree off its branch (#761): switch back when
+                # nothing can be lost, else refuse with an owner-facing note.
+                if (
+                    spec.bind_worktree is None
+                    or Path(workspace).resolve() == spec.bind_worktree.resolve()
+                ):
+                    moved_from = await asyncio.to_thread(
+                        self.workspaces.restore_branch, workspace, spec.branch
                     )
-                await self._sync_base(spec, workspace)
-            verified = await asyncio.to_thread(
-                self.workspaces.verify_worktree, workspace, spec.branch
-            )
-            if spec.bind_worktree is not None and verified.path != spec.bind_worktree.resolve():
-                return self._prepared(root, ok=False, reason="bound workspace differs")
-            capability = await self.provisioner.provision(spec.session_id)
-            await asyncio.to_thread(self._wire, verified, spec, capability.path)
+                    if moved_from is not None:
+                        LOG.warning(
+                            "worktree %s was off its branch: switched from %s to %s",
+                            workspace,
+                            moved_from,
+                            spec.branch,
+                        )
+                    await self._sync_base(spec, workspace)
+                verified = await asyncio.to_thread(
+                    self.workspaces.verify_worktree, workspace, spec.branch
+                )
+                if spec.bind_worktree is not None and verified.path != spec.bind_worktree.resolve():
+                    return self._prepared(root, ok=False, reason="bound workspace differs")
+                capability = await self.provisioner.provision(spec.session_id)
+                await asyncio.to_thread(self._wire, verified, spec, capability.path)
         except GitLockBusy as exc:
             return RetryableReadFailure(f"workspace busy: {exc}", GIT_LOCK_RETRY_US)
         except OffBranchError as exc:
             return self._prepared(root, ok=False, reason=f"workspace: {exc}", note=str(exc))
         except WorktreeError as exc:
-            return self._prepared(root, ok=False, reason=f"workspace: {exc}")
+            return self._prepared(
+                root,
+                ok=False,
+                reason=f"workspace: {exc}",
+                unusable=reuse and spec.workspace_kind == "reference",
+            )
         cost = pol.cost_policy(
             spec.policy_generation,
             pol.cost_threshold_usd(_cost(snap), spec.granted_us),
@@ -817,7 +873,13 @@ class OmnigentExecutionAdapter:
     def _static_policies(self, spec: StageSpec, root: str) -> tuple[pol.PolicySpec, ...]:
         return (
             pol.github_policy(spec.kind, self.config.repository, spec.branch),
-            *(self._cel if spec.kind == SessionKind.BUILD else self._cel_read_only),
+            *(
+                self._cel_reference
+                if spec.workspace_kind == "reference"
+                else self._cel
+                if spec.kind == SessionKind.BUILD
+                else self._cel_read_only
+            ),
             pol.caller_policy(root),
         )
 

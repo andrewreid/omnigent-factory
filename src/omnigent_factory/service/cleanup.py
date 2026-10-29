@@ -134,7 +134,7 @@ class WorkspaceCleaner:
             branches.add(f"factory/issue-{parcel.issue_number}")
         for session in parcel.sessions:
             data: Any = self.directory.dispatch_snapshot(session.session_id)
-            if not isinstance(data, dict):
+            if not isinstance(data, dict) or data.get("workspace_kind") == "reference":
                 continue
             if isinstance(data.get("workspace"), str):
                 paths.add(Path(data["workspace"]).resolve())
@@ -195,6 +195,8 @@ class WorkspaceCleaner:
         extra_branches: set[str] = set()
         failures = 0
         for path, branch in self.workspaces.worktrees():
+            if path.name.startswith("factory-ref-"):
+                continue  # reference snapshots belong exclusively to snapshot GC
             named = issue is not None and self.under_root(path) and issue_of(path.name) == issue
             if path not in paths and branch not in branches and not named:
                 continue

@@ -646,7 +646,7 @@ waits up to 90 s for it instead of failing.
 | `sessions prune [--dry-run]` | Delete (or list) the factory sessions session retention would remove now (through the daemon). |
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, `review_rounds_default`, `status_comment_edit_seconds`, `follow_up_max_depth`, `auto_replan_limit`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `bundling`, `bundle_max_members`, `bundle_command_max_members`, `bundle_max_points`, `session_retention_days`, the health sweep settings and `worktree_sweep_interval_hours`, `idle_worktree_days`, `clone_gc_interval_days`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, `review_rounds_default`, `status_comment_edit_seconds`, `follow_up_max_depth`, `auto_replan_limit`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `bundling`, `bundle_max_members`, `bundle_command_max_members`, `bundle_max_points`, `session_retention_days`, the health sweep settings and `worktree_sweep_interval_hours`, `idle_worktree_days`, `clone_gc_interval_days`, `lazy_issue_worktrees`, `reference_snapshot_max_age_hours`, `reference_snapshot_retention_hours`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 An **unresolved** webhook delivery is still in the normal inbox, waiting for its next
 identity-verified lookup after an automatic backoff. A **parked** delivery exhausted its
@@ -1304,3 +1304,61 @@ omnigent-factory doctor
 ```
 
 State (SQLite) migrates on start. Applied results are not re-read after a restart.
+
+### Lazy issue worktrees (opt-in)
+
+`lazy_issue_worktrees = false` is the default. Set it to `true` and run
+`omnigent-factory reload` to let TRIAGE runs without a live issue worktree use a
+shared, detached `factory-ref-<oid12>` snapshot under `worktree_root`. Existing
+issues with live worktrees keep them and retain the previous prompt versions.
+Only reference dispatches use the new snapshot prompts; flag-off prompts remain
+byte-identical. PLAN and BUILD always use an issue worktree; the first such run replaces the reference session, carries a stored handoff, and
+archives the old conversation after adoption. Ranking is unchanged.
+
+The daemon fetches the base under the clone lock before selecting a snapshot.
+`reference_snapshot_max_age_hours = 6` allows reuse of the newest clean snapshot
+within that age; otherwise the daemon creates a snapshot of the fetched base.
+If main has not changed, its existing clean snapshot is reused even when older
+than the age limit. A poisoned or incomplete snapshot stays at its original path;
+a fresh snapshot of the same OID uses `factory-ref-<oid12>-<generation>`. Missing or
+invalid creation metadata makes a snapshot unusable. The daemon writes that
+metadata atomically after setup finishes, so interrupted creation self-heals on
+the next selection. Snapshots are never reset, checked out again, cleaned or given
+node_modules. A dirty snapshot is permanently poisoned
+and cannot be given to another run, even if someone later restores its files.
+Only the exact factory-written untracked `.claude/settings.json` is exempt from
+the cleanliness check.
+
+Each dispatch pins its workspace kind and snapshot path before the create POST.
+GC serializes against pinning and retains snapshots used by any non-settled run.
+The existing worktree sweep removes unpinned snapshots after
+`reference_snapshot_retention_hours = 72`, or immediately if poisoned or incomplete,
+without dev environment teardown. The newest **usable** snapshot is always retained.
+Pinned snapshots are never removed, including poisoned or incomplete ones. Snapshot
+GC failures are logged and do not stop the issue-worktree sweep. Snapshot counts
+appear in `status` and `doctor`; sweep outcomes are logged. Both snapshot intervals are hot-reloadable. The existing `worktree_sweep_interval_hours` controls
+when GC runs (zero disables the sweep).
+
+Reference Git wiring is written only at creation: an empty effective credential
+helper chain, reset HTTP headers and a push guard, with no per-run Git configuration.
+TRIAGE receives a per-run read-only capability through the factory `gh` wrapper;
+the prompt supplies both paths. Its snapshot-only policy denies dependency
+installs (including bare `yarn` and install aliases), `dev-environment.sh`, Git
+fetch/push, remote/ref administration and the existing read-only Git mutation set.
+Snapshot policy conservatively denies `branch`, `tag`, `remote`, `config`, `notes`,
+`reflog` and `symbolic-ref` even in their read modes; use `show`, `log` and
+`for-each-ref` for inspection. PLAN's read-only policy and BUILD/PLAN credential
+handling are unchanged. Scratch files belong in `$TMPDIR`. A stale-snapshot note reports how many
+commits it lacks; current files can be read with `git show origin/main:path`
+(using the configured base branch when different), without fetching or checkout.
+
+The daemon writes `{"autoMemoryEnabled": false}` to `.claude/settings.json` in each
+snapshot. Claude Code auto-memory is keyed by repository root; the harness does
+not load `settings.local.json`. Whether project settings resolve from a linked
+worktree working directory remains **unverified**; this setting is not a proven
+memory-isolation boundary. Host-level token isolation is outside this feature.
+
+Roll out with the flag off, enable it for new triage runs, then inspect snapshot
+counts, handoffs and sweep logs. Turning the flag off is safe: in-flight dispatches
+retain their pinned behavior, and new runs use issue worktrees. Old template
+versions remain available so existing dispatch hashes still resolve.

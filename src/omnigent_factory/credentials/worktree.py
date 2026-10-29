@@ -29,7 +29,9 @@ for the origin URL must be exactly ``[factory helper]`` (:meth:`Workspaces.effec
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -40,6 +42,10 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
+
+REFERENCE_NAME = re.compile(r"factory-ref-(?P<oid>[0-9a-f]{12})(?:-[1-9][0-9]*)?\Z")
+REFERENCE_SETTINGS = '{"autoMemoryEnabled": false}\n'
+REFERENCE_META = "factory-reference.json"
 
 GITHUB_HTTPS = "https://github.com/"
 
@@ -65,6 +71,10 @@ HARNESS_ALLOW_RULES = (
 
 class WorktreeError(RuntimeError):
     """A workspace failed verification or could not be wired. Fail closed."""
+
+
+class ReferenceFetchError(WorktreeError):
+    """A reference snapshot could not refresh the base; retry before creating a session."""
 
 
 class GitLockBusy(WorktreeError):
@@ -482,6 +492,191 @@ class Workspaces:
             env=self.inspection_env,
         )
         return how
+
+    def reference_metadata(self, path: Path) -> dict[str, object]:
+        """Creation time and permanent poison marker, outside the working tree."""
+        try:
+            data = json.loads((self.admin_dir(path) / REFERENCE_META).read_text())
+            if (
+                isinstance(data, dict)
+                and type(data.get("created_at")) in (int, float)
+                and math.isfinite(data["created_at"])
+                and data["created_at"] >= 0
+                and isinstance(data.get("oid"), str)
+                and re.fullmatch(r"[0-9a-f]{40,64}", data["oid"])
+                and isinstance(data.get("poisoned"), bool)
+            ):
+                return data
+        except (OSError, ValueError, OverflowError):
+            pass
+        raise WorktreeError("reference snapshot has no valid creation record")
+
+    def _write_reference_metadata(self, path: Path, data: dict[str, object]) -> None:
+        target = self.admin_dir(path) / REFERENCE_META
+        temporary = target.with_suffix(".tmp")
+        temporary.write_text(json.dumps(data))
+        os.replace(temporary, target)
+
+    def references(self, root: Path) -> list[Path]:
+        return [
+            path
+            for path, _ in self.worktrees()
+            if path.parent == root.resolve()
+            and REFERENCE_NAME.fullmatch(path.name)
+            and path.is_dir()
+        ]
+
+    def reference_clean(self, path: Path) -> bool:
+        settings = path / ".claude/settings.json"
+        if (path / ".claude").is_symlink() or settings.is_symlink() or not settings.is_file():
+            return False
+        try:
+            if settings.read_text() != REFERENCE_SETTINGS or (path / "node_modules").exists():
+                return False
+        except (OSError, UnicodeError):
+            return False
+        # Only the exact factory-written, untracked settings file is exempt.
+        if self._git(["ls-files", "--", ".claude/settings.json"], path):
+            return False
+        return not self._git(
+            [
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--",
+                ".",
+                ":(exclude).claude/settings.json",
+            ],
+            path,
+        )
+
+    @_clone_write
+    def verify_reference(self, workspace: str | Path) -> VerifiedWorktree:
+        path = self._owned_worktree(workspace)
+        name = REFERENCE_NAME.fullmatch(path.name)
+        if name is None:
+            raise WorktreeError("workspace is not a reference snapshot")
+        oid = self._git(["rev-parse", "HEAD"], path)
+        metadata = self.reference_metadata(path)
+        if (
+            self._head_branch(path) is not None
+            or name["oid"] != oid[:12]
+            or metadata.get("oid") != oid
+            or not self.reference_clean(path)
+        ):
+            metadata["poisoned"] = True
+            self._write_reference_metadata(path, metadata)
+        if metadata.get("poisoned"):
+            raise WorktreeError("reference snapshot is poisoned")
+        self.check_transport(path)
+        if self.effective_helpers(path):
+            raise WorktreeError("reference snapshot credential helper chain is not empty")
+        if self._config_entries(path, r"^factory\.(capabilityfile|stagesession)$"):
+            raise WorktreeError("reference snapshot has per-run Git wiring")
+        for key in ("credential.helper", "http.extraHeader"):
+            entries = self._config_entries(path, "^" + re.escape(key.lower()) + "$")
+            if not entries or entries[-1][1] != "":
+                raise WorktreeError("reference snapshot lacks reset-only Git wiring")
+        guard = self._git(["config", "--get", "core.hooksPath"], path, check=False)
+        expected = self.push_guard_dir or (self.common_dir(path) / "factory-reference-hooks")
+        if guard != str(expected):
+            raise WorktreeError("reference snapshot push guard differs")
+        return VerifiedWorktree(path, "", oid)
+
+    @_clone_write
+    def select_reference(
+        self, root: Path, max_age_hours: float, now: float, base_branch: str = "main"
+    ) -> VerifiedWorktree:
+        """Fetch and select under the clone lock; never move an existing snapshot."""
+        self.ensure_source_clone()
+        try:
+            oid = self.fetch_base(base_branch)
+        except GitLockBusy:
+            raise
+        except WorktreeError as exc:
+            raise ReferenceFetchError(f"source fetch failed: {exc}") from exc
+        # Incomplete registrations and poisoned snapshots remain at their pinned
+        # paths. They cannot participate in selection or block a new generation.
+        usable: list[tuple[float, VerifiedWorktree]] = []
+        for candidate in self.references(root):
+            try:
+                verified = self.verify_reference(candidate)
+                created = float(str(self.reference_metadata(candidate)["created_at"]))
+                usable.append((created, verified))
+            except (WorktreeError, OSError):
+                continue
+        usable.sort(key=lambda row: row[0], reverse=True)
+        if usable and now - usable[0][0] < max_age_hours * 3600:
+            return usable[0][1]
+        for _, verified in usable:
+            if verified.head_oid == oid:
+                return verified  # an unchanged base needs no duplicate clean snapshot
+        path = root / f"factory-ref-{oid[:12]}"
+        generation = 0
+        while path.exists() or path.is_symlink():
+            generation += 1
+            path = root / f"factory-ref-{oid[:12]}-{generation}"
+        if root.resolve() not in self.owned_roots or root.is_symlink():
+            raise WorktreeError("reference root is not an approved owned root")
+        self._git(["worktree", "prune"], self.source_clone)
+        self._git(["worktree", "add", "--detach", str(path), oid], self.source_clone)
+        settings = path / ".claude/settings.json"
+        if (path / ".claude").is_symlink() or settings.exists() or settings.is_symlink():
+            raise WorktreeError("reference snapshot already contains Claude settings")
+        settings.parent.mkdir(exist_ok=True)
+        settings.write_text(REFERENCE_SETTINGS)
+        guard = self.push_guard_dir
+        if guard is None:
+            guard = self.common_dir(path) / "factory-reference-hooks"
+            guard.mkdir(exist_ok=True)
+            hook = guard / "pre-push"
+            if not hook.exists():
+                hook.write_text("#!/bin/sh\nexit 1\n")
+                hook.chmod(0o700)
+        for key, value in (
+            ("credential.helper", ""),
+            ("http.extraHeader", ""),
+            ("credential.useHttpPath", "true"),
+            ("credential.interactive", "false"),
+            ("core.hooksPath", str(guard)),
+        ):
+            self._git(["config", "--worktree", "--add", key, value], path)
+        # Commit the creation record last. A crash at any earlier step leaves an
+        # unusable registration that selection skips and GC can safely collect.
+        self._write_reference_metadata(path, {"created_at": now, "oid": oid, "poisoned": False})
+        return self.verify_reference(path)
+
+    @_clone_write
+    def collect_references(
+        self, root: Path, pins: set[Path], now: float, retention_hours: float
+    ) -> dict[str, str]:
+        """Retain every pin and the newest usable snapshot; never reset or clean."""
+        paths = self.references(root)
+        usable: dict[Path, float] = {}
+        for path in paths:
+            try:
+                self.verify_reference(path)
+                usable[path] = float(str(self.reference_metadata(path)["created_at"]))
+            except (WorktreeError, OSError):
+                pass  # includes incomplete creation and malformed metadata
+        newest = max(usable, key=lambda p: usable[p]) if usable else None
+        outcomes: dict[str, str] = {}
+        for path in paths:
+            if path in pins:
+                outcomes[str(path)] = "pinned"
+            elif path == newest:
+                outcomes[str(path)] = "newest"
+            elif path not in usable or now - usable[path] >= retention_hours * 3600:
+                try:
+                    self.remove_worktree(path, force=True)
+                    outcomes[str(path)] = (
+                        "removed poisoned" if path not in usable else "removed expired"
+                    )
+                except (WorktreeError, OSError) as exc:
+                    outcomes[str(path)] = f"removal failed: {exc}"
+            else:
+                outcomes[str(path)] = "retained"
+        return outcomes
 
     def verify_worktree(self, workspace: str | Path, branch: str) -> VerifiedWorktree:
         """Verify ``workspace`` is our clone's worktree on ``branch`` inside owned roots."""

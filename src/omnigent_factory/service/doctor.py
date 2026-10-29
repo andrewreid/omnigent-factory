@@ -20,6 +20,7 @@ from typing import Any
 import httpx
 import yaml
 
+from omnigent_factory.credentials.worktree import REFERENCE_NAME
 from omnigent_factory.github.auth import AppAuthenticator, InstallationTokenService
 from omnigent_factory.github.client import GitHubAPIError, GitHubClient
 from omnigent_factory.omnigent.rest import (
@@ -1004,10 +1005,16 @@ def _check_worktrees(config: ServiceConfig, report: DoctorReport) -> None:
         for line in proc.stdout.splitlines()
         if line.startswith("worktree ")
     )
+    references = sum(
+        Path(line[9:]).parent == root and bool(REFERENCE_NAME.fullmatch(Path(line[9:]).name))
+        for line in proc.stdout.splitlines()
+        if line.startswith("worktree ")
+    )
     state = read_state(config.source_clone)
     report.pass_check(
         "worktrees",
-        f"{count} under {root}; last sweep {iso(state.get('sweep_at_us')) or 'never'}; "
+        f"{count} under {root}; {references} reference snapshots; "
+        f"last sweep {iso(state.get('sweep_at_us')) or 'never'}; "
         f"last gc {iso(state.get('gc_at_us')) or 'never'}",
     )
 

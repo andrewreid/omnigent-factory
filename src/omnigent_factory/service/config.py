@@ -87,6 +87,9 @@ HOT_RELOAD_KEYS = frozenset(
         "auto_replan_limit",
         "worktree_sweep_interval_hours",
         "idle_worktree_days",
+        "lazy_issue_worktrees",
+        "reference_snapshot_max_age_hours",
+        "reference_snapshot_retention_hours",
         "clone_gc_interval_days",
     }
 )
@@ -397,6 +400,10 @@ class ServiceConfig(BaseModel):
     #: worktrees under ``worktree_root`` (closed issues cleaned up, idle early-stage
     #: worktrees removed). 0: no sweep.
     worktree_sweep_interval_hours: float = Field(default=24.0, ge=0, le=24 * 365)
+    #: New triage runs without an issue worktree may share detached reference snapshots.
+    lazy_issue_worktrees: bool = False
+    reference_snapshot_max_age_hours: float = Field(default=6, ge=0, le=24 * 365)
+    reference_snapshot_retention_hours: float = Field(default=72, ge=0, le=24 * 365)
     #: An Inbox/Triage/Planning worktree untouched this long, with no work of its own, is
     #: removed by the sweep (the next stage run recreates it). 0: never.
     idle_worktree_days: float = Field(default=7.0, ge=0, le=365)

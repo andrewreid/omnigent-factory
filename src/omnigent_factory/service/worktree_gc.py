@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Any
 
 from omnigent_factory.core.effects import EffectKind
 from omnigent_factory.core.types import SETTLED_LIFECYCLES, Hold, Parcel, Stage
-from omnigent_factory.credentials.worktree import Workspaces, WorktreeError
+from omnigent_factory.credentials.worktree import REFERENCE_NAME, Workspaces, WorktreeError
 from omnigent_factory.github.client import GitHubAPIError, GitHubClient
 from omnigent_factory.service.cleanup import WorkspaceCleaner, issue_of
 from omnigent_factory.service.config import ServiceConfig
@@ -268,13 +268,40 @@ class WorktreeGC:
     async def sweep_once(self) -> dict[str, object]:
         self._loop = asyncio.get_running_loop()
         root = self.cleaner.worktree_root
+        snapshots: dict[str, str] = {}
+        directory = self.cleaner.directory
+        snapshot_error = ""
+        try:
+            if await asyncio.to_thread(self.workspaces.references, root):
+                async with directory.reference_lock:
+                    pins = await directory.reference_pins()
+                    snapshots = await asyncio.to_thread(
+                        self.workspaces.collect_references,
+                        root,
+                        pins,
+                        self.service.clock.now_utc_us() / _US,
+                        self.config.reference_snapshot_retention_hours,
+                    )
+        except Exception as exc:
+            # A snapshot fault must not prevent the independent issue sweep.
+            snapshot_error = str(exc)[:300]
+            LOG.warning("reference snapshot sweep failed: %s", exc, exc_info=True)
+        for snapshot_path, snapshot_outcome in snapshots.items():
+            log = LOG.warning if "failed" in snapshot_outcome else LOG.info
+            log("reference snapshot sweep: %s path=%s", snapshot_outcome, snapshot_path)
         rows = await asyncio.to_thread(self.workspaces.worktrees)
+        remaining_snapshots = sum(
+            path.parent == root and bool(REFERENCE_NAME.fullmatch(path.name)) for path, _ in rows
+        )
+        LOG.info("reference snapshot count=%s", remaining_snapshots)
         by_issue: dict[int, list[tuple[Path, str | None]]] = defaultdict(list)
         registered = {path for path, _ in rows}
         strays_by_issue: dict[int, list[Path]] = defaultdict(list)
         unnamed: list[str] = []
         for path, branch in rows:
             if root not in path.parents:
+                continue
+            if REFERENCE_NAME.fullmatch(path.name):
                 continue
             number = issue_of(path.name)
             if number is None:
@@ -356,7 +383,12 @@ class WorktreeGC:
                     strays[str(path)] = outcome
         self.state.last_sweep_us = self.service.clock.now_utc_us()
         self.state.last_sweep = {
-            "worktrees": sum(len(w) for w in by_issue.values()) + len(unnamed),
+            "worktrees": sum(len(w) for w in by_issue.values())
+            + len(unnamed)
+            + remaining_snapshots,
+            "reference_snapshots": snapshots,
+            "reference_snapshot_count": remaining_snapshots,
+            "reference_snapshot_error": snapshot_error,
             "stray_entries": sum(len(paths) for paths in strays_by_issue.values()),
             "closed": closed,
             "idle": idle,
@@ -468,11 +500,16 @@ class WorktreeGC:
             rows = await asyncio.to_thread(self.workspaces.worktrees)
             root = self.cleaner.worktree_root
             count: int | None = sum(root in path.parents for path, _ in rows)
+            reference_count: int | None = sum(
+                root == path.parent and bool(REFERENCE_NAME.fullmatch(path.name))
+                for path, _ in rows
+            )
         except WorktreeError:
-            count = None
+            count = reference_count = None
         cfg = self.config
         return {
             "worktrees": count,
+            "reference_snapshots": reference_count,
             "sweep_interval_hours": cfg.worktree_sweep_interval_hours,
             "idle_worktree_days": cfg.idle_worktree_days,
             "gc_interval_days": cfg.clone_gc_interval_days,
