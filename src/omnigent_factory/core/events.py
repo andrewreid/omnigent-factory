@@ -85,6 +85,7 @@ class EventKind(enum.StrEnum):
     BOARD_FIELDS_OBSERVED = "BoardFieldsObserved"
     COLUMN_OBSERVED = "ColumnObserved"
     PR_OBSERVED = "PRObserved"
+    OPEN_PR_CAPACITY_RECONCILED = "OpenPRCapacityReconciled"
     CHECKS_CHANGED = "ChecksChanged"
     REVIEW_CHANGED = "ReviewChanged"
     READINESS_EVIDENCE = "ReadinessEvidence"
@@ -570,6 +571,22 @@ class PRObserved(_Body):
     merged: bool = False
     bot_authored: bool = False
     parcel_branch: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class OpenPRCapacityReconciled(_Body):
+    """A bounded repository read repaired open-PR accounting.
+
+    ``open_prs`` and ``closed_prs`` are fresh GitHub facts. Reservation IDs are stale
+    local records (terminal parcel, or unbound with no live build) selected by the
+    service; the reducer still protects an unbound reservation if its build is live.
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.OPEN_PR_CAPACITY_RECONCILED
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    open_prs: tuple[int, ...] = ()
+    closed_prs: tuple[int, ...] = ()
+    expired_reservation_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1228,6 +1245,7 @@ EventBody = (
     | GitHubSnapshot
     | ColumnObserved
     | PRObserved
+    | OpenPRCapacityReconciled
     | ChecksChanged
     | ReviewChanged
     | ReadinessEvidence
@@ -1315,6 +1333,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         GitHubSnapshot,
         ColumnObserved,
         PRObserved,
+        OpenPRCapacityReconciled,
         ChecksChanged,
         ReviewChanged,
         ReadinessEvidence,
@@ -1466,6 +1485,7 @@ __all__ = [
     "ItemRemoved",
     "LeftwardMove",
     "MessageAck",
+    "OpenPRCapacityReconciled",
     "OperatorResume",
     "OwnerDirectOmnigentMessage",
     "OwnerQuestion",

@@ -355,6 +355,66 @@ def admissible_head(admission: AdmissionSnapshot, config: TrustedConfig) -> Queu
     return None
 
 
+def holds_pr_slot(
+    admission: AdmissionSnapshot,
+    parcel_id: str,
+    *,
+    open_pr_parcels: frozenset[str] = frozenset(),
+) -> bool:
+    """Whether ``parcel_id`` can build without consuming another open-PR slot.
+
+    Reservations are the durable ownership record. ``open_pr_parcels`` supplements it
+    with parcel aggregates whose linked PR is in ``open_bot_prs`` (used by the service
+    while choosing a parcel; the reducer normally sees the same ownership as a bound
+    reservation).
+    """
+    return parcel_id in open_pr_parcels or any(
+        r.parcel_id == parcel_id and r.kind == ReservationKind.OPEN_PR and r.live
+        for r in admission.reservations
+    )
+
+
+def admissible_build(
+    admission: AdmissionSnapshot,
+    config: TrustedConfig,
+    *,
+    open_pr_parcels: frozenset[str] = frozenset(),
+    excluded_parcels: frozenset[str] = frozenset(),
+) -> QueueEntry | None:
+    """The ordered queued entry capacity may try next.
+
+    Normally this is :func:`admissible_head`. If (and only if) that entry is blocked by
+    the open-PR cap, the first later entry which already owns a PR slot may pass it. As
+    soon as a slot is free the head wins again. Auto-build entries whose separate cap is
+    full and temporarily excluded deliveries keep their existing pass-over semantics.
+    """
+    queued = sorted(
+        (
+            q
+            for q in admission.queue
+            if q.status == QueueStatus.QUEUED and q.parcel_id not in excluded_parcels
+        ),
+        key=admission_key,
+    )
+    auto_full = not auto_build_capacity_available(admission, config)
+    eligible = [q for q in queued if not (q.auto and auto_full)]
+    if not eligible:
+        return None
+    head = eligible[0]
+    if pr_capacity_available(admission, config) or holds_pr_slot(
+        admission, head.parcel_id, open_pr_parcels=open_pr_parcels
+    ):
+        return head
+    return next(
+        (
+            q
+            for q in eligible[1:]
+            if holds_pr_slot(admission, q.parcel_id, open_pr_parcels=open_pr_parcels)
+        ),
+        None,
+    )
+
+
 def running_text(entries: tuple[QueueEntry, ...]) -> str:
     """``#673, #680`` for running build episodes (``?`` for an unknown issue)."""
     return ", ".join(f"#{q.issue_number}" if q.issue_number else "?" for q in entries)
@@ -380,10 +440,7 @@ def startable_build(admission: AdmissionSnapshot, config: TrustedConfig) -> Queu
     slot) and an open-PR slot free unless the head already holds one: the repository-wide
     checks of ``CapacityAvailable`` (its per-parcel preconditions are the parcel's own).
     """
-    head = admissible_head(admission, config)
+    head = admissible_build(admission, config)
     if head is None or admission.paused or not building_capacity_available(admission, config):
         return None
-    holds_pr = any(
-        r.parcel_id == head.parcel_id for r in admission.live_reservations(ReservationKind.OPEN_PR)
-    )
-    return head if holds_pr or pr_capacity_available(admission, config) else None
+    return head

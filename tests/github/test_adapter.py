@@ -156,6 +156,21 @@ async def test_fresh_issue_and_board_snapshot_verifies_identities():
 
 
 @pytest.mark.asyncio
+async def test_lightweight_pull_request_state_reports_closed_merge():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/pulls/807")
+        return httpx.Response(
+            200,
+            json={"state": "closed", "merged": True, "merged_at": "2026-09-27T00:00:00Z"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        state = await adapter(http).pull_request_state(807)
+    assert not isinstance(state, RetryableReadFailure)
+    assert not state.open and state.merged
+
+
+@pytest.mark.asyncio
 async def test_pull_request_snapshot_reads_all_check_pages_and_current_reviews():
     required = frozenset({("required", 15368)})
 

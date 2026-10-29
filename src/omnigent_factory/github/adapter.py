@@ -57,6 +57,7 @@ from omnigent_factory.ports.github import (
     IssueRef,
     LabelEvent,
     PullRequestEvidence,
+    PullRequestState,
     stage_for_option,
 )
 
@@ -901,6 +902,19 @@ class GitHubAPIAdapter:
         if not isinstance(pr, dict):
             raise GitHubAPIError("pull request response was malformed")
         return pr
+
+    async def pull_request_state(self, pr_number: int) -> PullRequestState | RetryableReadFailure:
+        """Read only the state needed to repair repository PR-cap accounting."""
+        try:
+            pr = await self._pull(pr_number)
+            return PullRequestState(
+                open=pr.get("state") == "open",
+                merged=pr.get("merged") is True or pr.get("merged_at") is not None,
+            )
+        except RateLimited as exc:
+            return RetryableReadFailure(str(exc), exc.retry_after_us)
+        except GitHubAPIError as exc:
+            return RetryableReadFailure(str(exc))
 
     async def _review_bot_pending_since(
         self, pr: dict[str, Any], pr_number: int, head_sha: str

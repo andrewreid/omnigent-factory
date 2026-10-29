@@ -109,6 +109,15 @@ build is admitted. Resuming builds are admitted before new ones (then manual bui
 auto-builds). Open PRs still count towards `max_open_bot_prs` while parked. `status`
 lists running and parked builds separately.
 
+`max_open_bot_prs` limits open factory-authored PRs plus builds which have reserved a PR
+slot but have not opened one yet. The periodic reconcile verifies a bounded batch of the
+tracked PRs against GitHub and releases closed/merged PRs and stale reservations, so a
+missed webhook cannot permanently consume capacity. A reservation for a live build is
+never expired. When the cap blocks the queue head, its note says, for example,
+`Queued: waiting for an open-PR slot (10/10 open)`. Later builds keep their normal order;
+only the first rework that already owns a PR slot may pass that head. Once any PR slot is
+free, the head is first again.
+
 At most `triage_concurrency` triage runs (default 1) run at once, whatever started them
 (drag, label, command, comment or auto-triage). A further triage request is not dropped:
 the card moves to Triage with the note `Queued: triage starts when a triage slot is free`
@@ -149,7 +158,7 @@ submitting` when it was folded or gated). See
 | `Bot` | Meaning |
 |---|---|
 | `Working` | A run is doing work. |
-| `Queued` | Approved build waiting for a slot; note `Queued: 2nd in line (1/1 running: #673)`, `Queued: waiting for a build slot to resume` or `Waiting for an auto-build slot (1/1 in use: #673)`. |
+| `Queued` | Approved build waiting for a slot; note `Queued: 2nd in line (1/1 running: #673)`, `Queued: waiting for an open-PR slot (10/10 open)`, `Queued: waiting for a build slot to resume` or `Waiting for an auto-build slot (1/1 in use: #673)`. |
 | `Needs you` | An open question, or a hold only the owner can clear. |
 | `Checkpoint` | The run used its time block; comment `/continue`. |
 | `Blocked` | Something failed, or a required check is red on Ready; the note says what. |

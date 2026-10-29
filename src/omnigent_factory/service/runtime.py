@@ -23,11 +23,12 @@ from omnigent_factory.core.effects import (
     AdapterOutcome,
     EffectIntent,
     EffectKind,
+    RetryableReadFailure,
     RetryClass,
 )
 from omnigent_factory.core.events import Event, Provenance
 from omnigent_factory.core.predicates import board_pending, run_closed, settled
-from omnigent_factory.core.projection import admission_key, auto_build_capacity_available
+from omnigent_factory.core.projection import admissible_build
 from omnigent_factory.core.reducer import awaiting_evidence
 from omnigent_factory.core.stall import stall_view
 from omnigent_factory.core.types import (
@@ -40,9 +41,12 @@ from omnigent_factory.core.types import (
     Parcel,
     QueueStatus,
     ReservationKind,
+    SessionKind,
+    Stage,
 )
 from omnigent_factory.ports.adapter import EffectAdapter
 from omnigent_factory.ports.clock import Clock, SystemClock
+from omnigent_factory.ports.github import PullRequestState
 from omnigent_factory.service.cleanup import finished as cleanup_finished
 from omnigent_factory.service.config import HOT_RELOAD_KEYS, ServiceConfig, load_config
 from omnigent_factory.service.db import StoreWorker
@@ -123,6 +127,10 @@ _OPEN_QUEUE_STATES = frozenset({QueueStatus.QUEUED, QueueStatus.RESERVED, QueueS
 #: Reconcile-loop ticks per reconcile interval: per-parcel reads are spread over the
 #: interval (never one burst), each parcel still read about once per interval.
 RECONCILE_TICKS_PER_INTERVAL = 4
+#: One pass is deliberately bounded even if corrupted legacy accounting is much larger
+#: than the configured cap. The live cap is normally <= this, so every member is checked
+#: on the first pass after deploy.
+OPEN_PR_RECONCILE_BATCH = 20
 
 RETRYABLE_PUBLICATION_KINDS = frozenset(
     {
@@ -216,6 +224,14 @@ class FactoryService:
         #: Issue bundling and its ``bundles`` operator command (composition;
         #: ``service.bundles.Bundles``). None: not wired.
         self.bundles: Any = None
+        #: Lightweight GitHub PR-state read used to repair repository capacity accounting.
+        #: Production wires ``GitHubAPIAdapter.pull_request_state``; tests may leave it
+        #: absent. Retryable failures (including rate limits) defer the next pass.
+        self.open_pr_reader: (
+            Callable[[int], Awaitable[PullRequestState | RetryableReadFailure]] | None
+        ) = None
+        self._next_open_pr_reconcile_us = 0
+        self._open_pr_reconcile_cursor: int | None = None
         self._fatal_exit = fatal_exit
         self._fatal_reason: str | None = None
         self._delivery_failures: dict[str, int] = {}
@@ -776,22 +792,36 @@ class FactoryService:
                 failures = await self._background_error("admission", failures)
 
     async def _admit_once(self) -> None:
-        admission = await self.db.call(lambda store: store.load_admission(self.config.repo_id))
-        queued = sorted(
-            (q for q in admission.queue if q.status == QueueStatus.QUEUED), key=admission_key
-        )
-        if not queued:
-            return
         if await self.db.call(lambda store: store.has_pending_delivery()):
             return
-        head = None
-        auto_full = not auto_build_capacity_available(admission, self.config.trusted)
-        for candidate in queued:
-            if candidate.auto and auto_full:
-                continue  # an auto-build waiting for an auto-build slot holds up no one
-            if not self.parked.blocks(candidate.parcel_id):
-                head = candidate
-                break
+
+        def snapshot(store: SqliteStore) -> tuple[AdmissionSnapshot, frozenset[str]]:
+            admission = store.load_admission(self.config.repo_id)
+            open_pr_parcels: set[str] = set()
+            for entry in admission.queue:
+                if entry.status != QueueStatus.QUEUED:
+                    continue
+                parcel = store.load_parcel(entry.parcel_id)
+                if (
+                    parcel is not None
+                    and parcel.pr_number is not None
+                    and parcel.pr_number in admission.open_bot_prs
+                ):
+                    open_pr_parcels.add(entry.parcel_id)
+            return admission, frozenset(open_pr_parcels)
+
+        admission, open_pr_parcels = await self.db.call(snapshot)
+        excluded = frozenset(
+            q.parcel_id
+            for q in admission.queue
+            if q.status == QueueStatus.QUEUED and self.parked.blocks(q.parcel_id)
+        )
+        head = admissible_build(
+            admission,
+            self.config.trusted,
+            open_pr_parcels=open_pr_parcels,
+            excluded_parcels=excluded,
+        )
         if head is None:
             return
         parcel = await self.db.call(partial(_load_parcel, parcel_id=head.parcel_id))
@@ -854,9 +884,98 @@ class FactoryService:
         for parcel_id in parcel_ids:
             self._reconcile_due[parcel_id] = (due, interval)
 
+    async def reconcile_open_pr_capacity(self, *, force: bool = False) -> int:
+        """Repair open-PR accounting with a bounded, retry-aware GitHub pass.
+
+        Returns the number of remote PR states attempted. Local stale reservations are
+        repaired even when there is no PR number to read.
+        """
+        reader = self.open_pr_reader
+        now = self.clock.now_utc_us()
+        if reader is None or (not force and now < self._next_open_pr_reconcile_us):
+            return 0
+        interval_us = max(1, int(self.config.reconcile_interval_seconds * 1_000_000))
+        self._next_open_pr_reconcile_us = now + interval_us
+
+        def snapshot(
+            store: SqliteStore,
+        ) -> tuple[AdmissionSnapshot, dict[str, Parcel], str | None]:
+            admission = store.load_admission(self.config.repo_id)
+            parcels = {
+                str(row[0]): parcel
+                for row in store.query(
+                    "SELECT parcel_id FROM parcels WHERE repo_id = ? ORDER BY parcel_id",
+                    (self.config.repo_id,),
+                )
+                if (parcel := store.load_parcel(str(row[0]))) is not None
+            }
+            return admission, parcels, next(iter(parcels), None)
+
+        admission, parcels, anchor = await self.db.call(snapshot)
+        if anchor is None:
+            return 0
+        live_builds = {
+            parcel.parcel_id
+            for parcel in parcels.values()
+            if (session := parcel.current_session) is not None
+            and session.kind == SessionKind.BUILD
+            and not run_closed(parcel, session)
+        }
+        expired = {
+            r.reservation_id
+            for r in admission.live_reservations(ReservationKind.OPEN_PR)
+            if (
+                (parcel := parcels.get(r.parcel_id)) is not None
+                and (
+                    Hold.COMPLETED in parcel.holds
+                    or parcel.stage == Stage.DONE
+                    or (r.pr_number is None and r.parcel_id not in live_builds)
+                )
+            )
+        }
+        numbers = sorted(
+            set(admission.open_bot_prs)
+            | {
+                r.pr_number
+                for r in admission.live_reservations(ReservationKind.OPEN_PR)
+                if r.pr_number is not None
+            }
+        )
+        if numbers and self._open_pr_reconcile_cursor in numbers:
+            start = numbers.index(self._open_pr_reconcile_cursor) + 1
+            numbers = numbers[start:] + numbers[:start]
+        batch = numbers[:OPEN_PR_RECONCILE_BATCH]
+        opened: set[int] = set()
+        closed: set[int] = set()
+        attempted = 0
+        for number in batch:
+            attempted += 1
+            self._open_pr_reconcile_cursor = number
+            state = await reader(number)
+            if isinstance(state, RetryableReadFailure):
+                if state.retry_after_us is not None:
+                    self._next_open_pr_reconcile_us = now + max(interval_us, state.retry_after_us)
+                    break
+                continue
+            (opened if state.open else closed).add(number)
+        if not (opened or closed or expired):
+            return attempted
+        body = ev.OpenPRCapacityReconciled(
+            open_prs=tuple(sorted(opened)),
+            closed_prs=tuple(sorted(closed)),
+            expired_reservation_ids=tuple(sorted(expired)),
+        )
+        digest = hashlib.sha256(repr(body).encode()).hexdigest()[:16]
+        await self.apply_event(self._event(anchor, body, f"open-pr-capacity:{now}:{digest}"))
+        return attempted
+
     async def _reconcile_tick(self) -> None:
         loop_now = asyncio.get_running_loop().time()
         interval = self.config.reconcile_interval_seconds
+        try:
+            await self.reconcile_open_pr_capacity()
+        except Exception:
+            LOG.warning("open-PR capacity reconcile failed", exc_info=True)
         if self.deferred is not None:
             try:
                 # Ready report ticks whose batch window has passed start their rework.

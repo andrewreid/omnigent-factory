@@ -24,6 +24,8 @@ from omnigent_factory.core.types import (
     Lifecycle,
     Parcel,
     QueueStatus,
+    Reservation,
+    ReservationKind,
     SessionKind,
     Size,
     Stage,
@@ -752,6 +754,57 @@ def test_C05_open_pr_cap():
     assert h.send(P, ev.CapacityAvailable()).audit.reason == "open-pr-cap"
 
 
+def _pr_capped_queue() -> Harness:
+    h = Harness(cfg=config(max_open_bot_prs=2, max_building=2))
+    h.plan_published(P)
+    h.plan_published(Q)
+    h.approve(P)
+    h.approve(Q)
+    q = h.admission.queue_entry(Q)
+    assert q is not None
+    h.admission = replace(
+        h.admission,
+        open_bot_prs=frozenset({99, 100}),
+        reservations=(
+            *h.admission.reservations,
+            Reservation("rs-q-pr", Q, ReservationKind.OPEN_PR, q.approval_id, 99),
+        ),
+    )
+    return h
+
+
+def test_C05_pr_owner_passes_only_a_pr_cap_blocked_head():
+    h = _pr_capped_queue()
+    assert h.send(P, ev.CapacityAvailable()).audit.reason == "open-pr-cap"
+    admitted = h.send(Q, ev.CapacityAvailable())
+    assert admitted.audit.accepted
+    assert h.admission.queue_entry(Q).status == QueueStatus.RESERVED
+
+
+def test_C05_head_goes_first_as_soon_as_a_pr_slot_frees():
+    h = _pr_capped_queue()
+    h.send(
+        P,
+        ev.OpenPRCapacityReconciled(closed_prs=(100,)),
+        provenance=Provenance.SCHEDULER,
+    )
+    assert h.send(Q, ev.CapacityAvailable()).audit.reason == "not-queue-head"
+    assert h.send(P, ev.CapacityAvailable()).audit.accepted
+
+
+def test_C05_building_cap_blocks_even_a_later_pr_owner():
+    h = _pr_capped_queue()
+    h.admission = replace(
+        h.admission,
+        reservations=(
+            *h.admission.reservations,
+            Reservation("rs-building", "I_busy", ReservationKind.BUILDING, "busy"),
+            Reservation("rs-building-2", "I_busy_2", ReservationKind.BUILDING, "busy"),
+        ),
+    )
+    assert h.send(Q, ev.CapacityAvailable()).audit.reason == "building-cap"
+
+
 def test_C06_session_created_prepares_and_verifies_nonce():
     h = Harness()
     h.eligible()
@@ -1406,6 +1459,7 @@ def _sample_bodies(p: Parcel):
         EventKind.PR_OBSERVED: ev.PRObserved(
             pr_number=7, head_sha=HEAD, bot_authored=True, parcel_branch=True
         ),
+        EventKind.OPEN_PR_CAPACITY_RECONCILED: ev.OpenPRCapacityReconciled(),
         EventKind.CHECKS_CHANGED: ev.ChecksChanged(pr_number=7, head_sha=HEAD),
         EventKind.REVIEW_CHANGED: ev.ReviewChanged(pr_number=7, head_sha=HEAD),
         EventKind.READINESS_EVIDENCE: ev.ReadinessEvidence(

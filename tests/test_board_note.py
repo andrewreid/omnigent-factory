@@ -27,10 +27,19 @@ from omnigent_factory.core.effects import (
     RetryableReadFailure,
 )
 from omnigent_factory.core.preconditions import effect_still_valid
-from omnigent_factory.core.types import MICROS_PER_HOUR, BotState, Hold, QueueStatus, Stage, Via
+from omnigent_factory.core.types import (
+    MICROS_PER_HOUR,
+    BotState,
+    Hold,
+    QueueStatus,
+    Reservation,
+    ReservationKind,
+    Stage,
+    Via,
+)
 from omnigent_factory.github.adapter import BoardSchema, GitHubAPIAdapter, ParcelBinding
 from omnigent_factory.github.client import GitHubClient
-from omnigent_factory.testing.builders import result_candidate, snapshot
+from omnigent_factory.testing.builders import config, result_candidate, snapshot
 from omnigent_factory.testing.harness import Harness
 
 P = "I_parcel_1"
@@ -103,6 +112,31 @@ def test_admission_clears_the_queued_note():
     r = h.send(P, ev.CapacityAvailable())
     assert h.p().bot == BotState.WORKING and h.p().note == ""
     assert notes(r) == [""]
+
+
+def test_pr_cap_queue_notes_name_the_block_and_the_head():
+    h = Harness(cfg=config(max_open_bot_prs=1, max_building=2))
+    h.plan_published(P)
+    h.plan_published(Q)
+    h.approve(P)
+    h.approve(Q)
+    q = h.admission.queue_entry(Q)
+    assert q is not None
+    h.admission = replace(
+        h.admission,
+        open_bot_prs=frozenset({99}),
+        reservations=(
+            *h.admission.reservations,
+            Reservation("rs-q-pr", Q, ReservationKind.OPEN_PR, q.approval_id, 99),
+        ),
+    )
+    h.send(P, ev.ReconcileDue())
+    h.send(Q, ev.ReconcileDue())
+    assert h.p(P).note == "Queued: waiting for an open-PR slot (1/1 open)"
+    assert h.p(Q).note == (
+        f"Queued: 2nd in line behind #{h.p(P).issue_number}, which is waiting for "
+        "an open-PR slot (1/1 open)"
+    )
 
 
 def test_stop_is_a_note_and_survives_the_drain():

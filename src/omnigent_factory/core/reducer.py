@@ -64,12 +64,14 @@ from omnigent_factory.core.predicates import (
 )
 from omnigent_factory.core.projection import (
     NOTE_MAX,
+    admissible_build,
     admissible_head,
     admission_key,
     auto_build_capacity_available,
     building_capacity_available,
     bundle_member_refusal,
     bundle_note,
+    holds_pr_slot,
     pr_capacity_available,
     project_bot,
     project_note,
@@ -3606,6 +3608,9 @@ def _complete(ctx: _Ctx) -> None:
     """
     ctx.hold(Hold.COMPLETED)
     ctx.unhold(Hold.CHECKS_FAILED, Hold.READINESS_FAILED, Hold.REWORK_CONTROL_REQUIRED)
+    # The reservation belongs to this parcel, not to the PR's lifetime. The open PR
+    # itself remains in ``open_bot_prs`` until a close/merge observation releases it.
+    _release_pr(ctx, ctx.p.pr_number)
     _drop_queued_move(ctx)
     _cancel_pending(ctx)
     cur = ctx.p.current_session
@@ -3686,6 +3691,40 @@ def _h_pr_observed(ctx: _Ctx, body: ev.PRObserved) -> None:
         _invalidate_ready(ctx, "pr-closed-unmerged")
     ctx.hold(Hold.PR_CLOSED)
     ctx.note(f"PR #{body.pr_number} closed without merging")
+
+
+def _h_open_pr_capacity_reconciled(ctx: _Ctx, body: ev.OpenPRCapacityReconciled) -> None:
+    """Apply fresh repository PR states and retire demonstrably stale reservations."""
+    closed = set(body.closed_prs)
+    prs = set(ctx.admission.open_bot_prs)
+    prs.difference_update(closed)
+    prs.update(set(body.open_prs) - closed)
+    expired = set(body.expired_reservation_ids)
+    live_builds = {
+        q.parcel_id
+        for q in ctx.admission.queue
+        if q.status in (QueueStatus.RESERVED, QueueStatus.HELD)
+        or (q.status == QueueStatus.QUEUED and q.resume)
+    }
+
+    def retire(r: Reservation) -> bool:
+        if not r.live or r.kind != ReservationKind.OPEN_PR:
+            return False
+        if r.pr_number is not None and r.pr_number in closed:
+            return True
+        if r.reservation_id not in expired:
+            return False
+        # A stale-read decision may race a newly admitted build. Its unbound reservation
+        # is protected for as long as that build holds a slot.
+        return r.pr_number is not None or r.parcel_id not in live_builds
+
+    ctx.admission = replace(
+        ctx.admission,
+        open_bot_prs=frozenset(prs),
+        reservations=tuple(
+            replace(r, live=False) if retire(r) else r for r in ctx.admission.reservations
+        ),
+    )
 
 
 def _invalidate_ready(ctx: _Ctx, reason: str) -> None:
@@ -5856,16 +5895,19 @@ def _h_capacity(ctx: _Ctx, body: ev.CapacityAvailable) -> None:
         raise Rejected("building-cap")
     if entry.auto and not auto_build_capacity_available(ctx.admission, ctx.config):
         raise Rejected("auto-build-cap")
-    if admissible_head(ctx.admission, ctx.config) != entry:
-        raise Rejected("not-queue-head")
     has_pr = ctx.p.pr_number is not None and ctx.p.pr_number in ctx.admission.open_bot_prs
     has_pr_reservation = any(
         r.parcel_id == ctx.p.parcel_id and r.kind == ReservationKind.OPEN_PR and r.live
         for r in ctx.admission.reservations
     )
     need_pr = not has_pr and not has_pr_reservation
-    if need_pr and not pr_capacity_available(ctx.admission, ctx.config):
-        raise Rejected("open-pr-cap")
+    open_pr_parcels = frozenset({ctx.p.parcel_id}) if has_pr else frozenset()
+    candidate = admissible_build(ctx.admission, ctx.config, open_pr_parcels=open_pr_parcels)
+    if candidate != entry:
+        head = admissible_head(ctx.admission, ctx.config)
+        if head == entry and need_pr and not pr_capacity_available(ctx.admission, ctx.config):
+            raise Rejected("open-pr-cap")
+        raise Rejected("not-queue-head")
     if not dispatchable(ctx.p) or not all_settled(ctx.p) or ctx.p.pending_authorization_id:
         raise Rejected("admission-preconditions")
     if auth.eligibility_epoch != ctx.p.eligibility_epoch:
@@ -6059,6 +6101,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.BOARD_FIELDS_OBSERVED: _h_board_fields,
     EventKind.COLUMN_OBSERVED: _h_column_observed,
     EventKind.PR_OBSERVED: _h_pr_observed,
+    EventKind.OPEN_PR_CAPACITY_RECONCILED: _h_open_pr_capacity_reconciled,
     EventKind.CHECKS_CHANGED: _h_checks_changed,
     EventKind.REVIEW_CHANGED: _h_review_changed,
     EventKind.READINESS_EVIDENCE: _h_readiness,
@@ -6181,11 +6224,29 @@ def _queued_note(ctx: _Ctx) -> str:
     if entry.resume:
         text = "Queued: waiting for a build slot to resume"
     else:
+        head = admissible_head(admission, config)
+        head_cap_blocked = (
+            head is not None
+            and not head.resume
+            and not holds_pr_slot(admission, head.parcel_id)
+            and not pr_capacity_available(admission, config)
+        )
+        if entry == head and head_cap_blocked:
+            return (
+                "Queued: waiting for an open-PR slot "
+                f"({admission.prospective_pr_count}/{config.max_open_bot_prs} open)"
+            )
         key = admission_key(entry)
         ahead = sum(
             1 for q in admission.queue if q.status == QueueStatus.QUEUED and admission_key(q) < key
         )
         text = f"Queued: {_ordinal(ahead + 1)} in line"
+        if head_cap_blocked and head is not None and admission_key(head) < key:
+            who = f"#{head.issue_number}" if head.issue_number else "the first build"
+            text += (
+                f" behind {who}, which is waiting for an open-PR slot "
+                f"({admission.prospective_pr_count}/{config.max_open_bot_prs} open)"
+            )
     running = admission.running()
     if running and not building_capacity_available(admission, config):
         text += f" ({len(running)}/{config.max_building} running: {running_text(running)})"

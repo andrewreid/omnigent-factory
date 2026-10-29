@@ -108,6 +108,8 @@ ADMISSION: dict[EventKind, Admission] = {
     # A daemon_effect_id is honoured only from ADAPTER (checked in the handler).
     EventKind.COLUMN_OBSERVED: Admission(_OBSERVED),
     EventKind.PR_OBSERVED: Admission(_OBSERVED),
+    # bounded repository-level GitHub reads repair capacity accounting
+    EventKind.OPEN_PR_CAPACITY_RECONCILED: Admission(_SCHEDULER),
     EventKind.CHECKS_CHANGED: Admission(_OBSERVED),
     EventKind.REVIEW_CHANGED: Admission(_OBSERVED),
     EventKind.READINESS_EVIDENCE: Admission(_ADAPTER),

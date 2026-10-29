@@ -429,6 +429,7 @@ async def build_production(
     )
     service.health_sweep = sweep
     service.board_diff = BoardDiff(service, github.board_cards)
+    service.open_pr_reader = github.pull_request_state
     service.label_recovery = LabelRecovery(service, github.label_events, github.issue_snapshot)
     board = BoardIndex(github.board_issues, clock)
     service.auto_triager = AutoTriager(service, board, github.issue_snapshot)

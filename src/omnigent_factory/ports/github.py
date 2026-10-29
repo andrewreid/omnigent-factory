@@ -307,6 +307,14 @@ class PullRequestEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class PullRequestState:
+    """Lightweight state used by bounded open-PR capacity reconciliation."""
+
+    open: bool
+    merged: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class ContractPublication:
     """A bot comment found by effect marker: its rendered contract section and hash marker.
 
