@@ -738,6 +738,13 @@ factory (someone typing in Omnigent) holds the next run until the session is idl
 that asks nothing of the owner, so the note reads `Waiting: the Omnigent session is busy
 outside the factory; ...` and `Bot` stays as derived.
 
+**PR body ELI5.** The build agent writes the PR body itself. Its prompt asks for a
+`## ELI5` section near the top, after the `Closes` lines: 2-4 short, plain-English
+sentences, no jargon, saying what the PR changes and why. Rework, conflict and readiness
+runs keep that section, update it (`gh pr edit`) when what the PR does changed, and add
+it to a PR that has none. It is a prompt rule only: the factory never reads the PR body
+for it, so a missing ELI5 never holds Ready or a merge.
+
 **Ready means the bot's work is done**: the PR is open and closes the issue, the
 cross-vendor review is accepted for the head (or carried to an owner/base sync of it),
 every review-bot finding has an outcome and the bot has nothing left to do. Required

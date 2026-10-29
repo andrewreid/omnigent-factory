@@ -1,0 +1,43 @@
+Factory rework run {run_id} for {repository} issue #{issue_number} on branch {branch}: the
+owner ticked items in the Ready report of PR #{pr_number}. Your Omnigent session id is
+{session_id}: pass it as session_id to every factory tool.
+{handoff}
+{base_note}
+Do exactly these, in the same branch and PR, nothing else:
+{brief}
+The plan approval stands (factory_get_plan, hash {plan_hash}; echo it as plan_hash); if an
+item needs more than the plan, ask with factory_ask_owner. Read factory_get_feedback for
+any owner comment. A ticked follow-up is fixed here: the factory updates its follow-up
+issue, so leave that issue alone.
+If the approved plan no longer fits current {base_ref}, submit "blocked" with the reason;
+never widen the scope to make it fit.
+Use only the factory git credential helper and gh wrapper {gh_wrapper} (capability handle
+{capability_file}). Never merge. Never open issues.
+Owner-directed separate work ("file the rest as an issue") goes in split_out (relation
+after_source if it comes after this issue, before_source if it must land first);
+the factory files it.
+New review findings get the outcome rule (fix in this PR, follow-up or advisory, listed in
+deferred); review rounds count across runs (factory_get_status review_rounds).
+Flaky CI: `gh run rerun <id> --failed`; never push an empty commit to retrigger CI.
+Finish with factory_submit_result (kind "build_ready", or "blocked"); if CI or bots are
+pending, submit current evidence and end the turn: you are woken.
+Summary: what changed; no CI or review-bot status. Text is posted for a human: GitHub
+Markdown, short paragraphs, no internal labels or IDs (de_..., ef_...).
+Extra git worktrees (yours or your workers') go beside this issue's worktree, named
+factory-issue-{issue_number}-<suffix>; never in /tmp or under other names.
+Dev environment (never required): if you started one, keep it running through Ready and
+report its URL in dev_environment_url; do not tear it down when the PR opens: the factory
+tears it down when the issue is done.
+Active-time budget: {granted_minutes} minutes.
+
+For triage, epic_triage, plan and build_ready results, always fill eli5: explain what
+this means for the owner in 2-4 short, plain-English sentences, like they are five.
+Use no jargon; aim for at most 600 characters. Keep eli5 outside the plan contract.
+When asking with factory_ask_owner, always pass eli5 explaining the choice in the
+same style (at most 600 characters). The factory labels these summaries ELI5.
+
+PR body ELI5: the PR body keeps a `## ELI5` section near the top, after the `Closes`
+lines: 2-4 short, plain-English sentences, no jargon, saying what the PR changes and
+why, like the reader is five. If this run changed what the PR does, update that section
+with gh pr edit (keep the `Closes` lines); if the body has none, add it; otherwise leave
+it as it is.

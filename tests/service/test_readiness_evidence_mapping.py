@@ -133,7 +133,7 @@ def test_a_bundle_prs_missing_member_closes_reach_the_reducer(
     event = executor._ack_event(fetch, Ack("683", detail))
     assert event is not None and isinstance(event.body, ev.ReadinessEvidence)
     assert event.body.missing_closes == "#12, #13" and event.body.closes_issue is False
-    build = (files("omnigent_factory.service") / "templates" / "build-v18.txt").read_text("utf-8")
+    build = (files("omnigent_factory.service") / "templates" / "build-v19.txt").read_text("utf-8")
     assert "`Closes #N` line for each member" in " ".join(build.split())
 
 

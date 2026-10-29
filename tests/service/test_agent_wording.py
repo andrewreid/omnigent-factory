@@ -136,3 +136,47 @@ def test_live_result_and_question_prompts_request_eli5_and_keep_old_versions():
         prefix, version = name.removesuffix(".txt").rsplit("-v", 1)
         old = (root / f"{prefix}-v{int(version) - 1}.txt").read_text("utf-8")
         assert text.startswith(old.rstrip() + "\n")
+
+
+def test_pr_writing_prompts_ask_for_a_pr_body_eli5_and_keep_old_versions():
+    from omnigent_factory.service import directory
+
+    root = files("omnigent_factory.service") / "templates"
+    rule = (
+        "2-4 short, plain-English sentences, no jargon, saying what the PR changes and why, "
+        "like the reader is five."
+    )
+    opening = directory._FIRST_TEMPLATES[directory.SessionKind.BUILD]
+    updating = {
+        directory._REWORK_TEMPLATE,
+        directory._ITEMS_REWORK_TEMPLATE,
+        directory._CONFLICT_TEMPLATE,
+        directory._READINESS_WAKE_TEMPLATE,
+        directory._FINDINGS_WAKE_TEMPLATE,
+        directory._CONFLICT_WAKE_TEMPLATE,
+    }
+    assert {opening, *updating} == {
+        "build-v19.txt",
+        "build-rework-v15.txt",
+        "build-rework-items-v6.txt",
+        "build-conflict-v6.txt",
+        "readiness-wake-v14.txt",
+        "readiness-findings-wake-v6.txt",
+        "readiness-conflict-wake-v3.txt",
+    }
+    for name in {opening, *updating}:
+        flat = " ".join((root / name).read_text("utf-8").split())
+        assert "`## ELI5` section" in flat and rule in flat, name
+        assert "after the `Closes` lines" in flat, name
+        # The result-field ELI5 paragraph is kept as it was.
+        assert "always fill eli5" in flat and "factory_ask_owner, always pass eli5" in flat
+        prefix, version = name.removesuffix(".txt").rsplit("-v", 1)
+        old = (root / f"{prefix}-v{int(version) - 1}.txt").read_text("utf-8")
+        assert "## ELI5" not in old  # the released template is untouched
+        assert (root / name).read_text("utf-8").startswith(old.rstrip() + "\n")
+    flat = " ".join((root / opening).read_text("utf-8").split())
+    assert "add a `## ELI5` section" in flat and "update it if what the PR does" in flat
+    for name in updating:
+        flat = " ".join((root / name).read_text("utf-8").split())
+        assert "If this run changed what the PR does, update that section with gh pr edit" in flat
+        assert "if the body has none, add it; otherwise leave it as it is." in flat

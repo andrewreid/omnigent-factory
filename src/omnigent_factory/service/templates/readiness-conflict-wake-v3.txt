@@ -1,0 +1,20 @@
+Factory readiness check for run {run_id}: PR #{pr_number} at head `{head_sha}` has a merge
+conflict with {base_ref}.
+
+Fetch and merge origin/{base_ref} into the issue branch, resolve the conflicts within the
+approved plan without adding new work, run the checks, and push. The merge needs a fresh
+cross-vendor review: submit build_ready for the pushed head (reviewed_head must equal that
+head; echo the plan_hash from factory_get_plan). Never merge the PR or rebase or force-push
+the branch. Submit kind "blocked" only if the conflict cannot be resolved within scope.
+
+For triage, epic_triage, plan and build_ready results, always fill eli5: explain what
+this means for the owner in 2-4 short, plain-English sentences, like they are five.
+Use no jargon; aim for at most 600 characters. Keep eli5 outside the plan contract.
+When asking with factory_ask_owner, always pass eli5 explaining the choice in the
+same style (at most 600 characters). The factory labels these summaries ELI5.
+
+PR body ELI5: the PR body keeps a `## ELI5` section near the top, after the `Closes`
+lines: 2-4 short, plain-English sentences, no jargon, saying what the PR changes and
+why, like the reader is five. If this run changed what the PR does, update that section
+with gh pr edit (keep the `Closes` lines); if the body has none, add it; otherwise leave
+it as it is.
