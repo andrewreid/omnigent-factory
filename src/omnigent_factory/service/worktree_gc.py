@@ -1,8 +1,9 @@
 """Worktree housekeeping of the factory-owned clone (never the owner's checkouts).
 
 Every ``worktree_sweep_interval_hours`` (default 24) the sweep lists the clone's
-registered worktrees under ``worktree_root`` and, by the issue number in the directory
-name (``factory-issue-<N>`` or ``factory-issue-<N>-<suffix>``):
+registered worktrees and factory-named unregistered leftovers under ``worktree_root``
+and, by the issue number in the name (``factory-issue-<N>`` or
+``factory-issue-<N>-<suffix>``):
 
 * an issue GitHub reports closed (one batched read) gets the Done cleanup
   (:meth:`WorkspaceCleaner.clean_closed`: dev-environment teardown, then removal; a dirty
@@ -10,6 +11,9 @@ name (``factory-issue-<N>`` or ``factory-issue-<N>-<suffix>``):
 * an open issue whose card is in Inbox, Triage or Planning, untouched for
   ``idle_worktree_days`` (default 7; 0 never), loses a worktree holding no work of its own
   (:meth:`WorkspaceCleaner.remove_idle`); the next stage run recreates it.
+* an eligible issue also loses exact factory-named stray files/directories left directly
+  in ``worktree_root``; Git directories retain the same clean/no-ahead protection and a
+  configured dev-environment teardown must succeed.
 
 An issue with a live (starting, running, draining) stage session, a pending stage start
 or an effect of unknown outcome is never touched, nor a Ready card the factory has not
@@ -17,9 +21,9 @@ yet seen finished. Each removal re-checks that under the clone lock, so no stage
 bind the worktree in between. A name without an issue number is logged, never removed.
 
 Every ``clone_gc_interval_days`` (default 7) ``git worktree prune`` and ``git gc --auto``
-run on the clone under the same lock. Both times persist in the clone's Git directory
-(:data:`STATE_FILE`), so a restart does not run them again early; the intervals are
-reload-applied.
+run on the clone under the same lock. Fetch's redundant automatic maintenance is
+disabled. Both times persist in the clone's Git directory (:data:`STATE_FILE`), so a
+restart does not run them again early; the intervals are reload-applied.
 """
 
 from __future__ import annotations
@@ -89,6 +93,21 @@ def _write_state(source_clone: Path, state: dict[str, int]) -> None:
 
 def iso(us: int | None) -> str | None:
     return datetime.fromtimestamp(us / _US, UTC).isoformat() if us else None
+
+
+def _entry_last_touched(path: Path) -> float:
+    """Newest lstat mtime in an unregistered factory-named root entry.
+
+    Unlike registered worktrees these leftovers have no reliable reflog.  Never follow a
+    symlink; :meth:`WorkspaceCleaner.remove_stray` refuses symlinks in all cases.
+    """
+    try:
+        times = [path.lstat().st_mtime]
+        if path.is_dir() and not path.is_symlink():
+            times.extend(item.lstat().st_mtime for item in path.rglob("*"))
+    except OSError as exc:
+        raise WorktreeError(f"stray entry activity is unreadable: {exc}") from exc
+    return max(times)
 
 
 async def github_issue_states(
@@ -251,6 +270,8 @@ class WorktreeGC:
         root = self.cleaner.worktree_root
         rows = await asyncio.to_thread(self.workspaces.worktrees)
         by_issue: dict[int, list[tuple[Path, str | None]]] = defaultdict(list)
+        registered = {path for path, _ in rows}
+        strays_by_issue: dict[int, list[Path]] = defaultdict(list)
         unnamed: list[str] = []
         for path, branch in rows:
             if root not in path.parents:
@@ -261,22 +282,38 @@ class WorktreeGC:
                 unnamed.append(str(path))
                 continue
             by_issue[number].append((path, branch))
-        parcels = await self._parcels(sorted(by_issue))
+        try:
+            root_entries = tuple(root.iterdir())
+        except OSError as exc:
+            raise WorktreeError(f"worktree_root is unreadable: {exc}") from exc
+        for path in root_entries:
+            if path.resolve() in registered:
+                continue
+            number = issue_of(path.name)
+            if number is None:
+                LOG.info("worktree sweep: non-factory root entry kept path=%s", path)
+                continue
+            strays_by_issue[number].append(path)
+        issue_numbers = sorted(set(by_issue) | set(strays_by_issue))
+        parcels = await self._parcels(issue_numbers)
         unknown = await self._unknown_effect_parcels()
         states: dict[int, bool] = {}
         state_error = ""
-        if by_issue:
+        if issue_numbers:
             try:
-                states = await self.issue_states(sorted(by_issue))
+                states = await self.issue_states(issue_numbers)
             except (GitHubAPIError, OSError, ValueError) as exc:
                 # Closed issues wait for the next sweep; idle removal needs no GitHub read.
                 state_error = str(exc)[:300]
                 LOG.warning("worktree sweep: issue states unreadable: %s", exc)
         closed: dict[str, object] = {}
         idle: dict[str, str] = {}
+        strays: dict[str, str] = {}
         skipped: dict[str, str] = {}
         cutoff = self.service.clock.now_utc_us() / _US - self.config.idle_worktree_days * 86400
-        for number, worktrees in sorted(by_issue.items()):
+        for number in issue_numbers:
+            worktrees = by_issue.get(number, [])
+            issue_strays = strays_by_issue.get(number, [])
             parcel = parcels.get(number)
             why = _blocker(parcel, unknown)
             if why is not None:
@@ -290,6 +327,13 @@ class WorktreeGC:
                     skipped[f"#{number}"] = why
                     continue
                 merged = parcel is not None and await self._merged(parcel)
+                for path in issue_strays:
+                    strays[str(path)] = await asyncio.to_thread(
+                        self.cleaner.remove_stray,
+                        path,
+                        reason="issue closed",
+                        guard=self._guard(number, idle=False),
+                    )
                 closed[f"#{number}"] = await asyncio.to_thread(
                     self.cleaner.clean_closed,
                     number,
@@ -306,20 +350,27 @@ class WorktreeGC:
                 outcome = await asyncio.to_thread(self._idle_one, number, path, branch, cutoff)
                 if outcome is not None:
                     idle[str(path)] = outcome
+            for path in issue_strays:
+                outcome = await asyncio.to_thread(self._idle_stray, number, path, cutoff)
+                if outcome is not None:
+                    strays[str(path)] = outcome
         self.state.last_sweep_us = self.service.clock.now_utc_us()
         self.state.last_sweep = {
             "worktrees": sum(len(w) for w in by_issue.values()) + len(unnamed),
+            "stray_entries": sum(len(paths) for paths in strays_by_issue.values()),
             "closed": closed,
             "idle": idle,
+            "strays": strays,
             "skipped": skipped,
             "unnamed": unnamed,
             "issue_state_error": state_error,
         }
         self._persist()
         LOG.info(
-            "worktree sweep done closed=%s idle=%s skipped=%s unnamed=%s",
+            "worktree sweep done closed=%s idle=%s strays=%s skipped=%s unnamed=%s",
             len(closed),
             sum(v == "removed" or v.startswith("removed;") for v in idle.values()),
+            sum(v == "removed" for v in strays.values()),
             len(skipped),
             len(unnamed),
         )
@@ -333,6 +384,15 @@ class WorktreeGC:
         if touched > cutoff_s:
             return None  # touched recently: nothing to report
         return self.cleaner.remove_idle(path, branch, guard=self._guard(number, idle=True))
+
+    def _idle_stray(self, number: int, path: Path, cutoff_s: float) -> str | None:
+        try:
+            touched = _entry_last_touched(path)
+        except WorktreeError as exc:
+            return f"kept: {exc}"
+        if touched > cutoff_s:
+            return None
+        return self.cleaner.remove_stray(path, reason="idle", guard=self._guard(number, idle=True))
 
     def _guard(self, number: int, *, idle: bool) -> Callable[[], str | None]:
         """Re-checks the issue's record on the event loop (from a worker thread holding the

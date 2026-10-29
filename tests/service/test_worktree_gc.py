@@ -61,12 +61,25 @@ def _registered(git_env: GitEnv) -> set[Path]:
 
 
 def _age(ws: Any, path: Path, days: float) -> None:
-    """Make everything the idle check reads ``days`` old (relative to NOW_S)."""
+    """Make real reflog activity and relevant mtimes ``days`` old."""
     then = NOW_S - days * DAY
     admin = ws.admin_dir(path)
+    reflog = admin / "logs" / "HEAD"
+    text = reflog.read_text(encoding="utf-8")
+    reflog.write_text(
+        re.sub(r" \d+ [+-]\d{4}\t", f" {int(then)} +0000\t", text),
+        encoding="utf-8",
+    )
     for item in (path, admin / "index", admin / "HEAD", admin / "logs" / "HEAD"):
         if item.exists():
             os.utime(item, (then, then))
+
+
+def _age_entry(path: Path, days: float) -> None:
+    then = NOW_S - days * DAY
+    paths = (path, *path.rglob("*")) if path.is_dir() else (path,)
+    for item in reversed(paths):
+        os.utime(item, (then, then), follow_symlinks=False)
 
 
 # ------------------------------------------------------------------ naming
@@ -411,6 +424,113 @@ async def test_idle_early_stage_worktree_without_own_work_is_removed(
     _age(ws, recent, 30)
     await off.sweep_once()
     assert recent.exists()
+
+
+@pytest.mark.asyncio
+async def test_housekeeping_reflog_mtime_does_not_make_an_idle_worktree_recent(
+    git_env: GitEnv, gc_config: ServiceConfig
+):
+    ws = git_env.workspaces()
+    ws.ensure_source_clone()
+    ws.fetch_base()
+    idle = _add(git_env, "factory-issue-26", "factory/issue-26")
+    _age(ws, idle, 10)
+    # Fetch-triggered maintenance / gc expires and replaces this file without appending
+    # a reflog entry.  The content still says the worktree was last used ten days ago.
+    reflog = ws.admin_dir(idle) / "logs" / "HEAD"
+    os.utime(reflog, (NOW_S, NOW_S))
+    assert ws.last_touched(idle) == NOW_S - 10 * DAY
+    gc, _ = _gc(
+        git_env,
+        gc_config,
+        _Store({26: _parcel(26, Stage.TRIAGED)}, set(), set()),
+        {26: True},
+    )
+    result = await gc.sweep_once()
+    assert result["idle"][str(idle)] == "removed"  # type: ignore[index]
+    assert not idle.exists()
+
+
+@pytest.mark.asyncio
+async def test_sweep_removes_only_eligible_factory_named_strays(
+    git_env: GitEnv, gc_config: ServiceConfig, caplog: pytest.LogCaptureFixture
+):
+    ws = git_env.workspaces()
+    ws.ensure_source_clone()
+    ws.fetch_base()
+    root = git_env.worktrees
+    closed_log = root / "factory-issue-30-devenv-start.log"
+    closed_log.write_text("finished\n")
+    closed_dir = root / "factory-issue-30-leftover"
+    closed_dir.mkdir()
+    (closed_dir / "output.log").write_text("finished\n")
+    idle_log = root / "factory-issue-31-review.md"
+    idle_log.write_text("old\n")
+    live_log = root / "factory-issue-32-review.md"
+    live_log.write_text("old\n")
+    recent_log = root / "factory-issue-33-review.md"
+    recent_log.write_text("recent\n")
+    unrelated = root / "mutation.diff"
+    unrelated.write_text("never factory-owned by name\n")
+    for path in (closed_log, closed_dir, idle_log, live_log, unrelated):
+        _age_entry(path, 10)
+    _age_entry(recent_log, 2)
+    store = _Store(
+        {
+            31: _parcel(31, Stage.SCOPED),
+            32: _parcel(32, Stage.TRIAGED, live=True),
+            33: _parcel(33, Stage.INBOX),
+        },
+        set(),
+        set(),
+    )
+    gc, reads = _gc(git_env, gc_config, store, {30: False, 31: True, 32: True, 33: True})
+    with caplog.at_level(logging.INFO):
+        result = await gc.sweep_once()
+    assert reads == [[30, 31, 32, 33]]
+    assert not closed_log.exists() and not closed_dir.exists() and not idle_log.exists()
+    assert live_log.exists() and recent_log.exists() and unrelated.exists()
+    assert result["strays"] == {  # type: ignore[comparison-overlap]
+        str(closed_log): "removed",
+        str(closed_dir): "removed",
+        str(idle_log): "removed",
+    }
+    assert result["skipped"] == {  # type: ignore[comparison-overlap]
+        "#32": "a stage session is live (starting, running or draining)"
+    }
+    removed = [
+        r.getMessage() for r in caplog.records if "stray worktree entry removed" in r.getMessage()
+    ]
+    assert {str(closed_log), str(closed_dir), str(idle_log)} <= {
+        next(path for path in (str(closed_log), str(closed_dir), str(idle_log)) if path in line)
+        for line in removed
+    }
+
+
+@pytest.mark.asyncio
+async def test_stray_directory_waits_for_dev_environment_teardown(
+    git_env: GitEnv, gc_config: ServiceConfig, tmp_path: Path
+):
+    ws = git_env.workspaces()
+    ws.ensure_source_clone()
+    ws.fetch_base()
+    stray = git_env.worktrees / "factory-issue-34-devenv"
+    stray.mkdir()
+    (stray / "state").write_text("running\n")
+    _age_entry(stray, 10)
+    script = tmp_path / "teardown.sh"
+    script.write_text("#!/bin/sh\nexit 1\n")
+    script.chmod(0o755)
+    gc, _ = _gc(
+        git_env,
+        gc_config,
+        _Store({34: _parcel(34, Stage.TRIAGED)}, set(), set()),
+        {34: True},
+        teardown=(str(script),),
+    )
+    result = await gc.sweep_once()
+    assert stray.exists()
+    assert "dev environment teardown failed" in result["strays"][str(stray)]  # type: ignore[index]
 
 
 @pytest.mark.asyncio

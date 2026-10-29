@@ -32,6 +32,7 @@ import contextlib
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -308,6 +309,69 @@ class WorkspaceCleaner:
                     if not self._delete_branch(branch, "idle", f"path={path}", skipped):
                         return f"removed; branch kept: {skipped[0]}"
             return "removed"
+
+    def remove_stray(self, path: Path, *, reason: str, guard: Guard | None = None) -> str:
+        """Remove one factory-named root entry that is not a registered worktree.
+
+        Plain files/directories are factory-owned leftovers by their strict name.  A
+        directory carrying Git metadata is removed only when it can still be verified as
+        part of the dedicated clone, is clean and has no commits beyond the fetched base.
+        Symlinks and special files are always kept.  A configured dev-environment teardown
+        must also succeed before a directory is removed.
+        """
+        with self._lock:
+            kept = self._stray_problem(path)
+            if kept is not None:
+                LOG.info("stray worktree entry kept path=%s reason=%s", path, kept)
+                return f"kept: {kept}"
+            if path.is_dir() and self.teardown:
+                failed = self._run_teardown(path)
+                if failed is not None:
+                    LOG.warning(
+                        "stray dev environment teardown failed path=%s reason=%s", path, failed
+                    )
+                    return f"kept: dev environment teardown failed: {failed}"
+            with CLONE_LOCK:
+                why_not = (guard() if guard is not None else None) or self._stray_problem(path)
+                if why_not is None and any(
+                    path.resolve() == p for p, _ in self.workspaces.worktrees()
+                ):
+                    why_not = "became a registered worktree"
+                if why_not is not None:
+                    LOG.info("stray worktree entry kept path=%s reason=%s", path, why_not)
+                    return f"kept: {why_not}"
+                try:
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
+                except OSError as exc:
+                    return f"kept: removal failed: {str(exc)[:_REASON_CHARS]}"
+            LOG.info("stray worktree entry removed path=%s reason=%s", path, reason)
+            return "removed"
+
+    def _stray_problem(self, path: Path) -> str | None:
+        """Why an unregistered root entry cannot safely be removed (None: it can)."""
+        if path.parent.resolve() != self.worktree_root or issue_of(path.name) is None:
+            return "outside factory-named worktree_root entries"
+        if path.is_symlink():
+            return "symlink"
+        if not path.exists():
+            return "already gone"
+        if path.is_file():
+            return None
+        if not path.is_dir():
+            return "special file"
+        git_marker = path / ".git"
+        if not os.path.lexists(git_marker):
+            return None
+        try:
+            clone_git = (self.workspaces.source_clone / ".git").resolve()
+            if self.workspaces.common_dir(path) != clone_git:
+                return "Git directory does not belong to the dedicated clone"
+            return self._own_work(path)
+        except WorktreeError as exc:
+            return f"Git state is unreadable: {str(exc)[:_REASON_CHARS]}"
 
     def _own_work(self, path: Path) -> str | None:
         """Why the worktree holds work of its own (None: it holds none)."""

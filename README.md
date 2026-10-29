@@ -1064,18 +1064,30 @@ idle_worktree_days = 7              # idle Inbox/Triage/Planning worktree remova
 clone_gc_interval_days = 7          # git worktree prune + gc --auto on the clone (0 = never)
 ```
 
-All three are hot-reloadable. The sweep lists the clone's registered worktrees under
-`worktree_root` and takes the issue number from the directory name (`factory-issue-<N>`
-or `factory-issue-<N>-<suffix>`); a worktree without one is logged and kept. One batched
-GitHub read (100 issues per query) gives each issue's state:
+All three are hot-reloadable. The sweep lists the clone's registered worktrees and the
+direct children of `worktree_root`, and takes the issue number from the strict factory
+name (`factory-issue-<N>` or `factory-issue-<N>-<suffix>`). Anything with another name is
+logged and kept. One batched GitHub read (100 issues per query) gives each issue's state:
 
 * **Closed issue:** the Done cleanup above (teardown first; a failed teardown keeps the
   worktree until a later sweep). A dirty worktree is force-removed only when the factory
   recorded the PR as merged; otherwise it is kept and logged.
-* **Open issue, card in Inbox, Triage or Planning:** a worktree nothing has touched for
-  `idle_worktree_days` (newest mtime of the directory and its Git index, HEAD and HEAD
-  reflog) is removed with its branch after the teardown, but only when it is clean and its
-  branch has no commits beyond `origin/main`; otherwise it is kept and logged.
+* **Open issue, card in Inbox, Triage or Planning:** a worktree with no real HEAD activity
+  for `idle_worktree_days` is removed with its branch after the teardown, but only when it
+  is clean and its branch has no commits beyond `origin/main`; otherwise it is kept and
+  logged. Activity comes from timestamps stored in HEAD reflog entries, not filesystem
+  mtimes: fetch/gc may rewrite every reflog file, factory wiring writes ignored files, and
+  `git status` may refresh the index without anyone using that worktree. A real edit is
+  still protected by the clean check and a real commit by the ahead-of-base check.
+
+For either eligible case, the sweep also removes unregistered files or directories left
+directly in `worktree_root` whose names strictly match the same factory pattern (for
+example `factory-issue-737-devenv-start.log`). It logs every removal. A stray Git
+directory must still be readable, belong to the dedicated clone, be clean and have no
+commits beyond `origin/main`; a symlink, special file or unreadable Git directory is kept.
+A configured dev-environment teardown must succeed before a stray directory is removed.
+The last sweep result reports these decisions under `strays`; there is no worktree-sweep
+dry-run command.
 
 An issue with a starting, running or draining stage session, a stage run about to start,
 an effect of unknown outcome, or a Ready card the factory has not yet seen finished is
@@ -1084,8 +1096,10 @@ so a stage run that starts during a teardown keeps its worktree. If the GitHub r
 fails, closed issues wait for the next sweep (idle removal still runs).
 
 Every `clone_gc_interval_days` the daemon runs `git worktree prune` and `git gc --auto` on
-the source clone, holding the same clone lock as worktree creation. The last sweep and
-gc times are stored in the clone (`.git/omnigent-factory-maintenance.json`), so a restart
+the source clone, holding the same clone lock as worktree creation. The factory disables
+the redundant automatic maintenance normally launched by its base fetches, so one
+issue's preparation does not rewrite every linked-worktree reflog. The last sweep and gc
+times are stored in the clone (`.git/omnigent-factory-maintenance.json`), so a restart
 does not re-run them early; a missing file means both run soon after startup. `status`
 shows the worktree count, the settings, the last sweep and its result and the last gc;
 `doctor` shows the count and both times.

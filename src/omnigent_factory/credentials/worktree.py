@@ -333,9 +333,17 @@ class Workspaces:
 
     @_clone_write
     def fetch_base(self, base_branch: str = "main") -> str:
-        """Fetch ``origin/<base>`` explicitly and return its OID (§5.1)."""
+        """Fetch ``origin/<base>`` explicitly and return its OID (§5.1).
+
+        The daemon schedules clone maintenance itself.  Suppress fetch's implicit
+        ``maintenance run --auto``: reflog expiry rewrites every linked worktree's HEAD
+        reflog even when that worktree had no activity.
+        """
         ref = f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}"
-        self._git(["fetch", "--no-tags", "origin", ref], self.source_clone)
+        self._git(
+            ["-c", "maintenance.auto=false", "fetch", "--no-tags", "origin", ref],
+            self.source_clone,
+        )
         return self._git(["rev-parse", f"refs/remotes/origin/{base_branch}"], self.source_clone)
 
     def commits_behind(self, workspace: str | Path, base_branch: str = "main") -> int:
@@ -871,17 +879,32 @@ class Workspaces:
         return int(out or 0)
 
     def last_touched(self, path: Path) -> float:
-        """Newest mtime (epoch seconds) of the worktree directory and its own Git index,
-        HEAD and HEAD reflog: when anything last checked out, committed or staged there.
-        Read before any ``git status`` (which may rewrite the index)."""
+        """Epoch seconds of the worktree's newest real HEAD activity.
+
+        Reflog *file mtimes* are not activity: fetch's automatic maintenance and explicit
+        ``git gc`` may expire/rewrite every linked worktree reflog.  Directory mtimes are
+        likewise changed by factory-owned ignored harness files, and ``git status`` may
+        refresh an index.  Reflog entry timestamps instead record creation, checkout,
+        reset, fast-forward and commit events without being changed by housekeeping.
+
+        Dirty worktrees and commits ahead of the base are independently protected by
+        :meth:`WorkspaceCleaner.remove_idle`; this timestamp only decides whether a clean,
+        no-ahead worktree is old enough to consider.
+        """
         admin = self.admin_dir(path)
-        times = []
-        for item in (path, admin / "index", admin / "HEAD", admin / "logs" / "HEAD"):
-            try:
-                times.append(item.stat().st_mtime)
-            except OSError:
-                continue
-        return max(times, default=0.0)
+        reflog = admin / "logs" / "HEAD"
+        try:
+            lines = reflog.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            raise WorktreeError(f"worktree HEAD reflog is unreadable: {exc}") from exc
+        timestamps: list[int] = []
+        for line in lines:
+            metadata = line.partition("\t")[0].rsplit(" ", 2)
+            if len(metadata) == 3 and metadata[-2].isdigit():
+                timestamps.append(int(metadata[-2]))
+        if not timestamps:
+            raise WorktreeError("worktree HEAD reflog has no activity timestamps")
+        return float(max(timestamps))
 
     @_clone_write
     def maintain_clone(self, *, timeout: float = 1800) -> None:
