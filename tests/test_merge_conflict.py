@@ -125,8 +125,9 @@ def test_push_to_main_rereads_a_ready_or_building_pr():
     assert r.audit.accepted
     # Only GitHub-origin input (the signed webhook, a recovery or a daemon read).
     assert not h.send(P, ev.BasePushed(head_sha=MAIN2), provenance=Provenance.MCP).audit.accepted
-    [fetch] = fetches(r)
+    [fetch, delayed] = fetches(r)
     assert fetch.args["pr_number"] == PR and fetch.args["head_sha"] == HEAD
+    assert delayed.args["not_before_us"] == h.p().base_read_due_us
 
 
 def test_push_is_nothing_for_a_parcel_without_a_build_ready():
@@ -326,8 +327,8 @@ def test_review_before_a_conflict_never_carries_to_the_resolving_merge():
     # She resubmits with a fresh review of the merged head: its reads carry normally.
     submit(h, MERGED)
     r = push(h)
-    [fetch] = fetches(r)
-    assert fetch.args["reviewed_head"] == MERGED and "sync_carry" not in fetch.args
+    for fetch in fetches(r):
+        assert fetch.args["reviewed_head"] == MERGED and "sync_carry" not in fetch.args
 
 
 def test_clean_owner_sync_still_carries_the_review():

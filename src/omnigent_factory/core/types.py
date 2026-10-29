@@ -1038,6 +1038,11 @@ class Parcel:
     #: "<PR head>:<base head>" of the last merge-conflict wake (a wake of the build run or
     #: a conflict rework): at most one per pair, never re-sent after a restart.
     conflict_wake: str = ""
+    #: Latest pushed base tip still awaiting a mergeability answer checked against it.
+    #: Parcel-scoped so a new PR head or build_ready cannot discard the expectation.
+    expected_base_head: str = ""
+    #: Due time of the last delayed base-push read: coalesce bursts into one per minute.
+    base_read_due_us: int = 0
     #: The reviewed head current when a merge conflict with the base was seen: its review
     #: never carries to a later head as a base sync (resolving a conflict is new work
     #: that needs a fresh cross-vendor review).

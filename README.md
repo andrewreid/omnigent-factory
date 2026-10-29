@@ -939,12 +939,19 @@ ends with the [Deferred checkboxes](#follow-ups); an in-place edit keeps your ti
 ### Merge conflicts with main
 
 A push to the default branch (the App's `push` event) re-reads the PR of every Building
-or Ready card that has one; pushes to other branches are ignored. Each PR read (also the
-periodic catch-up reads, the backstop for a lost webhook) asks GitHub whether the PR
-merges into its base. GitHub computes that lazily: a read that gets no answer re-reads it
-a few times over about 7 seconds, and still no answer is unknown, asked again at the next
-catch-up read (never taken as a conflict, nor as clean). A PR that is only behind but
-merges cleanly needs nothing: the factory never updates the branch.
+or Ready card that has one; pushes to other branches are ignored. It also schedules a
+second read about 60 seconds later, coalescing pushes within that minute into one delayed
+read per card. Periodic catch-up reads cover unverified readiness, review/report waits,
+and unknown mergeability; a fully verified Ready card with none of those waits is not
+polled. Each PR read asks GitHub whether the PR merges into its base. GitHub computes
+that lazily: a null answer is re-read a few times over about 7 seconds, then stays unknown.
+After a default-branch push, even a clean answer is unknown until the test merge commit
+has the pushed base tip and current PR head as its parents. The PR response's
+`base.sha` alone is insufficient. The expected tip persists across restarts and is
+carried into subsequent reads; an older read cannot clear a newer push's expectation.
+Unknown mergeability keeps catch-up reads running without changing the card's status or
+note; a conflict answer is acted on immediately. A PR that is only behind but merges
+cleanly needs nothing: the factory never updates the branch.
 
 On a conflict, once per (PR head, main head):
 

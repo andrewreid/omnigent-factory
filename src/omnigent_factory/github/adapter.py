@@ -726,6 +726,7 @@ class GitHubAPIAdapter:
         cross_vendor_review: bool = False,
         reviewed_head: str | None = None,
         sync_carry: bool = True,
+        expected_base_head: str = "",
     ) -> PullRequestEvidence | RetryableReadFailure:
         """Fresh PR facts for readiness (owner direction: the owner's approval is NOT part
         of Ready; the ruleset requires it at merge).
@@ -740,7 +741,8 @@ class GitHubAPIAdapter:
 
         Mergeability is computed lazily by GitHub (``mergeable`` null on a first read): the
         PR is re-read after each of ``mergeable_retry_delays``; still null after that is
-        "unknown", never a conflict and never clean.
+        "unknown", never a conflict and never clean. With an expected base tip, a clean
+        answer also needs test-merge parents proving that tip and the current PR head.
         """
         if ref.repo_id != self.repository_node_id:
             return RetryableReadFailure("pull request repository identity mismatch")
@@ -758,6 +760,15 @@ class GitHubAPIAdapter:
                 raise GitHubAPIError("pull request head was malformed")
             base = pr.get("base")
             base_ref = base.get("ref") if isinstance(base, dict) else None
+            base_head = str(base.get("sha") or "") if isinstance(base, dict) else ""
+            mergeable = _mergeable(pr)
+            if expected_base_head and mergeable not in (MERGE_CONFLICT, MERGE_UNKNOWN):
+                if mergeable == MERGE_CLEAN and await self._merge_covers_base(
+                    pr, expected_base_head, head_sha
+                ):
+                    base_head = expected_base_head
+                else:
+                    mergeable = MERGE_UNKNOWN
             checks = await self._checks_state(
                 head_sha, base_ref if isinstance(base_ref, str) else None
             )
@@ -823,8 +834,8 @@ class GitHubAPIAdapter:
                 findings_earlier_rounds=any(
                     oid != head_sha for oid in self._last_bot_thread_commits
                 ),
-                mergeable=_mergeable(pr),
-                base_head=str(base.get("sha") or "") if isinstance(base, dict) else "",
+                mergeable=mergeable,
+                base_head=base_head,
                 base_ref=base_ref if isinstance(base_ref, str) else "",
                 review_rounds_used=rounds.used if rounds is not None else 0,
                 review_rounds_budget=rounds.budget if rounds is not None else 0,
@@ -838,6 +849,34 @@ class GitHubAPIAdapter:
             return RetryableReadFailure(str(exc), exc.retry_after_us)
         except GitHubAPIError as exc:
             return RetryableReadFailure(str(exc))
+
+    async def _merge_covers_base(
+        self, pr: Mapping[str, Any], expected_base: str, head: str
+    ) -> bool:
+        """GitHub documents merge_commit_sha as the test merge when mergeable is true.
+
+        Its immutable parents tie that answer to both tips; base.sha alone does not
+        establish which base GitHub used for its cached mergeability calculation.
+        https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+        """
+        sha = pr.get("merge_commit_sha")
+        if pr.get("state") != "open" or pr.get("merged") or not isinstance(sha, str) or not sha:
+            return False
+        try:
+            commit = await self.client.get_json(f"/repos/{self.repository}/git/commits/{sha}")
+        except RateLimited:
+            raise
+        except GitHubAPIError:
+            return False  # unavailable test merge is unknown, retried by catch-up
+        if not isinstance(commit, dict) or commit.get("sha") != sha:
+            return False
+        parents = commit.get("parents")
+        return (
+            isinstance(parents, list)
+            and len(parents) == 2
+            and all(isinstance(p, dict) for p in parents)
+            and [p.get("sha") for p in parents] == [expected_base, head]
+        )
 
     async def _review_rounds(
         self, ref: IssueRef, pr_number: int, head_sha: str, base_sync: bool
@@ -1523,6 +1562,7 @@ class GitHubAPIAdapter:
                     cross_vendor_review=review,
                     reviewed_head=reviewed if isinstance(reviewed, str) else None,
                     sync_carry=effect.args.get("sync_carry") is not False,
+                    expected_base_head=str(effect.args.get("expected_base_head") or ""),
                 )
                 if isinstance(evidence, RetryableReadFailure):
                     return evidence

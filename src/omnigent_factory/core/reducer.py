@@ -3725,6 +3725,8 @@ def _fetch_evidence(ctx: _Ctx, r: Readiness, *, not_before_us: int = 0) -> None:
         "session_id": r.session_id,
         "issue_number": ctx.p.issue_number,
     }
+    if ctx.p.expected_base_head:
+        args["expected_base_head"] = ctx.p.expected_base_head
     if reviewed == ctx.p.conflict_reviewed_head:
         args["sync_carry"] = False
     if not_before_us > ctx.now:
@@ -3821,6 +3823,16 @@ def _h_readiness(ctx: _Ctx, body: ev.ReadinessEvidence) -> None:
     )
     if body.remediation_exhausted:
         ctx.hold(Hold.REMEDIATION_EXHAUSTED)
+    if ctx.p.expected_base_head:
+        if body.expected_base_head == ctx.p.expected_base_head and body.mergeable in (
+            ev.MERGE_CLEAN,
+            ev.MERGE_CONFLICT,
+        ):
+            ctx.update(expected_base_head="")
+        elif body.mergeable != ev.MERGE_CONFLICT:
+            # A read queued before the push (or for an earlier push) cannot discharge
+            # its freshness requirement, even if GitHub called the old base clean.
+            body = replace(body, mergeable=ev.MERGE_UNKNOWN)
     if r.merge_unknown != (body.mergeable == ev.MERGE_UNKNOWN):
         r = replace(r, merge_unknown=body.mergeable == ev.MERGE_UNKNOWN)
         ctx.update(readiness=r)
@@ -4567,7 +4579,6 @@ def _h_base_pushed(ctx: _Ctx, body: ev.BasePushed) -> None:
     """The default branch moved: re-read the parcel's open PR, whose mergeability GitHub
     recomputes against the new base. Only a Building or Ready card with a recorded PR
     and build_ready; a build that has not submitted yet is read when it does."""
-    _ = body
     r = ctx.p.readiness
     if (
         r is None
@@ -4576,7 +4587,14 @@ def _h_base_pushed(ctx: _Ctx, body: ev.BasePushed) -> None:
         or Hold.PR_CLOSED in ctx.p.holds
     ):
         return
+    if body.head_sha:
+        r = replace(r, merge_unknown=True)
+        ctx.update(expected_base_head=body.head_sha, readiness=r)
     _fetch_evidence(ctx, r)
+    if ctx.p.base_read_due_us <= ctx.now:
+        due = ctx.now + MICROS_PER_MINUTE
+        ctx.update(base_read_due_us=due)
+        _fetch_evidence(ctx, r, not_before_us=due)
 
 
 def _conflict_note(base: str) -> str:
@@ -5461,6 +5479,11 @@ def _h_result(ctx: _Ctx, body: ev.ResultCandidate) -> None:
                 "head_sha": body.head_sha,
                 "session_id": s.session_id,
                 "issue_number": ctx.p.issue_number,
+                **(
+                    {"expected_base_head": ctx.p.expected_base_head}
+                    if ctx.p.expected_base_head
+                    else {}
+                ),
             },
         )
         if s.root_id is not None:
@@ -5971,6 +5994,7 @@ def awaiting_evidence(p: Parcel, now_us: int) -> bool:
             or (not r.ready and _in_review_grace(r))
             or _report_line_pending_at(p, r, now_us)
             or r.merge_unknown  # GitHub had not computed mergeability: ask again
+            or bool(p.expected_base_head)  # no answer demonstrably covers the last push
         )
         and Hold.COMPLETED not in p.holds
         and Hold.PR_CLOSED not in p.holds

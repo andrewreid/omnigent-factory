@@ -643,9 +643,12 @@ class ReadinessEvidence(_Body):
     #: Whether the PR merges into its base: "clean", "conflict" or "unknown" (GitHub was
     #: still computing it after the read's bounded re-reads); "" = not told (older reads).
     mergeable: str = ""
-    #: The base branch head GitHub's mergeability was computed against, and its name.
+    #: Reported PR base head (or the proven test-merge base for a constrained clean
+    #: answer), and its name.
     base_head: str = ""
     base_ref: str = ""
+    #: Base tip the read was required to verify ("" for older/unconstrained reads).
+    expected_base_head: str = ""
     #: Review-bot rounds of the issue so far and its budget (0 = not counted: older
     #: reads, no bot configured); at or past the budget no further review is awaited.
     review_rounds_used: int = 0
