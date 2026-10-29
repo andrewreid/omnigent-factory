@@ -8,7 +8,8 @@ source-shaped fake Omnigent server and a small GitHub fake, both behind
 :class:`CrashAfterCommit`, which counts *every* external write and kills the process right
 after the targeted write commits. A second service is then built on the same state
 directory and database file; each case asserts exactly one external write and the
-recovered outcome the design requires (adoption, or an explicit unknown/held state).
+recovered outcome the design requires (adoption, safe reapplication, or an explicit
+unknown/held state).
 """
 
 from __future__ import annotations
@@ -28,13 +29,14 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.effects import CredentialProfile, EffectIntent, EffectKind
-from omnigent_factory.core.types import DecisionImpact, Lifecycle, Parcel, Size, Via
+from omnigent_factory.core.types import DecisionImpact, Lifecycle, Parcel, SessionKind, Size, Via
 from omnigent_factory.credentials.broker import LocalCredentialBroker
 from omnigent_factory.credentials.capabilities import CapabilityRegistry, read_capability_file
 from omnigent_factory.credentials.server import BrokerServer, StageProvisioner
 from omnigent_factory.github.adapter import BoardSchema, GitHubAPIAdapter, ParcelBinding
 from omnigent_factory.github.auth import AppAuthenticator, InstallationTokenService
 from omnigent_factory.github.client import GitHubClient
+from omnigent_factory.omnigent import policies as pol
 from omnigent_factory.omnigent.adapter import OmnigentConfig, OmnigentExecutionAdapter
 from omnigent_factory.omnigent.rest import OmnigentRest
 from omnigent_factory.ports.credentials import TokenGrant, TokenRefusal
@@ -142,6 +144,28 @@ def _root(server: FakeOmnigentServer, **fields: Any) -> FakeSession:
             **fields,
         )
     )
+
+
+def _install_policy(server: FakeOmnigentServer, spec: pol.PolicySpec) -> None:
+    response = server.handle(
+        httpx.Request(
+            "POST",
+            f"http://omnigent.test/v1/sessions/{ROOT}/policies",
+            json=spec.body(),
+        )
+    )
+    assert response.status_code == 200
+
+
+def _prepared_triage_policies(rig: CrashRig, generation: int) -> None:
+    """Mirror the remote policies that StoreDriver's acknowledged PREPARE represents."""
+    for spec in (
+        pol.github_policy(SessionKind.TRIAGE, REPO, BRANCH),
+        pol.factory_cel_policy(rig.config.default_branch, read_only=True),
+        pol.caller_policy(ROOT),
+        pol.cost_policy(generation, 140.0),
+    ):
+        _install_policy(rig.omnigent, spec)
 
 
 # ------------------------------------------------------------------ rig
@@ -559,10 +583,14 @@ async def test_elicitation_resolve_crash_stays_unknown_and_is_never_resent(
 
 
 @pytest.mark.asyncio
-async def test_policy_write_crash_is_held_unknown_and_never_rewritten(rig: CrashRig) -> None:
+async def test_policy_write_crash_recovers_current_generation_without_duplicate(
+    rig: CrashRig,
+) -> None:
     _root(rig.omnigent)
     policy_post = _path("POST", f"/v1/sessions/{ROOT}/policies")
     effect = rig.seed(Boundary(_continued_after_checkpoint, EffectKind.REPLACE_COST_POLICY))
+    generation = int(effect.args["generation"])
+    _prepared_triage_policies(rig, generation - 1)
     rig.omnigent_wire.arm(policy_post)
     first, _ = rig.build()
     await rig.crash(first)
@@ -571,26 +599,43 @@ async def test_policy_write_crash_is_held_unknown_and_never_rewritten(rig: Crash
     await second.start()
     try:
 
-        async def recorded_unknown() -> bool:
+        async def recovered() -> bool:
             current = await parcel(second)
-            return current.unknown_effect(effect.effect_id) is not None
+            session = current.current_session
+            return (
+                await effect_state(second, effect.effect_id) == "done"
+                and session is not None
+                and session.grant.ready
+            )
 
-        await until(recorded_unknown)
-        await asyncio.sleep(0.2)
+        await until(recovered)
         current = await parcel(second)
         assert current.current_session is not None
-        assert not current.current_session.grant.ready  # no PolicyReady without proof
-        assert await effect_state(second, effect.effect_id) == "unknown"
+        # The retry is still the persisted current grant/generation. It adopts the policy
+        # created before the crash, deletes the older generation, and never creates a
+        # duplicate policy.
+        assert effect.args["grant_id"] == current.current_session.grant.grant_id
+        assert effect.args["generation"] == current.current_session.grant.policy_generation
         assert rig.omnigent_wire.count(policy_post) == 1
-        assert await bodies(second, ev.PolicyReady) == []
-        assert len(await bodies(second, ev.EffectUnknown)) == 1
+        costs = [
+            row["name"]
+            for row in rig.omnigent.policies[ROOT]
+            if pol.family_of(row.get("name")) == pol.COST_PREFIX
+        ]
+        assert costs == [pol.cost_policy_name(generation)]
+        [ready] = await bodies(second, ev.PolicyReady)
+        assert (ready.session_id, ready.grant_id) == (
+            current.current_session.session_id,
+            current.current_session.grant.grant_id,
+        )
+        assert await bodies(second, ev.EffectUnknown) == []
     finally:
         await second.stop()
         await rig.close()
 
 
 @pytest.mark.asyncio
-async def test_comment_post_crash_is_held_unknown_and_never_reposted(rig: CrashRig) -> None:
+async def test_comment_post_crash_is_adopted_by_marker_without_reposting(rig: CrashRig) -> None:
     comment = _path("POST", "/issues/1/comments")
     effect = rig.seed(Boundary(_plan_published, EffectKind.PUBLISH_CONTRACT))
     rig.github_wire.arm(comment)
@@ -603,24 +648,33 @@ async def test_comment_post_crash_is_held_unknown_and_never_reposted(rig: CrashR
     await second.start()
     try:
 
-        async def recorded_unknown() -> bool:
-            return (await parcel(second)).unknown_effect(effect.effect_id) is not None
+        async def adopted() -> bool:
+            current = await parcel(second)
+            return (
+                await effect_state(second, effect.effect_id) == "done"
+                and bool(current.contracts)
+                and current.contracts[0].comment_id == str(posted["id"])
+            )
 
-        await until(recorded_unknown)
-        await asyncio.sleep(0.2)
+        await until(adopted)
         current = await parcel(second)
         [contract] = current.contracts
-        assert contract.comment_id is None  # publication unverified: approval stays closed
-        assert await effect_state(second, effect.effect_id) == "unknown"
+        assert contract.comment_id == str(posted["id"]) and contract.published
         assert rig.github_wire.count(comment) == 1
-        assert await bodies(second, ev.ContractPublished) == []
+        [published] = await bodies(second, ev.ContractPublished)
+        assert (published.contract_id, published.comment_id, published.verified) == (
+            contract.contract_id,
+            str(posted["id"]),
+            True,
+        )
+        assert await bodies(second, ev.EffectUnknown) == []
     finally:
         await second.stop()
         await rig.close()
 
 
 @pytest.mark.asyncio
-async def test_board_write_crash_keeps_the_move_pending_and_never_rewrites(
+async def test_board_write_crash_is_read_back_and_adopted_without_rewriting(
     rig: CrashRig,
 ) -> None:
     effect = rig.seed(Boundary(_triage_commanded, EffectKind.MOVE_CARD))
@@ -635,18 +689,20 @@ async def test_board_write_crash_keeps_the_move_pending_and_never_rewrites(
     await second.start()
     try:
 
-        async def recorded_unknown() -> bool:
-            return (await parcel(second)).unknown_effect(effect.effect_id) is not None
+        async def adopted() -> bool:
+            current = await parcel(second)
+            state = await effect_state(second, effect.effect_id)
+            return state == "done" and not current.pending_moves
 
-        await until(recorded_unknown)
-        await asyncio.sleep(0.2)
+        await until(adopted)
         current = await parcel(second)
-        assert [move.effect_id for move in current.pending_moves] == [effect.effect_id]
-        # No session is created while the move is unproven.
-        assert rig.omnigent_wire.count(_path("POST", "/v1/sessions")) == 0
-        assert await effect_state(second, effect.effect_id) == "unknown"
+        assert current.unknown_effect(effect.effect_id) is None
+        # Read-back sees the first mutation's target and adopts it, so no duplicate
+        # Project mutation occurs and normal triage startup may continue.
         assert rig.github_wire.count(_status_write) == 1
-        assert await bodies(second, ev.ColumnObserved) == []
+        [observed] = await bodies(second, ev.ColumnObserved)
+        assert (observed.daemon_effect_id, observed.stage) == (effect.effect_id, current.stage)
+        assert await bodies(second, ev.EffectUnknown) == []
     finally:
         await second.stop()
         await rig.close()

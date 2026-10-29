@@ -15,7 +15,15 @@ from omnigent_factory.core.predicates import (
     message_uncertain,
     work_allowed,
 )
-from omnigent_factory.core.types import Hold, Lifecycle, Parcel, SessionKind, Stage
+from omnigent_factory.core.types import (
+    SETTLED_LIFECYCLES,
+    Hold,
+    Lifecycle,
+    Parcel,
+    SessionKind,
+    Stage,
+    issue_session_title,
+)
 
 #: Comments that would regress a merged/closed parcel if posted after the fact.
 _REGRESSION_COMMENTS = frozenset({"ready-blocked"})
@@ -33,6 +41,12 @@ def effect_still_valid(parcel: Parcel | None, effect: EffectIntent) -> str | Non
         if s is None or s.lifecycle != Lifecycle.PREPARING or s.fences:
             return "session-not-preparing"
         return None
+    if (
+        effect.kind == EffectKind.SET_BOT
+        and parcel is not None
+        and effect.args.get("bot") != parcel.bot.value
+    ):
+        return "bot-superseded"  # a newer derived Bot value is queued; latest wins
     if (
         effect.kind == EffectKind.SET_NOTE
         and parcel is not None
@@ -55,6 +69,35 @@ def effect_still_valid(parcel: Parcel | None, effect: EffectIntent) -> str | Non
         completed = _completed_invalid(effect)
         if completed is not None:
             return completed
+    if (
+        effect.kind == EffectKind.MOVE_CARD
+        and parcel is not None
+        and effect.args.get("to") != (parcel.stage.value if parcel.stage is not None else None)
+    ):
+        return "move-superseded"  # a newer owner/factory target is the desired column
+    if effect.kind == EffectKind.REACT_COMMENT and parcel is not None:
+        comment_id = effect.args.get("comment_id")
+        if (
+            effect.args.get("content") == "eyes"
+            and f"github:comment:{comment_id}:created" not in parcel.unread_feedback
+        ):
+            return "reaction-superseded"  # the later thumbs-up removed these eyes
+    if effect.kind == EffectKind.INTERRUPT_TREE:
+        superseded = _interrupt_superseded(parcel, effect)
+        if superseded:
+            return superseded
+    if effect.kind == EffectKind.REPLACE_COST_POLICY:
+        superseded = _cost_policy_superseded(parcel, effect)
+        if superseded:
+            return superseded
+    if effect.kind == EffectKind.RENAME_SESSION:
+        superseded = _rename_superseded(parcel, effect)
+        if superseded:
+            return superseded
+    if effect.kind == EffectKind.VERIFY_POLICIES:
+        superseded = _policy_verification_superseded(parcel, effect)
+        if superseded:
+            return superseded
     if not effect.work_bearing:
         return None
     if parcel is None:
@@ -85,6 +128,73 @@ def effect_still_valid(parcel: Parcel | None, effect: EffectIntent) -> str | Non
         return "not-dispatchable"
     if not work_allowed(parcel, s):
         return "execution-gate-closed"
+    return None
+
+
+def _interrupt_superseded(parcel: Parcel | None, effect: EffectIntent) -> str | None:
+    """Do not let an old stage's root-wide stop interrupt a newer run on that root."""
+    if parcel is None:
+        return "interrupt-superseded"
+    session = parcel.session(effect.preconditions.session_id)
+    root_id = effect.args.get("root_id")
+    if session is None or not root_id or session.root_id != root_id:
+        return "interrupt-superseded"
+    current = parcel.current_session
+    if (
+        current is not None
+        and current.session_id != session.session_id
+        and current.root_id == root_id
+        and current.lifecycle not in SETTLED_LIFECYCLES
+    ):
+        return "interrupt-superseded"
+    return None
+
+
+def _cost_policy_superseded(parcel: Parcel | None, effect: EffectIntent) -> str | None:
+    """A shared root's cost policy belongs to the current run's current grant."""
+    if parcel is None:
+        return "cost-policy-superseded"
+    session = parcel.session(effect.preconditions.session_id)
+    if (
+        session is None
+        or session.session_id != parcel.current_session_id
+        or effect.preconditions.grant_id != session.grant.grant_id
+        or effect.args.get("grant_id") != session.grant.grant_id
+        or effect.args.get("generation") != session.grant.policy_generation
+    ):
+        return "cost-policy-superseded"
+    return None
+
+
+def _rename_superseded(parcel: Parcel | None, effect: EffectIntent) -> str | None:
+    """Only the current issue title may rename the current reusable conversation."""
+    if parcel is None or parcel.issue_session is None:
+        return "rename-superseded"
+    issue = parcel.issue_session
+    expected = issue_session_title(parcel.issue_number, parcel.issue_title)
+    if (
+        not issue.reusable
+        or effect.args.get("root_id") != issue.root_id
+        or effect.args.get("title") != expected
+    ):
+        return "rename-superseded"
+    return None
+
+
+def _policy_verification_superseded(parcel: Parcel | None, effect: EffectIntent) -> str | None:
+    """Verification/reconciliation is meaningful only for the latest run and grant."""
+    if parcel is None:
+        return "policy-verification-superseded"
+    session = parcel.session(effect.preconditions.session_id)
+    if (
+        session is None
+        or session.session_id != parcel.current_session_id
+        or session.root_id != effect.args.get("root_id")
+        or effect.preconditions.grant_id != session.grant.grant_id
+        or session.policy_ready
+        or session.execution_closed
+    ):
+        return "policy-verification-superseded"
     return None
 
 

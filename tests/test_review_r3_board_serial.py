@@ -11,6 +11,7 @@ import pytest
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.effects import EffectKind
 from omnigent_factory.core.events import Provenance
+from omnigent_factory.core.preconditions import effect_still_valid
 from omnigent_factory.core.types import FenceKind, SessionKind, Stage, Via
 from omnigent_factory.testing.builders import snapshot
 from omnigent_factory.testing.harness import HEAD, Harness
@@ -104,10 +105,20 @@ def test_owner_drag_during_inflight_write_is_queued_not_lost():
     h.send(P, ev.RequestPlan(via=Via.DRAG))  # owner drags to Scoped meanwhile
     p = h.p()
     assert p.stage == Stage.SCOPED and p.queued_move == Stage.SCOPED
+    old_effect = next(move for move in issued_moves(h) if move.effect_id == inflight.effect_id)
+    assert effect_still_valid(p, old_effect) == "move-superseded"
     r = h.send(P, ev.ColumnObserved(stage=Stage.TRIAGED, daemon_effect_id=inflight.effect_id))
     [reissue] = [e for e in r.effects if e.kind == EffectKind.MOVE_CARD]
     assert reissue.args == {"to": "Scoped", "expected_from": "Triaged"}
     assert h.p().stage == Stage.SCOPED and h.p().queued_move is None
+
+
+def test_current_inflight_move_remains_valid_for_retry():
+    h = Harness(auto_ack_moves=False)
+    h.eligible()
+    result = h.send(P, ev.RequestTriage(via=Via.COMMAND))
+    [move] = Harness.of(result, EffectKind.MOVE_CARD)
+    assert effect_still_valid(h.p(), move) is None
 
 
 def test_rightward_observation_during_pending_write_keeps_single_desired_target():

@@ -16,8 +16,8 @@ while any is pending. Only the executor (``Provenance.ADAPTER``) resolves it:
 * after a successful write, read back and emit
   ``ColumnObserved(stage=<exact target>, daemon_effect_id=<effect_id>)``;
 * on a definitive failure/cancellation emit ``EffectCancelled`` for it; on an ambiguous
-  write emit ``EffectUnknown`` and later ``EffectReconciled`` (``delivered`` with the
-  project item ID, or proven absent).
+  write, re-read/re-apply it with bounded backoff. Only an exhausted recovery budget emits
+  ``EffectUnknown``.
 
 Absence reconciles the source column as a fresh observation (leftward => safety). A
 webhook echo naming the effect is never an acknowledgement (``core.admission``).

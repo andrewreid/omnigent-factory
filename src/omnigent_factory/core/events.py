@@ -97,6 +97,7 @@ class EventKind(enum.StrEnum):
     CREATE_REJECTED = "CreateRejected"
     ADOPTION_RESULT = "AdoptionResult"
     EFFECT_UNKNOWN = "EffectUnknown"
+    EFFECT_RECOVERY_STARTED = "EffectRecoveryStarted"
     EFFECT_CANCELLED = "EffectCancelled"
     PREPARED = "Prepared"
     MESSAGE_ACK = "MessageAck"
@@ -756,6 +757,17 @@ class EffectUnknown(_Body):
     effect_id: str = ""
     effect_kind: str = ""
     session_id: str | None = None
+    attempts: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class EffectRecoveryStarted(_Body):
+    """A legacy/manual unknown safe write is returning to bounded automatic recovery."""
+
+    KIND: ClassVar[EventKind] = EventKind.EFFECT_RECOVERY_STARTED
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    effect_id: str = ""
+    effect_kind: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -769,6 +781,9 @@ class EffectCancelled(_Body):
     effect_kind: str = ""
     session_id: str | None = None
     failed: bool = False
+    #: A newer persisted intent replaced this retry; the original remote outcome may
+    #: still be ambiguous, so consumers must not treat it as proven absent.
+    superseded: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1256,6 +1271,7 @@ EventBody = (
     | CreateRejected
     | AdoptionResult
     | EffectUnknown
+    | EffectRecoveryStarted
     | EffectCancelled
     | Prepared
     | MessageAck
@@ -1344,6 +1360,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         CreateRejected,
         AdoptionResult,
         EffectUnknown,
+        EffectRecoveryStarted,
         EffectCancelled,
         Prepared,
         MessageAck,
@@ -1466,6 +1483,7 @@ __all__ = [
     "Deleted",
     "EffectCancelled",
     "EffectReconciled",
+    "EffectRecoveryStarted",
     "EffectUnknown",
     "ElicitationGone",
     "ElicitationOpened",

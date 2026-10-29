@@ -38,7 +38,12 @@ from pathlib import Path
 from typing import Any
 
 from omnigent_factory.core import codec
-from omnigent_factory.core.effects import READ_ONLY_KINDS, EffectIntent, EffectKind
+from omnigent_factory.core.effects import (
+    AUTOMATIC_RECOVERY_KINDS,
+    READ_ONLY_KINDS,
+    EffectIntent,
+    EffectKind,
+)
 from omnigent_factory.core.events import (
     AdoptionResult,
     CreateRejected,
@@ -170,6 +175,7 @@ _BODY_UNREAD_KINDS_JSON = json.dumps(
 #: stored: the IDs never recur, so no duplicate check depends on them.
 UNSTORED_SNAPSHOT_PREFIXES = ("effect:", "startup-github:")
 _SETTLED_EFFECT_STATES = frozenset({"done", "cancelled", "failed"})
+_AUTOMATIC_RECOVERY_KIND_VALUES = frozenset(kind.value for kind in AUTOMATIC_RECOVERY_KINDS)
 #: Effects pruned with their observation event: reads and board drift corrections, which
 #: nothing (operator retry/re-render, recovery) looks up once settled.
 _PRUNABLE_EFFECT_KINDS = frozenset(
@@ -2220,7 +2226,7 @@ class SqliteStore:
         return False
 
     def mark_effect_unknown(self, effect_id: str, reason: str) -> bool:
-        """Ambiguous write: never returns to ``pending`` automatically."""
+        """Persist an exhausted or non-idempotent ambiguous write as ``unknown``."""
         return self._finish_effect(
             effect_id, "unknown", from_states=("claimed",), remote_id=None, reason=reason
         )
@@ -2266,17 +2272,58 @@ class SqliteStore:
             )
             return cur.rowcount == 1
 
-    def recover_claimed(self) -> list[StoredEffect]:
-        """On startup: claimed-but-unfinished effects become ``unknown`` (never re-sent).
+    def recover_unknown_effect(
+        self,
+        effect_id: str,
+        event: Event,
+        config: TrustedConfig,
+        kinds: frozenset[str],
+        *,
+        reset_attempts: bool = False,
+    ) -> bool:
+        """Atomically clear a safe ambiguity fence and return its row to ``pending``.
 
-        Retry-safe classes (reads, local idempotent operations) return to ``pending``.
+        The reducer event restores the normal Bot/note projection; coupling it to the
+        outbox update prevents a crash from leaving either half of recovery stranded.
+        """
+        if not kinds:
+            return False
+        placeholders = ",".join("?" for _ in kinds)
+        with self._txn() as conn:
+            row = conn.execute(
+                f"SELECT state, kind FROM effects WHERE effect_id = ? "
+                f"AND state = 'unknown' AND kind IN ({placeholders})",
+                (effect_id, *sorted(kinds)),
+            ).fetchone()
+            if row is None:
+                return False
+            applied = self._apply_in_txn(conn, event, config, transition, None)
+            if not applied.accepted or applied.duplicate:
+                return False
+            attempts_sql = "attempts = 0, " if reset_attempts else ""
+            cur = conn.execute(
+                f"UPDATE effects SET state = 'pending', {attempts_sql}next_at_us = NULL, "
+                "outcome_reason = 'automatic-recovery', updated_at_us = ? "
+                "WHERE effect_id = ? AND state = 'unknown'",
+                (self._clock.now_utc_us(), effect_id),
+            )
+            return cur.rowcount == 1
+
+    def recover_claimed(self) -> list[StoredEffect]:
+        """On startup, classify claimed-but-unfinished effects by replay safety.
+
+        Reads, local idempotent operations and automatic-recovery writes return to
+        ``pending``. Genuinely non-idempotent writes become ``unknown`` and are fenced.
         """
         out: list[StoredEffect] = []
         with self._txn() as conn:
             rows = conn.execute("SELECT * FROM effects WHERE state = 'claimed'").fetchall()
             now = self._clock.now_utc_us()
             for r in rows:
-                safe = r["retry_class"] in ("read", "local_idempotent")
+                safe = (
+                    r["retry_class"] in ("read", "local_idempotent")
+                    or r["kind"] in _AUTOMATIC_RECOVERY_KIND_VALUES
+                )
                 new_state = "pending" if safe else "unknown"
                 conn.execute(
                     "UPDATE effects SET state = ?, outcome_reason = 'process-restart', "

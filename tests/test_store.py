@@ -360,8 +360,10 @@ def test_restart_recovery_never_resends_non_idempotent_writes(db):
         "JOIN effects e ON e.effect_id = d.effect_id"
     )
     assert [tuple(r) for r in rows] == [("unknown", "unknown")]
-    assert all(state == "unknown" for state in recovered.values())  # no blind resend
-    assert recovered.get(EffectKind.SET_BOT, "unknown") == "unknown"
+    assert recovered[EffectKind.SET_BOT] == "pending"  # safe field value is re-applied
+    assert all(
+        state == "unknown" for kind, state in recovered.items() if kind == EffectKind.CREATE_SESSION
+    )  # non-idempotent create remains fenced
     store.close()
 
 

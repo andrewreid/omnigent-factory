@@ -620,7 +620,7 @@ waits up to 90 s for it instead of failing.
 | `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. It also reads the configured agent's bundle (through its newest session, or the `--live` probe) and fails naming any factory MCP tool the agent's `tools:` allowlist for the factory server leaves out (a warning when the bundle cannot be read). It warns when the App installation is not subscribed to `push` (tick Push in the App settings) or to `sub_issues`/`issue_dependencies` (Sub issues, Issue dependencies), when the subscribed events can be read, and when the repository has no `Epic` issue type (epics are then not typed). It fails when Omnigent's own `/health` is not ok and warns when the configured host is offline. It shows the worktree count under `worktree_root` and the last worktree sweep and clone gc times, and whether status comments are pinned (a warning, with GitHub's message, once pinning was refused), and whether bundling is on with its proposals pending, active bundles and members held. |
 | `explain <parcel>` | The parcel's persisted state: stage, bot, sessions, holds, effects, the current run's stall episode (`stall`) and what the last health sweep made of it. |
 | `recovery` | Failed/unknown effects and parked webhook deliveries. |
-| `retry-effect <effect_id>` | Requeue a failed/unknown `publish_triage`/`publish_report`/`post_comment`; it adopts an existing comment by its marker, so it never duplicates. |
+| `retry-effect <effect_id>` | Requeue any failed/unknown verifiable write (for example `set_bot`) or marker-adoptable comment create. Non-idempotent Omnigent sends remain fenced. |
 | `rerender-comment <effect_id>` | Re-render a published comment in place (found by its marker). |
 | `resume <parcel> --message-file note.md` | Re-open the parcel's existing stage session after a stale block and relay one operator note. No authority, approval or time is added. |
 | `cleanup <parcel> [--merged]` | Tear down the dev environment (`devenv_teardown`) and remove the factory worktree(s) (its own and its `factory-issue-<N>-*` extras) and local branches of a finished parcel (PR merged, issue closed or Done; refused for a Ready card) from the factory clone. |
@@ -704,8 +704,28 @@ Create the `Autopilot` (SINGLE_SELECT: `Full`, `Delayed`, `Plan only`) and `Para
 While `epic_autopilot` is on or either field is configured, `doctor` fails when the
 Autopilot field is missing or its IDs differ (naming the board's IDs when it has one).
 
-A triage/report/status publication that failed definitively leaves the card at
-`Bot: Blocked`. Fix the cause, then run `recovery` and `retry-effect <effect_id>`.
+An ambiguous safe write recovers automatically. The default is five total attempts with
+exponential delays of 2, 4, 8 and 16 minutes (rate-limit `Retry-After` wins), configured by
+`effect_recovery_max_attempts`, `effect_recovery_backoff_seconds` and
+`effect_recovery_max_backoff_seconds`. During those attempts the card keeps its normal Bot
+and note; a transient display-write timeout is not owner work. A retry reads the requested
+field value or marker before writing, and a newer desired value supersedes the older effect.
+Only exhaustion changes the card to Blocked with the exact update and effect ID. Existing
+safe `unknown` rows enter this path on startup, so upgrades self-heal without a database edit.
+
+Effect ambiguity is classified as follows:
+
+| Class | Effect kinds | Unknown-outcome handling |
+|---|---|---|
+| Verifiable/idempotent remote write | `move_card`, `set_bot`, `set_note`, `set_auto_build`, `set_autopilot`, `react_comment`, `edit_report`, `ensure_project_item`, `interrupt_tree`, `replace_cost_policy`, `close_session`, `rename_session`, `verify_policies` | Bounded automatic read/re-apply; done when observed or superseded; `retry-effect` remains available after exhaustion. |
+| Marker-adoptable create | `post_comment`, `publish_contract`, `publish_triage`, `publish_report` | Bounded marker lookup and adoption before any create; `retry-effect` is safe. |
+| Read | `fetch_pr_evidence`, `reconcile_parcel`, `scan_tree`, `reconcile_session` | Retried because no write can have occurred. |
+| Local idempotent | `prepare_session`, `disable_issuance`, `enable_issuance`, `cleanup_workspace`, `arm_timer`, `wake_scheduler` | Re-applied after transient failure or restart. |
+| Genuinely ambiguous | `create_session`, `send_message`, `resolve_elicitation` | Never blindly retried. Session creation reconciles its nonce; messages/answers reconcile their exact item and remain fenced if delivery cannot be proved. |
+
+A definitive publication failure, or a safe write whose recovery budget is exhausted,
+leaves the card at `Bot: Blocked`. Fix the cause, then run `recovery` and
+`retry-effect <effect_id>` for the listed recoverable effect.
 
 ### Card status vs. comments
 

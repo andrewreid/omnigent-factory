@@ -9,6 +9,7 @@ a replan) moves it to Building first (``ready_bot_ok``).
 
 from __future__ import annotations
 
+from omnigent_factory.core.effects import EffectKind
 from omnigent_factory.core.types import (
     BLOCKING_HOLDS,
     NEEDS_YOU_HOLDS,
@@ -247,7 +248,7 @@ def project_note(p: Parcel, bot: BotState) -> str:
     if bot == BotState.BLOCKED:
         why = [_HOLD_TEXT[h] for h in sorted(p.holds & BLOCKING_HOLDS) if h in _HOLD_TEXT]
         if p.unknown_effects:
-            why.append("unconfirmed write")
+            return _unknown_effect_note(p.unknown_effects[0])[:NOTE_MAX]
         if not why and sync_red(p):
             assert p.readiness is not None  # noqa: S101 - sync_red checks it
             return sync_red_note(p.readiness.red_checks)
@@ -281,6 +282,42 @@ def project_note(p: Parcel, bot: BotState) -> str:
         # above outranks it.
         text = p.epic_note or related_note(p)
     return text[:NOTE_MAX]
+
+
+_UNKNOWN_GITHUB_TARGETS = {
+    EffectKind.MOVE_CARD.value: "Status field",
+    EffectKind.SET_BOT.value: "Bot field",
+    EffectKind.SET_NOTE.value: "Factory note",
+    EffectKind.SET_AUTO_BUILD.value: "Auto-build field",
+    EffectKind.SET_AUTOPILOT.value: "Autopilot field",
+    EffectKind.REACT_COMMENT.value: "reaction",
+    EffectKind.POST_COMMENT.value: "comment",
+    EffectKind.PUBLISH_CONTRACT.value: "contract comment",
+    EffectKind.PUBLISH_TRIAGE.value: "triage comment",
+    EffectKind.PUBLISH_REPORT.value: "report comment",
+    EffectKind.EDIT_REPORT.value: "report edit",
+    EffectKind.ENSURE_PROJECT_ITEM.value: "project item",
+}
+
+
+def _unknown_effect_note(unknown: object) -> str:
+    """Specific bounded owner text for an ambiguity which exhausted safe recovery."""
+    kind = str(getattr(unknown, "kind", ""))
+    effect_id = str(getattr(unknown, "effect_id", ""))
+    attempts = int(getattr(unknown, "attempts", 0))
+    target = _UNKNOWN_GITHUB_TARGETS.get(kind)
+    if target is not None:
+        tried = f" after {attempts} tries" if attempts else ""
+        return f"Blocked: GitHub {target} update unconfirmed{tried}. Run retry-effect {effect_id}."
+    if kind == EffectKind.SEND_MESSAGE.value:
+        return (
+            "Blocked: Omnigent message delivery unconfirmed; inspect the session, then run recovery"
+        )
+    if kind == EffectKind.RESOLVE_ELICITATION.value:
+        return (
+            "Blocked: Omnigent answer delivery unconfirmed; inspect the session, then run recovery"
+        )
+    return f"Blocked: {kind or 'external'} update unconfirmed; inspect it, then run recovery"
 
 
 def waiting_on_note(p: Parcel) -> str:

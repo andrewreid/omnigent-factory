@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterable
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.codec import issue_links_from_data
 from omnigent_factory.core.effects import (
+    AUTOMATIC_RECOVERY_KINDS,
     READ_ONLY_KINDS,
     Ack,
     AdapterOutcome,
@@ -76,6 +77,9 @@ class EffectExecutor:
         failure_limit: int = 10,
         parked_blocks: Callable[[str | None], bool] | None = None,
         fallback_seconds: float = 30.0,
+        recovery_max_attempts: int = 5,
+        recovery_backoff_seconds: float = 120.0,
+        recovery_max_backoff_seconds: float = 1_200.0,
     ) -> None:
         self._db = db
         self._config = config
@@ -87,6 +91,9 @@ class EffectExecutor:
         self._error_backoff_seconds = error_backoff_seconds
         self._failure_limit = failure_limit
         self._parked_blocks = parked_blocks or _never_blocks
+        self._recovery_max_attempts = recovery_max_attempts
+        self._recovery_backoff_us = int(recovery_backoff_seconds * 1_000_000)
+        self._recovery_max_backoff_us = int(recovery_max_backoff_seconds * 1_000_000)
         self._adapters: dict[EffectKind, EffectAdapter] = {}
         self._queues: dict[str, asyncio.Queue[str | None]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
@@ -331,17 +338,23 @@ class EffectExecutor:
             effect.parcel_id,
             reason,
         )
+        superseded = effect.kind in AUTOMATIC_RECOVERY_KINDS and reason.endswith("-superseded")
         event = self._event(
             effect,
             ev.EffectCancelled(
                 effect_id=effect.effect_id,
                 effect_kind=effect.kind.value,
                 session_id=effect.preconditions.session_id,
+                superseded=superseded,
             ),
             "cancelled",
         )
         await self._record(
-            effect, "cancelled", event, from_states=("pending", "claimed"), reason=reason
+            effect,
+            "done" if superseded else "cancelled",
+            event,
+            from_states=("pending", "claimed"),
+            reason=reason,
         )
 
     async def _finish(self, stored: StoredEffect, outcome: AdapterOutcome) -> None:
@@ -364,25 +377,34 @@ class EffectExecutor:
             await self._record(effect, "done", event, remote_id=outcome.remote_id)
             return
         if isinstance(outcome, AmbiguousWrite):
-            LOG.warning(
-                "effect outcome unknown kind=%s effect_id=%s parcel=%s reason=%s",
-                effect.kind.value,
-                effect.effect_id,
-                effect.parcel_id,
-                outcome.reason,
-            )
-            event = self._event(
-                effect,
-                ev.EffectUnknown(
-                    effect_id=effect.effect_id,
-                    effect_kind=effect.kind.value,
-                    session_id=effect.preconditions.session_id,
-                ),
-                "unknown",
-            )
-            await self._record(effect, "unknown", event, reason=outcome.reason)
+            if effect.kind in AUTOMATIC_RECOVERY_KINDS:
+                await self._retry_or_unknown(stored, RetryableReadFailure(outcome.reason))
+                return
+            await self._mark_unknown(stored, outcome.reason)
             return
         await self._retry_or_unknown(stored, outcome)
+
+    async def _mark_unknown(self, stored: StoredEffect, reason: str) -> None:
+        effect = stored.effect
+        LOG.warning(
+            "effect outcome unknown kind=%s effect_id=%s parcel=%s attempt=%s reason=%s",
+            effect.kind.value,
+            effect.effect_id,
+            effect.parcel_id,
+            stored.attempts,
+            reason,
+        )
+        event = self._event(
+            effect,
+            ev.EffectUnknown(
+                effect_id=effect.effect_id,
+                effect_kind=effect.kind.value,
+                session_id=effect.preconditions.session_id,
+                attempts=stored.attempts,
+            ),
+            "unknown",
+        )
+        await self._record(effect, "unknown", event, reason=reason)
 
     async def _record(
         self,
@@ -416,29 +438,32 @@ class EffectExecutor:
     ) -> None:
         effect = stored.effect
         if isinstance(outcome, RetryableReadFailure):
-            adoptable = effect.retry_class == RetryClass.ADOPTABLE_WRITE
-            if adoptable and not no_external_call and stored.attempts >= _ADOPTABLE_RETRY_LIMIT:
-                # Proven-not-written every time: stop retrying and surface it as Blocked.
-                await self._retry_or_unknown(
-                    stored, DefinitiveFailure(f"retries exhausted: {outcome.reason}")
-                )
+            recoverable = effect.kind in AUTOMATIC_RECOVERY_KINDS
+            if (
+                recoverable
+                and not no_external_call
+                and stored.attempts >= self._recovery_max_attempts
+            ):
+                await self._mark_unknown(stored, f"automatic recovery exhausted: {outcome.reason}")
                 return
             if (
                 not no_external_call
-                and not adoptable
+                and not recoverable
                 and effect.retry_class
                 not in (
                     RetryClass.READ,
                     RetryClass.LOCAL_IDEMPOTENT,
                 )
             ):
-                await self._finish(stored, AmbiguousWrite("write-returned-retryable-failure"))
+                await self._mark_unknown(stored, "write-returned-retryable-failure")
                 return
             if outcome.retry_after_us is not None:
                 delay = outcome.retry_after_us
-            elif adoptable:
-                # An adoptable write re-checks its marker/current value before writing.
-                delay = min(2 ** max(stored.attempts, 1), 300) * 1_000_000
+            elif recoverable:
+                delay = min(
+                    self._recovery_backoff_us * 2 ** max(stored.attempts - 1, 0),
+                    self._recovery_max_backoff_us,
+                )
             else:
                 delay = 1_000_000
             retry_at = self._clock.now_utc_us() + max(delay, 1)
@@ -732,9 +757,6 @@ _ACK_EVENT_REQUIRED = frozenset(
 _PUBLICATION_ACK_KINDS = frozenset(
     {EffectKind.PUBLISH_TRIAGE, EffectKind.PUBLISH_REPORT, EffectKind.POST_COMMENT}
 )
-
-#: Attempts (claims) before a proven-not-written adoptable write is reported failed.
-_ADOPTABLE_RETRY_LIMIT = 5
 
 
 def _log_ack(effect: EffectIntent, ack: Ack) -> None:

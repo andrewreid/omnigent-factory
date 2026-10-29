@@ -68,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     _config_arg(release)
     retry = sub.add_parser(
         "retry-effect",
-        help="requeue a failed/unknown triage/report/status publication (adopts, no duplicate)",
+        help="requeue a failed/unknown verifiable or marker-adoptable write",
     )
     retry.add_argument("effect")
     _config_arg(retry)

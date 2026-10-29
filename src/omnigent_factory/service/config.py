@@ -317,6 +317,12 @@ class ServiceConfig(BaseModel):
     #: net only (every committed change and each due timer wakes them at once).
     idle_fallback_seconds: float = Field(default=30.0, gt=0)
     effect_poll_seconds: float = Field(default=0.05, gt=0)
+    #: Ambiguous idempotent/verifiable writes are retried this many total times.  With
+    #: the default exponential delay (2, 4, 8 and 16 minutes), escalation is about
+    #: 30 minutes after the initial attempt.
+    effect_recovery_max_attempts: int = Field(default=5, ge=1, le=20)
+    effect_recovery_backoff_seconds: float = Field(default=120.0, gt=0)
+    effect_recovery_max_backoff_seconds: float = Field(default=1200.0, gt=0)
     #: Longest the delivery loop sleeps with nothing due. A committed webhook delivery or
     #: an operator release wakes it at once; this only bounds a missed wake-up.
     delivery_idle_poll_seconds: float = Field(default=5.0, gt=0)

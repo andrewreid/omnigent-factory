@@ -18,6 +18,7 @@ from typing import Any
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.codec import parcel_from_json
 from omnigent_factory.core.effects import (
+    AUTOMATIC_RECOVERY_KINDS,
     READ_ONLY_KINDS,
     Ack,
     AdapterOutcome,
@@ -43,6 +44,7 @@ from omnigent_factory.core.types import (
     ReservationKind,
     SessionKind,
     Stage,
+    TrustedConfig,
 )
 from omnigent_factory.ports.adapter import EffectAdapter
 from omnigent_factory.ports.clock import Clock, SystemClock
@@ -132,13 +134,7 @@ RECONCILE_TICKS_PER_INTERVAL = 4
 #: on the first pass after deploy.
 OPEN_PR_RECONCILE_BATCH = 20
 
-RETRYABLE_PUBLICATION_KINDS = frozenset(
-    {
-        EffectKind.PUBLISH_TRIAGE.value,
-        EffectKind.PUBLISH_REPORT.value,
-        EffectKind.POST_COMMENT.value,
-    }
-)
+RETRYABLE_EFFECT_KINDS = frozenset(kind.value for kind in AUTOMATIC_RECOVERY_KINDS)
 
 
 class FactoryService:
@@ -257,6 +253,9 @@ class FactoryService:
             failure_limit=config.background_failure_limit,
             parked_blocks=self.parked.blocks,
             fallback_seconds=config.idle_fallback_seconds,
+            recovery_max_attempts=config.effect_recovery_max_attempts,
+            recovery_backoff_seconds=config.effect_recovery_backoff_seconds,
+            recovery_max_backoff_seconds=config.effect_recovery_max_backoff_seconds,
         )
         self.operator = OperatorServer(
             config.operator_socket,
@@ -317,6 +316,7 @@ class FactoryService:
             await self._adopt_terminal_claims()
             await self.db.call(lambda store: store.recover_claimed())
             unknown = await self.db.call(lambda store: store.effects_in_state("unknown"))
+            unknown = await self._requeue_unknown_writes(unknown)
             unknown = await self._requeue_unknown_reads(unknown)
             await self._recover_outbox(unknown)
         except BaseException:
@@ -482,6 +482,48 @@ class FactoryService:
                 remaining.append(stored)
         return remaining
 
+    async def _requeue_unknown_writes(self, unknown: list[StoredEffect]) -> list[StoredEffect]:
+        """Startup: legacy safe ambiguities resume without a visible Blocked fence."""
+        remaining: list[StoredEffect] = []
+        for stored in unknown:
+            effect = stored.effect
+            if effect.kind not in AUTOMATIC_RECOVERY_KINDS or effect.parcel_id is None:
+                remaining.append(stored)
+                continue
+            event = self._recovery_event(stored, Provenance.ADAPTER)
+            recovered = await self.db.call(
+                partial(
+                    _recover_unknown_effect,
+                    effect_id=effect.effect_id,
+                    event=event,
+                    config=self.config.trusted,
+                    kinds=RETRYABLE_EFFECT_KINDS,
+                )
+            )
+            if recovered:
+                LOG.info(
+                    "unknown write entered automatic recovery kind=%s effect_id=%s",
+                    effect.kind.value,
+                    effect.effect_id,
+                )
+            else:
+                remaining.append(stored)
+        return remaining
+
+    def _recovery_event(self, stored: StoredEffect, provenance: Provenance) -> Event:
+        effect = stored.effect
+        return Event(
+            event_id=f"effect-recovery:{uuid.uuid4()}",
+            repo_id=self.config.repo_id,
+            parcel_id=effect.parcel_id,
+            source_time_us=self.clock.now_utc_us(),
+            provenance=provenance,
+            body=ev.EffectRecoveryStarted(
+                effect_id=effect.effect_id,
+                effect_kind=effect.kind.value,
+            ),
+        )
+
     async def _recover_outbox(self, recovered: list[StoredEffect]) -> None:
         """Reconstruct reducer-visible ambiguity before any dispatch is enabled."""
         for stored in recovered:
@@ -512,6 +554,7 @@ class FactoryService:
                     effect_id=effect.effect_id,
                     effect_kind=effect.kind.value,
                     session_id=effect.preconditions.session_id,
+                    attempts=stored.attempts,
                 ),
             )
             await self.apply_event(unknown_event)
@@ -1529,11 +1572,27 @@ class FactoryService:
             effect_id = str(args.get("effect", ""))
             if not effect_id:
                 raise ValueError("effect is required")
-            requeued = await self.db.call(
-                lambda store: store.requeue_effect(effect_id, RETRYABLE_PUBLICATION_KINDS)
-            )
+            stored = await self.db.call(lambda store: store.get_effect(effect_id))
+            if stored is None or stored.effect.kind not in AUTOMATIC_RECOVERY_KINDS:
+                raise ValueError("effect is not a failed/unknown recoverable write")
+            if stored.state == "unknown" and stored.effect.parcel_id is not None:
+                event = self._recovery_event(stored, Provenance.OPERATOR)
+                requeued = await self.db.call(
+                    partial(
+                        _recover_unknown_effect,
+                        effect_id=effect_id,
+                        event=event,
+                        config=self.config.trusted,
+                        kinds=RETRYABLE_EFFECT_KINDS,
+                        reset_attempts=True,
+                    )
+                )
+            else:
+                requeued = await self.db.call(
+                    lambda store: store.requeue_effect(effect_id, RETRYABLE_EFFECT_KINDS)
+                )
             if not requeued:
-                raise ValueError("effect is not a failed/unknown publication")
+                raise ValueError("effect is not a failed/unknown recoverable write")
             LOG.info("operator requeued effect effect_id=%s", effect_id)
             return {"requeued": effect_id, **await self._status()}
         if command == "release-delivery":
@@ -1739,6 +1798,24 @@ class FactoryService:
 
 def _requeue_effect(store: SqliteStore, *, effect_id: str, kind: str) -> bool:
     return store.requeue_effect(effect_id, frozenset({kind}))
+
+
+def _recover_unknown_effect(
+    store: SqliteStore,
+    *,
+    effect_id: str,
+    event: Event,
+    config: TrustedConfig,
+    kinds: frozenset[str],
+    reset_attempts: bool = False,
+) -> bool:
+    return store.recover_unknown_effect(
+        effect_id,
+        event,
+        config,
+        kinds,
+        reset_attempts=reset_attempts,
+    )
 
 
 def _load_parcel(store: SqliteStore, *, parcel_id: str) -> Parcel | None:

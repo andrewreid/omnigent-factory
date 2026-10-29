@@ -34,6 +34,7 @@ from omnigent_factory.core.canonical import (
     sha256_hex,
 )
 from omnigent_factory.core.effects import (
+    AUTOMATIC_RECOVERY_KINDS,
     EffectIntent,
     EffectKind,
     JsonValue,
@@ -4969,7 +4970,12 @@ def _h_effect_unknown(ctx: _Ctx, body: ev.EffectUnknown) -> None:
         ctx.update(
             unknown_effects=(
                 *ctx.p.unknown_effects,
-                UnknownEffect(body.effect_id, body.effect_kind, body.session_id),
+                UnknownEffect(
+                    body.effect_id,
+                    body.effect_kind,
+                    body.session_id,
+                    max(body.attempts, 0),
+                ),
             )
         )
     if s is not None and body.effect_kind in (
@@ -4980,6 +4986,22 @@ def _h_effect_unknown(ctx: _Ctx, body: ev.EffectUnknown) -> None:
         ctx.emit(EffectKind.RECONCILE_SESSION, session=s, args={"effect_id": body.effect_id})
         return
     ctx.emit(EffectKind.RECONCILE_PARCEL, args={"effect_id": body.effect_id})
+
+
+def _h_effect_recovery_started(ctx: _Ctx, body: ev.EffectRecoveryStarted) -> None:
+    """Remove the visible fence while a safe legacy/manual write is retried."""
+    unknown = ctx.p.unknown_effect(body.effect_id)
+    if unknown is None:
+        raise Rejected("effect-not-unknown")
+    try:
+        kind = EffectKind(body.effect_kind)
+    except ValueError as exc:
+        raise Rejected("unknown-effect-kind") from exc
+    if unknown.kind != body.effect_kind or kind not in AUTOMATIC_RECOVERY_KINDS:
+        raise Rejected("effect-not-automatically-recoverable")
+    ctx.update(
+        unknown_effects=tuple(u for u in ctx.p.unknown_effects if u.effect_id != body.effect_id)
+    )
 
 
 _PUBLICATION_KINDS = frozenset(
@@ -4996,6 +5018,20 @@ def _h_effect_cancelled(ctx: _Ctx, body: ev.EffectCancelled) -> None:
         move = ctx.p.pending_move(body.effect_id)
         if move is None:
             raise Rejected("unknown-board-write")
+        if body.superseded:
+            # Its timed-out write may have landed or not. Retire it without pretending
+            # either remote column is known, then reconcile only the latest target.
+            ctx.update(
+                pending_moves=tuple(
+                    pending
+                    for pending in ctx.p.pending_moves
+                    if pending.effect_id != move.effect_id
+                )
+            )
+            queued = ctx.p.queued_move
+            if queued is not None:
+                _issue_move(ctx, queued, None)
+            return
         _retire_move(ctx, move, landed=False)  # never happened: reconcile the source
         return
     if body.effect_kind in _PUBLICATION_KINDS:
@@ -6128,6 +6164,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.CREATE_REJECTED: _h_create_rejected,
     EventKind.ADOPTION_RESULT: _h_adoption_result,
     EventKind.EFFECT_UNKNOWN: _h_effect_unknown,
+    EventKind.EFFECT_RECOVERY_STARTED: _h_effect_recovery_started,
     EventKind.EFFECT_CANCELLED: _h_effect_cancelled,
     EventKind.PREPARED: _h_prepared,
     EventKind.MESSAGE_ACK: _h_message_ack,

@@ -759,6 +759,8 @@ class UnknownEffect:
     effect_id: str
     kind: str
     session_id: str | None = None
+    #: Claim count when bounded recovery was exhausted (0 for legacy/non-retryable rows).
+    attempts: int = 0
 
 
 @dataclass(frozen=True, slots=True)

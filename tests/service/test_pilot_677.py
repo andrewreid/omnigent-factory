@@ -21,6 +21,7 @@ import pytest
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.effects import (
     Ack,
+    AmbiguousWrite,
     DefinitiveFailure,
     EffectIntent,
     EffectKind,
@@ -333,6 +334,46 @@ async def test_transient_publication_failure_retries_then_idle(service_config):
         _, parcel = await _state(service, effect_id)
         assert len(github.executed(EffectKind.PUBLISH_TRIAGE)) == 2
         assert parcel.bot == BotState.IDLE and Hold.AWAITING_OWNER in parcel.holds
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_unknown_marker_publication_is_looked_up_and_adopted_automatically(
+    service_config,
+):
+    config = service_config.model_copy(
+        update={
+            "effect_recovery_backoff_seconds": 1.0,
+            "effect_recovery_max_backoff_seconds": 8.0,
+        }
+    )
+    github = FakeGitHub()
+    github.script(
+        EffectKind.PUBLISH_TRIAGE,
+        AmbiguousWrite("comment response timed out"),
+        Ack("adopted-comment"),
+    )
+    clock = FakeClock()
+    service, effect_id = await _triage_result_published(config, github, clock)
+    try:
+
+        async def retrying_without_block() -> bool:
+            state, parcel = await _state(service, effect_id)
+            return state == "pending" and parcel.bot != BotState.BLOCKED
+
+        await eventually(retrying_without_block)
+        clock.advance(1_000_001)
+        service.db.poke()
+
+        async def done() -> bool:
+            clock.advance(1_000_000)
+            return (await _state(service, effect_id))[0] == "done"
+
+        await eventually(done)
+        _, parcel = await _state(service, effect_id)
+        assert parcel.unknown_effects == ()
+        assert len(github.executed(EffectKind.PUBLISH_TRIAGE)) == 2
     finally:
         await service.stop()
 

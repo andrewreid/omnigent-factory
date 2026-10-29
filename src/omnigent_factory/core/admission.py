@@ -122,6 +122,7 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.CREATE_REJECTED: Admission(_ADAPTER),
     EventKind.ADOPTION_RESULT: Admission(_ADAPTER),
     EventKind.EFFECT_UNKNOWN: Admission(_ADAPTER),
+    EventKind.EFFECT_RECOVERY_STARTED: Admission(_ADAPTER | _OPERATOR),
     EventKind.EFFECT_CANCELLED: Admission(_ADAPTER),
     EventKind.EFFECT_RECONCILED: Admission(_ADAPTER | _OPERATOR),
     EventKind.PREPARED: Admission(_ADAPTER),

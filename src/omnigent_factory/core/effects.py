@@ -98,6 +98,51 @@ READ_ONLY_KINDS = frozenset(
 )
 
 
+#: Remote writes whose requested end state can be read back or safely applied again.
+#: An ambiguous outcome is retried with a bounded backoff instead of immediately
+#: blocking the parcel.  This is also the operator ``retry-effect`` allow-list.
+VERIFIABLE_WRITE_KINDS = frozenset(
+    {
+        EffectKind.MOVE_CARD,
+        EffectKind.SET_BOT,
+        EffectKind.SET_NOTE,
+        EffectKind.SET_AUTO_BUILD,
+        EffectKind.SET_AUTOPILOT,
+        EffectKind.REACT_COMMENT,
+        EffectKind.EDIT_REPORT,
+        EffectKind.ENSURE_PROJECT_ITEM,
+        EffectKind.INTERRUPT_TREE,
+        EffectKind.REPLACE_COST_POLICY,
+        EffectKind.CLOSE_SESSION,
+        EffectKind.RENAME_SESSION,
+        EffectKind.VERIFY_POLICIES,
+    }
+)
+
+#: Creates carrying a stable hidden marker.  Re-execution first looks the marker up and
+#: adopts the existing object, so a lost acknowledgement cannot create a duplicate.
+MARKER_ADOPTABLE_CREATE_KINDS = frozenset(
+    {
+        EffectKind.POST_COMMENT,
+        EffectKind.PUBLISH_CONTRACT,
+        EffectKind.PUBLISH_TRIAGE,
+        EffectKind.PUBLISH_REPORT,
+    }
+)
+
+#: Ambiguous remote writes which may start or answer agent work.  They retain their
+#: dedicated reconciliation/fencing paths and are never automatically re-applied.
+NON_IDEMPOTENT_AMBIGUOUS_KINDS = frozenset(
+    {
+        EffectKind.CREATE_SESSION,
+        EffectKind.SEND_MESSAGE,
+        EffectKind.RESOLVE_ELICITATION,
+    }
+)
+
+AUTOMATIC_RECOVERY_KINDS = VERIFIABLE_WRITE_KINDS | MARKER_ADOPTABLE_CREATE_KINDS
+
+
 class MessagePurpose(enum.StrEnum):
     FIRST = "first"
     FEEDBACK = "feedback"
@@ -116,7 +161,7 @@ class MessagePurpose(enum.StrEnum):
 
 class RetryClass(enum.StrEnum):
     READ = "read"  # safe to repeat
-    ADOPTABLE_WRITE = "adoptable_write"  # lost ack resolved by marker/nonce adoption
+    ADOPTABLE_WRITE = "adoptable_write"  # lost ack resolved by read-back/marker adoption
     LOCAL_IDEMPOTENT = "local_idempotent"  # local config/timer, safe to reapply
     NEVER_BLIND = "never_blind"  # ambiguity becomes UNKNOWN, never a blind retry
 
@@ -196,7 +241,11 @@ class RetryableReadFailure:
 
 @dataclass(frozen=True, slots=True)
 class AmbiguousWrite:
-    """A write may or may not have happened. Never retried blindly (§3.4)."""
+    """A write may or may not have happened.
+
+    Verifiable/idempotent kinds recover by read/re-apply; genuinely non-idempotent kinds
+    become UNKNOWN and use their correlation-specific reconciliation (§3.4).
+    """
 
     reason: str
 
