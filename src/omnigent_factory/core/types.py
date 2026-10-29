@@ -418,6 +418,11 @@ class IssueSnapshot:
     title: str
     body: str | None
     read_at_us: int
+    #: Logins of human assignees, when the read supplied them. ``human_assigned`` stays
+    #: authoritative because an incomplete assignee response must fail closed.
+    human_assignees: tuple[str, ...] = ()
+    #: GitHub content identity. The issues REST endpoint also returns pull requests.
+    content_type: str = "Issue"
     #: The board's current Bot value (display name) when read; None when not read.
     bot: str | None = None
     #: The board's current "Factory note" text ("" when empty); None when not read.
@@ -438,7 +443,11 @@ class IssueSnapshot:
     @property
     def eligible(self) -> bool:
         return (
-            self.open and not self.human_assigned and self.repo_matches and (self.identity_resolved)
+            self.content_type == "Issue"
+            and self.open
+            and not self.human_assigned
+            and self.repo_matches
+            and self.identity_resolved
         )
 
 
@@ -1009,6 +1018,10 @@ class Parcel:
     version: int = 0
     stage: Stage | None = None
     eligible: bool = False
+    #: Stable cause from the latest eligibility evidence; audit rejection codes remain
+    #: separate. Used only to explain an owner-facing refusal.
+    ineligibility_reason: str = "unverified"
+    human_assignees: tuple[str, ...] = ()
     in_project: bool = False
     eligibility_epoch: int = 0
     barrier_time_us: int = 0

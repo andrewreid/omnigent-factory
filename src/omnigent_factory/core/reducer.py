@@ -168,7 +168,7 @@ class Rejected(Exception):
         self.reason = reason
         self.explain = explain
         self.rollback_to = rollback_to
-        #: The owner-facing note instead of ``Command refused: <reason>``.
+        #: An explicit owner-facing note instead of the plain default rendering.
         self.note = note
 
 
@@ -897,13 +897,33 @@ def _safety(ctx: _Ctx, reason: str, *, fence: FenceKind = FenceKind.SAFETY) -> N
     _ = reason
 
 
+def _snapshot_ineligibility(snap: IssueSnapshot) -> str:
+    """Stable failed predicate behind ``IssueSnapshot.eligible`` (empty when eligible)."""
+    if snap.content_type != "Issue":
+        return "pull-request" if snap.content_type == "PullRequest" else "not-an-issue"
+    if not snap.identity_resolved:
+        return "unverified"
+    if not snap.repo_matches:
+        return "other-repository"
+    if not snap.open:
+        return "closed"
+    if snap.human_assigned:
+        return "assigned"
+    return ""
+
+
 def _apply_evidence(ctx: _Ctx) -> None:
     snap = ctx.event.evidence
     if snap is None or ctx.maybe_parcel is None:
         return
     was_eligible = ctx.p.eligible
     was_in_project = ctx.p.in_project
-    ctx.update(eligible=snap.eligible, in_project=snap.in_project)
+    ctx.update(
+        eligible=snap.eligible,
+        ineligibility_reason=_snapshot_ineligibility(snap),
+        human_assignees=snap.human_assignees if snap.human_assigned else (),
+        in_project=snap.in_project,
+    )
     if snap.links is not None and snap.links != ctx.p.links:
         ctx.update(links=snap.links)
     _sync_session_title(ctx, snap)
@@ -3428,7 +3448,15 @@ def _h_leftward(ctx: _Ctx, body: ev.LeftwardMove) -> None:
 def _h_ineligible(
     ctx: _Ctx, body: ev.AssignedHuman | ev.Closed | ev.Transferred | ev.Deleted
 ) -> None:
-    ctx.update(eligible=False)
+    reason = ctx.p.ineligibility_reason
+    if ctx.event.evidence is None:
+        reason = {
+            ev.AssignedHuman: "assigned",
+            ev.Closed: "closed",
+            ev.Transferred: "other-repository",
+            ev.Deleted: "unverified",
+        }[type(body)]
+    ctx.update(eligible=False, ineligibility_reason=reason)
     _safety(ctx, body.KIND.value)
     if isinstance(body, ev.Closed):
         _complete(ctx)
@@ -6196,6 +6224,98 @@ HANDLERS: dict[EventKind, _Handler] = {
 }
 
 
+_REFUSAL_NOTES = {
+    "control-not-fresh-after-barrier": (
+        "Cannot use that control: it predates a stop or safety change. Try it again."
+    ),
+    "grant-duration-out-of-bounds": "Cannot grant that time: choose 1 to 12 whole hours.",
+    "triage-not-allowed-from-stage": "Not triaged: triage cannot start from this column.",
+    "epic-plan-not-posted": "Cannot approve: the epic plan has not been posted yet.",
+    "epic-plan-revision-pending": "Cannot approve: the epic plan is being revised.",
+    "open-decisions": "Cannot do that while an owner question is open. Answer it first.",
+    "hash-does-not-identify-latest": "Cannot approve: that hash does not identify the latest plan.",
+    "epic-plan-not-posted-before-control": (
+        "Cannot approve: wait for the epic plan comment, then try again."
+    ),
+    "plan-not-allowed-from-ready": "Cannot plan from Ready. Start rework instead.",
+    "plan-not-allowed-from-stage": "Cannot plan from this column.",
+    "no-published-contract": "Cannot approve: there is no published plan yet.",
+    "approval-stage-invalid": ("Cannot approve from this column or while another build is active."),
+    "waiver-without-fresh-snapshot": (
+        "Cannot start an unplanned build: the issue could not be read. Try again."
+    ),
+    "revision-in-flight": "Cannot start the build while the plan is being revised.",
+    "waiver-stage-invalid": (
+        "Cannot start an unplanned build from this column or while a build is active."
+    ),
+    "decision-ambiguous": "Cannot record the answer: reply to the specific open question.",
+    "decision-not-open": "Cannot record the answer: that question is not open.",
+    "nothing-to-continue": "Cannot continue: this issue has no current run.",
+    "not-at-checkpoint": "Cannot continue: the current run is not at a checkpoint.",
+    "continue-cannot-clear-hard-fence": (
+        "Cannot continue: the run was stopped or safety-fenced. Start the stage again."
+    ),
+    "session-retired": "Cannot continue: that run has ended. Start the stage again.",
+    "stage-authority-invalid": (
+        "Cannot continue: the stage authority is no longer valid. Start the stage again."
+    ),
+    "tree-not-quiescent": "Cannot continue yet: the previous turn is still stopping.",
+    "rework-only-from-ready": "Cannot start rework: move the card to Ready first.",
+    "hard-fence-present": "Cannot resume: the run was stopped or safety-fenced.",
+    "continuation-preflight-failed": (
+        "Cannot continue: eligibility, approval, or an owner question still blocks the run."
+    ),
+    "card-in-ready": "Cannot resume in Ready. Move the card to Building first.",
+}
+
+
+def _ineligible_refusal(ctx: _Ctx) -> str:
+    action = {
+        EventKind.REQUEST_TRIAGE: "Not triaged",
+        EventKind.REQUEST_PLAN: "Cannot plan",
+        EventKind.REQUEST_REPLAN: "Cannot replan",
+        EventKind.APPROVE_PLAN: "Cannot approve",
+        EventKind.WAIVE_PLAN: "Cannot start the build",
+        EventKind.DECIDE: "Cannot record the answer",
+        EventKind.CONTINUE: "Cannot continue",
+        EventKind.REQUEST_REWORK: "Cannot start rework",
+    }.get(ctx.event.kind, "Cannot do that")
+    issue = f"#{ctx.p.issue_number}" if ctx.p.issue_number is not None else "This issue"
+    reason = ctx.p.ineligibility_reason
+    if reason == "assigned":
+        who = (
+            f"@{ctx.p.human_assignees[0]}"
+            + (" and others" if len(ctx.p.human_assignees) > 1 else "")
+            if ctx.p.human_assignees
+            else "someone"
+        )
+        return f"{action}: {issue} is assigned to {who}. Unassign it to let the factory work on it."
+    if reason == "closed":
+        return f"{action}: {issue} is closed. Reopen it to let the factory work on it."
+    if reason == "pull-request":
+        return f"{action}: {issue} is a pull request, not an issue."
+    if reason == "other-repository":
+        return f"{action}: {issue} belongs to another repository."
+    if reason == "not-an-issue":
+        return f"{action}: {issue} is not a GitHub issue."
+    return f"{action}: {issue} could not be verified as an issue in this repository."
+
+
+def _refusal_note(ctx: _Ctx, rejection: Rejected) -> str:
+    if rejection.note is not None:
+        return rejection.note
+    if rejection.reason == "parcel-not-eligible":
+        return _ineligible_refusal(ctx)
+    if rejection.reason.startswith("rework refused: "):
+        detail = rejection.reason.removeprefix("rework refused: ")
+        return f"Cannot start rework: {detail}."
+    known = _REFUSAL_NOTES.get(rejection.reason)
+    if known is not None:
+        return known
+    words = rejection.reason.replace("-", " ").replace("_", " ").strip() or "not allowed"
+    return f"Cannot do that: {words}."
+
+
 def _explanation(ctx: _Ctx, rejection: Rejected) -> None:
     """At most one explanation (and guarded card rollback) for an owner's invalid control.
 
@@ -6207,7 +6327,7 @@ def _explanation(ctx: _Ctx, rejection: Rejected) -> None:
         return
     if e.actor_id is None or e.actor_id not in ctx.config.owners:
         return
-    note = rejection.note or f"Command refused: {rejection.reason}"
+    note = _refusal_note(ctx, rejection)
     if rejection.rollback_to is not None:
         note += f"; card moved back to {rejection.rollback_to.value}"
     ctx.note(note)

@@ -289,7 +289,7 @@ def test_related_mark_never_clobbers_a_more_important_note():
     h2.eligible("B")
     h2.send("B", ev.ApprovePlan(via=Via.COMMAND))  # refused: no plan to approve
     refused = h2.p("B").board_note
-    assert refused.startswith("Command refused:")
+    assert refused == "Cannot approve: there is no published plan yet."
     r = mark(h2, "B", 12, "overlaps")
     assert r.audit.accepted and h2.of(r, EffectKind.SET_NOTE) == []
     assert h2.p("B").board_note == refused

@@ -289,7 +289,7 @@ def test_approve_before_the_plan_is_posted_is_refused():
     h.create_ok(EPIC)
     r = send_epic(h, ev.ApprovePlan(via=Via.COMMAND))
     assert not r.audit.accepted and r.audit.reason == "epic-plan-not-posted"
-    assert h.p(EPIC).note == "Command refused: epic-plan-not-posted"
+    assert h.p(EPIC).note == "Cannot approve: the epic plan has not been posted yet."
 
 
 def test_an_owner_comment_revises_the_epic_plan_and_voids_its_approval():

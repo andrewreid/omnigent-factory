@@ -348,6 +348,8 @@ def snapshot_key(snap: IssueSnapshot) -> tuple[object, ...]:
     return (
         snap.open,
         snap.human_assigned,
+        snap.human_assignees,
+        snap.content_type,
         snap.repo_matches,
         snap.identity_resolved,
         snap.in_project,
@@ -1305,6 +1307,27 @@ class SqliteStore:
                 (attempts, None if exhausted else retry_at_us, delivery_guid),
             )
         return exhausted
+
+    def retry_unresolved_delivery(self, delivery_guid: str) -> str | None:
+        """Make an unresolved delivery due now without spending a resolution attempt.
+
+        Return its status before the request, or ``None`` when the GUID is unknown. Only
+        an actual subsequent failed lookup increments ``resolution_attempts``.
+        """
+        with self._txn() as conn:
+            row = conn.execute(
+                "SELECT status FROM deliveries WHERE delivery_guid = ?", (delivery_guid,)
+            ).fetchone()
+            if row is None:
+                return None
+            status = str(row["status"])
+            if status == "unresolved":
+                conn.execute(
+                    "UPDATE deliveries SET resolution_retry_at_us = NULL "
+                    "WHERE delivery_guid = ? AND status = 'unresolved'",
+                    (delivery_guid,),
+                )
+            return status
 
     def _mark_delivery(self, conn: sqlite3.Connection, guid: str, status: str) -> None:
         cur = conn.execute(

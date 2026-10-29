@@ -269,9 +269,19 @@ class GitHubAPIAdapter:
             human_assigned = not isinstance(assignees, list) or any(
                 not isinstance(user, dict) or user.get("type") != "Bot" for user in assignees
             )
+            assignee_items = assignees if isinstance(assignees, list) else []
+            human_assignees = tuple(
+                str(user["login"])
+                for user in assignee_items
+                if isinstance(user, dict)
+                and user.get("type") != "Bot"
+                and isinstance(user.get("login"), str)
+            )
             return IssueSnapshot(
                 open=issue.get("state") == "open",
                 human_assigned=human_assigned,
+                human_assignees=human_assignees,
+                content_type="PullRequest" if "pull_request" in issue else "Issue",
                 repo_matches=True,
                 identity_resolved=True,
                 in_project=in_project,

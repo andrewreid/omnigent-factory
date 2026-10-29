@@ -29,8 +29,9 @@ session holds the next run until the session is idle (see [Card status vs. comme
 ### Slash commands
 
 Write the command as the whole comment, on the issue (a command on a PR is ignored).
-Accepted commands get a 👍 reaction, refused ones 😕; most refusals also put
-`Command refused: <reason>` in the card's `Factory note`. `<N>h` is a whole number of
+Accepted commands get a 👍 reaction, refused ones 😕; most refusals also put a
+short plain-English reason and, where possible, the fix in the card's `Factory note`.
+`<N>h` is a whole number of
 hours, 1–12. Without one, a grant is the time block for the parcel's size:
 `checkpoint_block_hours` S/M/L = 2/4/6 h by default (size from triage, else the plan;
 otherwise S for triage and M for the rest).
@@ -624,6 +625,7 @@ waits up to 90 s for it instead of failing.
 | `rerender-comment <effect_id>` | Re-render a published comment in place (found by its marker). |
 | `resume <parcel> --message-file note.md` | Re-open the parcel's existing stage session after a stale block and relay one operator note. No authority, approval or time is added. |
 | `cleanup <parcel> [--merged]` | Tear down the dev environment (`devenv_teardown`) and remove the factory worktree(s) (its own and its `factory-issue-<N>-*` extras) and local branches of a finished parcel (PR merged, issue closed or Done; refused for a Ready card) from the factory clone. |
+| `retry-delivery <guid>` | Process an unresolved delivery now instead of waiting for its backoff, without spending an attempt merely for retrying. For a parked delivery, release it and its hold first, then process it with a fresh retry budget. Identity verification is never bypassed. |
 | `release-delivery <guid>` | Release one parked webhook delivery for processing. |
 | `pause` / `unpause` | Stop / resume admitting new work repository-wide; in-flight parcels and safety events carry on. |
 | `auto-triage status` | Idle-time auto-triage: enabled (and whether config or the CLI decides), today's used/limit/granted, idle or what keeps it busy, triage slots, the next candidate, the eligible count and why the other Inbox issues are left out (`excluded_inbox`). |
@@ -645,6 +647,13 @@ waits up to 90 s for it instead of failing.
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
 | `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, `review_rounds_default`, `status_comment_edit_seconds`, `follow_up_max_depth`, `auto_replan_limit`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `bundling`, `bundle_max_members`, `bundle_command_max_members`, `bundle_max_points`, `session_retention_days`, the health sweep settings and `worktree_sweep_interval_hours`, `idle_worktree_days`, `clone_gc_interval_days`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+
+An **unresolved** webhook delivery is still in the normal inbox, waiting for its next
+identity-verified lookup after an automatic backoff. A **parked** delivery exhausted its
+resolution attempts (or failed permanently) and stays stopped until an operator releases
+or retries it. A parcel affected by either shows `Blocked: webhook delivery held`; work
+does not resume merely because the hold clears, because the safety fence still requires a
+fresh owner stage control.
 
 The host config file (`~/.config/omnigent-factory/config.toml`) is the single source
 of factory configuration; the target repository carries no factory config file.

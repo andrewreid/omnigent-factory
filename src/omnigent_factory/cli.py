@@ -66,6 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     release.add_argument("delivery")
     _config_arg(release)
+    retry_delivery = sub.add_parser(
+        "retry-delivery",
+        help="make one unresolved or parked webhook delivery due for processing now",
+    )
+    retry_delivery.add_argument("delivery")
+    _config_arg(retry_delivery)
     retry = sub.add_parser(
         "retry-effect",
         help="requeue a failed/unknown verifiable or marker-adoptable write",
@@ -255,6 +261,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _operator(config, "explain", {"parcel": args.parcel})
     if args.command == "release-delivery":
         return _operator(config, "release-delivery", {"delivery": args.delivery})
+    if args.command == "retry-delivery":
+        return _operator(config, "retry-delivery", {"delivery": args.delivery})
     if args.command == "resume":
         message = (
             args.message

@@ -295,7 +295,7 @@ def test_refused_command_comment_gets_confused_and_a_note():
     h.eligible()
     r = _command(h, ev.Continue(), comment_id=56)
     assert not r.audit.accepted and reactions(r) == [(56, "confused")]
-    assert notes(r) == ["Command refused: nothing-to-continue"]
+    assert notes(r) == ["Cannot continue: this issue has no current run."]
     assert EffectKind.POST_COMMENT not in kinds(r)
 
 

@@ -698,7 +698,7 @@ async def resolve_project_delivery(
     query($id: ID!, $after: String) {
       node(id: $id) { __typename id ... on Issue {
         id number title body state
-        assignees(first: 100) { nodes { __typename } }
+        assignees(first: 100) { nodes { __typename login } }
         repository { id databaseId nameWithOwner }
         projectItems(first: 100, after: $after) {
           nodes { id project { id } fieldValueByName(name: "Status") {
@@ -784,9 +784,18 @@ async def resolve_project_delivery(
         not isinstance(assignee, dict) or assignee.get("__typename") != "Bot"
         for assignee in assignee_nodes
     )
+    assignee_items = assignee_nodes if isinstance(assignee_nodes, list) else []
+    human_assignees = tuple(
+        str(assignee["login"])
+        for assignee in assignee_items
+        if isinstance(assignee, dict)
+        and assignee.get("__typename") != "Bot"
+        and isinstance(assignee.get("login"), str)
+    )
     evidence = IssueSnapshot(
         open=issue.get("state") == "OPEN",
         human_assigned=human_assigned,
+        human_assignees=human_assignees,
         repo_matches=True,
         identity_resolved=True,
         in_project=in_project,

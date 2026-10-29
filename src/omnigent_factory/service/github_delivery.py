@@ -247,7 +247,7 @@ class GitHubDeliveryProcessor:
 
         content_id = normalized.unresolved_content_node_id
         if content_id is not None:
-            lookup_failed = False
+            lookup_error: GitHubAPIError | None = None
             retry_after_us: int | None = None
             try:
                 normalized = await resolve_project_delivery(
@@ -263,13 +263,18 @@ class GitHubDeliveryProcessor:
                     "project delivery is invalid", parcel_id=content_id
                 ) from exc
             except GitHubAPIError as exc:
-                lookup_failed = True
+                lookup_error = exc
                 retry_after_us = exc.retry_after_us if isinstance(exc, RateLimited) else None
-            if lookup_failed:
+            if lookup_error is not None:
                 # A failed lookup proves nothing about the card: keep it fenced and retry
                 # on the durable schedule until the operator must decide.
+                status = getattr(lookup_error, "status_code", "unknown")
+                message = " ".join(str(lookup_error).split())[:240]
                 await self._set_aside(
-                    delivery.delivery_guid, content_id, "lookup failed", retry_after_us
+                    delivery.delivery_guid,
+                    content_id,
+                    f"lookup failed: {type(lookup_error).__name__} status={status}: {message}",
+                    retry_after_us,
                 )
                 return
             if not normalized.events:

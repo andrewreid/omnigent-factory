@@ -34,6 +34,8 @@ def snapshot(
     *,
     open: bool = True,
     human_assigned: bool = False,
+    human_assignees: tuple[str, ...] = (),
+    content_type: str = "Issue",
     in_project: bool = True,
     stage: Stage | None = None,
     title: str = "Add export button",
@@ -50,6 +52,8 @@ def snapshot(
     return IssueSnapshot(
         open=open,
         human_assigned=human_assigned,
+        human_assignees=human_assignees,
+        content_type=content_type,
         repo_matches=repo_matches,
         identity_resolved=identity_resolved,
         in_project=in_project,

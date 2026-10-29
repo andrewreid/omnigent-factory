@@ -273,6 +273,7 @@ async def test_inconclusive_lookup_never_retires_on_first_attempt(
 @pytest.mark.asyncio
 async def test_failed_lookups_are_set_aside_with_backoff_then_parked_repository_wide(
     service_config: ServiceConfig,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     async with BoardRig(service_config, lambda _: httpx.Response(502)) as rig:
         await rig.deliver(_board_delivery("drag", "I_unknown"))
@@ -284,6 +285,11 @@ async def test_failed_lookups_are_set_aside_with_backoff_then_parked_repository_
         # The card cannot be tied to a parcel, so every new dispatch is gated.
         assert rig.service.parked.records() == (("drag", None),)
         assert rig.service.parked.blocks("anything")
+        assert (
+            "project delivery unresolved delivery_guid=drag "
+            "reason=lookup failed: GitHubRejected status=502: "
+            "GitHub POST /graphql returned HTTP 502"
+        ) in caplog.text
 
 
 @pytest.mark.parametrize(

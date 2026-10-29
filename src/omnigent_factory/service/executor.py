@@ -639,6 +639,8 @@ class EffectExecutor:
                 evidence=IssueSnapshot(
                     open=detail.get("open") is True,
                     human_assigned=detail.get("human_assigned") is True,
+                    human_assignees=_json_strings(detail.get("human_assignees")),
+                    content_type=str(detail.get("content_type") or "Issue"),
                     repo_matches=detail.get("repo_matches") is True,
                     identity_resolved=detail.get("identity_resolved") is True,
                     in_project=detail.get("in_project") is True,
@@ -732,6 +734,12 @@ def _finding_refs(value: object) -> tuple[ev.FindingRef, ...]:
 
 def _json_int(value: object, default: int) -> int:
     return value if isinstance(value, int) else default
+
+
+def _json_strings(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    return tuple(item for item in value if isinstance(item, str))
 
 
 def _optional_int(value: object) -> int | None:

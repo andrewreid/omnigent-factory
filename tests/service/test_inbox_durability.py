@@ -11,6 +11,7 @@ import pytest
 from omnigent_factory.core.effects import EffectKind
 from omnigent_factory.core.types import FenceKind, Hold, InboxHold, InboxHoldReason, Lifecycle
 from omnigent_factory.service.config import ServiceConfig
+from omnigent_factory.service.interfaces import NonRetryableDelivery
 from omnigent_factory.service.parked import LEGACY_REGISTRY
 from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.store.sqlite import DeliveryRecord, SqliteStore
@@ -24,6 +25,20 @@ from omnigent_factory.testing.fakes import (
 from .test_remediation import PoisonProcessor, start_triage, wait_for_async
 
 pytestmark = pytest.mark.asyncio
+
+
+class PoisonOnceScopedProcessor:
+    def __init__(self, service: FactoryService) -> None:
+        self.service = service
+        self.calls = 0
+
+    async def process(self, delivery: DeliveryRecord) -> None:
+        self.calls += 1
+        if self.calls == 1:
+            raise NonRetryableDelivery("poison", parcel_id="P")
+        await self.service.db.call(
+            lambda store: store.mark_delivery(delivery.delivery_guid, "processed")
+        )
 
 
 def make(service_config: ServiceConfig, **kw: object):
@@ -49,13 +64,13 @@ async def running_triage(service: FactoryService, omnigent: FakeOmnigent, pid: s
 
 
 async def test_scoped_park_fences_and_interrupts_the_running_tree(service_config: ServiceConfig):
-    processor = PoisonProcessor("P")
     service, _, omnigent, broker = make(service_config)
+    processor = PoisonOnceScopedProcessor(service)
+    service.delivery_processor = processor
     await service.start()
     try:
         session = await running_triage(service, omnigent)
         assert broker.issuance_enabled(session.session_id)
-        service.delivery_processor = processor
         await service.persist_delivery(DeliveryRecord("poison", "issues", b"{}", {}))
         await wait_for_async(
             lambda: any(
@@ -76,8 +91,18 @@ async def test_scoped_park_fences_and_interrupts_the_running_tree(service_config
         )
         assert [tuple(r) for r in rows] == [("inbox", "InboxHoldSet")]
 
-        released = await service.operator_command("release-delivery", {"delivery": "poison"})
-        assert released["parked_deliveries"] == 0
+        retried = await service.operator_command("retry-delivery", {"delivery": "poison"})
+        assert retried["previous_status"] == "parked"
+        await wait_for_async(
+            lambda: service.db.call(
+                lambda store: (
+                    store.query("SELECT status FROM deliveries WHERE delivery_guid = 'poison'")[0][
+                        0
+                    ]
+                    == "processed"
+                )
+            )
+        )
         parcel = await service.db.call(lambda store: store.load_parcel("P"))
         assert parcel is not None and parcel.inbox_holds == ()
         still = parcel.session(session.session_id)
@@ -191,9 +216,9 @@ async def test_unresolved_delivery_for_known_parcel_fences_until_processed(
 
         assert await service.release_resolved_inbox_holds() == 0  # still unresolved
         await service.db.call(lambda s: s.mark_delivery("drag", "processed"))
-        await wait_for_async(
-            lambda: service.db.call(lambda s: not s.load_parcel("P").inbox_holds)  # type: ignore[union-attr]
-        )
+        # The live delivery loop may win the release before this explicit crash-recovery
+        # sweep; either path must leave the hold gone.
+        assert await service.release_resolved_inbox_holds() in (0, 1)
         parcel = await service.db.call(lambda s: s.load_parcel("P"))
         assert parcel is not None and Hold.INBOX not in parcel.holds
     finally:

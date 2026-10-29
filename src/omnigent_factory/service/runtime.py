@@ -1608,6 +1608,39 @@ class FactoryService:
                 self._delivery_wake.set()
                 self.db.poke()
                 return {"released": delivery_guid, **await self._status()}
+        if command == "retry-delivery":
+            delivery_guid = str(args.get("delivery", ""))
+            if not delivery_guid:
+                raise ValueError("delivery is required")
+            async with self._delivery_lock:
+                if self.parked.contains(delivery_guid):
+                    await self.parked.release(delivery_guid)
+                    previous_status = "parked"
+                else:
+                    status = await self.db.call(
+                        lambda store: store.retry_unresolved_delivery(delivery_guid)
+                    )
+                    if status is None:
+                        raise ValueError("delivery was not found")
+                    if status == "processed":
+                        raise ValueError("delivery is already processed")
+                    if status != "unresolved":
+                        raise ValueError(f"delivery is {status}, not unresolved or parked")
+                    previous_status = status
+                self._delivery_failures.pop(delivery_guid, None)
+                self._delivery_retry_at.pop(delivery_guid, None)
+                self._delivery_wake.set()
+                self.db.poke()
+                LOG.info(
+                    "operator retried delivery delivery_guid=%s previous_status=%s",
+                    delivery_guid,
+                    previous_status,
+                )
+                return {
+                    "retried": delivery_guid,
+                    "previous_status": previous_status,
+                    **await self._status(),
+                }
         raise ValueError("unknown command")
 
     async def reload_config(self) -> dict[str, object]:

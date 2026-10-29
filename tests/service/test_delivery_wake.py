@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from omnigent_factory.cli import build_parser
 from omnigent_factory.service.config import ServiceConfig
 from omnigent_factory.service.interfaces import NonRetryableDelivery
 from omnigent_factory.service.runtime import FactoryService
@@ -18,6 +19,15 @@ from .test_remediation import wait_for_async
 pytestmark = pytest.mark.asyncio
 
 DAY_US = 86_400 * 1_000_000
+
+
+async def test_retry_delivery_cli_accepts_guid_and_config() -> None:
+    args = build_parser().parse_args(
+        ["retry-delivery", "delivery-guid", "--config", "factory.toml"]
+    )
+    assert args.command == "retry-delivery"
+    assert args.delivery == "delivery-guid"
+    assert str(args.config) == "factory.toml"
 
 
 class RecordingProcessor:
@@ -134,7 +144,41 @@ async def test_durable_resolution_retry_wakes_at_its_deadline(service_config: Se
         await service.stop()
 
 
-async def test_operator_release_wakes_the_idle_loop(service_config: ServiceConfig):
+async def test_operator_retry_makes_unresolved_delivery_due_without_spending_an_attempt(
+    service_config: ServiceConfig,
+):
+    service, processor = make(service_config)
+    service.delivery_processor = None
+    await service.start()
+    try:
+        await service.persist_delivery(DeliveryRecord("project", "projects_v2_item", b"{}", {}))
+        await service.defer_unresolved_delivery("project", None)
+        before = await service.db.call(
+            lambda store: store.query(
+                "SELECT status, resolution_attempts, resolution_retry_at_us FROM deliveries "
+                "WHERE delivery_guid = 'project'"
+            )
+        )
+        assert before[0][0] == "unresolved" and before[0][1] == 1
+        assert before[0][2] is not None
+
+        service.delivery_processor = processor
+        retried = await service.operator_command("retry-delivery", {"delivery": "project"})
+        assert retried["previous_status"] == "unresolved"
+        await wait_for_async(lambda: "project" in processor.seen, timeout=1.0)
+        after = await service.db.call(
+            lambda store: store.query(
+                "SELECT status, resolution_attempts FROM deliveries WHERE delivery_guid = 'project'"
+            )
+        )
+        assert tuple(after[0]) == ("processed", 1)
+    finally:
+        await service.stop()
+
+
+async def test_operator_retry_releases_parked_delivery_and_wakes_the_idle_loop(
+    service_config: ServiceConfig,
+):
     service, processor = make(service_config)
     processor.poison.add("poison")
     await service.start()
@@ -143,9 +187,26 @@ async def test_operator_release_wakes_the_idle_loop(service_config: ServiceConfi
         await wait_for_async(lambda: service.parked.contains("poison"))
         await asyncio.sleep(0.2)  # the loop is now idle (30 s poll)
         released = asyncio.get_running_loop().time()
-        await service.operator_command("release-delivery", {"delivery": "poison"})
+        retried = await service.operator_command("retry-delivery", {"delivery": "poison"})
+        assert retried["previous_status"] == "parked"
         await wait_for_async(lambda: "poison" in processor.seen, timeout=1.0)
         assert processor.seen["poison"] - released < 0.1
+    finally:
+        await service.stop()
+
+
+async def test_operator_retry_refuses_processed_and_unknown_deliveries(
+    service_config: ServiceConfig,
+):
+    service, processor = make(service_config)
+    await service.start()
+    try:
+        await service.persist_delivery(DeliveryRecord("done", "issues", b"{}", {}))
+        await wait_for_async(lambda: "done" in processor.seen)
+        with pytest.raises(ValueError, match="delivery is already processed"):
+            await service.operator_command("retry-delivery", {"delivery": "done"})
+        with pytest.raises(ValueError, match="delivery was not found"):
+            await service.operator_command("retry-delivery", {"delivery": "missing"})
     finally:
         await service.stop()
 

@@ -152,6 +152,8 @@ class CountingGitHub:
                 detail={
                     "open": snap.open,
                     "human_assigned": snap.human_assigned,
+                    "human_assignees": snap.human_assignees,
+                    "content_type": snap.content_type,
                     "repo_matches": True,
                     "identity_resolved": True,
                     "in_project": snap.in_project,

@@ -258,7 +258,7 @@ def test_A13_irrelevant_events_are_audited_self_loops():
         assert not r.audit.accepted and not work(r)
     p = h.p()
     # Only the card's status note explains the refused owner control.
-    assert p.note == "Command refused: nothing-to-continue"
+    assert p.note == "Cannot continue: this issue has no current run."
     assert (
         replace(
             p,
@@ -1685,7 +1685,10 @@ def test_C02b_refused_waiver_drag_rolls_the_card_back_and_explains_next_step():
     )
     assert not r.audit.accepted and r.audit.reason == "open-decisions"
     assert not Harness.of(r, EffectKind.POST_COMMENT)
-    assert h.p().note == "Command refused: open-decisions; card moved back to Triaged"
+    assert h.p().note == (
+        "Cannot do that while an owner question is open. Answer it first.; "
+        "card moved back to Triaged"
+    )
     [note] = Harness.of(r, EffectKind.SET_NOTE)
     assert note.args == {"note": h.p().note}
     assert d.decision_id in {x.decision_id for x in h.p().open_decisions}
