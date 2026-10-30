@@ -25,6 +25,13 @@ while the factory has nothing else to do.
   skips it without spending budget, and the reducer refuses a start whose generation is
   no longer the newest. It shares the triage slots and never clears a hold; the run's
   brief lists the signals (``triage-refresh`` template).
+* **Close-candidate backfill.** A triage published before the ``factory:close-candidate``
+  label existed never issued it (only a publication's acknowledgement does). The scan
+  finds a Triaged card whose newest published triage recommends closing and has no
+  label generation yet, and issues it once (``CloseCandidateBackfill``: the same
+  generation-bound ``SET_CLOSE_CANDIDATE`` as a publication), at most
+  ``MAX_BACKFILLS_PER_PASS`` per pass. An owner's removal of that triage's label, or
+  leaving Triaged, stops it, as for a publication.
 """
 
 from __future__ import annotations
@@ -39,7 +46,7 @@ from datetime import UTC, datetime
 from functools import partial
 
 from omnigent_factory.core import events as ev
-from omnigent_factory.core.effects import RetryableReadFailure
+from omnigent_factory.core.effects import EffectKind, RetryableReadFailure
 from omnigent_factory.core.events import Event, EventKind, Provenance
 from omnigent_factory.core.predicates import settled
 from omnigent_factory.core.protocol import CLOSURE_RECOMMENDATIONS
@@ -83,6 +90,8 @@ BASE_HEAD_TTL_S = 60.0
 #: Cards whose Git facts are not cached yet that one pass asks Git about (at most two
 #: subprocesses each); the rest are evaluated on a later pass.
 MAX_GIT_CARDS_PER_PASS = 20
+#: Close-candidate labels one pass backfills (each one label write); the rest wait.
+MAX_BACKFILLS_PER_PASS = 5
 
 SnapshotReader = Callable[[IssueRef], Awaitable[IssueSnapshot | RetryableReadFailure]]
 CardReader = Callable[[], Awaitable[list[RankingCard] | RetryableReadFailure]]
@@ -380,6 +389,7 @@ class AutoRetriager:
             if parcel is None or (parcel.links is not None and parcel.links.epic):
                 continue  # never triaged here, or an epic (its triage is out of scope)
             judged.append((issue, parcel, await self.directory.triage_freshness(parcel)))
+        await self._backfill_close_candidates(judged)
         # Issues on the board are open; only the other referenced ones are read.
         referenced = {
             n
@@ -426,6 +436,60 @@ class AutoRetriager:
         self._scan = (now, stale)
         self._last_pass = current
         return stale
+
+    async def _backfill_close_candidates(
+        self, judged: Sequence[tuple[BoardIssue, Parcel, TriageFreshness | None]]
+    ) -> None:
+        """Issue the close-candidate label of each newest triage published before it
+        existed (a closure recommendation, no generation yet), at most
+        ``MAX_BACKFILLS_PER_PASS``; the reducer re-checks every rule."""
+        due = [
+            (issue, parcel, fresh)
+            for issue, parcel, fresh in judged
+            if fresh is not None
+            and fresh.recommendation in CLOSURE_RECOMMENDATIONS
+            and fresh.session_id not in (parcel.close_candidate_session, "")
+            and fresh.session_id != parcel.close_candidate_removed
+            and parcel.stage == Stage.TRIAGED
+            and parcel.eligible
+            and not issue.assigned
+            and Hold.PUBLICATION_PENDING not in parcel.holds
+            and _newest_triage(parcel) == fresh.session_id
+        ]
+        done = 0
+        for issue, parcel, fresh in due:
+            if done >= MAX_BACKFILLS_PER_PASS:
+                break
+            assert fresh is not None  # noqa: S101 - filtered above
+            sid = fresh.session_id
+            if not await self.service.db.call(
+                partial(_triage_published, parcel_id=parcel.parcel_id, session_id=sid)
+            ):
+                continue  # its publication is not acknowledged: that issues the label
+            result = await self.service.apply_event(
+                Event(
+                    # Per triage generation and parcel version: a repeat while nothing
+                    # changed (another pass, a restart) is a duplicate, no new event; an
+                    # accepted one records the generation, so none follows it.
+                    event_id=(
+                        f"close-candidate-backfill:{parcel.parcel_id}:{sid}:{parcel.version}"
+                    ),
+                    repo_id=self.service.config.repo_id,
+                    parcel_id=parcel.parcel_id,
+                    source_time_us=self.service.clock.now_utc_us(),
+                    provenance=Provenance.ADAPTER,
+                    body=ev.CloseCandidateBackfill(session_id=sid),
+                    issue_number=parcel.issue_number,
+                )
+            )
+            done += 1
+            LOG.info(
+                "close-candidate backfill issue=#%s session=%s accepted=%s reason=%s",
+                issue.number,
+                sid,
+                result.accepted,
+                result.reason or "-",
+            )
 
     def _old_enough(self, fresh: TriageFreshness, now_us: int) -> bool:
         """Signals other than the maximum age can count (``retriage_min_age_days``)."""
@@ -698,6 +762,21 @@ def _candidate(s: Stale) -> dict[str, object]:
         "rank": s.rank,
         "refused": s.refusal,
     }
+
+
+def _newest_triage(parcel: Parcel) -> str:
+    triages = [s.session_id for s in parcel.sessions if s.kind == SessionKind.TRIAGE]
+    return triages[-1] if triages else ""
+
+
+def _triage_published(store: SqliteStore, *, parcel_id: str, session_id: str) -> bool:
+    """The triage of ``session_id`` was published (its ``PUBLISH_TRIAGE`` is done)."""
+    rows = store.query(
+        "SELECT 1 FROM effects WHERE parcel_id = ? AND kind = ? AND state = 'done' "
+        "AND json_extract(payload_json, '$.args.session_id') = ? LIMIT 1",
+        (parcel_id, EffectKind.PUBLISH_TRIAGE.value, session_id),
+    )
+    return bool(rows)
 
 
 def _parcels_by_id(store: SqliteStore, *, parcel_ids: Sequence[str]) -> dict[str, Parcel]:

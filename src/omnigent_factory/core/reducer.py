@@ -1712,6 +1712,29 @@ def _h_close_candidate_removed(ctx: _Ctx, body: ev.CloseCandidateRemoved) -> Non
     ctx.update(close_candidate_removed=generation)
 
 
+def _h_close_candidate_backfill(ctx: _Ctx, body: ev.CloseCandidateBackfill) -> None:
+    """The stale-triage pass: the newest triage of a Triaged card, published before the
+    close-candidate label existed, gets its generation now, exactly as its publication
+    acknowledgement would have issued it (the service only asks for a closure
+    recommendation). Never for a triage whose publication is still pending (its
+    acknowledgement issues it), nor again once issued or removed by the owner."""
+    p = ctx.p
+    if p.stage != Stage.TRIAGED or ctx.origin_stage != Stage.TRIAGED:
+        raise Rejected("close-candidate-backfill-not-triaged")
+    if not p.eligible:
+        raise Rejected("close-candidate-backfill-ineligible")
+    triages = [s.session_id for s in p.sessions if s.kind == SessionKind.TRIAGE]
+    if not body.session_id or not triages or body.session_id != triages[-1]:
+        raise Rejected("close-candidate-backfill-not-newest-triage")
+    if Hold.PUBLICATION_PENDING in p.holds:
+        raise Rejected("close-candidate-backfill-publication-pending")
+    if body.session_id == p.close_candidate_session:
+        raise Rejected("close-candidate-issued")
+    if body.session_id == p.close_candidate_removed:
+        raise Rejected("close-candidate-removal-recorded")
+    _issue_close_candidate(ctx, body.session_id)
+
+
 def _h_triage_stale(ctx: _Ctx, body: ev.TriageStale) -> None:
     """The stale-triage pass flags (or clears) a Triaged card: display only."""
     text = " ".join(body.text.split())[:NOTE_MAX]
@@ -4960,11 +4983,18 @@ def _h_publication_acked(ctx: _Ctx, body: ev.PublicationAcked) -> None:
     ):
         # Once per published triage (its generation): the label follows its
         # recommendation; a repeated acknowledgement never re-adds an owner-removed label.
-        ctx.update(close_candidate_session=body.session_id, close_candidate_at_us=ctx.now)
-        ctx.emit(
-            EffectKind.SET_CLOSE_CANDIDATE,
-            args={"action": "triage", "session_id": body.session_id},
-        )
+        _issue_close_candidate(ctx, body.session_id)
+
+
+def _issue_close_candidate(ctx: _Ctx, session_id: str) -> None:
+    """Make ``session_id`` the close-candidate label's generation and converge the label
+    on its triage (``SET_CLOSE_CANDIDATE``): a publication, or a backfill of a triage
+    published before the label existed."""
+    ctx.update(close_candidate_session=session_id, close_candidate_at_us=ctx.now)
+    ctx.emit(
+        EffectKind.SET_CLOSE_CANDIDATE,
+        args={"action": "triage", "session_id": session_id},
+    )
 
 
 def _h_session_created(ctx: _Ctx, body: ev.SessionCreated) -> None:
@@ -6294,6 +6324,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.RELATED_MARKED: _h_related_marked,
     EventKind.EPIC_PROGRESS: _h_epic_progress,
     EventKind.TRIAGE_STALE: _h_triage_stale,
+    EventKind.CLOSE_CANDIDATE_BACKFILL: _h_close_candidate_backfill,
     EventKind.BUNDLE_HOLD: _h_bundle_hold,
     EventKind.AGENT_BLOCKED_ON: _h_agent_blocked_on,
     EventKind.CONTRACT_PUBLISHED: _h_contract_published,

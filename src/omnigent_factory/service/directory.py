@@ -48,6 +48,7 @@ from omnigent_factory.core.types import (
     ReplanRequest,
     ReplanStatus,
     SessionKind,
+    Stage,
     StageSession,
     issue_session_title,
 )
@@ -610,6 +611,11 @@ class ServiceDispatchDirectory:
 
     def latest_triage(self, parcel: Parcel) -> dict[str, Any] | None:
         """The most recent accepted triage result of the parcel, if any."""
+        entry = self.latest_triage_entry(parcel)
+        return entry[1] if entry is not None else None
+
+    def latest_triage_entry(self, parcel: Parcel) -> tuple[str, dict[str, Any]] | None:
+        """``latest_triage`` with the triage run that produced it."""
         for session in reversed(parcel.sessions):
             if session.kind != SessionKind.TRIAGE:
                 continue
@@ -617,7 +623,7 @@ class ServiceDispatchDirectory:
             record = stored.get("factory_result") if stored is not None else None
             body = record.get("result") if isinstance(record, dict) else None
             if isinstance(body, dict) and body.get("kind") in ("triage", "epic_triage"):
-                return body
+                return session.session_id, body
         return None
 
     async def elicitation_content(self, effect: EffectIntent) -> dict[str, FormValue] | None:
@@ -1375,7 +1381,56 @@ def eli5_text(result: Mapping[str, Any]) -> str:
     return "\n".join(_eli5_lines(result)).strip()
 
 
-def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> str:
+#: What the ``factory:close-candidate`` label of a triage is (``close_candidate_label``).
+LABEL_PENDING = "pending"
+LABEL_ADDED = "labelled"
+LABEL_OWNER_REMOVED = "owner_removed"
+LABEL_LEFT_TRIAGE = "left_triage"
+
+
+def close_candidate_label(store: SqliteStore, *, parcel: Parcel, session_id: str) -> str:
+    """Where the close-candidate label of the triage ``session_id`` stands: added only
+    once its generation's add is done; the owner's removal and leaving Triage end it."""
+    if session_id and parcel.close_candidate_removed == session_id:
+        return LABEL_OWNER_REMOVED
+    if not session_id or parcel.close_candidate_session != session_id:
+        return LABEL_PENDING  # not issued yet (publication, or backfill, to come)
+    if parcel.stage != Stage.TRIAGED:
+        return LABEL_LEFT_TRIAGE
+    rows = store.query(
+        "SELECT 1 FROM effects WHERE parcel_id = ? AND kind = ? AND state = 'done' "
+        "AND json_extract(payload_json, '$.args.action') = 'triage' "
+        "AND json_extract(payload_json, '$.args.session_id') = ? LIMIT 1",
+        (parcel.parcel_id, EffectKind.SET_CLOSE_CANDIDATE.value, session_id),
+    )
+    return LABEL_ADDED if rows else LABEL_PENDING
+
+
+def _close_candidate_line(label: str) -> str:
+    if label == LABEL_ADDED:
+        return (
+            f"**Close candidate:** labelled `{CLOSE_CANDIDATE_LABEL}`; the factory never "
+            "closes the issue (close it, or remove the label to keep it)."
+        )
+    if label == LABEL_OWNER_REMOVED:
+        return (
+            "**Close candidate:** label removed by the owner; the factory never closes the "
+            "issue and does not add the label again for this triage."
+        )
+    if label == LABEL_LEFT_TRIAGE:
+        return (
+            "**Close candidate:** label removed when the card left Triage; the factory "
+            "never closes the issue."
+        )
+    return (
+        f"**Close candidate:** label pending (`{CLOSE_CANDIDATE_LABEL}`); the factory never "
+        "closes the issue (close it, or remove the label to keep it)."
+    )
+
+
+def _public_result(
+    result: dict[str, Any], agent: str = "The factory agent", close_candidate: str = LABEL_PENDING
+) -> str:
     kind = str(result.get("kind") or "result")
     eli5 = _eli5_lines(result)
     if kind == "triage":
@@ -1395,10 +1450,7 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
         if evidence:
             lines.append(f"**Closure evidence:** {evidence}")
         if result.get("recommendation") in CLOSURE_RECOMMENDATIONS:
-            lines.append(
-                f"**Close candidate:** labelled `{CLOSE_CANDIDATE_LABEL}`; the factory never "
-                "closes the issue (close it, or remove the label to keep it)."
-            )
+            lines.append(_close_candidate_line(close_candidate))
         labels = result.get("labels")
         if isinstance(labels, list) and labels:
             lines.append("**Suggested labels:** " + ", ".join(f"`{label}`" for label in labels))
@@ -1463,10 +1515,13 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
     return "Report recorded."
 
 
-def stage_result_text(result: dict[str, Any], agent: str = "The factory agent") -> str:
+def stage_result_text(
+    result: dict[str, Any], agent: str = "The factory agent", close_candidate: str = LABEL_PENDING
+) -> str:
     """A stage result as its comment shows it (``_public_result``): the status comment
-    shows the triage result and the last checkpoint report this way."""
-    return _public_result(result, agent)
+    shows the triage result (with where its ``close_candidate`` label stands) and the
+    last checkpoint report this way."""
+    return _public_result(result, agent, close_candidate)
 
 
 def _epic_triage_text(result: Mapping[str, Any]) -> str:

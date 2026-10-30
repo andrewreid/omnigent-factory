@@ -310,7 +310,14 @@ out of Triage also removes it, however the move is seen (webhook or a later read
 are durable effects (`set_close_candidate`): rate limits, 5xx and unclear outcomes are
 retried with the effect-recovery backoff, a removal of an absent label is fine, and a
 refused (4xx) write shows under `recovery` for `retry-effect`. The factory never closes an
-issue. A close candidate is
+issue. A triage published before the label existed is backfilled: the stale-triage scan
+(each reconcile interval, whether or not auto-retriage is on) issues the label once for a
+Triaged card whose newest published triage recommends closing and has no label generation
+yet, bound to that triage exactly as its publication would be (so your removal, a newer
+triage or leaving Triage stop it the same way), at most 5 cards per pass; an assigned or
+ineligible card, or one whose triage is still being published, waits. The triage text says
+where the label stands: `labelled` only once that triage's add is done, `label pending`
+before, `label removed by the owner` after your removal. A close candidate is
 never proposed for a bundle (your own `/bundle` may still take it), and epic autopilot
 leaves a labelled sub-issue alone like `factory:skip`. Auto-build is unchanged. Epic
 triages are not labelled.

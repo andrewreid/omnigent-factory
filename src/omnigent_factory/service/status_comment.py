@@ -43,6 +43,7 @@ from typing import Any, TypeVar
 from omnigent_factory.core import report_lines as rl
 from omnigent_factory.core.codec import parcel_from_json
 from omnigent_factory.core.effects import EffectIntent, EffectKind
+from omnigent_factory.core.protocol import CLOSURE_RECOMMENDATIONS
 from omnigent_factory.core.types import (
     ApprovalKind,
     BotState,
@@ -61,9 +62,11 @@ from omnigent_factory.github.client import (
     RateLimited,
 )
 from omnigent_factory.service.directory import (
+    LABEL_PENDING,
     ServiceDispatchDirectory,
     agent_display_name,
     approved_epic_plan,
+    close_candidate_label,
     eli5_text,
     ready_text,
     review_bot_name,
@@ -840,12 +843,18 @@ class StatusComments:
         assert parcel.issue_number is not None  # noqa: S101 - callers check
         stage = parcel.stage
         stage_name = config.status_names.get(stage.value, stage.value) if stage else "Inbox"
-        triage = self.directory.latest_triage(parcel)
+        entry = self.directory.latest_triage_entry(parcel)
         triage_text = ""
         triage_header = ""
-        if triage is not None and triage.get("kind") == "triage":
+        if entry is not None and entry[1].get("kind") == "triage":
+            triage_sid, triage = entry
+            label = LABEL_PENDING
+            if triage.get("recommendation") in CLOSURE_RECOMMENDATIONS:
+                label = await self._db(
+                    partial(close_candidate_label, parcel=parcel, session_id=triage_sid)
+                )
             triage_text = self.publish_text(
-                _without_heading(stage_result_text(triage, agent_display_name(config)))
+                _without_heading(stage_result_text(triage, agent_display_name(config), label))
             )
             if self.triage_header is not None:
                 try:

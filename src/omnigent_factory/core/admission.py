@@ -149,6 +149,8 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.RELATED_MARKED: Admission(_ADAPTER),
     EventKind.EPIC_PROGRESS: Admission(_ADAPTER),
     EventKind.TRIAGE_STALE: Admission(_ADAPTER),
+    # the stale-triage pass: a pre-label triage's close-candidate label, once
+    EventKind.CLOSE_CANDIDATE_BACKFILL: Admission(_ADAPTER),
     EventKind.BUNDLE_HOLD: Admission(_ADAPTER),
     EventKind.AGENT_BLOCKED_ON: Admission(_ADAPTER),
     EventKind.AUTOPILOT_STATUS: Admission(_ADAPTER),

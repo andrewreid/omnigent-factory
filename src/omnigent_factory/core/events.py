@@ -120,6 +120,7 @@ class EventKind(enum.StrEnum):
     RELATED_MARKED = "RelatedMarked"
     EPIC_PROGRESS = "EpicProgress"
     TRIAGE_STALE = "TriageStale"
+    CLOSE_CANDIDATE_BACKFILL = "CloseCandidateBackfill"
     BUNDLE_HOLD = "BundleHold"
     AGENT_BLOCKED_ON = "AgentBlockedOn"
     AUTOPILOT_STATUS = "AutopilotStatus"
@@ -1044,6 +1045,18 @@ class TriageStale(_Body):
 
 
 @dataclass(frozen=True, slots=True)
+class CloseCandidateBackfill(_Body):
+    """The stale-triage pass found this Triaged card's newest published triage (a closure
+    recommendation) without a ``factory:close-candidate`` generation: it was published
+    before the label existed. Issues the label once for that triage, as its publication
+    would have."""
+
+    KIND: ClassVar[EventKind] = EventKind.CLOSE_CANDIDATE_BACKFILL
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    session_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class BundleHold(_Body):
     """The bundling service's membership of this issue in bundle issue ``bundle``.
 
@@ -1347,6 +1360,7 @@ EventBody = (
     | RelatedMarked
     | EpicProgress
     | TriageStale
+    | CloseCandidateBackfill
     | BundleHold
     | AgentBlockedOn
     | AutopilotStatus
@@ -1440,6 +1454,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         RelatedMarked,
         EpicProgress,
         TriageStale,
+        CloseCandidateBackfill,
         BundleHold,
         AgentBlockedOn,
         AutopilotStatus,
@@ -1533,6 +1548,7 @@ __all__ = [
     "CheckRef",
     "ChecksChanged",
     "ChecksState",
+    "CloseCandidateBackfill",
     "CloseCandidateRemoved",
     "Closed",
     "ColumnObserved",
