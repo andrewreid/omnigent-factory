@@ -472,6 +472,38 @@ class Workspaces:
                 return current
         return None
 
+    @_clone_write
+    def bind_clean_orphan(
+        self, branch: str, base_branch: str, unused: Callable[[Path], bool]
+    ) -> VerifiedWorktree | None:
+        """Bind an untouched failed-create worktree, checking ownership under CLONE_LOCK.
+
+        The caller's fresh local/remote ownership check runs under the same lock. No
+        removal, reset or branch move: binding preserves even ignored harness files.
+        """
+        path = self.find_branch_worktree(branch)
+        if (
+            path is None
+            or not re.fullmatch(r"factory/issue-[0-9]+(?:-g[0-9]+)?", branch)
+            or path.name != branch.replace("/", "-")
+        ):
+            return None
+        verified = self.verify_worktree(path, branch)
+        if self._operations_in_progress(path) or not self.is_clean(path):
+            return None
+        if self.commits_ahead(path, base_branch):
+            return None
+        ancestor = _run(
+            ["merge-base", "--is-ancestor", "HEAD", f"refs/remotes/origin/{base_branch}"],
+            path,
+            check=False,
+            git=self.git,
+            env=self.inspection_env,
+        )
+        if ancestor.returncode != 0 or not unused(path):
+            return None
+        return verified
+
     def branch_exists(self, branch: str) -> bool:
         proc = _run(
             ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],

@@ -11,6 +11,7 @@ from omnigent_factory.core.effects import EffectIntent, EffectKind, MessagePurpo
 from omnigent_factory.core.predicates import (
     authority_ok,
     board_pending,
+    create_watch_ended,
     dispatchable,
     message_uncertain,
     work_allowed,
@@ -29,9 +30,19 @@ from omnigent_factory.core.types import (
 _REGRESSION_COMMENTS = frozenset({"ready-blocked"})
 
 
-def effect_still_valid(parcel: Parcel | None, effect: EffectIntent) -> str | None:
+def effect_still_valid(
+    parcel: Parcel | None, effect: EffectIntent, *, now_us: int | None = None
+) -> str | None:
     """Return ``None`` if ``effect`` may execute now, else the cancellation reason."""
     pre = effect.preconditions
+    if (
+        effect.kind == EffectKind.RECONCILE_SESSION
+        and "nonce" in effect.args
+        and parcel is not None
+    ):
+        session = parcel.session(pre.session_id)
+        if session is not None and create_watch_ended(parcel, session, now_us):
+            return "create-watch-ended"
     if effect.kind == EffectKind.CREATE_SESSION:
         return _create_valid(parcel, effect)
     if effect.kind == EffectKind.PREPARE_SESSION:

@@ -561,7 +561,19 @@ class FactoryService:
                     attempts=stored.attempts,
                 ),
             )
+            if effect.kind == EffectKind.CREATE_SESSION:
+                # EffectUnknown may be a duplicate at boot. Seed missing legacy searches;
+                # persisted searches retain their pending flag and not-before timestamp.
+                await self.db.call(
+                    partial(
+                        _replace_legacy_create_search,
+                        parcel_id=effect.parcel_id,
+                        session_id=effect.preconditions.session_id,
+                    )
+                )
             await self.apply_event(unknown_event)
+            if effect.kind == EffectKind.CREATE_SESSION:
+                await self._reconcile(effect.parcel_id)
 
     async def _adopt_terminal_claims(self) -> None:
         """Close the event-before-outbox-state crash window without losing disposition."""
@@ -1874,6 +1886,28 @@ class FactoryService:
         LOG.error("managed background task stopped task=%s", name)
         if self._fatal_exit is not None:
             self._fatal_exit(1)
+
+
+def _replace_legacy_create_search(
+    store: SqliteStore, *, parcel_id: str, session_id: str | None
+) -> None:
+    """Boot only, before execution: replace legacy pending reads as one new search.
+
+    No writer is retried. A crash between cancellation and ReconcileDue is repaired by
+    the next boot because the aggregate still has no recorded pending search.
+    """
+    parcel = store.load_parcel(parcel_id)
+    session = parcel.session(session_id) if parcel is not None else None
+    if session is None or session.root_id is not None or session.create_search_pending:
+        return
+    for stored in store.effects_in_state("pending"):
+        effect = stored.effect
+        if (
+            effect.kind == EffectKind.RECONCILE_SESSION
+            and effect.preconditions.session_id == session_id
+            and effect.args.get("nonce") == session.nonce
+        ):
+            store.cancel_effect(effect.effect_id, "legacy-create-search-replaced")
 
 
 def _requeue_effect(store: SqliteStore, *, effect_id: str, kind: str) -> bool:

@@ -327,7 +327,9 @@ class OmnigentExecutionAdapter:
                 },
             )
         except OmnigentReadError as exc:
-            return RetryableReadFailure(f"nonce search incomplete: {exc.reason}")
+            return RetryableReadFailure(
+                f"nonce search incomplete: {exc.reason}", max(60_000_000, exc.retry_after_us or 0)
+            )
         return [
             row
             for row in rows
@@ -488,18 +490,25 @@ class OmnigentExecutionAdapter:
                 orphan = await asyncio.to_thread(self.workspaces.find_branch_worktree, spec.branch)
                 exists = await asyncio.to_thread(self.workspaces.branch_exists, spec.branch)
                 if orphan is not None or exists:
-                    return DefinitiveFailure(
-                        f"branch-already-exists: {spec.branch}"
-                        + (f" (worktree {orphan})" if orphan else "")
-                    )
-                await asyncio.to_thread(self.workspaces.ensure_source_clone)
-                base = spec.base_branch or "main"
-                try:
-                    base_oid = await asyncio.to_thread(self.workspaces.fetch_base, base)
-                except WorktreeError as exc:
-                    return RetryableReadFailure(f"source fetch failed: {exc}")
-                workspace = str(self.workspaces.source_clone)
-                git = {"branch_name": spec.branch, "base_branch": f"origin/{base}"}
+                    repaired = await self._bind_orphan(spec)
+                    if isinstance(repaired, RetryableReadFailure):
+                        return repaired
+                    if repaired is None:
+                        return DefinitiveFailure(
+                            f"branch-already-exists: {spec.branch}"
+                            + (f" (worktree {orphan})" if orphan else "")
+                        )
+                    workspace, base_oid = repaired
+                    git = {"branch_name": spec.branch, "existing_worktree": True}
+                else:
+                    await asyncio.to_thread(self.workspaces.ensure_source_clone)
+                    base = spec.base_branch or "main"
+                    try:
+                        base_oid = await asyncio.to_thread(self.workspaces.fetch_base, base)
+                    except WorktreeError as exc:
+                        return RetryableReadFailure(f"source fetch failed: {exc}")
+                    workspace = str(self.workspaces.source_clone)
+                    git = {"branch_name": spec.branch, "base_branch": f"origin/{base}"}
         except GitLockBusy as exc:  # another Git process held a clone lock (#888)
             return RetryableReadFailure(f"workspace busy: {exc}", GIT_LOCK_RETRY_US)
         except ReferenceFetchError as exc:
@@ -530,6 +539,18 @@ class OmnigentExecutionAdapter:
         if cls == WriteClass.DEFINITIVE:
             return DefinitiveFailure(f"create rejected: HTTP {resp.status} {resp.error_code or ''}")
         if cls == WriteClass.AMBIGUOUS or resp.body is None:
+            error = as_map((resp.body or {}).get("error"))
+            LOG.warning(
+                "session create ambiguous session=%s status=%s error_code=%s message=%s",
+                spec.session_id,
+                resp.status,
+                str(resp.error_code or (resp.body or {}).get("error_code") or "")[:100],
+                " ".join(
+                    str(
+                        error.get("message") or (resp.body or {}).get("message") or resp.error or ""
+                    ).split()
+                )[:300],
+            )
             return AmbiguousWrite(f"create outcome unknown: {resp.status or resp.error}")
         root = resp.body.get("id") or resp.body.get("session_id")
         if not isinstance(root, str) or not root:
@@ -544,6 +565,70 @@ class OmnigentExecutionAdapter:
                 "base_oid": base_oid,
             },
         )
+
+    async def _bind_orphan(self, spec: StageSpec) -> tuple[str, str] | RetryableReadFailure | None:
+        allowed = getattr(self.directory, "orphan_repair_allowed", None)
+        if allowed is None or not await allowed(spec.session_id):
+            return None
+        base = spec.base_branch or spec.default_branch
+        try:
+            await asyncio.to_thread(self.workspaces.fetch_base, base)
+        except WorktreeError as exc:
+            return RetryableReadFailure(f"source fetch failed: {exc}")
+
+        async def unused(path: Path) -> bool:
+            if not await allowed(spec.session_id):
+                return False
+            # Full inventory, including children and archived roots. Only a closed,
+            # inactive archived row may cease to own a worktree.
+            rows = await self.rest.paginate(
+                "/v1/sessions", {"kind": "any", "include_archived": "true", "visibility": "all"}
+            )
+            for row in rows:
+                if row.get("git_branch") != spec.branch and row.get("workspace") != str(path):
+                    continue
+                if row.get("archived") is not True:
+                    return False
+                snap = await self.rest.get_json(f"/v1/sessions/{row['id']}")
+                if snap.get("archived") is not True or self._unexpected_turn(snap, reuse=True):
+                    return False
+            return True
+
+        loop = asyncio.get_running_loop()
+
+        def check(path: Path) -> bool:
+            # The worker holds CLONE_LOCK through the fresh ownership reads; Git on
+            # the event loop would block it, so the reads themselves perform no Git.
+            future = asyncio.run_coroutine_threadsafe(unused(path), loop)
+            try:
+                return future.result(timeout=30)
+            finally:
+                if not future.done():
+                    future.cancel()
+
+        try:
+            verified = await asyncio.to_thread(
+                self.workspaces.bind_clean_orphan, spec.branch, base, check
+            )
+        except OmnigentReadError as exc:
+            return RetryableReadFailure(
+                f"orphan ownership search incomplete: {exc}",
+                max(60_000_000, exc.retry_after_us or 0),
+            )
+        except TimeoutError:
+            return RetryableReadFailure("orphan ownership search timed out", 60_000_000)
+        except WorktreeError:
+            return None  # preserve the definitive branch-already-exists reason
+        if verified is None:
+            return None
+        LOG.warning(
+            "binding clean orphan worktree session=%s branch=%s path=%s head=%s",
+            spec.session_id,
+            spec.branch,
+            verified.path,
+            verified.head_oid,
+        )
+        return str(verified.path), verified.head_oid
 
     async def _repair_worktree(
         self, workspace: str | Path, spec: StageSpec
@@ -605,6 +690,11 @@ class OmnigentExecutionAdapter:
         return spec.bind_worktree is None or verified.path == spec.bind_worktree.resolve()
 
     async def _reconcile(self, effect: EffectIntent) -> AdapterOutcome:
+        not_before = effect.args.get("not_before_us")
+        if isinstance(not_before, int) and not_before > self.clock.now_utc_us():
+            return RetryableReadFailure(
+                "nonce-search-not-due", not_before - self.clock.now_utc_us()
+            )
         effect_id = effect.args.get("effect_id")
         if isinstance(effect_id, str):
             return await self._reconcile_send(effect_id)

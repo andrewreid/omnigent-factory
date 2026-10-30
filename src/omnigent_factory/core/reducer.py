@@ -49,8 +49,10 @@ from omnigent_factory.core.predicates import (
     all_settled,
     approval_ok,
     authority_ok,
+    awaiting_create,
     board_pending,
     continued,
+    create_watch_ended,
     dispatchable,
     eligible,
     executable,
@@ -792,6 +794,9 @@ def _create_session(
         correction_count=correction_count,
         root_id=reuse.root_id if reuse is not None else None,
     )
+    old_current = ctx.p.current_session
+    if old_current is not None and old_current.create_unconfirmed:
+        ctx.note("Starting: retrying unconfirmed session create")
     ctx.update(sessions=(*ctx.p.sessions, s), current_session_id=sid)
     if reuse is not None:
         for old in ctx.p.sessions:
@@ -5011,6 +5016,11 @@ def _adopt(ctx: _Ctx, s: StageSession, root_id: str, nonce: str) -> None:
         raise Rejected("nonce-mismatch")
     if any(x.root_id == root_id for x in ctx.p.sessions):
         raise Rejected("root-already-bound")
+    if s.create_unconfirmed:
+        # A late empty create is never bound or given a credential/work message.
+        ctx.put_session(replace(s, root_id=root_id, create_search_pending=False))
+        _archive(ctx, root_id)
+        return
     if s.lifecycle not in (
         Lifecycle.INTENT,
         Lifecycle.CREATING,
@@ -5018,7 +5028,7 @@ def _adopt(ctx: _Ctx, s: StageSession, root_id: str, nonce: str) -> None:
         Lifecycle.DRAINING,
     ):
         raise Rejected("session-not-awaiting-create")
-    s = replace(s, root_id=root_id)
+    s = replace(s, root_id=root_id, create_search_pending=False)
     _bind_issue_session(ctx, s, root_id)
     if ctx.p.create_rejected_reason:
         ctx.update(create_rejected_reason="")
@@ -5107,17 +5117,101 @@ def _h_create_rejected(ctx: _Ctx, body: ev.CreateRejected) -> None:
     _finish_drain(ctx, replace(s, drain_target=Lifecycle.FENCED if s.fences else Lifecycle.RETIRED))
 
 
+# Four complete empty searches spanning at least ten minutes. Read failures keep
+# the same outbox search pending and never advance this budget.
+_CREATE_SEARCH_DELAYS_US = (60_000_000, 180_000_000, 360_000_000)
+_CREATE_WATCH_US = 600_000_000
+_CREATE_WATCH_WINDOW_US = 7 * 24 * 60 * 60 * 1_000_000
+
+
+def _search_create(ctx: _Ctx, s: StageSession, delay_us: int = 0) -> None:
+    if s.create_unconfirmed and not s.create_watch_until_us:
+        # Pre-deadline tombstones get one durable window, never extended on restart.
+        s = ctx.put_session(replace(s, create_watch_until_us=ctx.now + _CREATE_WATCH_WINDOW_US))
+    if create_watch_ended(ctx.p, s, ctx.now):
+        ctx.put_session(replace(s, create_search_pending=False, create_watch_stopped=True))
+        return
+    if s.create_search_pending or s.root_id is not None:
+        return
+    s = ctx.put_session(
+        replace(s, create_search_pending=True, create_search_not_before_us=ctx.now + delay_us)
+    )
+    ctx.emit(
+        EffectKind.RECONCILE_SESSION,
+        session=s,
+        args={
+            "nonce": s.nonce,
+            "search": s.create_searches + 1,
+            "not_before_us": s.create_search_not_before_us,
+        },
+    )
+
+
+def _expire_create_watches(ctx: _Ctx) -> None:
+    # Latch closure at the closing event, so an immediate reopen cannot renew watches.
+    for session in ctx.p.sessions:
+        if not session.create_watch_stopped and create_watch_ended(ctx.p, session, ctx.now):
+            ctx.put_session(
+                replace(session, create_search_pending=False, create_watch_stopped=True)
+            )
+
+
 def _h_adoption_result(ctx: _Ctx, body: ev.AdoptionResult) -> None:
     s = _session(ctx, body.session_id)
     if s.root_id is not None:
         raise Rejected("already-adopted")
+    if body.nonce != s.nonce:
+        raise Rejected("nonce-mismatch")
     if body.matches == 1 and body.root_id is not None:
         _adopt(ctx, s, body.root_id, body.nonce)
         return
-    if body.matches > 1:
-        ctx.comment("adoption-ambiguous", session_id=s.session_id, matches=body.matches)
-        ctx.note("Blocked: ambiguous Omnigent session adoption")
-    # Zero matches is not proof of failure; remain UNKNOWN (no work, no blind retry).
+    if body.matches < 0:
+        raise Rejected("invalid-adoption-match-count")
+    if body.matches > 0:
+        if body.matches > 1 and not s.create_match_seen:
+            ctx.comment("adoption-ambiguous", session_id=s.session_id, matches=body.matches)
+            ctx.note("Blocked: ambiguous Omnigent session adoption")
+        s = ctx.put_session(replace(s, create_match_seen=True))
+        # Even a stale positive response is existence evidence. Keep the current search
+        # pending, but permanently veto an absence conclusion for this nonce.
+        if body.search != s.create_searches + 1 or ctx.now < s.create_search_not_before_us:
+            return
+    if body.search != s.create_searches + 1 and not (body.search == s.create_searches == 0):
+        raise Rejected("stale-create-search")
+    if ctx.now < s.create_search_not_before_us:
+        raise Rejected("early-create-search")
+    if not awaiting_create(s) and not s.create_unconfirmed:
+        raise Rejected("session-not-awaiting-create")
+    s = ctx.put_session(
+        replace(
+            s,
+            create_searches=s.create_searches + 1,
+            create_search_pending=False,
+            create_match_seen=s.create_match_seen or body.matches != 0,
+        )
+    )
+    if s.create_unconfirmed or s.create_match_seen:
+        _search_create(ctx, s, _CREATE_WATCH_US)
+        return
+    if s.create_searches <= len(_CREATE_SEARCH_DELAYS_US):
+        _search_create(ctx, s, _CREATE_SEARCH_DELAYS_US[s.create_searches - 1])
+        return
+    # Retire through the reducer; only valid pending authority may start a successor.
+    s = ctx.put_session(
+        replace(
+            s,
+            create_unconfirmed=True,
+            restart_pending=False,
+            execution_closed=True,
+            create_watch_until_us=ctx.now + _CREATE_WATCH_WINDOW_US,
+        )
+    )
+    ctx.emit(EffectKind.DISABLE_ISSUANCE, session=s)
+    target = s.drain_target or (Lifecycle.FENCED if s.fences else Lifecycle.RETIRED)
+    _finish_drain(ctx, replace(s, drain_target=target))
+    _end_build_episode(ctx, s)  # even a checkpoint-fenced create never acquired a root
+    ctx.note("Blocked: Omnigent did not confirm the session; move the card or comment to retry")
+    _search_create(ctx, ctx.p.session(s.session_id) or s, _CREATE_WATCH_US)
 
 
 def _h_effect_unknown(ctx: _Ctx, body: ev.EffectUnknown) -> None:
@@ -5127,7 +5221,7 @@ def _h_effect_unknown(ctx: _Ctx, body: ev.EffectUnknown) -> None:
             raise Rejected("create-already-adopted")
         if s.lifecycle in (Lifecycle.INTENT, Lifecycle.CREATING):
             s = ctx.put_session(replace(s, lifecycle=Lifecycle.UNKNOWN))
-        ctx.emit(EffectKind.RECONCILE_SESSION, session=s, args={"nonce": s.nonce})
+        _search_create(ctx, s)
         return
     if ctx.p.unknown_effect(body.effect_id) is None:
         ctx.update(
@@ -6244,7 +6338,14 @@ def awaiting_evidence(p: Parcel, now_us: int) -> bool:
 
 
 def _h_reconcile_due(ctx: _Ctx, body: ev.ReconcileDue) -> None:
-    _ = body
+    for session in ctx.p.sessions:
+        s = session
+        if awaiting_create(s) or (s.root_id is None and s.create_unconfirmed):
+            if body.pending_create_searches is not None:
+                s = ctx.put_session(
+                    replace(s, create_search_pending=s.session_id in body.pending_create_searches)
+                )
+            _search_create(ctx, s, max(s.create_search_not_before_us - ctx.now, 0))
     ctx.emit(EffectKind.RECONCILE_PARCEL)
     _close_stale_decisions(ctx)
     _flush_pending_feedback(ctx)
@@ -6925,6 +7026,7 @@ def transition(state: State, event: Event) -> TransitionResult:
     dropped = 0
     new_parcel = ctx.maybe_parcel
     if new_parcel is not None:
+        _expire_create_watches(ctx)
         _settle_observed_move(ctx, accepted)
         _settle_auto_build(ctx)
         _settle_autopilot(ctx)

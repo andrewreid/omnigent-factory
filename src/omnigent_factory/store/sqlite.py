@@ -53,6 +53,7 @@ from omnigent_factory.core.events import (
     EventKind,
     MessageAck,
     PublicationAcked,
+    ReconcileDue,
     SessionCreated,
 )
 from omnigent_factory.core.predicates import RUNNING_LIFECYCLES
@@ -387,7 +388,8 @@ def _create_resolution(event: Event) -> tuple[str, bool, str] | None:
 
     A create whose write timed out is resolved by a separate event (the adoption search's
     ``AdoptionResult``, or a later ``SessionCreated`` / ``CreateRejected``), never by the
-    create effect's own outcome. Zero or several adoption matches prove nothing.
+    create effect's own outcome. A single empty search proves nothing; bounded absence
+    is closed separately from the reducer's persisted create_unconfirmed tombstone.
     """
     body = event.body
     if isinstance(body, SessionCreated) and body.session_id and body.root_id:
@@ -1517,6 +1519,21 @@ class SqliteStore:
                 existing,
                 self._load_admission(conn, event.repo_id),
             )
+        if isinstance(event.body, ReconcileDue):
+            # Sample atomically with the reducer: pending flags alone cannot prove an
+            # outbox read still exists after a rejected acknowledgement or cancellation.
+            searches = conn.execute(
+                "SELECT DISTINCT target FROM effects WHERE parcel_id = ? AND kind = ? "
+                "AND state IN ('pending', 'claimed') "
+                "AND json_extract(payload_json, '$.args.nonce') IS NOT NULL ORDER BY target",
+                (event.parcel_id, EffectKind.RECONCILE_SESSION.value),
+            ).fetchall()
+            event = replace(
+                event,
+                body=replace(
+                    event.body, pending_create_searches=tuple(str(row[0]) for row in searches)
+                ),
+            )
         admission = self._load_admission(conn, event.repo_id)
         parcel: Parcel | None = None
         if event.kind not in (EventKind.PAUSE, EventKind.UNPAUSE) or event.parcel_id:
@@ -1587,6 +1604,12 @@ class SqliteStore:
             created = _create_resolution(event)
             if created is not None and event.parcel_id is not None:
                 self._close_unknown_create(conn, event.parcel_id, *created)
+            if isinstance(event.body, AdoptionResult) and new.parcel is not None:
+                session = new.parcel.session(event.body.session_id)
+                if session is not None and session.create_unconfirmed:
+                    self._close_unknown_create(
+                        conn, new.parcel.parcel_id, session.session_id, False, ""
+                    )
         if new.parcel is not None:
             self._project(conn, old_parcel, new.parcel, event, now)
         self._write_admission(conn, new.admission, now)

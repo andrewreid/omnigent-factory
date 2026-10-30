@@ -218,6 +218,8 @@ class FakeOmnigentServer:
         queue = self.faults.get((request.method, path))
         if queue:
             action = queue.popleft()
+        if isinstance(action, httpx.Response):
+            return action
         if isinstance(action, int):
             return httpx.Response(action, json={"error": {"code": "injected", "message": "x"}})
         if action == "timeout-before":
@@ -335,6 +337,16 @@ class FakeOmnigentServer:
             branch = git["branch_name"]
             if not git.get("existing_worktree"):
                 workspace = self._make_worktree(branch, git.get("base_branch"))
+        if action == "worktree-then-409":
+            return httpx.Response(
+                409,
+                json={
+                    "error": {
+                        "code": "host_offline",
+                        "message": "Worktree host unavailable during reconnect",
+                    }
+                },
+            )
         if action == "worktree-then-500":
             return httpx.Response(500, json={"error": {"code": "internal", "message": "x"}})
         session = self.add(

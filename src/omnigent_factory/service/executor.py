@@ -249,7 +249,7 @@ class EffectExecutor:
             if effect.parcel_id is not None
             else None
         )
-        invalid = effect_still_valid(parcel, effect)
+        invalid = effect_still_valid(parcel, effect, now_us=self._clock.now_utc_us())
         if invalid is not None:
             await self._cancel(claimed, invalid)
             return

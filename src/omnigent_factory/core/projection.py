@@ -10,6 +10,7 @@ a replan) moves it to Building first (``ready_bot_ok``).
 from __future__ import annotations
 
 from omnigent_factory.core.effects import EffectKind
+from omnigent_factory.core.predicates import awaiting_create
 from omnigent_factory.core.types import (
     BLOCKING_HOLDS,
     NEEDS_YOU_HOLDS,
@@ -243,6 +244,8 @@ _EXTERNAL_ACTIVITY_NOTE = (
 
 def project_note(p: Parcel, bot: BotState) -> str:
     """The board's "Factory note": the latest status reason, else one derived from ``bot``."""
+    if any(awaiting_create(s) for s in p.sessions):
+        return "Blocked: session create unconfirmed (checking Omnigent)"
     if p.note:
         return p.note[:NOTE_MAX]
     if bot == BotState.BLOCKED:

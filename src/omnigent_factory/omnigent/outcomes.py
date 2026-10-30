@@ -92,6 +92,7 @@ def _reconciled(effect: EffectIntent, sid: str, outcome: Ack) -> tuple[ev.EventB
             ev.AdoptionResult(
                 session_id=sid,
                 matches=matches if isinstance(matches, int) else 0,
+                search=int(str(effect.args.get("search", 0))),
                 root_id=root if isinstance(root, str) else None,
                 nonce=str(d.get("nonce") or ""),
             ),

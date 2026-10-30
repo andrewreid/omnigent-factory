@@ -17,6 +17,7 @@ from omnigent_factory.core.types import (
     Lifecycle,
     Parcel,
     SessionKind,
+    Stage,
     StageSession,
 )
 
@@ -35,6 +36,26 @@ RUNNING_LIFECYCLES = frozenset(
         Lifecycle.UNKNOWN,
     }
 )
+
+
+def awaiting_create(s: StageSession) -> bool:
+    """An ambiguous root-less create remains unresolved even after fencing/draining."""
+    return (
+        s.root_id is None
+        and not s.create_unconfirmed
+        and (s.lifecycle == Lifecycle.UNKNOWN or s.create_search_pending or s.create_searches > 0)
+    )
+
+
+def create_watch_ended(p: Parcel, s: StageSession, now_us: int | None = None) -> bool:
+    """Only retired-nonce watches expire; unresolved creates must still settle."""
+    return s.create_unconfirmed and (
+        s.create_watch_stopped
+        or Hold.COMPLETED in p.holds
+        or p.stage == Stage.DONE
+        or p.ineligibility_reason == "closed"
+        or (now_us is not None and 0 < s.create_watch_until_us <= now_us)
+    )
 
 
 def holds_triage_slot(p: Parcel) -> bool:

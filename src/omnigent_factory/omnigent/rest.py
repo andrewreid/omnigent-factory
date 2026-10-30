@@ -14,8 +14,11 @@ first page (bounded), never skips.
 
 from __future__ import annotations
 
+import email.utils
 import enum
 import json
+import math
+import time
 from collections.abc import AsyncIterator, Callable, Generator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,10 +44,26 @@ def as_list(value: object) -> list[Any]:
 class OmnigentReadError(RuntimeError):
     """A read could not be completed; never evidence of absence or idleness."""
 
-    def __init__(self, reason: str, status: int | None = None) -> None:
+    def __init__(
+        self, reason: str, status: int | None = None, retry_after_us: int | None = None
+    ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.status = status
+        self.retry_after_us = retry_after_us
+
+
+def _retry_after_us(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        try:
+            seconds = float(value)
+        except ValueError:
+            seconds = email.utils.parsedate_to_datetime(value).timestamp() - time.time()
+        return max(1_000_000, int(seconds * 1_000_000)) if math.isfinite(seconds) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 class FileTokenAuth(httpx.Auth):
@@ -127,7 +146,11 @@ class OmnigentRest:
         except httpx.HTTPError as exc:
             raise OmnigentReadError(f"GET {path}: {type(exc).__name__}") from exc
         if resp.status_code != 200:
-            raise OmnigentReadError(f"GET {path}: HTTP {resp.status_code}", resp.status_code)
+            raise OmnigentReadError(
+                f"GET {path}: HTTP {resp.status_code}",
+                resp.status_code,
+                _retry_after_us(resp.headers.get("retry-after")),
+            )
         try:
             body = resp.json()
         except ValueError as exc:

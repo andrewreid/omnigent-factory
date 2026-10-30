@@ -629,6 +629,16 @@ class StageSession:
     #: A build run retired for Ready was re-opened once for review-bot findings that
     #: arrived after Ready (#799). Never again: a later late finding is the owner's.
     reopened: bool = False
+    #: Durable nonce-search progress; defaults recover records predating the budget.
+    create_searches: int = 0
+    create_search_pending: bool = False
+    create_search_not_before_us: int = 0
+    create_match_seen: bool = False
+    #: Tombstone: complete searches found no root; never prepare a late root.
+    create_unconfirmed: bool = False
+    #: Retired-nonce watch deadline; completion/closure can stop it sooner, permanently.
+    create_watch_until_us: int = 0
+    create_watch_stopped: bool = False
     #: Health-sweep stall episodes of this run (``StallWatch``).
     stall: StallWatch = field(default_factory=StallWatch)
 

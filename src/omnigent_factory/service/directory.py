@@ -165,6 +165,20 @@ class ServiceDispatchDirectory:
             ),
         )
 
+    async def orphan_repair_allowed(self, session_id: str) -> bool:
+        """Only a fresh successor of a concluded create can reclaim its orphan.
+
+        Issue branches are parcel-specific. Any other unclosed local run, or reusable
+        issue root, keeps ownership; the adapter additionally checks remote roots.
+        """
+        parcel = await self._parcel_for_session(session_id)
+        if parcel is None or parcel.current_session_id != session_id:
+            return False
+        if parcel.issue_session is not None and parcel.issue_session.reusable:
+            return False
+        others = [s for s in parcel.sessions if s.session_id != session_id]
+        return any(s.create_unconfirmed for s in others) and all(s.execution_closed for s in others)
+
     async def _make_snapshot(self, parcel: Parcel, session: StageSession) -> dict[str, object]:
         issue = parcel.issue_number or 0
         branch = f"factory/issue-{issue or _safe(parcel.parcel_id)}"

@@ -790,6 +790,7 @@ class AdoptionResult(_Body):
     matches: int = 0
     root_id: str | None = None
     nonce: str = ""
+    search: int = 0  # 0: legacy search, accepted only before any completed search
 
 
 @dataclass(frozen=True, slots=True)
@@ -1288,6 +1289,9 @@ class RetryDue(_Body):
 class ReconcileDue(_Body):
     KIND: ClassVar[EventKind] = EventKind.RECONCILE_DUE
     CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    #: Store-sampled pending/claimed nonce searches, in the applying transaction.
+    #: None means no outbox evidence (legacy events and pure reducer callers).
+    pending_create_searches: tuple[str, ...] | None = None
 
 
 EventBody = (

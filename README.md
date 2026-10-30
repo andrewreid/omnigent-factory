@@ -809,6 +809,48 @@ field value or marker before writing, and a newer desired value supersedes the o
 Only exhaustion changes the card to Blocked with the exact update and effect ID. Existing
 safe `unknown` rows enter this path on startup, so upgrades self-heal without a database edit.
 
+An ambiguous session create (including HTTP 409 during a host reconnect) searches the
+original dispatch nonce across all pages, including archived roots. After the first
+complete empty search it repeats after 1, 3 and 6 minutes. Read failures and rate limits
+retry the same search after at least a minute and do not consume the budget. Search
+numbers and deadlines live in the session aggregate JSON and outbox; restart preserves
+them. Fencing while the create POST is in flight does not abandon the search; exhaustion
+settles that run FENCED. Reconciliation checks the pending/claimed outbox atomically and
+re-queues a missing search without resetting its budget or deadline. Startup also starts
+this budget for legacy UNKNOWN creates left after an empty search, without a migration
+or database edits. While searching the note reads
+`Blocked: session create unconfirmed (checking Omnigent)`.
+
+Four complete empty searches retire the run through the reducer, disable issuance,
+release its triage/build slot and close the original create effect as failed. The note
+says Omnigent did not confirm the session and asks the owner to move the card or comment
+to retry. If valid pending owner authority exists, normal dispatch starts a new run with
+a fresh nonce automatically. The original POST is never retried. Any observed nonce
+match (even an unverified or ambiguous one) prevents concluding absence; identity checks
+remain unchanged.
+
+An absence conclusion is bounded observation, not a server guarantee about future
+visibility. The retired nonce remains a durable tombstone and is searched every ten
+minutes until a verified late root appears, the parcel completes/closes, or seven days
+have passed since retirement, whichever happens first. The deadline and stop flag are
+durable: reopening or restarting does not renew a stopped watch. Queued/retrying reads
+check these limits before any remote call. Adoption or a late `SessionCreated` archives
+that root without binding it as the issue session, preparing it, enabling credentials or
+sending work. Creates use empty `initial_items`, so delayed old creates cannot start a
+second factory run. These watches survive restart and continue even after a successor
+starts; incomplete watch reads are retried within that window. After watching stops,
+a later explicit creation/adoption observation still archives the old root, but the
+factory no longer actively searches for it.
+
+A successor can bind a clean orphan worktree left by the failed create using
+`existing_worktree`. Under `CLONE_LOCK`, it verifies the exact factory issue branch and
+worktree name, owned location, clean files, no Git operation in progress, no commits
+ahead of the fetched base, and ancestry of that base. Fresh local ownership and complete
+remote inventory checks must show no live session uses it. Binding is logged and keeps
+the worktree and branch intact; dirty, ahead, unowned or still-used worktrees retain the
+definitive `branch-already-exists` rejection. Ambiguous creates log bounded response
+error codes/messages alongside the HTTP status to diagnose reconnect failures.
+
 Effect ambiguity is classified as follows:
 
 | Class | Effect kinds | Unknown-outcome handling |
