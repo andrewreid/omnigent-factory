@@ -3560,6 +3560,11 @@ def _h_item_removed(ctx: _Ctx, body: ev.ItemRemoved) -> None:
     _safety(ctx, body.KIND.value)
 
 
+def _h_observation_failed(ctx: _Ctx, body: ev.ObservationFailed) -> None:
+    _safety(ctx, body.KIND.value)
+    ctx.note("Observation failed a store invariant; held for operator recovery")
+
+
 def _h_inbox_hold_set(ctx: _Ctx, body: ev.InboxHoldSet) -> None:
     """Hold the parcel on an uninterpretable delivery; treat it as a possible safety fact.
 
@@ -5710,6 +5715,7 @@ def _h_tree_quiescent(ctx: _Ctx, body: ev.TreeQuiescent) -> None:
     s = _session(ctx, body.session_id)
     if any(w.session_id == s.session_id for w in ctx.p.held_wakes):
         # Its message is held until it has a build slot: an idle tree is no turn ending.
+        # _settle_build_slot still uses this read to release observed occupancy.
         return
     if not body.complete or body.busy:
         s = ctx.put_session(replace(s, quiescent=False))
@@ -6259,6 +6265,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.APPROVAL_INVALIDATED: _h_approval_invalidated,
     EventKind.WAIVER_EDITED: _h_waiver_edited,
     EventKind.CONTRACT_TAMPERED: _h_contract_tampered,
+    EventKind.OBSERVATION_FAILED: _h_observation_failed,
     EventKind.INBOX_HOLD_SET: _h_inbox_hold_set,
     EventKind.INBOX_HOLD_RELEASED: _h_inbox_hold_released,
     EventKind.GITHUB_SNAPSHOT: _h_snapshot,
@@ -6579,9 +6586,13 @@ def _slot_free(ctx: _Ctx, entry: QueueEntry) -> bool:
     )
 
 
-def _acquire_slot(ctx: _Ctx, entry: QueueEntry) -> None:
+def _acquire_slot(ctx: _Ctx, entry: QueueEntry, *, observed: bool = False) -> None:
     building = Reservation(
-        ctx.new_id("rs"), ctx.p.parcel_id, ReservationKind.BUILDING, entry.approval_id
+        ctx.new_id("rs"),
+        ctx.p.parcel_id,
+        ReservationKind.BUILDING,
+        entry.approval_id,
+        observed_over_cap=observed and not building_capacity_available(ctx.admission, ctx.config),
     )
     ctx.admission = replace(ctx.admission, reservations=(*ctx.admission.reservations, building))
     _set_queue(ctx, replace(entry, status=QueueStatus.RESERVED, resume=False), ctx.p.parcel_id)
@@ -6657,11 +6668,33 @@ def _settle_build_slot(ctx: _Ctx) -> None:
         for e in ctx.effects
         if e.kind in _WAKE_KINDS and e.preconditions.session_id == s.session_id
     ]
-    holds_slot = any(
-        r.parcel_id == pid for r in ctx.admission.live_reservations(ReservationKind.BUILDING)
+    reservation = next(
+        (
+            r
+            for r in ctx.admission.live_reservations(ReservationKind.BUILDING)
+            if r.parcel_id == pid
+        ),
+        None,
     )
     if entry.status == QueueStatus.RESERVED:
-        if holds_slot and not wakes and build_parked(ctx.p):
+        if not _resumable(s) and p.held_wakes:
+            ctx.update(held_wakes=())  # stopping/checkpointed work cannot replay an old wake
+        observed = reservation is not None and reservation.observed_over_cap
+        if observed and ctx.admission.building_count > ctx.config.max_building:
+            # Counting uncertain work is not permission to wake it into a new turn.
+            _hold_wakes(ctx, wakes)
+            wakes = []
+        body = ctx.event.body
+        # A held wake has not run: don't end its turn, but still account for an idle tree.
+        idle_held = (
+            observed
+            and bool(ctx.p.held_wakes)
+            and isinstance(body, ev.TreeQuiescent)
+            and body.session_id == s.session_id
+            and body.complete
+            and not body.busy
+        )
+        if reservation is not None and not wakes and (idle_held or build_parked(ctx.p)):
             ctx.admission = replace(
                 ctx.admission,
                 reservations=tuple(
@@ -6671,8 +6704,17 @@ def _settle_build_slot(ctx: _Ctx) -> None:
                     for r in ctx.admission.reservations
                 ),
             )
-            _set_queue(ctx, replace(entry, status=QueueStatus.HELD, resume=True), pid)
+            status = QueueStatus.QUEUED if ctx.p.held_wakes else QueueStatus.HELD
+            _set_queue(ctx, replace(entry, status=status, resume=True), pid)
             ctx.update(slot_parked=True)
+        elif (
+            observed
+            and ctx.p.held_wakes
+            and ctx.admission.building_count <= ctx.config.max_building
+            and _resumable(s)
+        ):
+            # Another build released capacity: this run already holds its slot.
+            _replay_held(ctx)
         return
     if not parked_entry:
         return
@@ -6694,9 +6736,8 @@ def _settle_build_slot(ctx: _Ctx) -> None:
             ctx.note(_queued_note(ctx))
         return
     if not build_parked(ctx.p):
-        # Running again without a message (a busy read after a stale idle one): it holds
-        # a slot whether or not one is free.
-        _acquire_slot(ctx, entry)
+        # Account for authorized work observed busy/uncertain, without admitting a wake.
+        _acquire_slot(ctx, entry, observed=True)
 
 
 def _settle_observed_move(ctx: _Ctx, accepted: bool) -> None:

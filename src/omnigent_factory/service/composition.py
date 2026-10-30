@@ -83,6 +83,7 @@ from omnigent_factory.service.splits import Splits
 from omnigent_factory.service.status_comment import StatusComments
 from omnigent_factory.service.tokens import DaemonTokenProvider
 from omnigent_factory.service.worktree_gc import WorktreeGC, github_issue_states
+from omnigent_factory.store.sqlite import InvariantViolation
 
 LOG = logging.getLogger(__name__)
 
@@ -200,16 +201,19 @@ class ProductionRuntime:
                 continue
             LOG.info("policy guard held closed session=%s", session.session_id)
             held.add(session.session_id)
-            await self.service.apply_event(
-                Event(
-                    event_id=f"boot-policy-hold:{session.session_id}:{self.service.clock.now_utc_us()}",
-                    repo_id=self.config.repo_id,
-                    parcel_id=parcel.parcel_id,
-                    source_time_us=self.service.clock.now_utc_us(),
-                    provenance=Provenance.ADAPTER,
-                    body=ev.PolicyGuardFailed(session_id=session.session_id),
+            try:
+                await self.service.apply_event(
+                    Event(
+                        event_id=f"boot-policy-hold:{session.session_id}:{self.service.clock.now_utc_us()}",
+                        repo_id=self.config.repo_id,
+                        parcel_id=parcel.parcel_id,
+                        source_time_us=self.service.clock.now_utc_us(),
+                        provenance=Provenance.ADAPTER,
+                        body=ev.PolicyGuardFailed(session_id=session.session_id),
+                    )
                 )
-            )
+            except InvariantViolation:
+                await self.service.hold_observation_failure(parcel.parcel_id)
         return frozenset(held)
 
     async def _github_reconcile(self) -> frozenset[str]:
@@ -228,17 +232,21 @@ class ProductionRuntime:
             )
             if not isinstance(snapshot, IssueSnapshot):
                 continue
-            await self.service.apply_event(
-                Event(
-                    event_id=f"startup-github:{parcel.parcel_id}:{snapshot.read_at_us}",
-                    repo_id=self.config.repo_id,
-                    parcel_id=parcel.parcel_id,
-                    source_time_us=snapshot.read_at_us,
-                    provenance=Provenance.ADAPTER,
-                    body=ev.GitHubSnapshot(),
-                    evidence=snapshot,
+            try:
+                await self.service.apply_event(
+                    Event(
+                        event_id=f"startup-github:{parcel.parcel_id}:{snapshot.read_at_us}",
+                        repo_id=self.config.repo_id,
+                        parcel_id=parcel.parcel_id,
+                        source_time_us=snapshot.read_at_us,
+                        provenance=Provenance.ADAPTER,
+                        body=ev.GitHubSnapshot(),
+                        evidence=snapshot,
+                    )
                 )
-            )
+            except InvariantViolation:
+                await self.service.hold_observation_failure(parcel.parcel_id)
+                continue
             observed.add(parcel.parcel_id)
         # Read now: the reconcile loop's first periodic read of each is a full interval
         # away (no burst right after boot).

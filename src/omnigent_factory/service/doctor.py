@@ -142,6 +142,7 @@ async def run_doctor(
     await asyncio.to_thread(_check_status_pin, config, report)
     await asyncio.to_thread(_check_bundling, config, report)
     await asyncio.to_thread(_check_auto_retriage, config, report)
+    await asyncio.to_thread(_check_build_slots, config, report)
     _check_socket(config, report)
     await asyncio.to_thread(_check_bind, config, report)
     _check_mcp_token(config, report)
@@ -1125,6 +1126,33 @@ def _check_bundling(config: ServiceConfig, report: DoctorReport) -> None:
         f"most {config.bundle_command_max_members} members; {counts[0]} proposals pending, "
         f"{counts[1]} active bundles, {counts[2]} members held",
     )
+
+
+def _check_build_slots(config: ServiceConfig, report: DoctorReport) -> None:
+    """Read occupancy without migrating a database (including pre-v23 databases)."""
+    total = observed = 0
+    if config.database_path.exists():
+        try:
+            conn = sqlite3.connect(f"file:{config.database_path}?mode=ro", uri=True, timeout=5)
+            try:
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(reservations)")}
+                flag = "observed_over_cap" if "observed_over_cap" in columns else "0"
+                total, observed = conn.execute(
+                    f"SELECT COUNT(*), COALESCE(SUM({flag}), 0) FROM reservations "  # noqa: S608
+                    "WHERE repo_id = ? AND live = 1 AND kind = 'building'",
+                    (config.repo_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            report.warn("building", f"occupancy unavailable: {exc}")
+            return
+    excess = min(observed, max(0, total - config.max_building))
+    detail = f"building {total}/{config.max_building}, {excess} observed over cap"
+    if total > config.max_building:
+        report.warn("building", detail)
+    else:
+        report.pass_check("building", detail)
 
 
 def _check_auto_retriage(config: ServiceConfig, report: DoctorReport) -> None:

@@ -30,9 +30,7 @@ from omnigent_factory.store.sqlite import (
 from omnigent_factory.testing.builders import REPO_ID, config
 from omnigent_factory.testing.fakes import FakeClock
 
-from .test_store import P, StoreHarness, store_harness
-
-LATEST = max(m.version for m in MIGRATIONS)
+from .test_store import LATEST, P, StoreHarness, store_harness
 
 
 class Crash(Exception):
@@ -73,7 +71,7 @@ def test_v1_database_upgrades_to_v2_preserving_data_and_reopens(db: Path):
     v1.close()
 
     upgraded = open_store(db)
-    assert upgraded.schema_version() == LATEST == 22
+    assert upgraded.schema_version() == LATEST
     names = {r[0] for r in upgraded.query("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"own_sends", "capability_records", "worker_grants", "parked_deliveries"} <= names
     assert "mcp_feedback_reads" in names

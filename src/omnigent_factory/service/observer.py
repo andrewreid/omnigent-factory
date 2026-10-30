@@ -33,6 +33,7 @@ from omnigent_factory.omnigent.tree import TreeObservation
 from omnigent_factory.ports.clock import Clock
 from omnigent_factory.service.directory import ServiceDispatchDirectory
 from omnigent_factory.service.runtime import FactoryService
+from omnigent_factory.store.sqlite import InvariantViolation
 
 LOG = logging.getLogger(__name__)
 
@@ -275,17 +276,20 @@ class OmnigentObserver:
         observed: set[str] = set()
         for (parcel, session, _root), result in zip(due, results, strict=True):
             try:
-                if not isinstance(result, TreeObservation):
-                    raise result
-                await self._observe(parcel, result)
-            except (OmnigentReadError, OSError, ValueError):
-                tracker = self._tracker(
-                    session.session_id, session.grant.grant_id, session.grant.consumed_us
-                )
-                tracker.gap_started()
-                await self._activity(parcel, tracker)
-            else:
-                observed.add(session.session_id)
+                try:
+                    if not isinstance(result, TreeObservation):
+                        raise result
+                    await self._observe(parcel, result)
+                except (OmnigentReadError, OSError, ValueError):
+                    tracker = self._tracker(
+                        session.session_id, session.grant.grant_id, session.grant.consumed_us
+                    )
+                    tracker.gap_started()
+                    await self._activity(parcel, tracker)
+                else:
+                    observed.add(session.session_id)
+            except InvariantViolation:
+                await self.service.hold_observation_failure(parcel.parcel_id)
         return frozenset(observed)
 
     async def _observe(self, parcel: Parcel, observation: TreeObservation) -> None:

@@ -80,6 +80,7 @@ class EventKind(enum.StrEnum):
     APPROVAL_INVALIDATED = "ApprovalInvalidated"
     WAIVER_EDITED = "WaiverEdited"
     CONTRACT_TAMPERED = "ContractTampered"
+    OBSERVATION_FAILED = "ObservationFailed"
     INBOX_HOLD_SET = "InboxHoldSet"
     INBOX_HOLD_RELEASED = "InboxHoldReleased"
     # observation: GitHub
@@ -531,6 +532,14 @@ class ContractTampered(_Body):
     KIND: ClassVar[EventKind] = EventKind.CONTRACT_TAMPERED
     CLASS: ClassVar[EventClass] = EventClass.SAFETY
     contract_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationFailed(_Body):
+    """A parcel observation violated a store invariant; hold and fence it for recovery."""
+
+    KIND: ClassVar[EventKind] = EventKind.OBSERVATION_FAILED
+    CLASS: ClassVar[EventClass] = EventClass.SAFETY
 
 
 @dataclass(frozen=True, slots=True)
@@ -1301,6 +1310,7 @@ EventBody = (
     | ApprovalInvalidated
     | WaiverEdited
     | ContractTampered
+    | ObservationFailed
     | InboxHoldSet
     | InboxHoldReleased
     | GitHubSnapshot
@@ -1393,6 +1403,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         ApprovalInvalidated,
         WaiverEdited,
         ContractTampered,
+        ObservationFailed,
         InboxHoldSet,
         InboxHoldReleased,
         GitHubSnapshot,
@@ -1555,6 +1566,7 @@ __all__ = [
     "ItemRemoved",
     "LeftwardMove",
     "MessageAck",
+    "ObservationFailed",
     "OpenPRCapacityReconciled",
     "OperatorResume",
     "OwnerDirectOmnigentMessage",

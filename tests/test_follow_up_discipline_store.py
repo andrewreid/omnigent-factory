@@ -17,8 +17,7 @@ from omnigent_factory.store.migrations import MIGRATIONS
 from omnigent_factory.store.sqlite import SqliteStore
 from omnigent_factory.testing.builders import REPO_ID, config
 from omnigent_factory.testing.fakes import FakeClock
-
-LATEST = max(m.version for m in MIGRATIONS)
+from tests.test_store import LATEST
 
 
 def test_migration_17_upgrades_a_database_with_follow_ups_and_keeps_them(tmp_path: Path):
@@ -35,7 +34,7 @@ def test_migration_17_upgrades_a_database_with_follow_ups_and_keeps_them(tmp_pat
 
     store = SqliteStore.open(path, FakeClock())
     try:
-        assert store.schema_version() == LATEST == 22
+        assert store.schema_version() == LATEST
         row = store.follow_up(REPO_ID, 904)
         assert row is not None and row.source_issue == 747 and row.blocks == (882,)
         assert store.epic_follow_up_builds(REPO_ID, 878) == (True, 5)

@@ -1016,6 +1016,12 @@ CREATE TABLE auto_retriage (
 );
 """
 
+# Preserve existing reservations and their uniqueness; old rows are ordinary admissions.
+V23_SQL = """
+ALTER TABLE reservations ADD COLUMN observed_over_cap INTEGER NOT NULL DEFAULT 0
+    CHECK (observed_over_cap IN (0, 1) AND (observed_over_cap = 0 OR kind = 'building'));
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -1039,4 +1045,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(20, "status-comments", V20_SQL),
     Migration(21, "issue-bundling", V21_SQL),
     Migration(22, "auto-retriage", V22_SQL),
+    Migration(23, "observed-build-occupancy", V23_SQL),
 )

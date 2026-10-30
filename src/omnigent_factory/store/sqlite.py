@@ -15,7 +15,8 @@ Contract (architecture §3.2-§3.5):
 * :meth:`SqliteStore.record_effect_outcome` commits an effect's terminal/unknown state
   together with the reducer event that reports it, so no crash can separate them.
 * The store re-checks admission caps before commit (defense in depth): a transaction that
-  would raise the building or prospective-PR count above its cap is rolled back.
+  admits new work above its cap is rolled back. Authorized parked work observed busy or
+  uncertain may exceed the building cap; it is explicitly marked and validated.
 * Leases carry a boot UUID and monotonically increasing epoch. A lease held by another
   boot is never stolen implicitly; takeover requires the caller to assert (via the
   process lock) that the old process is gone.
@@ -55,7 +56,7 @@ from omnigent_factory.core.events import (
     SessionCreated,
 )
 from omnigent_factory.core.predicates import RUNNING_LIFECYCLES
-from omnigent_factory.core.reducer import TransitionResult, transition
+from omnigent_factory.core.reducer import TransitionResult, build_parked, transition
 from omnigent_factory.core.types import (
     FENCE_BITS,
     AdmissionSnapshot,
@@ -66,6 +67,7 @@ from omnigent_factory.core.types import (
     QueueStatus,
     Reservation,
     ReservationKind,
+    SessionKind,
     State,
     TrustedConfig,
 )
@@ -572,6 +574,7 @@ class SqliteStore:
                 r["episode_id"],
                 r["pr_number"],
                 bool(r["live"]),
+                observed_over_cap=bool(r["observed_over_cap"]),
             )
             for r in conn.execute(
                 "SELECT * FROM reservations WHERE repo_id = ? AND live = 1 ORDER BY reservation_id",
@@ -1543,7 +1546,9 @@ class SqliteStore:
                 admission=admission,
                 persisted=False,
             )
-        self._check_caps(admission, new.admission, config)
+        self._check_caps(
+            admission, new.admission, config, old=old_parcel, new=new.parcel, effects=result.effects
+        )
         seq_row = conn.execute("SELECT COALESCE(MAX(sequence), 0) + 1 AS s FROM events")
         sequence = int(seq_row.fetchone()["s"])
         if new.parcel is not None:
@@ -1690,10 +1695,68 @@ class SqliteStore:
 
     @staticmethod
     def _check_caps(
-        before: AdmissionSnapshot, after: AdmissionSnapshot, config: TrustedConfig
+        before: AdmissionSnapshot,
+        after: AdmissionSnapshot,
+        config: TrustedConfig,
+        *,
+        old: Parcel | None = None,
+        new: Parcel | None = None,
+        effects: tuple[EffectIntent, ...] = (),
     ) -> None:
-        if after.building_count > config.max_building and (
-            after.building_count > before.building_count
+        prior = {r.reservation_id: r for r in before.reservations if r.live}
+        added = [r for r in after.reservations if r.live and r.reservation_id not in prior]
+        for r in after.reservations:
+            if not r.live or not r.observed_over_cap:
+                continue
+            if r.reservation_id in prior:
+                if r != prior[r.reservation_id]:
+                    raise InvariantViolation("observed reservation cannot be relabelled")
+                continue
+            entry = before.queue_entry(r.parcel_id)
+            session = old.current_session if old is not None else None
+            approval = old.current_approval if old is not None else None
+            auth = old.authorization(session.authorization_id) if old and session else None
+            current = new.current_session if new is not None else None
+            if not (
+                r.kind == ReservationKind.BUILDING
+                and old is not None
+                and new is not None
+                and old.parcel_id == new.parcel_id == r.parcel_id
+                and before.building_count >= config.max_building
+                and old.slot_parked
+                and not build_parked(new)
+                and entry is not None
+                and (
+                    entry.status == QueueStatus.HELD
+                    or (entry.status == QueueStatus.QUEUED and entry.resume)
+                )
+                and session is not None
+                and current is not None
+                and session.kind == SessionKind.BUILD
+                and session.lifecycle in (Lifecycle.ACTIVE, Lifecycle.WAITING)
+                and not session.fences
+                and not session.execution_closed
+                and session.session_id == current.session_id
+                and session.authorization_id == current.authorization_id
+                and approval is not None
+                and auth is not None
+                and not auth.cancelled
+                and approval.valid
+                and not any(
+                    e.kind in (EffectKind.SEND_MESSAGE, EffectKind.RESOLVE_ELICITATION)
+                    for e in effects
+                )
+                and r.episode_id == entry.approval_id == approval.approval_id == auth.approval_id
+                and new.current_approval_id == old.current_approval_id
+                and not any(
+                    x.parcel_id == r.parcel_id
+                    for x in before.live_reservations(ReservationKind.BUILDING)
+                )
+            ):
+                raise InvariantViolation("observed reservation requires an authorized parked build")
+        # Observations never buy capacity for new work, even in a mixed transaction.
+        if after.building_count > config.max_building and any(
+            r.kind == ReservationKind.BUILDING and not r.observed_over_cap for r in added
         ):
             raise InvariantViolation("building reservations would exceed max_building")
         if after.prospective_pr_count > config.max_open_bot_prs and (
@@ -1921,8 +1984,9 @@ class SqliteStore:
         for r in sorted(a.reservations, key=lambda r: r.live):
             conn.execute(
                 "INSERT INTO reservations (reservation_id, repo_id, parcel_id, kind, episode_id, "
-                "pr_number, live) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(reservation_id) "
-                "DO UPDATE SET pr_number = excluded.pr_number, live = excluded.live",
+                "pr_number, live, observed_over_cap) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(reservation_id) DO UPDATE SET pr_number = excluded.pr_number, "
+                "live = excluded.live, observed_over_cap = excluded.observed_over_cap",
                 (
                     r.reservation_id,
                     a.repo_id,
@@ -1931,6 +1995,7 @@ class SqliteStore:
                     r.episode_id,
                     r.pr_number,
                     int(r.live),
+                    int(r.observed_over_cap),
                 ),
             )
 

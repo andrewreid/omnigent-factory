@@ -977,6 +977,8 @@ class Reservation:
     episode_id: str
     pr_number: int | None = None
     live: bool = True
+    #: Accounting for an already-authorized parked run observed busy/uncertain at cap.
+    observed_over_cap: bool = False
 
 
 #: How a triage relates another issue to the one it triaged (``related`` in a triage result).
@@ -1272,6 +1274,13 @@ class AdmissionSnapshot:
     @property
     def building_count(self) -> int:
         return len(self.live_reservations(ReservationKind.BUILDING))
+
+    def observed_over_cap_count(self, max_building: int) -> int:
+        """Current excess attributable to observed reservations (flags survive until release)."""
+        return min(
+            max(0, self.building_count - max_building),
+            sum(r.observed_over_cap for r in self.live_reservations(ReservationKind.BUILDING)),
+        )
 
     @property
     def prospective_pr_count(self) -> int:

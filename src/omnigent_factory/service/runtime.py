@@ -1451,6 +1451,24 @@ class FactoryService:
                 )
             )
 
+    async def hold_observation_failure(self, parcel_id: str) -> None:
+        """Contain a failed observation using the durable safety fence/drain path.
+
+        Call only from per-parcel reconciliation, never from admission. Failure to
+        persist the safety hold still propagates: startup must not reopen unsafe work.
+        """
+        LOG.exception("observation invariant failed; holding parcel=%s", parcel_id)
+        await self.apply_event(
+            Event(
+                event_id=f"observation-failed:{parcel_id}:{uuid.uuid4()}",
+                repo_id=self.config.repo_id,
+                parcel_id=parcel_id,
+                source_time_us=self.clock.now_utc_us(),
+                provenance=Provenance.ADAPTER,
+                body=ev.ObservationFailed(),
+            )
+        )
+
     def _event(self, parcel_id: str | None, body: ev.EventBody, event_id: str) -> Event:
         return Event(
             event_id=event_id,
@@ -1475,7 +1493,9 @@ class FactoryService:
         if command == "doctor":
             errors = self.config.validate_paths()
             schema_version = await self.db.call(lambda store: store.schema_version())
+            admission = await self.db.call(lambda store: store.load_admission(self.config.repo_id))
             return {
+                **self._building_status(admission),
                 "healthy": not errors,
                 "errors": errors,
                 "schema_version": schema_version,
@@ -1706,6 +1726,15 @@ class FactoryService:
         except ValueError as exc:
             LOG.warning("config reload refused: %s", exc)
 
+    def _building_status(self, admission: AdmissionSnapshot) -> dict[str, object]:
+        return {
+            "building": admission.building_count,
+            "building_cap": self.config.max_building,
+            "building_observed_over_cap": admission.observed_over_cap_count(
+                self.config.max_building
+            ),
+        }
+
     async def _status(self) -> dict[str, object]:
         admission = await self.db.call(lambda store: store.load_admission(self.config.repo_id))
         pending = await self.db.call(lambda store: len(store.effects_in_state("pending")))
@@ -1714,8 +1743,7 @@ class FactoryService:
         return {
             "ready": self.ready,
             "paused": admission.paused,
-            "building": admission.building_count,
-            "building_cap": self.config.max_building,
+            **self._building_status(admission),
             "building_running": [q.issue_number for q in admission.running()],
             "building_parked": [q.issue_number for q in admission.parked()],
             "open_bot_pr_cap": self.config.max_open_bot_prs,

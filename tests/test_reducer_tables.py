@@ -1453,6 +1453,7 @@ def _sample_bodies(p: Parcel):
             approval_id=p.current_approval_id or "x"
         ),
         EventKind.WAIVER_EDITED: ev.WaiverEdited(),
+        EventKind.OBSERVATION_FAILED: ev.ObservationFailed(),
         EventKind.CONTRACT_TAMPERED: ev.ContractTampered(contract_id=p.current_contract_id or "x"),
         EventKind.GITHUB_SNAPSHOT: ev.GitHubSnapshot(),
         EventKind.COLUMN_OBSERVED: ev.ColumnObserved(stage=Stage.READY),

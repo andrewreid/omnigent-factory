@@ -41,6 +41,7 @@ from omnigent_factory.testing.fakes import (
     FakeScheduler,
 )
 from omnigent_factory.testing.harness import Harness
+from tests.test_store import LATEST
 
 CTX = ExecutionContext(boot_id="b", lease_epoch=1, parcel_version=1, attempt=1)
 
@@ -167,4 +168,4 @@ def test_cli_version_and_db_init(tmp_path, capsys):
     assert cli.main(["version"]) == 0
     assert capsys.readouterr().out.strip() == "0.1.0"
     assert cli.main(["db", "init", str(tmp_path / "s.db")]) == 0
-    assert "schema version 22" in capsys.readouterr().out
+    assert f"schema version {LATEST}" in capsys.readouterr().out

@@ -103,6 +103,7 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.WAIVER_EDITED: Admission(_GITHUB_OR_READ),
     EventKind.APPROVAL_INVALIDATED: Admission(_OBSERVED),
     EventKind.CONTRACT_TAMPERED: Admission(_OBSERVED),
+    EventKind.OBSERVATION_FAILED: Admission(_ADAPTER),
     EventKind.INBOX_HOLD_SET: Admission(_INBOX),
     EventKind.INBOX_HOLD_RELEASED: Admission(_INBOX | _OPERATOR),
     # GitHub observations

@@ -108,7 +108,13 @@ note), the message takes a free slot at once; with none free it is held, the car
 `Queued: waiting for a build slot to resume`, and it is delivered exactly once when the
 build is admitted. Resuming builds are admitted before new ones (then manual builds, then
 auto-builds). Open PRs still count towards `max_open_bot_prs` while parked. `status`
-lists running and parked builds separately.
+lists running and parked builds separately. Observed excess occupancy is persisted only
+for an already-authorized parked build; it does not authorize new work. At or above the
+cap, new admissions and parked-build wakes wait for capacity. A complete idle scan
+releases the observed reservation. `status` and `doctor` show the total, cap and
+`building_observed_over_cap` count (for example, 5/4 with 1 observed over cap).
+A parcel observation that violates a store invariant is logged and safety-held during
+reconciliation; startup continues with the other parcels.
 
 `max_open_bot_prs` limits open factory-authored PRs plus builds which have reserved a PR
 slot but have not opened one yet. The periodic reconcile verifies a bounded batch of the

@@ -403,7 +403,8 @@ def test_leases_never_stolen_implicitly(db):
 # ============================================================= admission
 
 
-def test_store_rejects_reservations_beyond_cap(db):
+@pytest.mark.parametrize("observed", [False, True])
+def test_store_rejects_reservations_beyond_cap(db, observed):
     store = open_store(db)
     h = store_harness(store, max_building=1)
     h.to_building(P)
@@ -419,7 +420,9 @@ def test_store_rejects_reservations_beyond_cap(db):
             adm,
             reservations=(
                 *adm.reservations,
-                Reservation("rs-forced", Q, ReservationKind.BUILDING, "ep"),
+                Reservation(
+                    "rs-forced", Q, ReservationKind.BUILDING, "ep", observed_over_cap=observed
+                ),
             ),
         )
         return replace(result, state=replace(result.state, admission=forced))
@@ -527,3 +530,114 @@ def test_projection_constraints_hold_through_full_flow(db):
     assert copy.load_parcel(P) == h.p(P)
     copy.close()
     store.close()
+
+
+def test_migration_23_preserves_ordinary_reservations(db):
+    from omnigent_factory.core.types import Parcel
+
+    store = open_store(db, migrations=MIGRATIONS[:22])
+    try:
+        store.ensure_repository(config())
+        store._write_parcel(store._conn, Parcel(P, REPO_ID), 1)
+        store._conn.execute(
+            "INSERT INTO reservations VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("rs-old", REPO_ID, P, "building", "ap-old", None, 1),
+        )
+    finally:
+        store.close()
+    for _ in range(2):
+        store = open_store(db)
+        try:
+            [r] = store.load_admission(REPO_ID).reservations
+            assert r.reservation_id == "rs-old" and r.live and not r.observed_over_cap
+            assert store.schema_version() == LATEST
+        finally:
+            store.close()
+
+
+def test_migration_23_failure_rolls_back_column_and_version(db):
+    open_store(db, migrations=MIGRATIONS[:22]).close()
+
+    def crash(point):
+        if point == "migration-23":
+            raise Crash(point)
+
+    with pytest.raises(Crash):
+        open_store(db, fault_hook=crash)
+    old = open_store(db, migrations=MIGRATIONS[:22])
+    try:
+        assert old.schema_version() == 22
+        assert "observed_over_cap" not in {
+            r[1] for r in old.query("PRAGMA table_info(reservations)")
+        }
+    finally:
+        old.close()
+    open_store(db).close()
+
+
+@pytest.mark.parametrize("forgery", ["idle", "episode", "parcel", "wake"])
+def test_store_validates_observed_reservation_against_parked_episode(db, forgery):
+    from omnigent_factory.core.effects import EffectIntent, Preconditions
+    from omnigent_factory.core.types import Reservation
+    from tests.test_build_slots import blocked, building
+
+    store = open_store(db)
+    try:
+        h = store_harness(store)
+        building(h, P)
+        blocked(h, P)
+        building(h, Q)
+        before = store.load_parcel(P)
+        event = h.f(P).make(
+            ev.ReconcileDue()
+            if forgery == "idle"
+            else ev.TreeQuiescent(session_id=h.cur(P).session_id, complete=False, busy=False)
+        )
+
+        def cheating(state, event):
+            result = transition(state, event)
+            admission = result.state.admission
+            if forgery == "idle":
+                reservation = Reservation(
+                    "rs-forged",
+                    P,
+                    ReservationKind.BUILDING,
+                    before.current_approval_id,
+                    observed_over_cap=True,
+                )
+                admission = replace(admission, reservations=(*admission.reservations, reservation))
+            else:
+                admission = replace(
+                    admission,
+                    reservations=tuple(
+                        replace(r, episode_id="wrong")
+                        if forgery == "episode" and r.observed_over_cap
+                        else replace(r, parcel_id=Q)
+                        if forgery == "parcel" and r.observed_over_cap
+                        else r
+                        for r in admission.reservations
+                    ),
+                )
+            effects = result.effects
+            if forgery == "wake":
+                effects = (
+                    *effects,
+                    EffectIntent(
+                        "ef-forged",
+                        EffectKind.SEND_MESSAGE,
+                        P,
+                        "root",
+                        Preconditions(1, 0),
+                        {},
+                    ),
+                )
+            return replace(
+                result, state=replace(result.state, admission=admission), effects=effects
+            )
+
+        with pytest.raises(InvariantViolation, match="authorized parked build"):
+            store.apply_event(event, h.cfg, reducer=cheating)
+        assert store.load_admission(REPO_ID).building_count == 1
+        assert store.load_parcel(P) == before
+    finally:
+        store.close()

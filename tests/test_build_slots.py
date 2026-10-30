@@ -7,13 +7,23 @@ one through admission, resuming ahead of new builds, and is held until then.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
+
+import pytest
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.codec import parcel_from_json, parcel_to_json
 from omnigent_factory.core.effects import EffectKind, MessagePurpose
 from omnigent_factory.core.preconditions import effect_still_valid
-from omnigent_factory.core.types import BotState, Lifecycle, QueueEntry, QueueStatus, TrustedConfig
+from omnigent_factory.core.types import (
+    BotState,
+    DecisionImpact,
+    Lifecycle,
+    QueueEntry,
+    QueueStatus,
+    TrustedConfig,
+)
 from omnigent_factory.service.auto_build import admission_blocker
 from omnigent_factory.store.sqlite import SqliteStore
 from omnigent_factory.testing.builders import EventFactory, config, result_candidate, snapshot
@@ -146,6 +156,69 @@ def test_an_incomplete_or_busy_scan_counts_a_parked_build_as_running():
     assert h.admission.building_count == 2  # counted, even over the cap (fail closed)
 
 
+def test_1550_incomplete_idle_observation_persists_over_cap(tmp_path):
+    from tests.test_store import open_store, store_harness
+
+    store = open_store(tmp_path / "slots.sqlite3")
+    try:
+        h = store_harness(store, max_building=4, max_open_bot_prs=10)
+        building(h, A)
+        s = h.cur(A)
+        h.send(
+            A,
+            result_candidate(
+                s.session_id,
+                s.root_id,
+                s.revision,
+                ev.ResultKind.BUILD_READY,
+                pr_number=1550,
+                head_sha="a" * 40,
+            ),
+        )
+        h.quiesce(A, s.session_id)
+        assert h.cur(A).lifecycle == Lifecycle.WAITING
+        assert h.admission.queue_entry(A).status == QueueStatus.HELD
+        building(h, "I_parked")
+        blocked(h, "I_parked")
+        for pid in (B, C, "I_slot_d", "I_slot_e"):
+            building(h, pid)
+        h.send(A, ev.TreeQuiescent(session_id=h.cur(A).session_id, complete=False, busy=False))
+        assert store.load_admission(h.cfg.repo_id).building_count == 5
+        assert h.admission.observed_over_cap_count(4) == 1
+        h.plan_published("I_new")
+        h.approve("I_new")
+        assert not h.send("I_new", ev.CapacityAvailable()).audit.accepted
+        wake = h.send("I_parked", ev.PlanFeedback(text_digest="wait for capacity"))
+        assert not feedback_sends(wake) and h.p("I_parked").held_wakes
+        for complete, busy in ((False, False), (True, True), (False, False)):
+            h.send(A, ev.TreeQuiescent(session_id=s.session_id, complete=complete, busy=busy))
+            assert h.admission.building_count == 5
+            assert h.admission.observed_over_cap_count(4) == 1
+        store.close()
+        store = open_store(tmp_path / "slots.sqlite3")
+        h.store = store
+        h.admission = store.load_admission(h.cfg.repo_id)
+        assert h.admission.building_count == 5
+        assert h.admission.observed_over_cap_count(4) == 1
+        assert store.load_parcel(A).current_session.lifecycle == Lifecycle.WAITING
+        h.send(A, ev.TreeQuiescent(session_id=s.session_id, complete=False, busy=False))
+        assert h.admission.building_count == 5
+        h.quiesce(A, s.session_id)
+        assert h.admission.building_count == 4
+        assert h.admission.observed_over_cap_count(4) == 0
+        assert not h.send("I_new", ev.CapacityAvailable()).audit.accepted
+        assert not h.send("I_parked", ev.CapacityAvailable()).audit.accepted
+        blocked(h, B)
+        resumed = h.send("I_parked", ev.CapacityAvailable())
+        assert resumed.audit.accepted and len(feedback_sends(resumed)) == 1
+        assert h.admission.building_count == 4
+        blocked(h, C)
+        assert h.send("I_new", ev.CapacityAvailable()).audit.accepted
+        assert h.admission.building_count == 4
+    finally:
+        store.close()
+
+
 def test_auto_build_concurrency_counts_only_running_auto_builds():
     h = Harness(cfg=config(max_building=2, auto_build_concurrency=1))
     planned(h, A)
@@ -259,3 +332,167 @@ def test_a_board_left_on_queued_for_a_started_build_is_set_to_started_again():
     )
     writes = [e.args["value"] for e in r.effects if e.kind == EffectKind.SET_AUTO_BUILD]
     assert writes == ["Started"] and h.p(A).auto_build_field == "Started"
+
+
+@pytest.fixture
+def observed_build(tmp_path):
+    from tests.test_store import open_store, store_harness
+
+    store = open_store(tmp_path / "observed.sqlite3")
+    h = store_harness(store, max_building=4, max_open_bot_prs=10)
+    try:
+        s = building(h, A)
+        h.send(
+            A,
+            result_candidate(
+                s.session_id,
+                s.root_id,
+                s.revision,
+                ev.ResultKind.BUILD_READY,
+                pr_number=1550,
+                head_sha="a" * 40,
+            ),
+        )
+        h.quiesce(A, s.session_id)
+        for pid in (B, C, "I_slot_d", "I_slot_e"):
+            building(h, pid)
+        h.send(A, ev.TreeQuiescent(session_id=s.session_id, complete=False, busy=False))
+        assert h.admission.building_count == 5
+        assert h.admission.queue_entry(A).status == QueueStatus.RESERVED
+        yield h
+    finally:
+        h.store.close()
+
+
+def _observed_wake(h, kind):
+    if kind == "feedback":
+        return h.send(A, ev.PlanFeedback(text_digest="please change x"))
+    if kind == "continue":
+        s = h.cur(A)
+        h.send(A, ev.ActiveLimitReached(session_id=s.session_id, grant_id=s.grant.grant_id))
+        assert h.send(A, ev.Continue()).audit.accepted
+        return h.send(A, ev.PolicyReady(session_id=s.session_id, grant_id=h.cur(A).grant.grant_id))
+    if kind == "answer":
+        h.send(
+            A,
+            ev.ElicitationOpened(
+                session_id=h.cur(A).session_id,
+                elicitation_id="ask",
+                impact=DecisionImpact.WITHIN_CONTRACT,
+            ),
+        )
+        return h.send(A, ev.Decide(answer="yes", within_contract=True))
+    # Readiness handlers require idle eligibility. Seed that state with the observed
+    # reservation retained to exercise the shared post-handler gate for each wake.
+    p = h.p(A)
+    p = replace(
+        p,
+        version=p.version + 1,
+        sessions=tuple(
+            replace(s, quiescent=True) if s.session_id == p.current_session_id else s
+            for s in p.sessions
+        ),
+    )
+    h.store._write_parcel(h.store._conn, p, h.f(A).now)
+    h.parcels[A] = p
+    return h.send(
+        A,
+        ev.ReadinessEvidence(
+            session_id=h.cur(A).session_id,
+            pr_number=1550,
+            head_sha="a" * 40,
+            checks=ev.ChecksState.FAILED if kind == "checks" else ev.ChecksState.GREEN,
+            findings_open=kind == "findings",
+            review_bot_pending_since_us=0,
+            mergeable=ev.MERGE_CONFLICT if kind == "conflict" else ev.MERGE_CLEAN,
+            base_head="b" * 40,
+            base_ref="main",
+        ),
+    )
+
+
+def _wakes(result):
+    return [
+        e
+        for e in result.effects
+        if e.kind
+        in (
+            EffectKind.SEND_MESSAGE,
+            EffectKind.RESOLVE_ELICITATION,
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "kind", ["feedback", "checks", "findings", "conflict", "answer", "continue"]
+)
+@pytest.mark.parametrize("release", ["observed_idle", "other_build_idle"])
+def test_observed_overcap_wakes_wait_and_replay_once(observed_build, kind, release):
+    h = observed_build
+    result = _observed_wake(h, kind)
+    assert result.audit.accepted, result.audit.reason
+    assert not _wakes(result)
+    held = h.p(A).held_wakes
+    assert len(held) == 1
+    args = json.loads(held[0].args_json)
+    if kind in ("checks", "findings", "conflict"):
+        assert args["wake"] == kind
+    elif kind == "answer":
+        assert held[0].kind == EffectKind.RESOLVE_ELICITATION.value
+    else:
+        assert args["purpose"] == ("continuation" if kind == "continue" else "feedback")
+    assert h.admission.building_count == 5
+    assert h.admission.queue_entry(A).status == QueueStatus.RESERVED
+    assert not _wakes(h.send(A, ev.ReconcileDue()))
+    assert h.p(A).held_wakes == held
+    # A restart must preserve both occupancy and the undelivered wake.
+    from tests.test_store import open_store
+
+    path = h.store._conn.execute("PRAGMA database_list").fetchone()[2]
+    h.store.close()
+    h.store = open_store(path)
+    assert h.store.load_parcel(A).held_wakes == held
+    assert h.store.load_admission(h.cfg.repo_id).building_count == 5
+    if release == "observed_idle":
+        for complete, busy in ((False, False), (True, True)):
+            assert not _wakes(
+                h.send(
+                    A,
+                    ev.TreeQuiescent(
+                        session_id=h.cur(A).session_id,
+                        complete=complete,
+                        busy=busy,
+                    ),
+                )
+            )
+            assert h.admission.building_count == 5
+        h.quiesce(A, h.cur(A).session_id)
+        assert h.admission.building_count == 4
+        assert h.admission.queue_entry(A).status == QueueStatus.QUEUED
+        assert h.p(A).slot_parked and h.p(A).held_wakes == held
+        assert not _wakes(h.send(A, ev.CapacityAvailable()))
+        blocked(h, B)
+        replay = h.send(A, ev.CapacityAvailable())
+        assert replay.audit.accepted
+    else:
+        blocked(h, B)
+        assert h.admission.building_count == 4
+        replay = h.send(A, ev.ReconcileDue())
+    [wake] = _wakes(replay)
+    assert wake.kind.value == held[0].kind
+    assert wake.args == json.loads(held[0].args_json)
+    assert h.admission.building_count == 4
+    assert not h.p(A).held_wakes and not h.p(A).slot_parked
+    assert h.admission.queue_entry(A).status == QueueStatus.RESERVED
+    assert not _wakes(h.send(A, ev.ReconcileDue()))
+
+
+def test_stopped_observed_build_never_replays_held_wakes(observed_build):
+    h = observed_build
+    assert not _wakes(_observed_wake(h, "feedback"))
+    assert h.p(A).held_wakes
+    h.send(A, ev.Stop())
+    assert not h.p(A).held_wakes
+    blocked(h, B)
+    h.quiesce(A, h.cur(A).session_id)
+    assert not _wakes(h.send(A, ev.ReconcileDue()))
