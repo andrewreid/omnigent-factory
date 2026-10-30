@@ -307,3 +307,19 @@ def test_app_manifest_allows_workflows_but_not_admin_members_or_secrets():
         widened = SetupBundle(manifest, bundle.project_migration, bundle.ruleset)
         with pytest.raises(ValueError, match="approved permission boundary"):
             validate_setup(widened)
+
+
+def test_only_an_owners_close_candidate_unlabel_is_a_removal_event():
+    def unlabel(name: str, sender: dict) -> tuple:
+        data = payload(action="unlabeled", sender=sender, label={"name": name})
+        return tuple(type(e.body).__name__ for e in normalize(data, "issues").events)
+
+    owner = {"id": 114979, "type": "User"}
+    assert unlabel("factory:close-candidate", owner) == ("CloseCandidateRemoved",)
+    assert unlabel("factory:close-candidate", {"id": 777, "type": "Bot"}) == ()  # the factory
+    assert unlabel("factory:close-candidate", {"id": 114979, "type": "Bot"}) == ()
+    assert unlabel("factory:close-candidate", {"id": 222, "type": "User"}) == ()  # not owner
+    assert unlabel("area:api", owner) == ()  # an unrelated label
+    assert unlabel("factory:build", owner) == ()
+    labeled = payload(action="labeled", sender=owner, label={"name": "factory:close-candidate"})
+    assert normalize(labeled, "issues").events == ()  # adding it is no control

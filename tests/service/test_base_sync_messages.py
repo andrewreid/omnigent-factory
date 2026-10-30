@@ -104,10 +104,10 @@ def test_current_stage_templates_carry_the_sync_note_and_old_ones_are_kept() -> 
         d._CONFLICT_TEMPLATE,
     }
     assert current == {
-        "triage-v11.txt",
-        "plan-v12.txt",
+        "triage-v13.txt",
+        "plan-v13.txt",
         "build-v19.txt",
-        "triage-feedback-v8.txt",
+        "triage-feedback-v10.txt",
         "epic-triage-v5.txt",
         "build-rework-v15.txt",
         "build-rework-items-v6.txt",

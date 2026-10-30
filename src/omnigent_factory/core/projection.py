@@ -280,7 +280,7 @@ def project_note(p: Parcel, bot: BotState) -> str:
         # Lowest precedence: an epic's progress, else other issues' triage named this
         # one. Any status reason or derived Blocked/Needs you/Checkpoint/Queued note
         # above outranks it.
-        text = p.epic_note or related_note(p)
+        text = p.epic_note or triage_stale_note(p) or related_note(p)
     return text[:NOTE_MAX]
 
 
@@ -296,6 +296,7 @@ _UNKNOWN_GITHUB_TARGETS = {
     EffectKind.PUBLISH_TRIAGE.value: "triage comment",
     EffectKind.PUBLISH_REPORT.value: "report comment",
     EffectKind.EDIT_REPORT.value: "report edit",
+    EffectKind.SET_CLOSE_CANDIDATE.value: "close-candidate label",
     EffectKind.ENSURE_PROJECT_ITEM.value: "project item",
 }
 
@@ -346,6 +347,13 @@ RELATION_NOTE = dict(
         strict=True,
     )
 )
+
+
+def triage_stale_note(p: Parcel) -> str:
+    """``Triage may be stale: <why>`` on a flagged Triaged card ("" otherwise)."""
+    if not p.triage_stale or p.stage != Stage.TRIAGED:
+        return ""
+    return f"Triage may be stale: {p.triage_stale}"[:NOTE_MAX]
 
 
 def related_note(p: Parcel) -> str:

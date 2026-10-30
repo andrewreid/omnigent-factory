@@ -239,7 +239,9 @@
             "fix",
             "wont_fix",
             "duplicate",
-            "needs_info"
+            "needs_info",
+            "already_fixed",
+            "obsolete"
           ]
         },
         "duplicate_issue": {
@@ -285,6 +287,28 @@
               "type": "null"
             }
           ]
+        },
+        "closure_evidence": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2000
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "paths": {
+          "type": "array",
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          }
         }
       }
     },

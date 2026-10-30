@@ -236,6 +236,14 @@ def _run(
     return proc
 
 
+_OID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+
+def _check_oid(oid: str) -> None:
+    if not _OID.fullmatch(oid):
+        raise WorktreeError("not a full object id")
+
+
 def _within(path: Path, roots: Sequence[Path]) -> bool:
     return any(path == root or root in path.parents for root in roots)
 
@@ -355,6 +363,48 @@ class Workspaces:
             self.source_clone,
         )
         return self._git(["rev-parse", f"refs/remotes/origin/{base_branch}"], self.source_clone)
+
+    # Read-only questions about the fetched base (no fetch, no lock). The caller reads
+    # the base OID once (``base_head``) and passes it to every range, so a concurrent
+    # fetch moving the ref cannot mix two bases into one answer. OIDs must be full ids.
+
+    def base_head(self, base_branch: str = "main") -> str:
+        """The last fetched ``origin/<base>`` OID (no fetch)."""
+        oid = self._git(
+            ["rev-parse", "--verify", f"refs/remotes/origin/{base_branch}^{{commit}}"],
+            self.source_clone,
+        )
+        _check_oid(oid)
+        return oid
+
+    def commits_since(self, oid: str, head: str) -> int:
+        """Commits in ``head`` (a captured base OID, e.g. ``base_head``) since ``oid``."""
+        _check_oid(oid)
+        _check_oid(head)
+        out = self._git(["rev-list", "--count", f"{oid}..{head}"], self.source_clone)
+        return int(out or 0)
+
+    def changed_since(self, oid: str, head: str, paths: Sequence[str]) -> tuple[str, ...]:
+        """Which of ``paths`` (literal pathspecs; a directory covers its files) changed
+        between ``oid`` and ``head`` (a captured base OID)."""
+        _check_oid(oid)
+        _check_oid(head)
+        if not paths:
+            return ()
+        out = self._git(
+            [
+                "--literal-pathspecs",
+                "diff",
+                "--name-only",
+                "--no-renames",
+                oid,
+                head,
+                "--",
+                *paths,
+            ],
+            self.source_clone,
+        )
+        return tuple(line for line in out.splitlines() if line)
 
     def commits_behind(self, workspace: str | Path, base_branch: str = "main") -> int:
         """Commits on the last fetched ``origin/<base>`` that HEAD lacks (no fetch)."""

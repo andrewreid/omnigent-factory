@@ -999,6 +999,23 @@ CREATE TABLE bundle_members (
 CREATE INDEX ix_bundle_members_issue ON bundle_members (repo_id, issue_number, state);
 """
 
+# Idle-time auto-retriage of Triaged cards whose triage may be stale.
+#
+# * auto_retriage: the operator's ``auto-retriage on|off`` override of host config
+#   ``auto_retriage`` and today's extra budget from ``auto-retriage grant`` (same shape and
+#   rule as auto_triage). Auto-started re-triages are counted from their accepted
+#   ``AutoRetriage`` events.
+V22_SQL = """
+CREATE TABLE auto_retriage (
+    repo_id TEXT PRIMARY KEY REFERENCES repositories (repo_id),
+    enabled_override INTEGER CHECK (enabled_override IN (0, 1)),
+    override_config INTEGER CHECK (override_config IN (0, 1)),
+    grant_day TEXT,
+    granted INTEGER NOT NULL DEFAULT 0 CHECK (granted >= 0),
+    updated_at_us INTEGER NOT NULL
+);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -1021,4 +1038,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(19, "split-relation-direction", V19_SQL),
     Migration(20, "status-comments", V20_SQL),
     Migration(21, "issue-bundling", V21_SQL),
+    Migration(22, "auto-retriage", V22_SQL),
 )

@@ -288,6 +288,58 @@ today or parked). It is checked about every `reconcile_interval_seconds`, at mos
 audit records each start as an `AutoTriage` event from the trusted clock (the operator's
 standing authorisation), never as an owner control.
 
+### Closure candidates
+
+A triage recommends `fix`, `needs_info`, `duplicate` (with `duplicate_issue`), `wont_fix`,
+`already_fixed` (the current base already does it) or `obsolete` (what the issue is about
+is gone); `already_fixed` and `obsolete` must carry `closure_evidence` (the commit, PR,
+file or behaviour that shows it), which the triage comment shows. A superseded issue is a
+`duplicate` of the newer one, or `obsolete` with a `supersedes` related entry. Once per
+published triage the factory (never the agent) adds the `factory:close-candidate` label
+(creating it when absent) for `duplicate`, `wont_fix`, `already_fixed` and `obsolete`, and
+removes it when a newer triage says `fix` or `needs_info`. You decide: close the issue, or
+remove the label to keep it (your removal, seen by its `unlabeled` webhook from an owner,
+cancels that triage's pending or retried add, so it sticks until the next triage); moving the card
+out of Triage also removes it, however the move is seen (webhook or a later read). Both
+are durable effects (`set_close_candidate`): rate limits, 5xx and unclear outcomes are
+retried with the effect-recovery backoff, a removal of an absent label is fine, and a
+refused (4xx) write shows under `recovery` for `retry-effect`. The factory never closes an
+issue. A close candidate is
+never proposed for a bundle (your own `/bundle` may still take it), and epic autopilot
+leaves a labelled sub-issue alone like `factory:skip`. Auto-build is unchanged. Epic
+triages are not labelled.
+
+### Stale triage and auto-retriage
+
+A triage lists the repository `paths` it relied on (at most 20). The status comment's
+Triage section starts with `Triaged <date> against main@<sha7> · N commits behind`
+(local Git in the source clone, cached; the count is left out rather than waited on).
+
+About every ten minutes the factory checks each Triaged card's newest triage (not epics)
+for signals, without tokens: a cited path changed on the last fetched `origin/main` since
+the triage's base commit, GitHub reports its `duplicate_issue` or a related issue closed
+(one batched read; an unreadable state counts as open), or `main` moved at least
+`retriage_min_commits` commits. Signals count only once the triage is
+`retriage_min_age_days` old (no Git work before that); a triage `retriage_max_age_days`
+old is stale whatever changed. Git answers are cached and at most 20 cards ask Git per
+pass, the rest on later passes. A merged linked PR is not a signal
+(no stored data carries it cheaply). A stale card's note reads `Triage may be stale:
+<why>` until a triage starts or the card leaves Triaged.
+
+Auto-retriage is off by default (`auto_retriage = true` or `auto-retriage on`). When on,
+idle by the auto-triage rule and Inbox auto-triage has nothing to start, the factory
+re-triages one stale card at a time, at most `auto_retriage_daily_limit` per local day
+(`auto-retriage grant <n>` adds more for today), sharing `triage_concurrency`. It takes
+close candidates first, then the strongest signal (a closed duplicate, closed related
+issues, changed paths, age, commits), then `Rank`. It never takes a card that is held
+(also a bundle member), has an open question or `Needs you`, has a run requested or
+running, has `factory:skip`, is assigned, parked or was refused today, and it never clears
+a hold (a posted triage's resting hold stays while the refresh runs). The run's first message lists the signals. The audit records each start as an
+`AutoRetriage` event from the trusted clock, bound to the triage it judged: each card is
+re-checked just before the start, so one triaged again since the scan is skipped (no
+budget spent). `auto-retriage status` lists the stale cards with their reasons and why any
+is not taken (`refused`).
+
 ### Auto-build
 
 Off by default (`auto_build = true` or `auto-build on`). The project's `Auto-build`
@@ -474,7 +526,10 @@ change in the Triage or Planning column, one read-only Omnigent session (`Factor
 are weighed against each other and auto-build starts queued plans in that order. It weighs
 priority, size, dependencies and blockers (native links and each triage's related list), overlaps,
 clashes with Building or Ready work, stale or likely-done findings, how ready an issue is
-and age; it reads with `factory_list_issues` and `factory_get_issue` and submits
+and age. The pinned `ranking-v4` prompt puts close candidates last among unpinned issues,
+using the stored triage recommendation (`duplicate`, `wont_fix`, `already_fixed` or
+`obsolete`); unknown or missing recommendations do not imply closure. It reads all pages
+of `factory_list_issues` and details with `factory_get_issue`, and submits
 once with `factory_submit_ranking`. It never moves cards, starts stages or closes issues,
 and a ranking and auto-triage never run at the same time. `ranking now` skips the idle rule: it
 starts as soon as no triage and no other ranking is running, even while builds, plans or
@@ -507,9 +562,20 @@ Off by default (`bundling = true` or `bundles on`). Several related issues are b
 
 Both are 2 to 12, and `bundle_max_members` may not exceed `bundle_command_max_members`.
 
-**Proposed.** While bundling is on, the [triage ranking](#triage-ranking) may propose
-bundles (members, a theme, a reason that names the area of code they share). Each is
-checked; one that breaks a rule fails the ranking's submission with the exact problem:
+**Proposed.** While bundling is on, the [triage ranking](#triage-ranking) explicitly searches
+for worthwhile bundles, preferring tightly related follow-ups and same-file changes, and
+may propose up to **10 non-overlapping bundles per run** (members, a theme, and a reason
+explaining their shared implementation benefit and area of code). Factory computes pair
+hints without model calls from stored triage relations (including `depends_on`), shared
+parent epics and shared `area:*` labels on Triage/Planning cards. The ranker pages
+`factory_list_issues` with `view="bundles"`: at most 50 entries per call, existing proposals
+first, then unseen candidate pairs with eligibility verdicts and refusal reasons from
+the suggestion rules. All prior member sets, including accepted and stale proposals,
+are excluded from hints and must not be re-proposed. Hints are leads, not exhaustive
+clusters or automatic proposals; the ranker reads members in full and can form larger
+sets. Verdicts use stored state and board labels/links; submission rechecks fresh facts.
+Each proposed bundle is checked; one that breaks a rule fails the ranking's submission
+with the exact problem:
 
 | Rule | A member must |
 |---|---|
@@ -618,7 +684,7 @@ waits up to 90 s for it instead of failing.
 | Command | What it does |
 |---|---|
 | `status` | Readiness, pause state, building count/cap with the running and parked builds, queue, pending/unknown effects, parked deliveries, the [health sweep](#health-sweep-and-stalled-runs): Omnigent state, breaker, nudges last sweep and each open run's state and stall episode, and [worktree housekeeping](#worktree-housekeeping): worktree count, settings, last sweep (with its result) and last gc. |
-| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. It also reads the configured agent's bundle (through its newest session, or the `--live` probe) and fails naming any factory MCP tool the agent's `tools:` allowlist for the factory server leaves out (a warning when the bundle cannot be read). It warns when the App installation is not subscribed to `push` (tick Push in the App settings) or to `sub_issues`/`issue_dependencies` (Sub issues, Issue dependencies), when the subscribed events can be read, and when the repository has no `Epic` issue type (epics are then not typed). It fails when Omnigent's own `/health` is not ok and warns when the configured host is offline. It shows the worktree count under `worktree_root` and the last worktree sweep and clone gc times, and whether status comments are pinned (a warning, with GitHub's message, once pinning was refused), and whether bundling is on with its proposals pending, active bundles and members held. |
+| `doctor` | Checks config, secrets, GitHub/Omnigent reachability, Omnigent login expiry (fails when expired, warns within 7 days) and server/client version drift (warning only). `doctor --live` (opt-in) also creates a throwaway session for the configured agent in the configured project and archives it, which catches server-side create failures such as unresolved agent env vars. It also reads the configured agent's bundle (through its newest session, or the `--live` probe) and fails naming any factory MCP tool the agent's `tools:` allowlist for the factory server leaves out (a warning when the bundle cannot be read). It warns when the App installation is not subscribed to `push` (tick Push in the App settings) or to `sub_issues`/`issue_dependencies` (Sub issues, Issue dependencies), when the subscribed events can be read, and when the repository has no `Epic` issue type (epics are then not typed). It fails when Omnigent's own `/health` is not ok and warns when the configured host is offline. It shows the worktree count under `worktree_root` and the last worktree sweep and clone gc times, and whether status comments are pinned (a warning, with GitHub's message, once pinning was refused), whether bundling is on with its proposals pending, active bundles and members held, and whether auto-retriage is on with its settings and the Triaged cards flagged stale. |
 | `explain <parcel>` | The parcel's persisted state: stage, bot, sessions, holds, effects, the current run's stall episode (`stall`) and what the last health sweep made of it. |
 | `recovery` | Failed/unknown effects and parked webhook deliveries. |
 | `retry-effect <effect_id>` | Requeue any failed/unknown verifiable write (for example `set_bot`) or marker-adoptable comment create. Non-idempotent Omnigent sends remain fenced. |
@@ -631,6 +697,9 @@ waits up to 90 s for it instead of failing.
 | `auto-triage status` | Idle-time auto-triage: enabled (and whether config or the CLI decides), today's used/limit/granted, idle or what keeps it busy, triage slots, the next candidate, the eligible count and why the other Inbox issues are left out (`excluded_inbox`). |
 | `auto-triage on` / `off` | Turn auto-triage on/off at runtime. Stored in the state database, so it survives restarts, until `auto_triage` in the config file changes: then the config value applies again (the newer intent wins). |
 | `auto-triage grant <n>` | Add `<n>` (1-1000) auto-triages to today's budget (local day; it does not carry over). |
+| `auto-retriage status` | Auto-retriage: enabled (and whether config or the CLI decides), today's used/limit/granted, the staleness settings, idle or what keeps it busy, the stale Triaged cards (`candidates`: issue, reasons, close candidate, rank, `refused`) and the next one. |
+| `auto-retriage on` / `off` | Turn auto-retriage on/off at runtime; stored like `auto-triage on`/`off` (the newer intent wins). |
+| `auto-retriage grant <n>` | Add `<n>` (1-1000) auto-retriages to today's budget. |
 | `auto-build status` | Auto-build: enabled (and whether config or the CLI decides), the concurrency cap, auto-builds running and waiting for a slot, today's used/limit/granted, what the next start waits on (`waiting_on`), and the queue in start order with each card's rank, `eligible` and `blocker`. |
 | `auto-build on` / `off` | Turn auto-build on/off at runtime; stored like `auto-triage on`/`off` (the newer intent wins). Marks stay queued while it is off. |
 | `auto-build grant <n>` | Add `<n>` (1-1000) auto-builds to today's limit (only matters with `auto_build_daily_limit` > 0). |
@@ -646,7 +715,7 @@ waits up to 90 s for it instead of failing.
 | `sessions prune [--dry-run]` | Delete (or list) the factory sessions session retention would remove now (through the daemon). |
 | `prune [--dry-run]` | Apply history retention now (see [State database size](#state-database-size)) and print what was (or would be) removed. Runs through the daemon when it is up, else directly on the file. |
 | `vacuum` | Compact the state database and switch it to incremental auto_vacuum. Refuses while the daemon runs (it holds the write lock for the whole rebuild). |
-| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, `review_rounds_default`, `status_comment_edit_seconds`, `follow_up_max_depth`, `auto_replan_limit`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `bundling`, `bundle_max_members`, `bundle_command_max_members`, `bundle_max_points`, `session_retention_days`, the health sweep settings and `worktree_sweep_interval_hours`, `idle_worktree_days`, `clone_gc_interval_days`, `lazy_issue_worktrees`, `reference_snapshot_max_age_hours`, `reference_snapshot_retention_hours`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
+| `reload` | Re-read the config file into the running daemon (also `SIGHUP`). Applies only `max_building`, `max_open_bot_prs`, checkpoint settings, `drain_timeout_minutes`, cost backstop, `review_bot_grace_minutes`, `review_bot_ack_minutes`, `review_bot_max_wait_minutes`, `red_check_confirm_seconds`, `review_bot_login`, `review_bot_mention`, guidance, `independent_reviewer_ids`, `status_names`, `review_rounds_default`, `status_comment_edit_seconds`, `follow_up_max_depth`, `auto_replan_limit`, the reconcile intervals, the retention windows, `auto_triage`, `auto_triage_daily_limit`, `auto_triage_min_age_hours`, `auto_retriage`, `auto_retriage_daily_limit`, `retriage_min_age_days`, `retriage_min_commits`, `retriage_max_age_days`, `triage_concurrency`, `auto_build`, `auto_build_concurrency`, `auto_build_daily_limit`, `epic_autopilot`, `epic_autopilot_delay_minutes`, `epic_autopilot_concurrency`, `ranking`, `ranking_min_new_triages`, `ranking_status_update`, `rank_field_node_id`, `bundling`, `bundle_max_members`, `bundle_command_max_members`, `bundle_max_points`, `session_retention_days`, the health sweep settings and `worktree_sweep_interval_hours`, `idle_worktree_days`, `clone_gc_interval_days`, `lazy_issue_worktrees`, `reference_snapshot_max_age_hours`, `reference_snapshot_retention_hours`; any other change is refused with `restart required: <keys>` and an invalid file changes nothing. Lowering a cap never stops running builds. |
 
 An **unresolved** webhook delivery is still in the normal inbox, waiting for its next
 identity-verified lookup after an automatic backoff. A **parked** delivery exhausted its
@@ -664,6 +733,11 @@ Auto-triage, auto-build and ranking keys (under `[service]`; hot-reloadable unle
 auto_triage = false              # idle-time auto-triage of Inbox issues
 auto_triage_daily_limit = 20     # auto-started triages per local day
 auto_triage_min_age_hours = 24   # grace before a new issue is taken
+auto_retriage = false            # re-triage quiet Triaged cards whose triage may be stale
+auto_retriage_daily_limit = 5    # auto-started re-triages per local day
+retriage_min_age_days = 7        # signals count only once a triage is this old
+retriage_min_commits = 50        # commits on main since the triage that flag it
+retriage_max_age_days = 30       # a triage this old is stale whatever changed
 triage_concurrency = 1           # triage runs at once, however started
 auto_build = false               # start builds you queued with the Auto-build field
 auto_build_concurrency = 1       # auto-builds holding a build slot at once
@@ -845,7 +919,9 @@ Stage messages are short pointers; the agent works through eight MCP tools serve
 daemon at `http://<bind_host>:<bind_port>/mcp/` and `http://127.0.0.1:<mcp_port>/mcp/`
 (bearer token; any other listener address gets 404):
 `factory_get_issue`, `factory_get_plan`, `factory_get_feedback`, `factory_get_status`,
-`factory_list_issues` (a compact index of the other open board issues, read from GitHub
+`factory_list_issues` (a compact index of the other open board issues, at most 200 per call;
+pass `offset=next_offset` until `next_offset` is null, for ranking and triage duplicate
+checks alike, so later Triage, Planning, Building and Ready cards are included; read from GitHub
 through a one-minute cache), `factory_ask_owner`, `factory_submit_result` and
 `factory_submit_ranking` (triage ranking sessions only, which may also read any issue with
 `factory_get_issue`). Each takes the caller's own Omnigent
@@ -1362,3 +1438,75 @@ Roll out with the flag off, enable it for new triage runs, then inspect snapshot
 counts, handoffs and sweep logs. Turning the flag off is safe: in-flight dispatches
 retain their pinned behavior, and new runs use issue worktrees. Old template
 versions remain available so existing dispatch hashes still resolve.
+
+
+### Factory GitHub identity
+
+Every agent run uses a separate private capability file. TRIAGE (including epic triage
+and epic planning), PLAN (including autopilot plans and replans), and ranking receive
+`READ_ONLY` repository-scoped GitHub App tokens. BUILD retains its existing `BUILD`
+profile and parcel-branch push guard. The daemon performs board and publication writes
+with its own credentials. A capability is a broker handle, not a GitHub token; the
+broker checks the current execution gate even for cached tokens.
+
+Use the absolute wrapper and capability paths from the run brief on every CLI call:
+
+```sh
+OMNIGENT_FACTORY_CAPABILITY_FILE="/path/from/brief/run.cap" "/path/from/brief/gh" issue view 123
+```
+
+The render placeholders are `{gh_wrapper}` and `{capability_file}` for every stage,
+including both issue-worktree and reference triage, epic runs, retriage, and triage
+comment feedback. New plan and ranking templates include this instruction; triage
+wording is maintained separately. Released template files remain immutable. Stage
+dispatches pin template names and SHA-256; ranking does the same in
+`<state_dir>/ranking-dispatches/<run_id>.json` before session creation. Ranking enables
+issuance only after policy verification and its propagation barrier, checks its
+persisted run state and deadline on each token request, and retires the capability
+when finished. After restart it remains closed until policies are verified again;
+a missing or outdated ranking policy fails that run closed.
+
+The wrapper removes inherited GitHub token variables, sets only the broker's scoped
+token, uses an isolated `GH_CONFIG_DIR`, and invokes the configured real `gh` internally.
+Factory CEL policies inspect agent tool requests, not the wrapper's child process.
+They deny bare `gh`, `/usr/bin/gh`, `/bin/gh`, and `real_gh_path`, common `command`,
+`env`, quoting, backslash, inline alias and `sh -c` forms, token-variable references,
+`gh auth token` / `gh auth status --show-token`, and references to `.config/gh` or
+`hosts.yml`. Explicit `git credential` / `git credential-*` / `git-credential*`
+commands and credential aliases are also denied; Git may still invoke the factory
+helper internally during an otherwise allowed push or fetch. Direct read-tool path
+arguments are checked too. Denials direct the agent to the configured wrapper. Existing operation deny lists still apply to wrapper calls.
+All stages also deny `GIT_TRACE_REDACT=0`, `GIT_TRACE_CURL`, and `GIT_CURL_VERBOSE`
+in commands because Git curl tracing can expose authorization headers.
+Omnigent's verified-root policy inheritance also applies these rules to sub-agent tool
+calls; pass the wrapper and capability paths to workers.
+
+There is no generic per-session environment/PATH override in the inspected Omnigent
+session create or patch schemas. `terminal_launch_args` only passes native CLI arguments;
+it is not a portable environment API for mixed harnesses or their children. Agent
+terminal `env` settings are shared agent configuration. The factory therefore uses
+absolute wrapper invocations rather than changing host PATH or the shared agent bundle.
+Source evidence in the inspected Omnigent baseline: `server/schemas.py`
+(`_SessionCreateRequestBase`, session update schemas), `inner/datamodel.py`
+(`OSEnvSpec`, `TerminalEnvSpec`), `server/routes/_sessions/helpers.py`
+(`_validate_terminal_launch_args`), and `runtime/policies/builder.py` (root inheritance).
+
+These checks are defence in depth, not a sandbox. Raw shell scanning can reject harmless
+quoted text; use a body file for such text. It cannot reliably detect dynamically
+constructed commands/paths, pre-existing aliases/functions, renamed or copied binaries,
+symlinks, scripts read from disk, arbitrary interpreter code, environment dumps, or
+credentials accessed through unscanned tool shapes. Same-UID processes can still read
+owner files, other capabilities, or tokens already in their environment. Already-issued
+tokens can remain usable until expiry if revocation fails. Full isolation requires a
+separate Unix user with no access to the owner's credentials and a scrubbed runner
+environment. Remove personal `GITHUB_TOKEN`/`GH_TOKEN` exports and runner passthrough
+from the host separately; this change does not edit host configuration. Ordinary HTTPS
+`git fetch`, `git ls-remote`, and `git clone` outside a factory-wired worktree (for
+example in `/tmp` or ranking's source clone) still use the host's global helper and
+the owner's credentials until separate-Unix-user isolation lands.
+
+`doctor` warns if the wrapper directory/executable is absent and if GitHub token names
+appear in its environment, `OMNIGENT_RUNNER_ENV_PASSTHROUGH`, or the readable user
+`omni-host.service` unit/drop-ins. It reports names only, never token values. These are
+local advisory checks: environment files, live-process-only exports and remote runner
+environments may escape detection.

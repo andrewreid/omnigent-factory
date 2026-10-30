@@ -65,6 +65,15 @@ def effect_still_valid(parcel: Parcel | None, effect: EffectIntent) -> str | Non
         and effect.args.get("value") != parcel.autopilot_field
     ):
         return "autopilot-superseded"  # the owner set it again since: latest wins
+    if effect.kind == EffectKind.SET_CLOSE_CANDIDATE and parcel is not None:
+        generation = effect.args.get("session_id")
+        if generation != parcel.close_candidate_session:
+            return "close-candidate-superseded"  # a newer triage decides the label
+        if effect.args.get("action") == "triage" and (
+            parcel.stage != Stage.TRIAGED or parcel.close_candidate_removed == generation
+        ):
+            # Left Triage since, or the owner removed this triage's label: never re-add.
+            return "close-candidate-superseded"
     if parcel is not None and Hold.COMPLETED in parcel.holds:
         completed = _completed_invalid(effect)
         if completed is not None:

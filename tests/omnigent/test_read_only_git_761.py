@@ -88,7 +88,7 @@ READS = [
     "git branch -a --contains HEAD",
     "git -C /work/factory-issue-761 log -1",
     "git help checkout",
-    "gh issue view 761 --json body --jq .body",
+    "/factory/bin/gh issue view 761 --json body --jq .body",
     "ls .git/worktrees && cat .github/workflows/ci.yml",
 ]
 

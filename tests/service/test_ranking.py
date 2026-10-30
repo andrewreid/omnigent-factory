@@ -1061,6 +1061,14 @@ async def test_triage_and_planning_are_ranked_together_on_one_scale(
         text = " ".join((await r.ranker._start_message(run)).split())
         assert "Triage and Planning columns together, on one scale" in text
         assert "4 open issues (2 in Triage, 2 in Planning)" in text
+        from omnigent_factory.service.ranking import RANKING_TEMPLATE
+
+        assert RANKING_TEMPLATE == "ranking-v4.txt"
+        assert "offset=next_offset until next_offset is null" in text
+        assert "Rank close candidates last among unpinned issues" in text
+        assert "duplicate, wont_fix, already_fixed or obsolete" in text
+        assert "Unknown or missing recommendation strings" in text
+
         # Planning issues must be ranked too; a Building one is not ranked.
         with pytest.raises(RankingToolError, match="missing Triage/Planning issues: #4"):
             await r.submit({"ranking": [item(2), item(1), item(3)], "summary": "s"})

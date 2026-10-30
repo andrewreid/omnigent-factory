@@ -7,6 +7,7 @@ import importlib.metadata
 import io
 import ipaddress
 import os
+import re
 import socket
 import sqlite3
 import stat
@@ -78,6 +79,7 @@ async def run_doctor(
     variable the server cannot resolve) only show up then.
     """
     report = DoctorReport()
+    _check_github_credentials(config, report)
     try:
         key = _private_file(config.resolved_app_private_key_file)
         _private_file(config.resolved_webhook_secret_file)
@@ -139,12 +141,54 @@ async def run_doctor(
     await asyncio.to_thread(_check_worktrees, config, report)
     await asyncio.to_thread(_check_status_pin, config, report)
     await asyncio.to_thread(_check_bundling, config, report)
+    await asyncio.to_thread(_check_auto_retriage, config, report)
     _check_socket(config, report)
     await asyncio.to_thread(_check_bind, config, report)
     _check_mcp_token(config, report)
     _check_caller_policy(report)
     await _check_mcp_listener(config, report, transport=mcp_transport)
     return report
+
+
+def _check_github_credentials(config: ServiceConfig, report: DoctorReport) -> None:
+    """Cheap advisory checks; never return environment values or unit contents."""
+    wrapper = config.wrapper_bin_dir / "gh"
+    if (
+        not config.wrapper_bin_dir.is_dir()
+        or not wrapper.is_file()
+        or not os.access(wrapper, os.X_OK)
+    ):
+        report.warn("gh_wrapper", f"factory wrapper is missing or not executable: {wrapper}")
+    else:
+        report.pass_check("gh_wrapper", str(wrapper))
+    exposed = {name for name in ("GITHUB_TOKEN", "GH_TOKEN") if name in os.environ}
+    passthrough = os.environ.get("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "")
+    exposed.update(re.findall(r"\b(?:GITHUB_TOKEN|GH_TOKEN)\b", passthrough))
+    # `cat` includes drop-ins and ExecStart shell exports, unlike Environment alone.
+    try:
+        unit = subprocess.run(
+            ["systemctl", "--user", "cat", "omni-host.service"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if unit.returncode == 0:
+            exposed.update(re.findall(r"\b(?:GITHUB_TOKEN|GH_TOKEN)\b", unit.stdout))
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # Not every deployment uses a user unit or runs on the host.
+    if exposed:
+        report.warn(
+            "runner_github_tokens",
+            ", ".join(sorted(exposed)) + " detected in this environment, runner passthrough "
+            "or omni-host unit; remove personal token exports/passthrough from the host. "
+            "Same-UID agents can still read the owner's gh config.",
+        )
+    else:
+        report.pass_check(
+            "runner_github_tokens",
+            "no token names detected locally; remote runner env is unverified",
+        )
 
 
 def _check_mcp_token(config: ServiceConfig, report: DoctorReport) -> None:
@@ -1080,6 +1124,41 @@ def _check_bundling(config: ServiceConfig, report: DoctorReport) -> None:
         f"{config.bundle_max_members} members, {config.bundle_max_points} points; /bundle at "
         f"most {config.bundle_command_max_members} members; {counts[0]} proposals pending, "
         f"{counts[1]} active bundles, {counts[2]} members held",
+    )
+
+
+def _check_auto_retriage(config: ServiceConfig, report: DoctorReport) -> None:
+    """Whether auto-retriage is on, its settings and how many Triaged cards are flagged
+    stale (informational)."""
+    enabled = config.auto_retriage
+    source = "config"
+    flagged = 0
+    path = config.database_path
+    if path.exists():
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+            try:
+                row = conn.execute(
+                    "SELECT enabled_override, override_config FROM auto_retriage WHERE repo_id = ?",
+                    (config.repo_id,),
+                ).fetchone()
+                if row is not None and row[0] is not None and bool(row[1]) == config.auto_retriage:
+                    enabled, source = bool(row[0]), "operator"
+                flagged = conn.execute(
+                    "SELECT COUNT(*) FROM parcels WHERE repo_id = ? AND "
+                    "COALESCE(json_extract(aggregate_json, '$.parcel.triage_stale'), '') != ''",
+                    (config.repo_id,),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass  # no such table yet (an older database): nothing recorded
+    report.pass_check(
+        "auto_retriage",
+        f"{'on' if enabled else 'off'} ({source}); at most {config.auto_retriage_daily_limit} "
+        f"per day; stale after {config.retriage_min_age_days:g} days with a signal "
+        f"({config.retriage_min_commits} commits, cited paths or related issues closed) or "
+        f"{config.retriage_max_age_days:g} days; {flagged} triaged cards flagged stale",
     )
 
 

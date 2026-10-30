@@ -38,16 +38,13 @@ from tests.omnigent.test_liberal_policies import (
 )
 from tests.omnigent.test_read_only_git_761 import MOVES_HEAD, READS
 
-#: Policy names of the rule before #1394 (``<family>@<digest of handler+params>``).
-LEGACY_NAMES = {False: "factory-cel@fa18aec22b85", True: "factory-cel@a07f295518c7"}
 
-
-def _legacy_command_matches(regex: str) -> str:
-    """``_command_matches`` before #1394, verbatim."""
+def _legacy_command_matches(regex: str, *, keys: tuple[str, ...] = pol._COMMAND_KEYS) -> str:
+    """Pre-#1394 traversal, with today's argument keys and deny patterns."""
     args = "event.data.arguments"
     has_args = f"has({args}) && type({args}) == map"
     pattern = pol._cel_string(regex)
-    command_key = " || ".join(f'k == "{key}"' for key in pol._COMMAND_KEYS)
+    command_key = " || ".join(f'k == "{key}"' for key in keys)
     string_form = (
         f"({has_args} && {args}.exists(k, ({command_key})"
         f" && type({args}[k]) == string && {args}[k].matches({pattern})))"
@@ -55,7 +52,7 @@ def _legacy_command_matches(regex: str) -> str:
     list_forms = [
         f"({has_args} && has({args}.{key}) && type({args}.{key}) == list"
         f" && {args}.{key}.exists(x, type(x) == string && x.matches({pattern})))"
-        for key in pol._COMMAND_KEYS
+        for key in keys
     ]
     return "(" + " || ".join([string_form, *list_forms]) + ")"
 
@@ -72,7 +69,6 @@ Policy = Callable[[dict[str, Any]], Any]
 def pair(request: pytest.FixtureRequest) -> tuple[Policy, Policy]:
     read_only: bool = request.param
     legacy = _legacy_spec(read_only)
-    assert legacy.name == LEGACY_NAMES[read_only]  # the reconstruction is exact
     current = pol.factory_cel_policy("main", read_only=read_only)
     assert current.name != legacy.name  # content changed: a new version re-attaches
     return cel_policy(**legacy.factory_params), cel_policy(**current.factory_params)

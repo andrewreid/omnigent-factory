@@ -51,6 +51,11 @@ HOT_RELOAD_KEYS = frozenset(
         "auto_triage",
         "auto_triage_daily_limit",
         "auto_triage_min_age_hours",
+        "auto_retriage",
+        "auto_retriage_daily_limit",
+        "retriage_min_age_days",
+        "retriage_min_commits",
+        "retriage_max_age_days",
         "triage_concurrency",
         "auto_build",
         "auto_build_concurrency",
@@ -220,6 +225,20 @@ class ServiceConfig(BaseModel):
     auto_triage_daily_limit: int = Field(default=20, ge=0, le=1000)
     #: An issue must be at least this old before auto-triage takes it (owner grace).
     auto_triage_min_age_hours: float = Field(default=24.0, ge=0)
+    #: Idle-time auto-retriage: once Inbox auto-triage has nothing to do, re-triage a
+    #: quiet Triaged card whose triage may be stale (one at a time, up to the daily limit,
+    #: sharing ``triage_concurrency``). ``omnigent-factory auto-retriage on|off``
+    #: overrides it until it changes here.
+    auto_retriage: bool = False
+    #: Auto-started re-triages per local day (``auto-retriage grant <n>`` adds more today).
+    auto_retriage_daily_limit: int = Field(default=5, ge=0, le=1000)
+    #: A triage this young is never flagged stale by a signal (paths, related issues,
+    #: commits on the base); ``retriage_max_age_days`` flags it regardless.
+    retriage_min_age_days: float = Field(default=7.0, ge=0, le=3650)
+    #: Commits on the base branch since the triage that flag it stale (with the age).
+    retriage_min_commits: int = Field(default=50, ge=1, le=1_000_000)
+    #: A triage this old is flagged stale whatever changed.
+    retriage_max_age_days: float = Field(default=30.0, gt=0, le=3650)
     #: Triage runs at once, repository-wide (owner drags, labels, commands and comments
     #: included); further triage requests wait for a free slot.
     triage_concurrency: int = Field(default=1, ge=1, le=20)
@@ -463,6 +482,8 @@ class ServiceConfig(BaseModel):
 
     @model_validator(mode="after")
     def trusted_identities_are_consistent(self) -> ServiceConfig:
+        if self.retriage_max_age_days < self.retriage_min_age_days:
+            raise ValueError("retriage_max_age_days must be at least retriage_min_age_days")
         if self.github_bot_user_id in self.owners:
             raise ValueError("the factory bot cannot be an owner")
         if self.independent_reviewer_ids & (self.owners | {self.github_bot_user_id}):

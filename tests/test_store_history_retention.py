@@ -18,7 +18,7 @@ from omnigent_factory.store.sqlite import DeliveryRecord, SqliteStore
 from omnigent_factory.testing.builders import snapshot
 from omnigent_factory.testing.fakes import FakeClock
 
-from .test_store import P, Q, store_harness
+from .test_store import LATEST, P, Q, store_harness
 
 HOUR_US = 3600 * 1_000_000
 
@@ -113,7 +113,7 @@ def test_v8_aggregates_lose_their_event_id_sets_on_upgrade(db: Path):
     old.close()
 
     store = SqliteStore.open(db, clock)
-    assert store.schema_version() == 21
+    assert store.schema_version() == LATEST
     loaded = store.load_parcel(P)
     assert loaded is not None and loaded.applied_event_ids == frozenset()
     assert replace(loaded, applied_event_ids=bloated.applied_event_ids) == bloated

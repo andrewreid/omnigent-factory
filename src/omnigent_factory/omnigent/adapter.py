@@ -82,6 +82,7 @@ import hashlib
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -181,6 +182,8 @@ class OmnigentConfig:
     #: The fixed ``factory-cel`` deny rule is always attached and verified regardless.
     cel_expression: str | None = None
     cel_reason: str = pol.CEL_REASON
+    gh_wrapper: str = "/factory/bin/gh"
+    real_gh_path: str = "/usr/bin/gh"
     #: Replace a reused issue session before a new stage run when its last turn filled at
     #: least this fraction of the model's context window (``last_total_tokens`` /
     #: ``context_window`` from the session snapshot; absent telemetry never replaces).
@@ -265,15 +268,18 @@ class OmnigentExecutionAdapter:
         operator: tuple[pol.PolicySpec, ...] = ()
         if config.cel_expression is not None:
             operator = (pol.operator_cel_policy(config.cel_expression, config.cel_reason),)
-        self._cel = (pol.factory_cel_policy(config.default_branch), *operator)
+        cel = partial(
+            pol.factory_cel_policy, gh_wrapper=config.gh_wrapper, real_gh_path=config.real_gh_path
+        )
+        self._cel = (cel(config.default_branch), *operator)
         #: Shared reference snapshots additionally deny installs, dev setup and Git fetch.
         self._cel_reference = (
-            pol.factory_cel_policy(config.default_branch, read_only=True, reference=True),
+            cel(config.default_branch, read_only=True, reference=True),
             *operator,
         )
         #: Triage in issue worktrees, plan and ranking retain the read-only Git set (#761).
         self._cel_read_only = (
-            pol.factory_cel_policy(config.default_branch, read_only=True),
+            cel(config.default_branch, read_only=True),
             *operator,
         )
 

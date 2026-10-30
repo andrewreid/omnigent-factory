@@ -215,6 +215,7 @@ _DEFAULT_RETRY: dict[EffectKind, RetryClass] = {
     EffectKind.PUBLISH_TRIAGE: RetryClass.ADOPTABLE_WRITE,
     EffectKind.PUBLISH_REPORT: RetryClass.ADOPTABLE_WRITE,
     EffectKind.EDIT_REPORT: RetryClass.READ,  # idempotent PATCH of a marked comment
+    EffectKind.SET_CLOSE_CANDIDATE: RetryClass.ADOPTABLE_WRITE,  # idempotent label add/remove
     EffectKind.ENSURE_PROJECT_ITEM: RetryClass.ADOPTABLE_WRITE,
     EffectKind.FETCH_PR_EVIDENCE: RetryClass.READ,
     EffectKind.RECONCILE_PARCEL: RetryClass.READ,
@@ -1136,6 +1137,8 @@ def _start_stage(ctx: _Ctx, kind: SessionKind, duration_us: int) -> None:
     """Record owner stage authority as the pending action; drain the old tree first."""
     _refuse_bundled(ctx)
     _cancel_pending(ctx)
+    if kind == SessionKind.TRIAGE and ctx.p.triage_stale:
+        ctx.update(triage_stale="")  # a new triage answers the stale-triage flag
     auth = _new_authorization(ctx, kind, duration_us)
     ctx.update(pending_authorization_id=auth.authorization_id)
     cur = ctx.p.current_session
@@ -1632,6 +1635,91 @@ def _h_auto_triage(ctx: _Ctx, body: ev.AutoTriage) -> None:
         ctx.unhold(Hold.SAFETY)  # it fenced nothing: there was never work to stop
     _move(ctx, Stage.TRIAGED)
     _start_stage(ctx, SessionKind.TRIAGE, ctx.config.block_us(p.size or Size.S))
+
+
+def _h_auto_retriage(ctx: _Ctx, body: ev.AutoRetriage) -> None:
+    """Idle-time re-triage of a Triaged card whose triage may be stale (the operator's
+    standing authorisation, from the clock).
+
+    Starts a triage run like an owner's ``/triage`` on the card, but only on a quiet
+    card: triaged before, no hold beyond ``AWAITING_OWNER`` (the posted triage's resting
+    state; not a blocking hold, so the run works while it stays), no open question or
+    Needs you, no recorded or running stage run, nothing pending on the board. Unlike an
+    owner control it clears no hold at all: every hold the card had is kept whatever
+    the run's outcome, and a stopped, blocked, stalled or bundled card is refused. It is
+    bound to the triage it judged (``triage_session``): a newer triage refuses it. The
+    same idle checks as auto-triage apply: not paused, no queued build that could start
+    now, a triage slot free (it shares ``triage_concurrency``); a barrier after the read
+    refuses it.
+    """
+    p = ctx.p
+    if ctx.event.evidence is None:
+        raise Rejected("auto-retriage-without-fresh-read")
+    if ctx.now <= p.barrier_time_us:
+        raise Rejected("auto-retriage-not-fresh-after-barrier")
+    if ctx.admission.paused:
+        raise Rejected("paused")
+    if not dispatchable(p):
+        raise Rejected("parcel-not-dispatchable")
+    if ctx.origin_stage != Stage.TRIAGED or p.stage != Stage.TRIAGED:
+        raise Rejected("auto-retriage-not-triaged")
+    triages = [s.session_id for s in p.sessions if s.kind == SessionKind.TRIAGE]
+    if not triages:
+        raise Rejected("auto-retriage-never-triaged")
+    if body.triage_session and body.triage_session != triages[-1]:
+        raise Rejected("auto-retriage-triage-changed")  # judged an older triage
+    if p.holds - {Hold.AWAITING_OWNER}:
+        raise Rejected("auto-retriage-held")
+    if p.open_decisions or p.bot == BotState.NEEDS_YOU:
+        raise Rejected("auto-retriage-needs-owner")
+    cur = p.current_session
+    if p.pending_authorization_id is not None or (cur is not None and not settled(cur)):
+        raise Rejected("auto-retriage-run-in-flight")
+    if board_pending(p) or p.unknown_effects:
+        raise Rejected("auto-retriage-writes-pending")
+    if startable_build(ctx.admission, ctx.config) is not None:
+        raise Rejected("auto-retriage-factory-busy")
+    if not _triage_slot_free(ctx):
+        raise Rejected("auto-retriage-slot-busy")
+    _start_stage(ctx, SessionKind.TRIAGE, ctx.config.block_us(p.size or Size.S))
+
+
+#: GitHub webhook times (``updated_at``) are whole seconds: one second of slack when they
+#: are compared with the factory's microsecond clock (as ``service.label_recovery``).
+GITHUB_TIME_SLACK_US = 1_000_000
+
+
+def _h_close_candidate_removed(ctx: _Ctx, body: ev.CloseCandidateRemoved) -> None:
+    """An owner removed ``factory:close-candidate``: record it for the current triage
+    generation, so its pending, retried or recovered add is superseded (never re-adds).
+    A removal clearly from before that triage was published was of an earlier triage's
+    label. The webhook's time is GitHub's second-precision ``updated_at``: a removal
+    within ``GITHUB_TIME_SLACK_US`` of the publication counts for it (the label is
+    advisory, so the ambiguous boundary favours the owner)."""
+    _ = body
+    e = ctx.event
+    if e.provenance not in ev.CONTROL_PROVENANCES:
+        raise Rejected("control-without-authenticated-source")
+    if e.actor_id is None or e.actor_id not in ctx.config.owners:
+        raise Rejected("control-from-non-owner")
+    generation = ctx.p.close_candidate_session
+    if not generation:
+        raise Rejected("close-candidate-never-published")
+    if ctx.now < ctx.p.close_candidate_at_us - GITHUB_TIME_SLACK_US:
+        raise Rejected("close-candidate-removal-before-triage")
+    if ctx.p.close_candidate_removed == generation:
+        raise Rejected("close-candidate-removal-recorded")
+    ctx.update(close_candidate_removed=generation)
+
+
+def _h_triage_stale(ctx: _Ctx, body: ev.TriageStale) -> None:
+    """The stale-triage pass flags (or clears) a Triaged card: display only."""
+    text = " ".join(body.text.split())[:NOTE_MAX]
+    if text and ctx.p.stage != Stage.TRIAGED:
+        raise Rejected("triage-stale-not-triaged")
+    if text == ctx.p.triage_stale:
+        raise Rejected("triage-stale-unchanged")
+    ctx.update(triage_stale=text)
 
 
 def _h_stale_hold_cleared(ctx: _Ctx, body: ev.StaleHoldCleared) -> None:
@@ -4860,6 +4948,18 @@ def _h_publication_acked(ctx: _Ctx, body: ev.PublicationAcked) -> None:
     ):
         ctx.unhold(Hold.PUBLICATION_PENDING)
         ctx.hold(Hold.AWAITING_OWNER)
+    if (
+        body.effect_kind == EffectKind.PUBLISH_TRIAGE.value
+        and body.session_id
+        and body.session_id != ctx.p.close_candidate_session
+    ):
+        # Once per published triage (its generation): the label follows its
+        # recommendation; a repeated acknowledgement never re-adds an owner-removed label.
+        ctx.update(close_candidate_session=body.session_id, close_candidate_at_us=ctx.now)
+        ctx.emit(
+            EffectKind.SET_CLOSE_CANDIDATE,
+            args={"action": "triage", "session_id": body.session_id},
+        )
 
 
 def _h_session_created(ctx: _Ctx, body: ev.SessionCreated) -> None:
@@ -6172,6 +6272,8 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.BASE_PUSHED: _h_base_pushed,
     EventKind.OPERATOR_RESUME: _h_operator_resume,
     EventKind.AUTO_TRIAGE: _h_auto_triage,
+    EventKind.AUTO_RETRIAGE: _h_auto_retriage,
+    EventKind.CLOSE_CANDIDATE_REMOVED: _h_close_candidate_removed,
     EventKind.STALE_HOLD_CLEARED: _h_stale_hold_cleared,
     EventKind.AUTO_BUILD_MARKED: _h_auto_build_marked,
     EventKind.AUTO_BUILD: _h_auto_build,
@@ -6184,6 +6286,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.AUTOPILOT_QUESTION: _h_autopilot_question,
     EventKind.RELATED_MARKED: _h_related_marked,
     EventKind.EPIC_PROGRESS: _h_epic_progress,
+    EventKind.TRIAGE_STALE: _h_triage_stale,
     EventKind.BUNDLE_HOLD: _h_bundle_hold,
     EventKind.AGENT_BLOCKED_ON: _h_agent_blocked_on,
     EventKind.CONTRACT_PUBLISHED: _h_contract_published,
@@ -6617,6 +6720,19 @@ def _project_board(ctx: _Ctx) -> None:
     # served their purpose.
     if ctx.p.related_marks and ctx.p.stage not in (None, ctx.origin_stage or Stage.INBOX):
         ctx.update(related_marks=())
+    if ctx.p.triage_stale and ctx.p.stage != Stage.TRIAGED:
+        ctx.update(triage_stale="")
+    if (
+        ctx.origin_stage == Stage.TRIAGED
+        and ctx.p.stage not in (None, Stage.TRIAGED)
+        and ctx.p.close_candidate_session
+    ):
+        # The card left Triage (an owner's drag or command, or an observed move): the
+        # owner decided, so the close-candidate label goes (durable, retried effect).
+        ctx.emit(
+            EffectKind.SET_CLOSE_CANDIDATE,
+            args={"action": "remove", "session_id": ctx.p.close_candidate_session},
+        )
     _expire_red_unconfirmed(ctx)
     old_bot = ctx.p.bot
     bot = project_bot(ctx.p, queued=_queued(ctx))

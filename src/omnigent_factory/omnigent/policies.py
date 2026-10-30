@@ -205,7 +205,7 @@ def _shell_pattern(default_branch: str) -> str:
     branch = re.escape(default_branch)
     rules = [
         # merging and auto-merge (CLI, REST merge endpoints, GraphQL mutations)
-        r"\bgh\s+pr\s+merge\b",
+        r"\bgh['\"]?\s+pr\s+merge\b",
         r"/pulls/[0-9]+/merge\b",
         r"\brepos/[^\s/]+/[^\s/]+/merges\b",
         r"\b(mergePullRequest|enablePullRequestAutoMerge|mergeBranch)\b",
@@ -222,28 +222,28 @@ def _shell_pattern(default_branch: str) -> str:
         + branch
         + r"(\s|$|['\"])",
         # repository administration through the API or CLI
-        r"\bgh\s+api\b" + _SEG + r"(rulesets|/protection\b|/collaborators\b|/hooks\b"
+        r"\bgh['\"]?\s+api\b" + _SEG + r"(rulesets|/protection\b|/collaborators\b|/hooks\b"
         r"|/keys\b|/secrets\b|/variables\b|/environments\b|/transfer\b"
         r"|/actions/permissions\b|/branches/[^\s/]+/rename\b"
         r"|/actions/workflows/[^\s/]+/(enable|disable)\b)",
-        r"\bgh\s+api\b"
+        r"\bgh['\"]?\s+api\b"
         + _SEG
         + r"(-X|--method)[\s=]*(PATCH|PUT)\b"
         + _SEG
         + r"\brepos/[^\s/]+/[^\s/'\"]+/?(\s|$|['\"])",
-        r"\bgh\s+api\b" + _SEG + r"(-X|--method)[\s=]*(?i:DELETE)\b",
-        r"\bgh\s+(repo\s+(delete|edit|rename|archive|transfer)|ruleset|secret|variable)\b",
-        r"\bgh\s+workflow\s+(enable|disable|run)\b",
+        r"\bgh['\"]?\s+api\b" + _SEG + r"(-X|--method)[\s=]*(?i:DELETE)\b",
+        r"\bgh['\"]?\s+(repo\s+(delete|edit|rename|archive|transfer)|ruleset|secret|variable)\b",
+        r"\bgh['\"]?\s+workflow\s+(enable|disable|run)\b",
         # workflow/repository dispatch and deleting runs or caches (re-run and cancel
         # stay allowed)
-        r"\bgh\s+api\b" + _SEG + r"/dispatches\b",
-        r"\bgh\s+(run|cache)\s+delete\b",
+        r"\bgh['\"]?\s+api\b" + _SEG + r"/dispatches\b",
+        r"\bgh['\"]?\s+(run|cache)\s+delete\b",
         # closing / deleting issues and pull requests (CLI, REST, GraphQL) and deleting
         # repositories; creating issues, replying to and resolving threads stay allowed
-        r"\bgh\s+issue\s+(close|delete|transfer|lock)\b",
-        r"\bgh\s+pr\s+(close|lock)\b",
-        r"\bgh\s+(issue|pr)\s+comment\b" + _SEG + r"\s--delete-last\b",
-        r"\bgh\s+api\b"
+        r"\bgh['\"]?\s+issue\s+(close|delete|transfer|lock)\b",
+        r"\bgh['\"]?\s+pr\s+(close|lock)\b",
+        r"\bgh['\"]?\s+(issue|pr)\s+comment\b" + _SEG + r"\s--delete-last\b",
+        r"\bgh['\"]?\s+api\b"
         + _SEG
         + r"/(issues|pulls)/[0-9]+\b"
         + _SEG
@@ -287,10 +287,10 @@ def _issue_create_pattern() -> str:
     post = r"(-X|--request|--method)(\s|=)*['\"]?(?i:post)\b"
     fields = r"(-f|-F|--field|--raw-field|--input)(\s|=)"
     data = r"(-d|--data|--data-raw|--data-binary|--json)(\s|=)"
-    gh_api = r"\bgh\s+api\b" + _SEG
+    gh_api = r"\bgh['\"]?\s+api\b" + _SEG
     curl = r"\bcurl\b" + _SEG
     rules = [
-        r"\bgh\s+issue\s+(create|new)\b",
+        r"\bgh['\"]?\s+issue\s+(create|new)\b",
         gh_api + fields + _SEG + path,
         gh_api + path + _SEG + fields,
         curl + data + _SEG + path,
@@ -335,8 +335,87 @@ def _cel_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _git_credential_pattern() -> str:
+    """Explicit credential access, including Git global options and inline aliases.
+
+    Git's internal helper execution is not a tool request: ordinary push/fetch commands
+    remain governed by their existing stage policy and worktree credential wiring.
+    """
+    command = (
+        r"(^|[\s;&|(`'\"/\\])git['\"]?("
+        + _GAP
+        + r"("
+        + _GIT_OPTION
+        + r"))*"
+        + _GAP
+        + r"['\"]?credential(-[^\s;&|)`'\"]*)?"
+        + _END
+    )
+    alias = r"(?i:alias\.[^\s=]+\s*=)\s*['\"]?credential([\s'\"]|$|-)"
+    return "(" + command + "|" + alias + r"|\bgit-credential[^\s;&|)]*)"
+
+
+def _git_credential_argv_matches() -> str:
+    """Split argv needs the executable and credential subcommand in the same list."""
+    args = "event.data.arguments"
+    forms = []
+    for key in _COMMAND_KEYS:
+        argv = f"{args}.{key}"
+        # Only ?: is lazy in celpy. Prove list shape, length and element type before
+        # indexing or matching so malformed arguments cannot cause an abstention.
+        forms.append(
+            f"(has({args}) && type({args}) == map && has({argv})"
+            f" ? (type({argv}) == list ? (size({argv}) > 0"
+            f" ? (type({argv}[0]) == string"
+            f" ? ({argv}[0].matches({_cel_string(r'(^|/)(git|env|command|exec|sudo)$')})"
+            f" && {argv}.exists(x, type(x) == string"
+            f" ? x.matches({_cel_string(r'(^|/)git$')}) : false)"
+            f" && {argv}.exists(x, type(x) == string"
+            f" ? x.matches({_cel_string(r'^credential($|-)')}) : false))"
+            " : false) : false) : false) : false)"
+        )
+    return "(" + " || ".join(forms) + ")"
+
+
+def _github_identity_pattern(real_gh_path: str) -> str:
+    """Common shell spellings, not a shell parser or an OS security boundary.
+
+    The bare-name rule excludes a slash prefix, so the absolute wrapper is allowed.
+    Real binaries are matched separately; allowing a wrapper never exempts a command's
+    other invocations. Quotes and backslashes within the bare name are also covered.
+    """
+    bare = r"(^|[\s;&|(`\"'=\\])g['\"\\]*h($|[\s;&|)`'\"\\])"
+    paths = "|".join(re.escape(p) for p in sorted({"/usr/bin/gh", "/bin/gh", real_gh_path}))
+    real = r"(^|[\s;&|(`\"'=])(" + paths + r")($|[\s;&|)`'\"])"
+    auth = r"\bgh['\"]?\s+auth\s+(token\b|status\b[^\n;&|]*--show-token\b)"
+    tokens = r"\b(GITHUB_TOKEN|GH_TOKEN)\b"
+    return "(" + "|".join((bare, real, auth, tokens, _git_credential_pattern())) + ")"
+
+
+_GH_CONFIG_PATTERN = r"(\.config[/\\]+gh\b|\bhosts\.yml\b)"
+#: Curl tracing can expose authorization headers; disabling Git's redaction is equally
+#: unsafe. This applies to every stage, including otherwise writable build sessions.
+_GIT_TRACE_PATTERN = (
+    r"(\b(GIT_TRACE_CURL|GIT_CURL_VERBOSE)\b|"
+    r"\bGIT_TRACE_REDACT[ \t]*=[ \t]*['\"]?0\b)"
+)
+
+
+def _credential_arguments_match() -> str:
+    """Scan direct read-tool paths as well as shell arguments, without scanning content."""
+    return _command_matches(
+        _GH_CONFIG_PATTERN,
+        keys=(*_COMMAND_KEYS, "path", "file_path", "filename", "paths"),
+    )
+
+
 def factory_cel_expression(
-    default_branch: str = "main", *, read_only: bool = False, reference: bool = False
+    default_branch: str = "main",
+    *,
+    read_only: bool = False,
+    reference: bool = False,
+    gh_wrapper: str = "/factory/bin/gh",
+    real_gh_path: str = "/usr/bin/gh",
 ) -> str:
     """Fixed deny rule over the pinned ``PolicyEvent`` shape (policies/schema.py @1c0153aa).
 
@@ -370,6 +449,25 @@ def factory_cel_expression(
         f' ? {{"result": "DENY", "reason": {_cel_string(ISSUE_CREATE_REASON)}}}'
         f" : ({is_call}) && ({admin_tool} || {file_to_default} || {shell})"
         f' ? {{"result": "DENY", "reason": {_cel_string(CEL_REASON)}}}'
+        ' : {"result": "ALLOW"}'
+    )
+    identity = (
+        f"({_command_matches(_github_identity_pattern(real_gh_path))}"
+        f" || {_git_credential_argv_matches()})"
+    )
+    unsafe_trace = _command_matches(_GIT_TRACE_PATTERN)
+    config_read = _credential_arguments_match()
+    reason = (
+        f"Denied by factory policy: use the scoped wrapper {gh_wrapper} with "
+        "OMNIGENT_FACTORY_CAPABILITY_FILE from this run's brief. Personal gh config, "
+        "explicit Git credential commands, auth tokens, GITHUB_TOKEN/GH_TOKEN and unsafe "
+        "Git curl tracing are forbidden. If this matched literal "
+        "message text, use --body-file instead."
+    )
+    # Keep operation-specific guidance, then apply identity confinement.
+    rule = rule.removesuffix(' : {"result": "ALLOW"}') + (
+        f" : ({is_call}) && ({identity} || {config_read} || {unsafe_trace})"
+        f' ? {{"result": "DENY", "reason": {_cel_string(reason)}}}'
         ' : {"result": "ALLOW"}'
     )
     if reference:
@@ -417,12 +515,12 @@ def factory_cel_expression(
     )
 
 
-def _command_matches(regex: str) -> str:
+def _command_matches(regex: str, *, keys: tuple[str, ...] = _COMMAND_KEYS) -> str:
     """CEL: some command argument (shell text, string or list form) matches ``regex``."""
     args = "event.data.arguments"
     has_args = f"has({args}) && type({args}) == map"
     pattern = _cel_string(regex)
-    command_key = " || ".join(f'k == "{key}"' for key in _COMMAND_KEYS)
+    command_key = " || ".join(f'k == "{key}"' for key in keys)
     # celpy evaluates both operands of ``&&`` and ``||`` (only ``?:`` is lazy), and
     # ``exists`` visits every element. A list comprehension over a non-list argument
     # raises (the pinned cel_policy then abstains and the call would be ALLOWED) and one
@@ -439,7 +537,7 @@ def _command_matches(regex: str) -> str:
         f"({has_args} && has({args}.{key}) && type({args}.{key}) == list"
         f" ? {args}.{key}.exists(x, type(x) == string ? x.matches({pattern}) : false)"
         f" : false)"
-        for key in _COMMAND_KEYS
+        for key in keys
     ]
     return "(" + " || ".join([string_form, *list_forms]) + ")"
 
@@ -503,14 +601,25 @@ def caller_policy(session_id: str) -> PolicySpec:
 
 
 def factory_cel_policy(
-    default_branch: str = "main", *, read_only: bool = False, reference: bool = False
+    default_branch: str = "main",
+    *,
+    read_only: bool = False,
+    reference: bool = False,
+    gh_wrapper: str = "/factory/bin/gh",
+    real_gh_path: str = "/usr/bin/gh",
 ) -> PolicySpec:
     """The required fixed safety rule, always attached as ``factory-cel``. Not replaceable.
 
     The read-only variant is another version of the same family, so a stage switch on a
     reused root (plan -> build) adds the new rule before removing the old one.
     """
-    expression = factory_cel_expression(default_branch, read_only=read_only, reference=reference)
+    expression = factory_cel_expression(
+        default_branch,
+        read_only=read_only,
+        reference=reference,
+        gh_wrapper=gh_wrapper,
+        real_gh_path=real_gh_path,
+    )
     return _compiled(CEL_NAME, expression, CEL_REASON)
 
 

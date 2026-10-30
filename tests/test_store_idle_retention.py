@@ -15,7 +15,7 @@ from omnigent_factory.store.sqlite import DeliveryOutcome, DeliveryRecord, Sqlit
 from omnigent_factory.testing.builders import snapshot
 from omnigent_factory.testing.fakes import FakeClock
 
-from .test_store import P, store_harness
+from .test_store import LATEST, P, store_harness
 
 DAY_US = 86_400 * 1_000_000
 
@@ -46,7 +46,7 @@ def test_v7_database_with_inbox_rows_upgrades_and_uses_the_partial_index(db: Pat
     old.close()
 
     store = SqliteStore.open(db, clock)
-    assert store.schema_version() == 21
+    assert store.schema_version() == LATEST
     assert [d.delivery_guid for d in store.pending_deliveries()] == before == ["d-1"]
     assert store.inbox_due() == [("d-1", None), ("d-4", clock.now_utc_us() + 10)]
     assert store.has_pending_delivery()

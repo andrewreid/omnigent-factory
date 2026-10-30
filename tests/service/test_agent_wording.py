@@ -99,6 +99,17 @@ def test_readiness_wake_says_red_checks_outside_the_change_are_build_ready_not_b
     assert 'Submit kind "blocked" only if a required defect in this change' in wake
 
 
+#: Templates whose previous version is not the one numbered just below.
+PREDECESSORS = {
+    "triage-v13.txt": "triage-v11.txt",
+    "triage-feedback-v10.txt": "triage-feedback-v8.txt",
+    "triage-comment-v4.txt": "triage-comment-v2.txt",
+    "triage-v14.txt": "triage-v12.txt",
+    "triage-feedback-v11.txt": "triage-feedback-v9.txt",
+    "triage-comment-v5.txt": "triage-comment-v3.txt",
+}
+
+
 def test_live_result_and_question_prompts_request_eli5_and_keep_old_versions():
     from omnigent_factory.service import directory
 
@@ -134,8 +145,13 @@ def test_live_result_and_question_prompts_request_eli5_and_keep_old_versions():
         assert "Use no jargon" in flat and "Keep eli5 outside the plan contract" in flat
         assert "factory_ask_owner, always pass eli5" in flat
         prefix, version = name.removesuffix(".txt").rsplit("-v", 1)
-        old = (root / f"{prefix}-v{int(version) - 1}.txt").read_text("utf-8")
-        if name in {
+        # Issue-worktree and reference families each grow from their own predecessor.
+        previous = PREDECESSORS.get(name, f"{prefix}-v{int(version) - 1}.txt")
+        old = (root / previous).read_text("utf-8")
+        if name == "triage-refresh-v2.txt":
+            # The reference variant of the refresh run: its snapshot note only.
+            assert text.replace("{reference_note}\n", "", 1) == old
+        elif name in {
             "triage-v12.txt",
             "triage-feedback-v9.txt",
             "epic-triage-v6.txt",

@@ -64,6 +64,7 @@ GITHUB_EFFECT_KINDS = frozenset(
         EffectKind.PUBLISH_TRIAGE,
         EffectKind.PUBLISH_REPORT,
         EffectKind.EDIT_REPORT,
+        EffectKind.SET_CLOSE_CANDIDATE,
         EffectKind.ENSURE_PROJECT_ITEM,
         EffectKind.FETCH_PR_EVIDENCE,
         EffectKind.RECONCILE_PARCEL,

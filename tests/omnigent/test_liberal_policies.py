@@ -214,12 +214,12 @@ def test_issue_creation_is_the_factorys(command: str, read_only: bool) -> None:
 
 @pytest.mark.parametrize("command", ISSUE_READS)
 def test_reading_and_commenting_on_issues_stays_allowed(cel: Any, command: str) -> None:
-    assert _result(cel(_event(command))) == "ALLOW", command
+    assert _result(cel(_event(command.replace("gh ", "/factory/bin/gh ")))) == "ALLOW", command
 
 
 @pytest.mark.parametrize("command", NORMAL)
 def test_normal_work_is_allowed(cel: Any, command: str) -> None:
-    assert _result(cel(_event(command))) == "ALLOW", command
+    assert _result(cel(_event(command.replace("gh ", "/factory/bin/gh ")))) == "ALLOW", command
 
 
 @pytest.mark.parametrize("command", FORBIDDEN)

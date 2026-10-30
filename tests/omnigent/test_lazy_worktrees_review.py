@@ -145,6 +145,16 @@ LEGACY_TEMPLATES = {
 }
 
 
+#: The issue-worktree template of each variant new dispatches pin now (closure
+#: outcomes, closure_evidence, paths and the gh wrapper were added to the triage ones).
+CURRENT_TEMPLATES = {
+    "triage": "triage-v13.txt",
+    "feedback": "triage-feedback-v10.txt",
+    "epic": "epic-triage-v5.txt",
+    "autopilot": "epic-plan-v4.txt",
+}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["off", "live_issue", "reference"])
 @pytest.mark.parametrize("variant", list(LEGACY_TEMPLATES))
@@ -176,7 +186,8 @@ async def test_only_reference_dispatches_use_new_template_bytes(
     snapshot = directory.dispatch_snapshot(run.session_id)
     old_name, old_hash = LEGACY_TEMPLATES[variant]
     assert hashlib.sha256(module._template(old_name).encode()).hexdigest() == old_hash
-    name = module._REFERENCE_TEMPLATES[old_name] if mode == "reference" else old_name
+    current = CURRENT_TEMPLATES[variant]
+    name = module._REFERENCE_TEMPLATES[current] if mode == "reference" else current
     assert snapshot["template"] == name
     assert (
         snapshot["template_sha256"] == hashlib.sha256(module._template(name).encode()).hexdigest()
@@ -186,7 +197,8 @@ async def test_only_reference_dispatches_use_new_template_bytes(
     first_text = await directory.message_text(first)
     feedback_text = await directory.message_text(feedback)
     if mode != "reference":
-        assert first_text == module._template(old_name).format(
+        capability = directory.config.capability_dir / f"{run.session_id}.cap"
+        assert first_text == module._template(current).format(
             repository=directory.config.repository,
             issue_number=h.p().issue_number,
             run_id=run.session_id,
@@ -194,18 +206,28 @@ async def test_only_reference_dispatches_use_new_template_bytes(
             handoff="",
             base_note="",
             granted_minutes=max(1, spec.granted_us // MICROS_PER_MINUTE),
+            gh_wrapper=directory.config.wrapper_bin_dir / "gh",
+            capability_file=capability,
         )
-        assert snapshot["triage_comment_template"] == "triage-comment-v2.txt"
+        assert "shared read-only reference snapshot" not in first_text
+        # The legacy comment template's bytes are kept for in-flight dispatches.
         assert (
-            snapshot["triage_comment_sha256"]
+            hashlib.sha256(module._template("triage-comment-v2.txt").encode()).hexdigest()
             == "55dbee8191c4375267ef6c4aedc9e56826befe1fc8ef35f7201335628226c0d9"
         )
-        assert feedback_text == module._template("triage-comment-v2.txt").format(
-            run_id=run.session_id
+        assert snapshot["triage_comment_template"] == "triage-comment-v4.txt"
+        assert (
+            snapshot["triage_comment_sha256"]
+            == hashlib.sha256(module._template("triage-comment-v4.txt").encode()).hexdigest()
+        )
+        assert feedback_text == module._template("triage-comment-v4.txt").format(
+            run_id=run.session_id,
+            gh_wrapper=directory.config.wrapper_bin_dir / "gh",
+            capability_file=capability,
         )
     else:
         assert "shared read-only reference snapshot" in first_text
-        assert snapshot["triage_comment_template"] == "triage-comment-v3.txt"
+        assert snapshot["triage_comment_template"] == "triage-comment-v5.txt"
         assert "snapshot" in feedback_text
     directory.config = directory.config.model_copy(update={"lazy_issue_worktrees": mode == "off"})
     assert await directory.message_text(first) == first_text

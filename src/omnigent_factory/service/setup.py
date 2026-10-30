@@ -109,6 +109,11 @@ review_bot_mention = "@codex"
 review_bot_ack_minutes = 5        # no 👀 from the review bot by then: stop waiting
 review_bot_max_wait_minutes = 45  # 👀 (reviewing) or unreadable: wait at most this long
 review_bot_grace_minutes = 10     # the wait when the bot's 👀 cannot be told
+auto_retriage = false          # re-triage quiet Triaged cards whose triage may be stale
+auto_retriage_daily_limit = 5  # auto-started re-triages per local day
+retriage_min_age_days = 7      # signals count only once a triage is this old
+retriage_min_commits = 50      # commits on the base since the triage that flag it
+retriage_max_age_days = 30     # a triage this old is flagged whatever changed
 auto_build = false             # start owner-queued (Auto-build = Queued) plans
 auto_build_concurrency = 1     # auto-builds at once, within max_building
 auto_build_daily_limit = 0     # auto-builds per local day (0 = unlimited)

@@ -73,12 +73,16 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.AUTO_BUILD_MARKED: _OWNER_CONTROL,
     # the owner's "Autopilot" field change on an epic (their own project-item webhook)
     EventKind.AUTOPILOT_MARKED: _OWNER_CONTROL,
+    # the owner removed the close-candidate label (their own issues webhook)
+    EventKind.CLOSE_CANDIDATE_REMOVED: _OWNER_CONTROL,
     # operator
     EventKind.PAUSE: Admission(_OPERATOR),
     EventKind.UNPAUSE: Admission(_OPERATOR),
     EventKind.OPERATOR_RESUME: Admission(_OPERATOR),
     # standing operator authorisation, acted on by the trusted clock (no actor)
     EventKind.AUTO_TRIAGE: Admission(_SCHEDULER),
+    # the same standing authorisation re-triaging a Triaged card whose triage may be stale
+    EventKind.AUTO_RETRIAGE: Admission(_SCHEDULER),
     # startup repair of a safety hold that fenced nothing (restores no authority)
     EventKind.STALE_HOLD_CLEARED: Admission(_SCHEDULER),
     # an owner's auto-build mark started when a build slot is free (the mark is the
@@ -143,6 +147,7 @@ ADMISSION: dict[EventKind, Admission] = {
     # display only: another issue's accepted triage named this one
     EventKind.RELATED_MARKED: Admission(_ADAPTER),
     EventKind.EPIC_PROGRESS: Admission(_ADAPTER),
+    EventKind.TRIAGE_STALE: Admission(_ADAPTER),
     EventKind.BUNDLE_HOLD: Admission(_ADAPTER),
     EventKind.AGENT_BLOCKED_ON: Admission(_ADAPTER),
     EventKind.AUTOPILOT_STATUS: Admission(_ADAPTER),

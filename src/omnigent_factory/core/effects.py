@@ -46,6 +46,13 @@ class EffectKind(enum.StrEnum):
     #: Keep the factory lines of a posted Ready report current: edit the comment its
     #: PUBLISH_REPORT marker finds (``args.report_effect_id``) in place; never posts.
     EDIT_REPORT = "edit_report"
+    #: Converge the issue's ``factory:close-candidate`` label (idempotent add/remove):
+    #: ``args.action`` "triage" applies the published triage ``args.session_id``'s
+    #: recommendation (add for a closure candidate, else remove); "remove" drops it when
+    #: the card left Triage. Keyed to that triage generation (``Parcel.close_candidate_
+    #: session``): an older one is superseded, so an owner's removal sticks until the next
+    #: triage. Never closes the issue.
+    SET_CLOSE_CANDIDATE = "set_close_candidate"
     ENSURE_PROJECT_ITEM = "ensure_project_item"
     FETCH_PR_EVIDENCE = "fetch_pr_evidence"
     RECONCILE_PARCEL = "reconcile_parcel"
@@ -110,6 +117,7 @@ VERIFIABLE_WRITE_KINDS = frozenset(
         EffectKind.SET_AUTOPILOT,
         EffectKind.REACT_COMMENT,
         EffectKind.EDIT_REPORT,
+        EffectKind.SET_CLOSE_CANDIDATE,
         EffectKind.ENSURE_PROJECT_ITEM,
         EffectKind.INTERRUPT_TREE,
         EffectKind.REPLACE_COST_POLICY,

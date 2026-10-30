@@ -33,6 +33,7 @@ from omnigent_factory.core.events import (
     ChecksState,
     FindingRef,
 )
+from omnigent_factory.core.protocol import CLOSE_CANDIDATE_LABEL
 from omnigent_factory.core.report_lines import keep_ticks
 from omnigent_factory.core.types import IssueLinks, IssueSnapshot, Stage
 from omnigent_factory.github.client import (
@@ -45,8 +46,11 @@ from omnigent_factory.github.client import (
 from omnigent_factory.github.links import (
     BOARD_LINK_FIELDS,
     ISSUE_LINK_FIELDS,
+    add_label,
     complete_links,
+    ensure_label,
     parse_links,
+    remove_label,
 )
 from omnigent_factory.ports.github import (
     GITHUB_EFFECT_KINDS,
@@ -105,7 +109,13 @@ class TriageFields:
     priority: str
     size: str
     labels: tuple[str, ...] = ()
+    #: The recommendation makes the issue a closure candidate: the factory adds
+    #: ``factory:close-candidate`` (False: a newer triage removes it; None: left alone).
+    close_candidate: bool | None = None
 
+
+#: Description of the ``factory:close-candidate`` label (created when absent).
+CLOSE_CANDIDATE_DESCRIPTION = "Triage suggests closing this issue; the owner decides"
 
 ParcelResolver = Callable[[str], Awaitable[ParcelBinding | None]]
 TriageFieldSource = Callable[[EffectIntent], Awaitable[TriageFields | None]]
@@ -1562,6 +1572,8 @@ class GitHubAPIAdapter:
                 return await self._display_write(effect)
             if effect.kind == EffectKind.ENSURE_PROJECT_ITEM:
                 return await self._ensure_project_item(effect)
+            if effect.kind == EffectKind.SET_CLOSE_CANDIDATE:
+                return await self._close_candidate(effect)
             if effect.kind == EffectKind.FETCH_PR_EVIDENCE:
                 read_started_us = self._now_us()  # before any read: covers earlier webhooks
                 not_before = effect.args.get("not_before_us")
@@ -1819,6 +1831,46 @@ class GitHubAPIAdapter:
                 expected=frozenset({200}),
             )
         return names
+
+    async def _close_candidate(self, effect: EffectIntent) -> AdapterOutcome:
+        """``SET_CLOSE_CANDIDATE``: add ``factory:close-candidate`` to a closure candidate
+        (creating the label first) or remove it (absent is success). Idempotent, so the
+        executor retries rate limits, 5xx and ambiguity with backoff; a 4xx is terminal
+        (a failed effect the operator sees). Independent of the triage comment's
+        informational labels. The factory never closes the issue."""
+        ref = await self._issue_ref(effect)
+        if ref is None:
+            return DefinitiveFailure("SET_CLOSE_CANDIDATE requires the parcel issue")
+        candidate = False
+        if effect.args.get("action") == "triage":
+            fields = await self.triage_fields(effect) if self.triage_fields is not None else None
+            if fields is None or fields.close_candidate is None:
+                return Ack(None, {"close_candidate": "unchanged"})  # e.g. an epic's triage
+            candidate = fields.close_candidate
+        elif effect.args.get("action") != "remove":
+            return DefinitiveFailure("SET_CLOSE_CANDIDATE action must be triage or remove")
+        try:
+            if candidate:
+                await ensure_label(
+                    self.client,
+                    self.repository,
+                    CLOSE_CANDIDATE_LABEL,
+                    CLOSE_CANDIDATE_DESCRIPTION,
+                )
+                await add_label(
+                    self.client, self.repository, ref.issue_number, CLOSE_CANDIDATE_LABEL
+                )
+            else:
+                await remove_label(
+                    self.client, self.repository, ref.issue_number, CLOSE_CANDIDATE_LABEL
+                )
+        except AmbiguousRequest as exc:
+            return RetryableReadFailure(f"label write uncertain: {exc}")
+        except GitHubRejected as exc:
+            if 400 <= exc.status_code < 500:
+                return DefinitiveFailure(str(exc))
+            return RetryableReadFailure(str(exc))
+        return Ack(None, {"close_candidate": "added" if candidate else "removed"})
 
     async def _single_select_fields(
         self, names: tuple[str, ...]

@@ -488,7 +488,7 @@ def test_proposal_shape_errors():
     assert any("reason is required" in p and "area of code" in p for p in problems)
     _ok, problems = parse_proposals([proposal(1, 2), proposal(2, 3)])
     assert problems == ["#2 is in bundles[1] and bundles[2]"]
-    assert parse_proposals("x")[1] == ["bundles: a list of at most 5"]
+    assert parse_proposals("x")[1] == ["bundles: a list of at most 10"]
 
 
 # ------------------------------------------------------------------ proposals
@@ -733,7 +733,7 @@ async def test_proposals_keep_the_suggestion_limits(service_config: ServiceConfi
         _found, problems = await r.bundles.check_proposals([proposal(1, 2)], {})
         assert any("#2 is size L or unsized" in p for p in problems), problems
         text, _field = await r.bundles.ranking_text()
-        assert "bundles of 2 to 2 related small issues" in text and "at most 4 points" in text
+        assert "2 to 2 related small issues" in text and "at most 4 points" in text
 
 
 @pytest.mark.asyncio

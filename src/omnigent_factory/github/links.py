@@ -346,6 +346,20 @@ async def add_label(client: GitHubClient, repository: str, number: int, name: st
     )
 
 
+async def remove_label(client: GitHubClient, repository: str, number: int, name: str) -> None:
+    """Remove the label ``name`` from issue ``number``; a label it does not carry (404)
+    is success."""
+    try:
+        await client.request(
+            "DELETE",
+            f"/repos/{repository}/issues/{number}/labels/{quote(name, safe='')}",
+            expected=frozenset({200, 204}),
+        )
+    except GitHubRejected as exc:
+        if exc.status_code != 404:
+            raise
+
+
 async def epic_issue_type(client: GitHubClient, owner: str, name: str) -> str | None:
     """The node ID of the repository's enabled "Epic" issue type (None: none)."""
     query = """

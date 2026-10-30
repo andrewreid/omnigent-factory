@@ -166,6 +166,10 @@ class FactoryService:
         #: Idle-time auto-triage and its ``auto-triage`` operator command (composition;
         #: ``service.auto_triage.AutoTriager``). None: not wired.
         self.auto_triager: Any = None
+        #: Stale-triage flags, idle-time re-triage and the ``auto-retriage`` operator
+        #: command (composition; ``service.auto_retriage.AutoRetriager``). None: not
+        #: wired. Its pass runs in the auto-triage loop, after each auto-triage pass.
+        self.auto_retriager: Any = None
         #: Owner-marked auto-builds and the ``auto-build`` operator command (composition;
         #: ``service.auto_build.AutoBuilder``). None: not wired.
         self.auto_builder: Any = None
@@ -1190,6 +1194,7 @@ class FactoryService:
             await self._wait(self.config.reconcile_interval_seconds)
             if self._stop.is_set() or not self.accepting_admission:
                 continue
+            outcome = ""
             try:
                 outcome = await self.auto_triager.run_once()
                 LOG.debug("auto-triage pass outcome=%s", outcome)
@@ -1197,6 +1202,15 @@ class FactoryService:
                 raise
             except Exception:
                 LOG.warning("auto-triage pass failed", exc_info=True)
+            if self.auto_retriager is None or outcome.startswith("started"):
+                continue  # an Inbox triage just took the slot: re-triage waits
+            try:
+                retriaged = await self.auto_retriager.run_once()
+                LOG.debug("auto-retriage pass outcome=%s", retriaged)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.warning("auto-retriage pass failed", exc_info=True)
 
     async def _auto_build_loop(self) -> None:
         """Auto-build passes (each starts at most one build), every reconcile interval and
@@ -1477,6 +1491,11 @@ class FactoryService:
                 raise ValueError("auto-triage is not wired")
             report: dict[str, object] = await self.auto_triager.command(args)
             return report
+        if command == "auto-retriage":
+            if self.auto_retriager is None:
+                raise ValueError("auto-retriage is not wired")
+            retriage: dict[str, object] = await self.auto_retriager.command(args)
+            return retriage
         if command == "auto-build":
             if self.auto_builder is None:
                 raise ValueError("auto-build is not wired")

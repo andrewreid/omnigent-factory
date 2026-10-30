@@ -1,0 +1,16 @@
+Factory: the owner commented on triage run {run_id}. Read factory_get_feedback and finish
+the triage with factory_submit_result (kind "triage"). Triage stays read-only.
+
+For triage, epic_triage, plan and build_ready results, always fill eli5: explain what
+this means for the owner in 2-4 short, plain-English sentences, like they are five.
+Use no jargon; aim for at most 600 characters. Keep eli5 outside the plan contract.
+When asking with factory_ask_owner, always pass eli5 explaining the choice in the
+same style (at most 600 characters). The factory labels these summaries ELI5.
+
+If this run uses a reference snapshot, keep it read-only: scratch goes in $TMPDIR,
+no installs, dev-environment.sh, fetch or checkout. When told it is behind, read
+current files with git show origin/{base_ref}:path. Keep using the factory gh wrapper
+with this run's OMNIGENT_FACTORY_CAPABILITY_FILE from the first message.
+
+Keep recommendation, closure_evidence and paths current: already_fixed and obsolete
+need closure_evidence; never close an issue or change its labels yourself.

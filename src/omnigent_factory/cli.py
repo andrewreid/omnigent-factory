@@ -119,6 +119,19 @@ def build_parser() -> argparse.ArgumentParser:
     grant = auto_sub.add_parser("grant", help="add <n> auto-triages to today's budget")
     grant.add_argument("count", type=int)
     _config_arg(grant)
+    retriage = sub.add_parser(
+        "auto-retriage",
+        help="idle-time re-triage of stale Triaged cards: status (candidates and why), "
+        "on/off (overrides the config until it changes), grant <n> more for today",
+    )
+    retriage_sub = retriage.add_subparsers(dest="retriage_command", required=True)
+    for name in ("status", "on", "off"):
+        _config_arg(retriage_sub.add_parser(name))
+    retriage_grant = retriage_sub.add_parser(
+        "grant", help="add <n> auto-retriages to today's budget"
+    )
+    retriage_grant.add_argument("count", type=int)
+    _config_arg(retriage_grant)
     build = sub.add_parser(
         "auto-build",
         help="owner-marked auto-builds: status, on/off (overrides the config until it "
@@ -207,6 +220,7 @@ def _operator(
         "cleanup": 60.0,
         "prune": 900.0,
         "auto-triage": 60.0,  # status reads the board
+        "auto-retriage": 120.0,  # status reads the board and local Git
         "auto-build": 60.0,
         "epic-autopilot": 60.0,
         "ranking": 60.0,
@@ -281,6 +295,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.auto_command == "grant":
             request["count"] = args.count
         return _operator(config, "auto-triage", request)
+    if args.command == "auto-retriage":
+        retriage_request: dict[str, object] = {"action": args.retriage_command}
+        if args.retriage_command == "grant":
+            retriage_request["count"] = args.count
+        return _operator(config, "auto-retriage", retriage_request)
     if args.command == "auto-build":
         build_request: dict[str, object] = {"action": args.build_command}
         if args.build_command == "grant":

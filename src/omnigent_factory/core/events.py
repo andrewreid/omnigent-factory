@@ -61,6 +61,8 @@ class EventKind(enum.StrEnum):
     UNPAUSE = "Unpause"
     OPERATOR_RESUME = "OperatorResume"
     AUTO_TRIAGE = "AutoTriage"
+    AUTO_RETRIAGE = "AutoRetriage"
+    CLOSE_CANDIDATE_REMOVED = "CloseCandidateRemoved"
     STALE_HOLD_CLEARED = "StaleHoldCleared"
     AUTO_BUILD_MARKED = "AutoBuildMarked"
     AUTO_BUILD = "AutoBuild"
@@ -116,6 +118,7 @@ class EventKind(enum.StrEnum):
     ISSUE_SESSION_CLOSED = "IssueSessionClosed"
     RELATED_MARKED = "RelatedMarked"
     EPIC_PROGRESS = "EpicProgress"
+    TRIAGE_STALE = "TriageStale"
     BUNDLE_HOLD = "BundleHold"
     AGENT_BLOCKED_ON = "AgentBlockedOn"
     AUTOPILOT_STATUS = "AutopilotStatus"
@@ -330,6 +333,37 @@ class AutoTriage(_Body):
     """
 
     KIND: ClassVar[EventKind] = EventKind.AUTO_TRIAGE
+    CLASS: ClassVar[EventClass] = EventClass.CONTROL
+
+
+@dataclass(frozen=True, slots=True)
+class AutoRetriage(_Body):
+    """Idle-time re-triage of one Triaged issue whose triage may be stale (the trusted
+    clock, never an owner).
+
+    The standing authorisation is the operator's: host config ``auto_retriage`` (or the
+    ``auto-retriage on`` CLI) and its daily budget. The service picks the issue from
+    deterministic signals (``signals``: what changed since the triage, for the run's
+    brief) and attaches a fresh read; the reducer starts a triage run exactly as an
+    owner's ``/triage`` on the Triaged card would, but never clears a hold: a held,
+    questioned, bundled or busy card is refused.
+    """
+
+    KIND: ClassVar[EventKind] = EventKind.AUTO_RETRIAGE
+    CLASS: ClassVar[EventClass] = EventClass.CONTROL
+    signals: tuple[str, ...] = ()
+    #: The triage run whose result was judged stale: refused unless it is still the
+    #: card's newest triage ("" = unbound).
+    triage_session: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class CloseCandidateRemoved(_Body):
+    """An owner removed the ``factory:close-candidate`` label (their own ``issues``
+    ``unlabeled`` webhook; never the factory's own write). The current triage
+    generation's label work is superseded: the removal sticks until the next triage."""
+
+    KIND: ClassVar[EventKind] = EventKind.CLOSE_CANDIDATE_REMOVED
     CLASS: ClassVar[EventClass] = EventClass.CONTROL
 
 
@@ -991,6 +1025,16 @@ class EpicProgress(_Body):
 
 
 @dataclass(frozen=True, slots=True)
+class TriageStale(_Body):
+    """The factory's stale-triage pass flagged this Triaged card ("" clears): the card's
+    note says "Triage may be stale" with why. Display only; never authority."""
+
+    KIND: ClassVar[EventKind] = EventKind.TRIAGE_STALE
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    text: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class BundleHold(_Body):
     """The bundling service's membership of this issue in bundle issue ``bundle``.
 
@@ -1239,6 +1283,8 @@ EventBody = (
     | OperatorResume
     | Unpause
     | AutoTriage
+    | AutoRetriage
+    | CloseCandidateRemoved
     | StaleHoldCleared
     | AutoBuildMarked
     | AutoBuild
@@ -1290,6 +1336,7 @@ EventBody = (
     | IssueSessionClosed
     | RelatedMarked
     | EpicProgress
+    | TriageStale
     | BundleHold
     | AgentBlockedOn
     | AutopilotStatus
@@ -1328,6 +1375,8 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         OperatorResume,
         Unpause,
         AutoTriage,
+        AutoRetriage,
+        CloseCandidateRemoved,
         StaleHoldCleared,
         AutoBuildMarked,
         AutoBuild,
@@ -1379,6 +1428,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         IssueSessionClosed,
         RelatedMarked,
         EpicProgress,
+        TriageStale,
         BundleHold,
         AgentBlockedOn,
         AutopilotStatus,
@@ -1455,6 +1505,7 @@ __all__ = [
     "AssignedHuman",
     "AutoBuild",
     "AutoBuildMarked",
+    "AutoRetriage",
     "AutoTriage",
     "AutopilotGateCreated",
     "AutopilotMarked",
@@ -1471,6 +1522,7 @@ __all__ = [
     "CheckRef",
     "ChecksChanged",
     "ChecksState",
+    "CloseCandidateRemoved",
     "Closed",
     "ColumnObserved",
     "Continue",
@@ -1541,6 +1593,7 @@ __all__ = [
     "StopTimeout",
     "Transferred",
     "TreeQuiescent",
+    "TriageStale",
     "Unpause",
     "WaivePlan",
     "WaiverEdited",

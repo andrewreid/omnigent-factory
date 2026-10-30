@@ -602,7 +602,9 @@ class SqliteStore:
     # ---------------------------------------------------------- auto-triage / build
 
     #: Tables holding an operator switch + daily grant (same shape; see migrations).
-    _SWITCH_TABLES = frozenset({"auto_triage", "auto_build", "epic_autopilot", "bundling"})
+    _SWITCH_TABLES = frozenset(
+        {"auto_triage", "auto_build", "epic_autopilot", "bundling", "auto_retriage"}
+    )
 
     def auto_triage_state(self, repo_id: str) -> AutoTriageState:
         return self._switch_state("auto_triage", repo_id)
@@ -617,6 +619,16 @@ class SqliteStore:
     def grant_auto_triage(self, repo_id: str, day: str, count: int) -> int:
         """Add ``count`` auto-triages to ``day``'s budget; returns that day's total grant."""
         return self._grant_switch("auto_triage", repo_id, day, count)
+
+    def auto_retriage_state(self, repo_id: str) -> AutoTriageState:
+        """Operator state of auto-retriage (same shape and rules as auto-triage's)."""
+        return self._switch_state("auto_retriage", repo_id)
+
+    def set_auto_retriage_override(self, repo_id: str, enabled: bool, config_value: bool) -> None:
+        self._set_switch_override("auto_retriage", repo_id, enabled, config_value)
+
+    def grant_auto_retriage(self, repo_id: str, day: str, count: int) -> int:
+        return self._grant_switch("auto_retriage", repo_id, day, count)
 
     def auto_build_state(self, repo_id: str) -> AutoTriageState:
         """Operator state of auto-build (same shape and rules as auto-triage's)."""

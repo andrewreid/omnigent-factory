@@ -9,11 +9,13 @@ import os
 import re
 import secrets
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from functools import partial
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-from omnigent_factory.core.codec import parcel_from_json
+from omnigent_factory.core.codec import event_from_json, parcel_from_json
 from omnigent_factory.core.contract_view import (
     ContractViewError,
     parcel_marker,
@@ -26,8 +28,10 @@ from omnigent_factory.core.effects import (
     EffectKind,
     ExecutionContext,
 )
-from omnigent_factory.core.events import EventKind
+from omnigent_factory.core.events import AutoRetriage, EventKind
 from omnigent_factory.core.protocol import (
+    CLOSE_CANDIDATE_LABEL,
+    CLOSURE_RECOMMENDATIONS,
     DEV_ENVIRONMENT_URL_PATTERN,
     ParsedResult,
     epic_plan_hash,
@@ -53,6 +57,7 @@ from omnigent_factory.omnigent.directory import FormValue, StageSpec, stale_bran
 from omnigent_factory.ports.adapter import EffectAdapter
 from omnigent_factory.service.config import ServiceConfig
 from omnigent_factory.service.db import StoreWorker
+from omnigent_factory.store.sqlite import SqliteStore
 
 _TOKEN = re.compile(
     r"(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
@@ -62,6 +67,46 @@ _TOKEN = re.compile(
 
 #: GitHub's issue-comment body limit minus room for the appended effect marker.
 _CANONICAL_PUBLICATION_LIMIT = 65_536 - 256
+
+
+@dataclass(frozen=True, slots=True)
+class TriageFreshness:
+    """What an accepted triage was made against (``triage_freshness``)."""
+
+    session_id: str
+    #: When the result was accepted (0: unknown).
+    accepted_at_us: int
+    #: The base commit the triage run read ("" = unknown).
+    base_oid: str
+    recommendation: str
+    duplicate_issue: int | None = None
+    related: tuple[int, ...] = ()
+    paths: tuple[str, ...] = ()
+
+
+def _triage_accepted_at(store: SqliteStore, *, run_id: str) -> int:
+    """When the run's triage result was accepted (its submit receipt; 0 = none)."""
+    rows = store.query(
+        "SELECT MAX(created_at_us) FROM mcp_receipts WHERE run_id = ? AND "
+        "tool = 'submit' AND json_extract(receipt_json, '$.kind') = 'triage'",
+        (run_id,),
+    )
+    return int(rows[0][0]) if rows and rows[0][0] is not None else 0
+
+
+def triage_base_oid(snapshot: Mapping[str, Any] | None) -> str:
+    """The base commit a run read: its synced issue worktree's head when the start
+    brought it level with the base, else the base OID at create (or the reference
+    snapshot's) ("" = unknown)."""
+    if snapshot is None:
+        return ""
+    sync = snapshot.get("base_sync")
+    if isinstance(sync, dict) and sync.get("status") in ("fast_forwarded", "up_to_date"):
+        oid = sync.get("new_oid")
+        if isinstance(oid, str) and oid:
+            return oid
+    oid = snapshot.get("base_oid")
+    return oid if isinstance(oid, str) else ""
 
 
 class ServiceDispatchDirectory:
@@ -141,6 +186,12 @@ class ServiceDispatchDirectory:
         claim = parcel.autopilot_claim
         auth = parcel.authorization(session.authorization_id)
         brief = ""
+        if template_name == _RETRIAGE_TEMPLATE and auth is not None:
+            signals = await self.retriage_signals(auth.source_event_id)
+            if signals is not None:
+                # The factory's own re-run of a triage that may be stale: why, as the brief.
+                template_name = _REFRESH_TEMPLATE
+                brief = "\n".join(f"- {signal}" for signal in signals) or "- the triage is old"
         if session.kind == SessionKind.PLAN and claim is not None and claim.active:
             template_name = _AUTOPILOT_PLAN_TEMPLATE  # a sub-issue epic autopilot drives
         elif session.kind == SessionKind.PLAN:
@@ -246,6 +297,8 @@ class ServiceDispatchDirectory:
                     spec.default_branch,
                 )
             data[pin_key] = str(verified.path)
+            if not reuse:
+                data.setdefault("base_oid", verified.head_oid)  # what the triage reads
             data.setdefault(
                 sync_key,
                 {
@@ -380,7 +433,12 @@ class ServiceDispatchDirectory:
                     hashlib.sha256(feedback.encode()).hexdigest() != digest
                 ):
                     return None
-                return feedback.format(run_id=sid, base_ref=spec.default_branch)
+                return feedback.format(
+                    run_id=sid,
+                    base_ref=spec.default_branch,
+                    gh_wrapper=self.config.wrapper_bin_dir / "gh",
+                    capability_file=self.config.capability_dir / f"{_safe(sid)}.cap",
+                )
             return _template("feedback-v4.txt").format(revision=parcel.revision, run_id=sid)
         if purpose == "readiness_wake":
             if effect.args.get("wake") == "conflict":
@@ -496,6 +554,59 @@ class ServiceDispatchDirectory:
             lines.append(f"- PR #{parcel.pr_number}")
         lines.append("Check factory_get_status before continuing.")
         return "\n".join(lines)
+
+    async def retriage_signals(self, source_event_id: str) -> tuple[str, ...] | None:
+        """The signals of the accepted ``AutoRetriage`` event that authorised a triage run
+        (None: another source, an owner's control or comment)."""
+        rows = await self.db.call(
+            lambda store: store.query(
+                "SELECT payload_json FROM events WHERE event_id = ? AND kind = ? AND accepted = 1",
+                (source_event_id, EventKind.AUTO_RETRIAGE.value),
+            )
+        )
+        if not rows:
+            return None
+        try:
+            body = event_from_json(str(rows[0][0])).body
+        except ValueError:
+            return None  # undecodable: an ordinary re-triage brief
+        if not isinstance(body, AutoRetriage):
+            return None
+        signals = body.signals
+        return tuple(" ".join(str(s).split())[:300] for s in signals[:10])
+
+    async def triage_freshness(self, parcel: Parcel) -> TriageFreshness | None:
+        """What the parcel's newest accepted (non-epic) triage was made against: the base
+        OID its run read, when it was accepted, and what it relied on (None: none)."""
+        for session in reversed(parcel.sessions):
+            if session.kind != SessionKind.TRIAGE:
+                continue
+            stored = self.latest_result(session.session_id)
+            record = stored.get("factory_result") if stored is not None else None
+            body = record.get("result") if isinstance(record, dict) else None
+            if not isinstance(body, dict) or body.get("kind") not in ("triage", "epic_triage"):
+                continue
+            if body.get("kind") != "triage":
+                return None  # an epic's triage: out of scope
+            sid = session.session_id
+            accepted: int = await self.db.call(partial(_triage_accepted_at, run_id=sid))
+            related = body.get("related")
+            paths = body.get("paths")
+            duplicate = body.get("duplicate_issue")
+            return TriageFreshness(
+                session_id=sid,
+                accepted_at_us=accepted,
+                base_oid=triage_base_oid(self.dispatch_snapshot(sid)),
+                recommendation=str(body.get("recommendation") or ""),
+                duplicate_issue=duplicate if isinstance(duplicate, int) else None,
+                related=tuple(
+                    item["issue"]
+                    for item in (related if isinstance(related, list) else [])
+                    if isinstance(item, dict) and isinstance(item.get("issue"), int)
+                ),
+                paths=tuple(str(path) for path in (paths if isinstance(paths, list) else [])),
+            )
+        return None
 
     def latest_triage(self, parcel: Parcel) -> dict[str, Any] | None:
         """The most recent accepted triage result of the parcel, if any."""
@@ -777,6 +888,7 @@ class PublicationRenderer:
             priority=str(body.get("priority") or ""),
             size=str(body.get("size") or ""),
             labels=tuple(str(label) for label in labels) if isinstance(labels, list) else (),
+            close_candidate=body.get("recommendation") in CLOSURE_RECOMMENDATIONS,
         )
 
     async def cross_vendor_review(self, effect: EffectIntent) -> bool:
@@ -1279,6 +1391,14 @@ def _public_result(result: dict[str, Any], agent: str = "The factory agent") -> 
         ]
         if result.get("duplicate_issue"):
             lines.append(f"**Duplicate of:** #{result.get('duplicate_issue')}")
+        evidence = str(result.get("closure_evidence") or "").strip()
+        if evidence:
+            lines.append(f"**Closure evidence:** {evidence}")
+        if result.get("recommendation") in CLOSURE_RECOMMENDATIONS:
+            lines.append(
+                f"**Close candidate:** labelled `{CLOSE_CANDIDATE_LABEL}`; the factory never "
+                "closes the issue (close it, or remove the label to keep it)."
+            )
         labels = result.get("labels")
         if isinstance(labels, list) and labels:
             lines.append("**Suggested labels:** " + ", ".join(f"`{label}`" for label in labels))
@@ -1608,29 +1728,33 @@ def _new_boundary() -> str:
 #: First-message template of each stage run (the dispatch snapshot pins name and bytes).
 # Only a pinned reference dispatch selects snapshot-specific prompt bytes.
 _REFERENCE_TEMPLATES = {
-    "triage-v11.txt": "triage-v12.txt",
-    "triage-feedback-v8.txt": "triage-feedback-v9.txt",
-    "triage-comment-v2.txt": "triage-comment-v3.txt",
+    "triage-v13.txt": "triage-v14.txt",
+    "triage-feedback-v10.txt": "triage-feedback-v11.txt",
+    "triage-comment-v4.txt": "triage-comment-v5.txt",
+    "triage-refresh-v1.txt": "triage-refresh-v2.txt",
     "epic-triage-v5.txt": "epic-triage-v6.txt",
     "epic-plan-v4.txt": "epic-plan-v5.txt",
 }
 _FIRST_TEMPLATES = {
-    SessionKind.TRIAGE: "triage-v11.txt",
-    SessionKind.PLAN: "plan-v12.txt",
+    SessionKind.TRIAGE: "triage-v13.txt",
+    SessionKind.PLAN: "plan-v13.txt",
     SessionKind.BUILD: "build-v19.txt",
 }
 _ANSWER_TEMPLATE = "answer-v3.txt"
-_RETRIAGE_TEMPLATE = "triage-feedback-v8.txt"
-_TRIAGE_COMMENT_TEMPLATE = "triage-comment-v2.txt"
+_RETRIAGE_TEMPLATE = "triage-feedback-v10.txt"
+_TRIAGE_COMMENT_TEMPLATE = "triage-comment-v4.txt"
+#: The factory's own re-run of a triage that may be stale (``AutoRetriage``; its brief:
+#: the signals that fired).
+_REFRESH_TEMPLATE = "triage-refresh-v1.txt"
 #: The triage of an epic (an issue with sub-issues), first run and re-runs alike.
 _EPIC_TRIAGE_TEMPLATE = "epic-triage-v5.txt"
 #: The epic planning pass of an epic on autopilot (the epic triage plus the epic plan).
 _EPIC_PLAN_TEMPLATE = "epic-plan-v4.txt"
 #: A plan run of a sub-issue epic autopilot drives (keeps to its part of the epic plan).
-_AUTOPILOT_PLAN_TEMPLATE = "plan-autopilot-v4.txt"
+_AUTOPILOT_PLAN_TEMPLATE = "plan-autopilot-v5.txt"
 #: The plan run the factory started on a build's ``replan_required`` (its brief: what the
 #: build said must change).
-_REPLAN_TEMPLATE = "plan-replan-v2.txt"
+_REPLAN_TEMPLATE = "plan-replan-v3.txt"
 _REWORK_TEMPLATE = "build-rework-v15.txt"
 #: A rework the owner started by ticking Ready report items: its brief is those items.
 _ITEMS_REWORK_TEMPLATE = "build-rework-items-v6.txt"

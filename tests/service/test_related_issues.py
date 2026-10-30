@@ -153,6 +153,9 @@ async def test_list_issues_reports_an_unreadable_board(service_config: ServiceCo
         with_board(rig, None)
         with pytest.raises(FactoryToolError, match="GitHub could not be read"):
             await rig.tools.list_issues(root)
+        with_board(rig, [])
+        with pytest.raises(FactoryToolError, match="only available to ranking"):
+            await rig.tools.list_issues(root, view="bundles")
         rig.tools.board = None
         with pytest.raises(FactoryToolError, match="not available"):
             await rig.tools.list_issues(root)
@@ -283,3 +286,43 @@ async def test_the_adapter_schedules_marking_once_the_triage_comment_exists():
         await adapter._after_comment(effect(EffectKind.PUBLISH_TRIAGE), ref, "c1", {})
         await adapter._after_comment(effect(EffectKind.PUBLISH_REPORT), ref, "c2", {})
     assert seen == ["ef_publish_triage"]
+
+
+@pytest.mark.parametrize("ranking", [False, True])
+async def test_list_issues_pages_past_200_through_planning_and_building(
+    service_config, monkeypatch, ranking
+):
+    from types import SimpleNamespace
+
+    async with started(service_config) as rig:
+        root = await triaged(rig)
+        if ranking:
+
+            async def ranking_caller(_session_id):
+                return SimpleNamespace(run_id="rk_page")
+
+            monkeypatch.setattr(rig.tools, "_ranking_caller", ranking_caller)
+        board = [board_issue(n, f"I_{n}", Stage.INBOX) for n in range(100, 310)]
+        board += [
+            board_issue(400, "I_400", Stage.TRIAGED),
+            board_issue(401, "I_401", Stage.SCOPED),
+            board_issue(402, "I_402", Stage.BUILDING),
+            board_issue(403, "I_403", Stage.READY),
+            board_issue(42, "I_mcp_parcel", Stage.TRIAGED),
+        ]
+        with_board(rig, board)
+        first = await rig.tools.list_issues(root)
+        assert first["count"] == 200 and first["next_offset"] == 200
+        second = await rig.tools.list_issues(root, offset=first["next_offset"])
+        assert second["next_offset"] is None and not second["truncated"]
+        lines = first["index"].splitlines()[1:-1] + second["index"].splitlines()[1:-1]
+        numbers = [int(line.split()[0][1:]) for line in lines]
+        expected = {i.number for i in board if ranking or i.number != 42}
+        assert len(numbers) == len(set(numbers)) == len(expected)
+        assert set(numbers) == expected
+        assert "#401" in second["index"] and "#402" in second["index"]
+        assert (await rig.tools.list_issues(root, offset=999))["next_offset"] is None
+        with pytest.raises(FactoryToolError, match="nonnegative integer"):
+            await rig.tools.list_issues(root, offset=-1)
+        with pytest.raises(FactoryToolError, match="nonnegative integer"):
+            await rig.tools.list_issues(root, offset=True)

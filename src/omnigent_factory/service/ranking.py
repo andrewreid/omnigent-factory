@@ -38,16 +38,19 @@ from datetime import datetime
 from functools import partial
 from typing import Any
 
-from omnigent_factory.core.effects import RetryableReadFailure
+from omnigent_factory.core.effects import CredentialProfile, RetryableReadFailure
 from omnigent_factory.core.types import MICROS_PER_HOUR, MICROS_PER_MINUTE, Stage
+from omnigent_factory.credentials.broker import LocalCredentialBroker
 from omnigent_factory.github.ranking import PRIORITIES, RankingBoard, RankingWriteError
 from omnigent_factory.omnigent.ranking import RankingSessionError, RankingSessions
 from omnigent_factory.ports.github import RankingCard
 from omnigent_factory.service.auto_triage import stage_busy
 from omnigent_factory.service.config import ServiceConfig
-from omnigent_factory.service.directory import _safe_publication, _template
+from omnigent_factory.service.directory import _atomic_json, _safe, _safe_publication, _template
 from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.store import ranking as rs
+
+RANKING_TEMPLATE = "ranking-v4.txt"
 
 LOG = logging.getLogger(__name__)
 
@@ -365,11 +368,14 @@ class Ranker:
         board: RankingBoard | None,
         sessions: RankingSessions | None,
         policy_barrier_us: int = 35_000_000,
+        broker: LocalCredentialBroker | None = None,
     ) -> None:
         self.service = service
         self.board = board
         self.sessions = sessions
         self.policy_barrier_us = policy_barrier_us
+        self.broker = broker
+        self._credential_runs: set[str] = set()
         self._lock = asyncio.Lock()
         #: Inferred owner choices were repaired (once per process).
         self._repaired = False
@@ -747,6 +753,7 @@ class Ranker:
         now = self._now()
         try:
             if run.state == "creating":
+                self._pinned_template(run)
                 if now - run.created_at_us > SETUP_TIMEOUT_US:
                     return await self._fail(run, "the session could not be created")
                 root = await self.sessions.create(
@@ -769,14 +776,21 @@ class Ranker:
                 if run.policy_ready_at_us is not None and self._now() < run.policy_ready_at_us:
                     return "waiting for the policy propagation barrier"
                 await self.sessions.verify(run.root_id)
+                await self._enable_credentials(run)
                 text = await self._start_message(run)
                 await self.sessions.send_once(run.root_id, f"ranking:{run.run_id}:start", text)
                 await self._update(run, state="running", started_at_us=self._now())
                 LOG.info("ranking session ready run=%s root=%s", run.run_id, run.root_id)
                 return "started"
             if run.state == "running":
+                if self.broker is not None and run.run_id not in self._credential_runs:
+                    assert run.root_id is not None  # noqa: S101
+                    # Boot is default-deny; an old/missing policy fails the run closed.
+                    await self.sessions.verify(run.root_id)
+                    await self._enable_credentials(run)
                 return await self._watch(run)
             if run.state == "applying":
+                await self._retire_credentials(run)
                 return await self._apply(run)
         except RankingSessionError as exc:
             if exc.retry:
@@ -787,6 +801,42 @@ class Ranker:
             LOG.info("ranking step retried run=%s reason=%s", run.run_id, exc)
             return f"retrying: {exc}"
         return run.state
+
+    async def _enable_credentials(self, run: rs.RankingRun) -> None:
+        if self.broker is None:
+            return  # test-only compositions without the credential service
+        if not self.broker.capabilities.usable(run.run_id):
+            await self.broker.provision(run.run_id)
+        if not await self.broker.reenable_after_recheck(run.run_id, CredentialProfile.READ_ONLY):
+            raise RankingSessionError("ranking credential gate is closed", retry=False)
+        self._credential_runs.add(run.run_id)
+
+    async def _retire_credentials(self, run: rs.RankingRun) -> None:
+        if self.broker is not None:
+            await self.broker.retire(run.run_id)
+        self._credential_runs.discard(run.run_id)
+
+    def _pinned_template(self, run: rs.RankingRun) -> str:
+        """Persist name and digest before create/send; retries keep those exact bytes."""
+        path = self.service.config.state_dir / "ranking-dispatches" / f"{_safe(run.run_id)}.json"
+        if path.exists():
+            try:
+                pin = json.loads(path.read_text(encoding="utf-8"))
+                text = _template(pin["template"])
+                if hashlib.sha256(text.encode()).hexdigest() != pin["template_sha256"]:
+                    raise ValueError("template hash mismatch")
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise RankingSessionError("ranking template pin is invalid", retry=False) from exc
+            return text
+        text = _template(RANKING_TEMPLATE)
+        _atomic_json(
+            path,
+            {
+                "template": RANKING_TEMPLATE,
+                "template_sha256": hashlib.sha256(text.encode()).hexdigest(),
+            },
+        )
+        return text
 
     async def _watch(self, run: rs.RankingRun) -> str:
         assert self.sessions is not None and run.root_id is not None  # noqa: S101
@@ -831,11 +881,13 @@ class Ranker:
             f"#{c.number} at {rank_text(pinned[c.node_id])}" for c in ranked if c.node_id in pinned
         )
         return (
-            _template("ranking-v3.txt")
+            self._pinned_template(run)
             .format(
                 run_id=run.run_id,
                 repository=config.repository,
                 session_id=run.root_id,
+                gh_wrapper=config.wrapper_bin_dir / "gh",
+                capability_file=config.capability_dir / f"{_safe(run.run_id)}.cap",
                 triage_column=config.status_names.get(Stage.TRIAGED.value, Stage.TRIAGED.value),
                 planning_column=config.status_names.get(Stage.SCOPED.value, Stage.SCOPED.value),
                 triage_count=sum(c.stage == Stage.TRIAGED for c in ranked),
@@ -852,6 +904,7 @@ class Ranker:
         await self._db(rs.update_run, run_id=run.run_id, now_us=self._now(), **fields)
 
     async def _fail(self, run: rs.RankingRun, reason: str) -> str:
+        await self._retire_credentials(run)
         state = await self.state()
         backoff = _backoff(state.failures)
         await self._db(
@@ -893,6 +946,7 @@ class Ranker:
             else:
                 await self._update(run, root_id=root)
         for run in await self._db(rs.unarchived_runs, repo_id=self.repo_id):
+            await self._retire_credentials(run)
             assert run.root_id is not None  # noqa: S101 - selected with a root
             try:
                 await self.sessions.archive(run.root_id)

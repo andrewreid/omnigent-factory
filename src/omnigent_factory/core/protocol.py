@@ -119,18 +119,38 @@ class Related(_Strict):
     note: RelatedNote
 
 
+#: Why an issue may be closed (``closure_evidence``): a commit, PR or file that already
+#: fixes it, or what made it obsolete.
+ClosureEvidence = Annotated[str, StringConstraints(min_length=1, max_length=2000)]
+#: A repository path the triage relied on (``paths``): auto-retriage watches them.
+TriagePath = Annotated[str, StringConstraints(min_length=1, max_length=300)]
+
+#: Recommendations that make the issue a closure candidate (``factory:close-candidate``).
+CLOSURE_RECOMMENDATIONS = frozenset({"duplicate", "wont_fix", "already_fixed", "obsolete"})
+#: Recommendations that require ``closure_evidence``.
+EVIDENCED_RECOMMENDATIONS = frozenset({"already_fixed", "obsolete"})
+#: The label the factory (never the agent) puts on a closure candidate's issue.
+CLOSE_CANDIDATE_LABEL = "factory:close-candidate"
+
+
 class TriageResult(_Strict):
     kind: Literal["triage"]
     eli5: Text | None = None
     summary: Text
     priority: Literal["P0", "P1", "P2", "P3"]
     size: SizeLit
-    recommendation: Literal["fix", "wont_fix", "duplicate", "needs_info"]
+    recommendation: Literal[
+        "fix", "wont_fix", "duplicate", "needs_info", "already_fixed", "obsolete"
+    ]
     duplicate_issue: Annotated[int, Field(ge=1)] | None
     labels: Annotated[list[Label], Field(max_length=20)]
     missing_information: Texts
     related: Annotated[list[Related], Field(max_length=20)] = []
     split_out: SplitOuts = []
+    #: Required for ``already_fixed`` and ``obsolete``: the evidence the owner checks.
+    closure_evidence: ClosureEvidence | None = None
+    #: Files the triage relied on (auto-retriage re-runs when they change on the base).
+    paths: Annotated[list[TriagePath], Field(max_length=20)] = []
 
 
 class EpicOrder(_Strict):
@@ -410,7 +430,9 @@ _EJECTED_SHAPE = '"ejected"?:[{"issue":int(a bundle member),"reason":str}],'
 RESULT_SHAPES: dict[str, str] = {
     "triage": '{"kind":"triage","eli5"?:str|null,'
     '"summary":str,"priority":"P0|P1|P2|P3","size":"S|M|L",'
-    '"recommendation":"fix|wont_fix|duplicate|needs_info","duplicate_issue":int|null,'
+    '"recommendation":"fix|wont_fix|duplicate|needs_info|already_fixed|obsolete",'
+    '"duplicate_issue":int|null,"closure_evidence"?:str(required for already_fixed and '
+    'obsolete),"paths"?:[str(repository paths the triage relied on, at most 20)],'
     '"labels":[str],"missing_information":[str],"related"?:[{"issue":int,'
     '"relation":"duplicate|overlaps|conflicts|depends_on|blocks|supersedes","note":str}],'
     + _SPLIT_SHAPE,
@@ -696,6 +718,12 @@ def validate_result(result: Mapping[str, object], expected: Correlation) -> Pars
             raise ResultError("this issue is an epic (it has sub-issues): submit epic_triage")
         if (r.recommendation == "duplicate") != (r.duplicate_issue is not None):
             raise ResultError("duplicate_issue present iff recommendation is duplicate")
+        if r.recommendation in EVIDENCED_RECOMMENDATIONS and r.closure_evidence is None:
+            raise ResultError(
+                f"closure_evidence is required when recommendation is {r.recommendation}"
+            )
+        if len(set(r.paths)) != len(r.paths):
+            raise ResultError("paths must be unique")
         if len(set(r.labels)) != len(r.labels):
             raise ResultError("labels must be unique")
         if any(label.lower().startswith("factory:") for label in r.labels):

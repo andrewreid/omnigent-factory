@@ -13,7 +13,8 @@ Each step is safe to repeat after a crash or a lost response:
   does not already hold it;
 * archive and delete are idempotent (a missing root counts as done).
 
-The session gets no credential capability: it reads through the factory tools only.
+The service provisions a per-run READ_ONLY capability after policy verification.
+The brief supplies its path; this adapter never changes the shared clone configuration.
 """
 
 from __future__ import annotations

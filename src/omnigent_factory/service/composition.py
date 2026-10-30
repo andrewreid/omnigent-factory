@@ -38,6 +38,7 @@ from omnigent_factory.omnigent.rest import OmnigentReadError, OmnigentRest
 from omnigent_factory.ports.clock import SystemClock
 from omnigent_factory.ports.github import IssueRef
 from omnigent_factory.service.auto_build import AutoBuilder
+from omnigent_factory.service.auto_retriage import AutoRetriager
 from omnigent_factory.service.auto_triage import AutoTriager
 from omnigent_factory.service.autopilot import EpicAutopilotService
 from omnigent_factory.service.board_diff import BoardDiff
@@ -387,6 +388,8 @@ async def build_production(
             repository=config.repository,
             project_id=_required_text(config.omnigent_project_id, "omnigent_project_id"),
             default_branch=config.default_branch,
+            gh_wrapper=str(config.wrapper_bin_dir / "gh"),
+            real_gh_path=str(config.real_gh_path),
         ),
         directory=directory,
         ledger=StoreOwnItemLedger(service.db),
@@ -434,6 +437,17 @@ async def build_production(
     board = BoardIndex(github.board_issues, clock)
     service.auto_triager = AutoTriager(service, board, github.issue_snapshot)
     ranking_board = RankingBoard(github)
+    auto_retriager = AutoRetriager(
+        service,
+        board,
+        github.issue_snapshot,
+        directory=directory,
+        workspaces=workspaces,
+        triager=service.auto_triager,
+        cards=lambda: ranking_board.cards(service.config.rank_field_node_id),
+        issue_states=partial(github_issue_states, github.client, config.repository),
+    )
+    service.auto_retriager = auto_retriager
     marker = RelatedMarker(service, board, directory)
     native_links = NativeLinks(
         service,
@@ -465,6 +479,7 @@ async def build_production(
         directory,
         lambda text: safe_publication(text, service.config),
         deferred_section=deferred.report_section,
+        triage_header=auto_retriager.header,
     )
     service.status_comments = status_comments
     github.status_comments = status_comments
@@ -508,8 +523,9 @@ async def build_production(
     ranker = Ranker(
         service,
         board=ranking_board,
-        # Read-only: no git worktree or credential capability, only the factory tools.
+        # Read-only capability; never write per-run Git config in the shared clone.
         sessions=RankingSessions(omnigent_adapter, str(config.source_clone)),
+        broker=broker,
         policy_barrier_us=omnigent_adapter.config.policy_barrier_us,
     )
     service.ranker = ranker

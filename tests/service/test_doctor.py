@@ -25,6 +25,18 @@ from omnigent_factory.service.doctor import (
 from omnigent_factory.service.mcp import TOOL_NAMES
 
 
+@pytest.fixture(autouse=True)
+def no_live_systemd(monkeypatch):
+    run = subprocess.run
+
+    def inspect(argv, **kwargs):
+        if argv[0] == "systemctl":
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no test unit")
+        return run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", inspect)
+
+
 def _secret(path: Path, value: bytes) -> None:
     path.write_bytes(value)
     os.chmod(path, 0o600)

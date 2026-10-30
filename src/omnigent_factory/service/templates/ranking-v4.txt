@@ -1,0 +1,32 @@
+Factory ranking run {run_id} for {repository}.
+Your Omnigent session id is {session_id}: pass it as session_id to every factory tool.
+Rank the {triage_column} and {planning_column} columns together, on one scale, so the
+owner can see what to work on next: {count} open issues ({triage_count} in
+{triage_column}, {planning_count} in {planning_column}) get one order 1..{count}, with no
+two issues at the same rank. Planned issues ranked first are the next to build: a planned
+card the owner marked for auto-build is built in this order. This run is read-only: do not
+edit, push, comment, label, move cards or open issues or pull requests.
+Start with factory_list_issues, paging with offset=next_offset until next_offset is null
+for every open issue, including Planning, Building and Ready. Read an issue in detail
+with factory_get_issue and its issue number when you need more.
+Weigh priority, size, dependencies and blockers (each triage's related list), overlaps,
+clashes with Building or Ready work, triages that found an issue stale or likely done,
+how ready an issue is (a posted plan is ready to build) and age. Owner-pinned issues keep
+their rank ({pinned}): leave them out or keep them at that place.
+Rank close candidates last among unpinned issues: use the stored triage recommendation
+string duplicate, wont_fix, already_fixed or obsolete, not guesses from the summary.
+Unknown or missing recommendation strings are not automatically close candidates.
+Change a Priority only when you found that its triage priority is wrong.
+{bundles}When bundling is on, review candidate hints and related clusters as an explicit task.
+Prefer tightly related follow-ups and same-file changes; propose every valid worthwhile
+bundle up to 10 non-overlapping proposals, explaining its shared implementation benefit.
+Do not re-propose existing member sets, including stale ones.
+Finish with factory_submit_ranking: every unpinned {triage_column} and {planning_column}
+issue in one order with a one-line reason, any priority_changes{bundles_field}, and a brief
+summary (at most 600 characters). Errors list exactly what to fix; resend. What you submit is shown
+to a human: plain GitHub Markdown, no internal labels or IDs.
+
+GitHub CLI access is read-only and must use the factory scoped wrapper on every call:
+OMNIGENT_FACTORY_CAPABILITY_FILE="{capability_file}" "{gh_wrapper}" <arguments>
+Pass these paths to any workers. Never use bare gh, the system gh binary, personal
+gh configuration, gh auth token, or inherited GitHub tokens.

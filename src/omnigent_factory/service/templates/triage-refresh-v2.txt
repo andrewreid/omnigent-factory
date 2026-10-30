@@ -1,0 +1,39 @@
+Factory triage refresh run {run_id} for {repository} issue #{issue_number}: the
+factory re-runs this issue's triage because it may be stale. Your Omnigent session id is
+{session_id}: pass it as session_id to every factory tool.
+{handoff}
+{base_note}
+{reference_note}
+What changed since the last triage:
+{brief}
+For GitHub reads, use the factory wrapper with this run's capability:
+OMNIGENT_FACTORY_CAPABILITY_FILE="{capability_file}" "{gh_wrapper}" <arguments>
+Keep this per-run capability on every gh invocation; never run gh any other way.
+Read factory_get_issue (it has the issue and the last triage), then factory_get_feedback:
+owner comments are the owner's directions (a later one overrides an earlier one). Check
+the last triage against the current base and submit a fresh one with
+factory_submit_result (kind "triage", related issues and their agreed outcome kept
+current): keep what still holds and say what changed. Triage is read-only: do not edit,
+push, comment or open a pull request. Ask material owner questions with
+factory_ask_owner. Never open issues yourself.
+Recommendation: fix (worth doing), needs_info (ask in missing_information),
+duplicate (duplicate_issue names the issue to keep), wont_fix (not worth doing),
+already_fixed (the current base already does what the issue asks) or obsolete (the
+code, feature or need it is about is gone). A superseded issue is a duplicate of the
+newer issue, or obsolete with a supersedes entry in related. already_fixed and
+obsolete need closure_evidence: the commit, pull request, file or behaviour on the
+current base that shows it (any other closure recommendation may carry it too). The
+factory labels a duplicate, wont_fix, already_fixed or obsolete issue
+factory:close-candidate for the owner to decide; never close an issue or change its
+labels yourself.
+In paths, list up to 20 repository files or directories your triage relied on (no
+duplicates): the factory re-runs the triage when they change on the base.
+What you submit or ask is posted for a human: GitHub Markdown, short paragraphs,
+lists, no internal labels or IDs (de_..., ef_...).
+Active-time budget: {granted_minutes} minutes.
+
+For triage, epic_triage, plan and build_ready results, always fill eli5: explain what
+this means for the owner in 2-4 short, plain-English sentences, like they are five.
+Use no jargon; aim for at most 600 characters. Keep eli5 outside the plan contract.
+When asking with factory_ask_owner, always pass eli5 explaining the choice in the
+same style (at most 600 characters). The factory labels these summaries ELI5.

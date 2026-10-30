@@ -56,6 +56,7 @@ from omnigent_factory.core.codec import parcel_from_json
 from omnigent_factory.core.effects import RetryableReadFailure
 from omnigent_factory.core.events import Event, Provenance
 from omnigent_factory.core.predicates import settled
+from omnigent_factory.core.protocol import CLOSE_CANDIDATE_LABEL
 from omnigent_factory.core.types import (
     AUTOPILOT_DELAYED,
     AUTOPILOT_FULL,
@@ -430,8 +431,9 @@ class EpicAutopilotService:
             return ""  # a nested epic only blocks; autopilot never recurses into it
         if Hold.BUNDLED in p.holds:
             return ""  # built as part of its bundle issue, never on its own
-        if SKIP_LABEL in (await self.labels(p) or []):
-            return ""
+        labels = await self.labels(p) or []
+        if SKIP_LABEL in labels or CLOSE_CANDIDATE_LABEL in labels:
+            return ""  # skipped, or triage suggests closing it: left to the owner
         blockers = [b.ref for b in _links(sub).open_blockers] + [f"#{n}" for n in sorted(gates)]
         if blockers:
             return f"#{sub.number} waits on {', '.join(dict.fromkeys(blockers))}"

@@ -20,6 +20,7 @@ from typing import Any
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.events import Event, Provenance
+from omnigent_factory.core.protocol import CLOSE_CANDIDATE_LABEL
 from omnigent_factory.core.types import MICROS_PER_HOUR, IssueSnapshot, Stage, Via, is_leftward
 from omnigent_factory.github.client import GitHubClient
 from omnigent_factory.ports.github import STATUS_OPTION_IDS, stage_for_option
@@ -314,6 +315,8 @@ class DeliveryNormalizer:
                 return (ev.WaiverEdited(),)
             if action == "labeled":
                 return self._label(payload, actor_id)
+            if action == "unlabeled" and not sender_is_bot:
+                return self._unlabel(payload, actor_id)
             return ()
         if event_name == "projects_v2_item":
             if action == "deleted":
@@ -443,6 +446,15 @@ class DeliveryNormalizer:
         if body is None:
             return ()
         return (body,)
+
+    def _unlabel(self, payload: dict[str, Any], actor_id: int) -> tuple[ev.EventBody, ...]:
+        """An owner's removal of ``factory:close-candidate`` (any other label, and anyone
+        else's removal, the factory's own included, is no transition)."""
+        if actor_id == self.identity.bot_user_id or actor_id not in self.identity.owner_ids:
+            return ()
+        if label_name(payload) != CLOSE_CANDIDATE_LABEL:
+            return ()
+        return (ev.CloseCandidateRemoved(),)
 
     def _project_move(self, payload: dict[str, Any], actor_id: int) -> tuple[ev.EventBody, ...]:
         item = payload.get("projects_v2_item")

@@ -1140,6 +1140,17 @@ class Parcel:
     bundled_into: int = 0
     #: The bundle issue's Bot value, mirrored on this member's card ("" = not mirrored).
     bundle_bot: str = ""
+    #: Why the triage of this Triaged card may be stale (the factory's stale-triage pass;
+    #: "" = not flagged). Display only; cleared when a triage starts or the card moves.
+    triage_stale: str = ""
+    #: The newest published triage whose ``factory:close-candidate`` convergence was
+    #: issued (``SET_CLOSE_CANDIDATE``; "" = none): the label's generation.
+    close_candidate_session: str = ""
+    #: When that generation was published (its acknowledgement): an owner's removal of
+    #: the label older than this was of an earlier triage's label.
+    close_candidate_at_us: int = 0
+    #: The generation whose label the owner removed ("" = none): its add never runs.
+    close_candidate_removed: str = ""
     applied_event_ids: frozenset[str] = frozenset()
 
     def session(self, session_id: str | None) -> StageSession | None:

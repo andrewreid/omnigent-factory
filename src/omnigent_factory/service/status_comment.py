@@ -166,6 +166,9 @@ class IssueView:
     rounds: str = ""
     #: Rendered sections: triage, plan, PR, checkpoint (each "" when there is none).
     triage: str = ""
+    #: What the triage was made against (``Triaged <date> against main@<sha7> · N
+    #: commits behind``; "" = unknown).
+    triage_header: str = ""
     plan: PlanView | None = None
     pr: str = ""
     deferred: str = ""
@@ -262,7 +265,10 @@ def render_issue(view: IssueView, history: Sequence[tuple[int, str]], headline: 
     if view.bundle:
         lines += ["", "#### Bundle", "", view.bundle]
     if view.triage:
-        lines += ["", "#### Triage", "", view.triage]
+        lines += ["", "#### Triage", ""]
+        if view.triage_header:
+            lines += [f"_{view.triage_header}_", ""]
+        lines.append(view.triage)
     if view.plan is not None:
         lines += ["", "#### Plan", "", _plan_line(view.plan)]
     if view.pr or view.deferred:
@@ -458,6 +464,9 @@ class StatusComments:
     deferred_section: Callable[[Parcel], Awaitable[str]] | None = None
     #: The Bundle section (``service.bundles.Bundles.section``); None: none.
     bundle_section: Callable[[Parcel], Awaitable[str]] | None = None
+    #: The triage freshness line (``service.auto_retriage.AutoRetriager.header``; local
+    #: Git, cached, never waited on); None: none.
+    triage_header: Callable[[Parcel], Awaitable[str]] | None = None
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     #: Per epic, the sub-issue stamp (``_epic_stamps``) last rendered by ``tick`` (in
     #: memory: after a restart each finished epic is rendered once more).
@@ -833,10 +842,16 @@ class StatusComments:
         stage_name = config.status_names.get(stage.value, stage.value) if stage else "Inbox"
         triage = self.directory.latest_triage(parcel)
         triage_text = ""
+        triage_header = ""
         if triage is not None and triage.get("kind") == "triage":
             triage_text = self.publish_text(
                 _without_heading(stage_result_text(triage, agent_display_name(config)))
             )
+            if self.triage_header is not None:
+                try:
+                    triage_header = await self.triage_header(parcel)
+                except Exception:  # display only: never blocks the status comment
+                    LOG.warning("triage header failed issue=#%s", parcel.issue_number)
         r = parcel.readiness
         pr_text = ""
         checks = ""
@@ -878,6 +893,7 @@ class StatusComments:
             checks=checks,
             rounds=r.review_rounds_note if r is not None else "",
             triage=triage_text,
+            triage_header=triage_header,
             plan=self._plan(parcel),
             pr=pr_text,
             deferred=deferred,
