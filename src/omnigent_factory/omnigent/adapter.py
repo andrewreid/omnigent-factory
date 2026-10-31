@@ -11,7 +11,8 @@ Outcome contract per effect kind (``Ack.detail`` keys are stable):
     ``factory.dispatch`` nonce label. ``Ack(remote_id=root)`` with ``nonce``, ``workspace``,
     ``branch``, ``base_oid``. Rejections before the POST (spec mismatch, pre-existing
     branch/orphan worktree, bind-worktree verification) and server-proven pre-side-effect
-    4xx are ``DefinitiveFailure``. Transport errors, timeouts, 5xx, 400/409 and a 2xx
+    4xx are ``DefinitiveFailure``. Transient failures before POST (fetch, clone lock,
+    orphan inventory) are ``PreSendRetryable``. Transport errors, timeouts, 5xx, 400/409 and a 2xx
     without an ID are ``AmbiguousWrite`` - never retried blindly.
 ``RECONCILE_SESSION``
     ``args.nonce``: nonce search over every page including archived roots. ``detail``:
@@ -45,7 +46,8 @@ Outcome contract per effect kind (``Ack.detail`` keys are stable):
     Locates the exact node holding the pending elicitation in a fresh tree scan, checks
     the stored answer conforms to its flat form schema, records intent, resolves that one
     ID. Not pending -> ``DefinitiveFailure(ELICITATION_NOT_PENDING)``. A 404 on resolve is
-    ambiguous (not proof the tool did or did not run).
+    ambiguous (not proof the tool did or did not run). An incomplete scan before the
+    POST is ``PreSendRetryable``.
 ``INTERRUPT_TREE``
     Interrupts the root and every busy or parked descendant. ``Ack`` detail lists
     interrupted/failed nodes. A receipt is never stop evidence; follow with ``SCAN_TREE``.
@@ -97,6 +99,7 @@ from omnigent_factory.core.effects import (
     EffectKind,
     ExecutionContext,
     JsonValue,
+    PreSendRetryable,
     RetryableReadFailure,
 )
 from omnigent_factory.core.types import SessionKind
@@ -190,6 +193,8 @@ class OmnigentConfig:
     context_rollover_ratio: float = 0.8
     #: Least spacing of a ``SCAN_TREE`` after a non-quiescent read of the same root.
     rescan_min_interval_s: float = 5.0
+    #: Whole orphan ownership scan, including all pages and matching archived snapshots.
+    orphan_ownership_timeout_s: float = 180.0
 
 
 def _message_texts(item: Mapping[str, Any]) -> list[str]:
@@ -462,6 +467,9 @@ class OmnigentExecutionAdapter:
         return None if sid is None else await self.directory.stage_spec(sid)
 
     async def _create(self, effect: EffectIntent) -> AdapterOutcome:
+        # A retry reaches here only after a durable PreSendRetryable: no previous
+        # attempt could have posted. Ambiguity/crash recovery fences the effect and
+        # performs nonce adoption via RECONCILE_SESSION, never another _create.
         spec = await self._spec(effect)
         if spec is None or effect.args.get("nonce") != spec.nonce:
             return DefinitiveFailure("stage-spec-mismatch")
@@ -479,6 +487,8 @@ class OmnigentExecutionAdapter:
                 base_oid = verified.head_oid
             elif spec.bind_worktree is not None:
                 repair = await self._repair_worktree(spec.bind_worktree, spec)
+                if isinstance(repair, RetryableReadFailure):
+                    return PreSendRetryable(repair.reason, repair.retry_after_us)
                 if repair is not None:
                     return repair
                 verified = await asyncio.to_thread(
@@ -492,7 +502,7 @@ class OmnigentExecutionAdapter:
                 if orphan is not None or exists:
                     repaired = await self._bind_orphan(spec)
                     if isinstance(repaired, RetryableReadFailure):
-                        return repaired
+                        return PreSendRetryable(repaired.reason, repaired.retry_after_us)
                     if repaired is None:
                         return DefinitiveFailure(
                             f"branch-already-exists: {spec.branch}"
@@ -506,13 +516,13 @@ class OmnigentExecutionAdapter:
                     try:
                         base_oid = await asyncio.to_thread(self.workspaces.fetch_base, base)
                     except WorktreeError as exc:
-                        return RetryableReadFailure(f"source fetch failed: {exc}")
+                        return PreSendRetryable(f"source fetch failed: {exc}")
                     workspace = str(self.workspaces.source_clone)
                     git = {"branch_name": spec.branch, "base_branch": f"origin/{base}"}
         except GitLockBusy as exc:  # another Git process held a clone lock (#888)
-            return RetryableReadFailure(f"workspace busy: {exc}", GIT_LOCK_RETRY_US)
+            return PreSendRetryable(f"workspace busy: {exc}", GIT_LOCK_RETRY_US)
         except ReferenceFetchError as exc:
-            return RetryableReadFailure(str(exc))
+            return PreSendRetryable(str(exc))
         except WorktreeError as exc:
             return DefinitiveFailure(f"workspace-rejected: {exc}")
         body: dict[str, Any] = {
@@ -579,10 +589,13 @@ class OmnigentExecutionAdapter:
         async def unused(path: Path) -> bool:
             if not await allowed(spec.session_id):
                 return False
+            # The server list API has no workspace/branch/label filter. Filtering by
+            # agent/project would miss other owners, so exhaust the paged inventory.
             # Full inventory, including children and archived roots. Only a closed,
             # inactive archived row may cease to own a worktree.
             rows = await self.rest.paginate(
-                "/v1/sessions", {"kind": "any", "include_archived": "true", "visibility": "all"}
+                "/v1/sessions",
+                {"kind": "any", "include_archived": "true", "visibility": "all", "limit": 1000},
             )
             for row in rows:
                 if row.get("git_branch") != spec.branch and row.get("workspace") != str(path):
@@ -601,7 +614,7 @@ class OmnigentExecutionAdapter:
             # the event loop would block it, so the reads themselves perform no Git.
             future = asyncio.run_coroutine_threadsafe(unused(path), loop)
             try:
-                return future.result(timeout=30)
+                return future.result(timeout=self.config.orphan_ownership_timeout_s)
             finally:
                 if not future.done():
                     future.cancel()
@@ -1100,7 +1113,7 @@ class OmnigentExecutionAdapter:
         holder = obs.node_with_elicitation(eid)
         if holder is None:
             if not obs.complete:
-                return RetryableReadFailure("tree scan incomplete; prompt location unknown")
+                return PreSendRetryable("tree scan incomplete; prompt location unknown")
             return DefinitiveFailure(ELICITATION_NOT_PENDING)
         event = obs.owned_elicitations()[eid][1]
         problem = check_form_answer(event, content)

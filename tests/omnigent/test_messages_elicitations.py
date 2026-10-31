@@ -10,6 +10,7 @@ from omnigent_factory.core.effects import (
     AmbiguousWrite,
     DefinitiveFailure,
     EffectKind,
+    PreSendRetryable,
     RetryableReadFailure,
 )
 from omnigent_factory.omnigent.adapter import ELICITATION_NOT_PENDING, effect_marker
@@ -233,7 +234,7 @@ async def test_resolve_with_incomplete_scan_is_retryable(git_env: GitEnv) -> Non
     _tree_with_prompt(rig)
     rig.server.fail_paths.add("/v1/sessions/conv_grand")
     outcome = await rig.adapter.execute(_resolve(rig, {"answer": "x"}), CTX)
-    assert isinstance(outcome, RetryableReadFailure)
+    assert isinstance(outcome, PreSendRetryable)
     assert rig.server.resolved == []
 
 

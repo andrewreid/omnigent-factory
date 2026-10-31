@@ -809,6 +809,23 @@ field value or marker before writing, and a newer desired value supersedes the o
 Only exhaustion changes the card to Blocked with the exact update and effect ID. Existing
 safe `unknown` rows enter this path on startup, so upgrades self-heal without a database edit.
 
+When the adapter proves a failure happened before a POST (for example an orphan
+ownership timeout or a base-fetch failure), the same effect and dispatch nonce retry.
+The `effect_recovery_*` settings also bound these attempts: five by default, with
+2, 4, 8 and 16 minute delays (at least any server retry-after). Each attempt logs the
+original reason, bounded to 500 characters. The run, owner authorization and normal
+Working/Queued card remain intact. Exhaustion is a definitive failure: the card says
+`Blocked: could not start the session: <reason>`, releases the slot and disables issuance;
+an owner control can start a fresh run. No nonce searches are needed for proven-unsent
+attempts. Incomplete elicitation scans use the same pre-send retry path. An owner move,
+fence or supersession makes an invalid waiting effect due for cancellation immediately;
+unrelated parcel events preserve its retry deadline.
+
+Only a persisted pre-send proof returns a non-idempotent effect to pending. Once a POST
+may have begun, an unclear response or a crash with the effect still claimed goes to
+UNKNOWN; it cannot re-enter create/send. A retry runs the complete pre-send checks again.
+This ordering prevents two POSTs for one nonce, including across process restarts.
+
 An ambiguous session create (including HTTP 409 during a host reconnect) searches the
 original dispatch nonce across all pages, including archived roots. After the first
 complete empty search it repeats after 1, 3 and 6 minutes. Read failures and rate limits
@@ -846,7 +863,13 @@ A successor can bind a clean orphan worktree left by the failed create using
 `existing_worktree`. Under `CLONE_LOCK`, it verifies the exact factory issue branch and
 worktree name, owned location, clean files, no Git operation in progress, no commits
 ahead of the fetched base, and ancestry of that base. Fresh local ownership and complete
-remote inventory checks must show no live session uses it. Binding is logged and keeps
+remote inventory checks must show no live session uses it. The server has no workspace,
+branch or arbitrary-label list filter, so the check pages through all agents/projects,
+including children and archived sessions, in pages of up to 1,000 rows, with a
+15-second per-request timeout and a configurable overall budget
+(`orphan_ownership_timeout_seconds`, default 180 seconds).
+An incomplete or timed-out inventory is a pre-send retry, never evidence of no owner
+and never an ambiguous create. Binding is logged and keeps
 the worktree and branch intact; dirty, ahead, unowned or still-used worktrees retain the
 definitive `branch-already-exists` rejection. Ambiguous creates log bounded response
 error codes/messages alongside the HTTP status to diagnose reconnect failures.

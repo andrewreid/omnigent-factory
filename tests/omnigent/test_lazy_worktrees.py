@@ -486,7 +486,7 @@ async def test_template_pins_old_bytes_and_reference_ack_cannot_move_pin(git_env
 
 @pytest.mark.asyncio
 async def test_reference_fetch_failure_retries_without_post(git_env, monkeypatch):
-    from omnigent_factory.core.effects import RetryableReadFailure
+    from omnigent_factory.core.effects import PreSendRetryable
 
     rig, _directory, h = setup(git_env, monkeypatch)
 
@@ -494,7 +494,7 @@ async def test_reference_fetch_failure_retries_without_post(git_env, monkeypatch
         raise WorktreeError("offline")
 
     monkeypatch.setattr(rig.adapter.workspaces, "fetch_base", fail)
-    assert isinstance(await create(rig, h), RetryableReadFailure)
+    assert isinstance(await create(rig, h), PreSendRetryable)
     assert rig.server.count("POST", "/v1/sessions") == 0
 
 

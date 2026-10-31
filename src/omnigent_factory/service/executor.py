@@ -22,6 +22,7 @@ from omnigent_factory.core.effects import (
     EffectKind,
     ExecutionContext,
     MessagePurpose,
+    PreSendRetryable,
     RetryableReadFailure,
     RetryClass,
 )
@@ -382,7 +383,37 @@ class EffectExecutor:
                 return
             await self._mark_unknown(stored, outcome.reason)
             return
+        if isinstance(outcome, PreSendRetryable):
+            await self._retry_pre_send(stored, outcome)
+            return
         await self._retry_or_unknown(stored, outcome)
+
+    async def _retry_pre_send(self, stored: StoredEffect, outcome: PreSendRetryable) -> None:
+        # Persist the proof as pending only after the adapter returns. If the process
+        # dies before that commit, claimed recovery still chooses UNKNOWN. Thus a
+        # retry cannot follow an attempt that may have posted, even across restarts.
+        effect = stored.effect
+        reason = " ".join(outcome.reason.split())[:500]
+        LOG.warning(
+            "effect not sent kind=%s effect_id=%s parcel=%s attempt=%s reason=%s",
+            effect.kind.value,
+            effect.effect_id,
+            effect.parcel_id,
+            stored.attempts,
+            reason,
+        )
+        if stored.attempts >= self._recovery_max_attempts:
+            await self._retry_or_unknown(stored, DefinitiveFailure(reason))
+            return
+        delay = min(
+            self._recovery_backoff_us * 2 ** max(stored.attempts - 1, 0),
+            self._recovery_max_backoff_us,
+        )
+        retry_at = self._clock.now_utc_us() + max(delay, outcome.retry_after_us or 0, 1)
+        # No reducer event: the run, authorization, normal Bot and note stay intact.
+        await self._db.call(
+            lambda store: store.fail_effect(effect.effect_id, reason, retry_at_us=retry_at)
+        )
 
     async def _mark_unknown(self, stored: StoredEffect, reason: str) -> None:
         effect = stored.effect
@@ -455,7 +486,7 @@ class EffectExecutor:
                     RetryClass.LOCAL_IDEMPOTENT,
                 )
             ):
-                await self._mark_unknown(stored, "write-returned-retryable-failure")
+                await self._mark_unknown(stored, outcome.reason[:500])
                 return
             if outcome.retry_after_us is not None:
                 delay = outcome.retry_after_us

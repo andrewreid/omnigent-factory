@@ -248,6 +248,18 @@ class RetryableReadFailure:
 
 
 @dataclass(frozen=True, slots=True)
+class PreSendRetryable:
+    """Transient failure with proof that this attempt never began its remote write.
+
+    Only this explicit proof permits retrying a non-idempotent effect. A transport
+    error during/after POST is ambiguous, even if it looks like a connection failure.
+    """
+
+    reason: str
+    retry_after_us: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class AmbiguousWrite:
     """A write may or may not have happened.
 
@@ -258,7 +270,7 @@ class AmbiguousWrite:
     reason: str
 
 
-AdapterOutcome = Ack | DefinitiveFailure | RetryableReadFailure | AmbiguousWrite
+AdapterOutcome = Ack | DefinitiveFailure | RetryableReadFailure | PreSendRetryable | AmbiguousWrite
 
 
 @dataclass(frozen=True, slots=True)

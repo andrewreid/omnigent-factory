@@ -11,6 +11,7 @@ from omnigent_factory.core.effects import (
     AmbiguousWrite,
     DefinitiveFailure,
     EffectKind,
+    PreSendRetryable,
     RetryableReadFailure,
 )
 from omnigent_factory.core.types import Stage, Via
@@ -212,7 +213,7 @@ async def test_orphan_binding_preserves_unsafe_or_unowned_worktree(git_env, monk
     rig.directory.specs["S2"] = spec("S2", nonce="new")
     result = await rig.adapter.execute(intent(EffectKind.CREATE_SESSION, "S2", nonce="new"), CTX)
     if unsafe == "read-error":
-        assert isinstance(result, RetryableReadFailure)
+        assert isinstance(result, PreSendRetryable)
     else:
         assert isinstance(result, DefinitiveFailure) and "branch-already-exists" in result.reason
     assert rig.server.count("POST", "/v1/sessions") == 1
@@ -247,3 +248,26 @@ async def test_nonce_search_honors_retry_after(git_env):
     assert isinstance(outcome, RetryableReadFailure)
     assert outcome.retry_after_us == 180_000_000 and observations(effect, outcome) == ()
     await rig.rest.aclose()
+
+
+async def test_1576_orphan_read_failure_proves_no_create_was_sent(git_env, monkeypatch):
+    rig = make_rig(git_env)
+    branch = "factory/issue-42-g1"
+    path = git_env.worktrees / branch.replace("/", "-")
+    git("worktree", "add", "-b", branch, str(path), "origin/main", cwd=git_env.source)
+    rig.directory.specs["S1"] = spec()
+
+    async def allowed(_sid):
+        return True
+
+    monkeypatch.setattr(rig.directory, "orphan_repair_allowed", allowed, raising=False)
+    rig.server.fail_paths.add("/v1/sessions")
+    try:
+        outcome = await rig.adapter.execute(
+            intent(EffectKind.CREATE_SESSION, nonce="nonce-abc"), CTX
+        )
+        assert rig.server.count("POST", "/v1/sessions") == 0
+        assert type(outcome).__name__ == "PreSendRetryable"
+        assert "orphan ownership search incomplete" in outcome.reason
+    finally:
+        await rig.rest.aclose()

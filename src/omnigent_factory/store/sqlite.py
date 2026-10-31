@@ -41,6 +41,7 @@ from typing import Any
 from omnigent_factory.core import codec
 from omnigent_factory.core.effects import (
     AUTOMATIC_RECOVERY_KINDS,
+    NON_IDEMPOTENT_AMBIGUOUS_KINDS,
     READ_ONLY_KINDS,
     EffectIntent,
     EffectKind,
@@ -56,6 +57,7 @@ from omnigent_factory.core.events import (
     ReconcileDue,
     SessionCreated,
 )
+from omnigent_factory.core.preconditions import effect_still_valid
 from omnigent_factory.core.predicates import RUNNING_LIFECYCLES
 from omnigent_factory.core.reducer import TransitionResult, build_parked, transition
 from omnigent_factory.core.types import (
@@ -1612,6 +1614,7 @@ class SqliteStore:
                     )
         if new.parcel is not None:
             self._project(conn, old_parcel, new.parcel, event, now)
+            self._wake_invalid_deferred_writes(conn, new.parcel, now)
         self._write_admission(conn, new.admission, now)
         for effect in result.effects:
             self._insert_effect(conn, effect, event, now)
@@ -2059,6 +2062,29 @@ class SqliteStore:
             )
 
     # --------------------------------------------------------------- outbox
+
+    def _wake_invalid_deferred_writes(
+        self, conn: sqlite3.Connection, parcel: Parcel, now: int
+    ) -> None:
+        """Expose invalid pre-send retries to normal claim/precondition cancellation.
+
+        Run in the parcel event's transaction: a fence or supersession must not wait
+        for a retry deadline to release the run's slot. Valid effects retain their
+        backoff across unrelated events. Claimed/unknown writes are never touched.
+        """
+        rows = conn.execute(
+            "SELECT * FROM effects WHERE parcel_id = ? AND state = 'pending' AND next_at_us > ?",
+            (parcel.parcel_id, now),
+        ).fetchall()
+        for row in rows:
+            if row["kind"] not in NON_IDEMPOTENT_AMBIGUOUS_KINDS:
+                continue
+            effect = codec.effect_from_json(row["payload_json"])
+            if effect_still_valid(parcel, effect, now_us=now) is not None:
+                conn.execute(
+                    "UPDATE effects SET next_at_us = NULL, updated_at_us = ? WHERE effect_id = ?",
+                    (now, effect.effect_id),
+                )
 
     def pending_effects(self, *, now_us: int | None = None, limit: int = 100) -> list[StoredEffect]:
         now = self._clock.now_utc_us() if now_us is None else now_us

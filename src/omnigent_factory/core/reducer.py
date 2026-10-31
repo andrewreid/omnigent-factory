@@ -5109,11 +5109,11 @@ def _h_create_rejected(ctx: _Ctx, body: ev.CreateRejected) -> None:
         ctx.hold(Hold.CREATE_REJECTED)
         if body.reason and body.reason == ctx.p.create_rejected_reason:
             # Already commented with this exact reason: no second identical comment.
-            ctx.note("Blocked again: Omnigent refused to create the session (same reason)")
+            ctx.note(f"Blocked again: could not start the session: {body.reason}")
         else:
             ctx.comment("create-rejected", reason=body.reason)
             ctx.update(create_rejected_reason=body.reason)
-            ctx.note("Blocked: Omnigent refused to create the session")
+            ctx.note(f"Blocked: could not start the session: {body.reason}")
     _finish_drain(ctx, replace(s, drain_target=Lifecycle.FENCED if s.fences else Lifecycle.RETIRED))
 
 

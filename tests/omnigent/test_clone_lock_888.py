@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent_factory.core.effects import DefinitiveFailure, EffectKind, RetryableReadFailure
+from omnigent_factory.core.effects import DefinitiveFailure, EffectKind, PreSendRetryable
 from omnigent_factory.core.types import SessionKind
 from omnigent_factory.credentials import worktree
 from tests.credentials.repos import GitEnv, git
@@ -84,9 +84,9 @@ async def test_a_lock_outlasting_the_retries_is_retryable_not_a_rejection(
     )
     out = await rig.adapter.execute(intent(EffectKind.CREATE_SESSION, "P1", nonce="nonce-1"), CTX)
     assert not isinstance(out, DefinitiveFailure), out
-    assert isinstance(out, RetryableReadFailure), out
+    assert isinstance(out, PreSendRetryable), out
     assert "could not lock" in out.reason
     assert not rig.server.requests  # no session was asked for
     lock.unlink()
     again = await rig.adapter.execute(intent(EffectKind.CREATE_SESSION, "P1", nonce="nonce-1"), CTX)
-    assert not isinstance(again, DefinitiveFailure | RetryableReadFailure), again
+    assert not isinstance(again, DefinitiveFailure | PreSendRetryable), again

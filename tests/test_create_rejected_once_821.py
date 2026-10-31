@@ -32,7 +32,7 @@ def test_same_reason_on_retry_updates_the_note_only() -> None:
     retry = h.send(P, ev.PlanFeedback(text_digest="retry"))  # the owner's "Retry"
     assert Harness.of(retry, EffectKind.CREATE_SESSION)
     assert _rejected_plan(h) == []
-    assert h.p().note == "Blocked again: Omnigent refused to create the session (same reason)"
+    assert h.p().note == f"Blocked again: could not start the session: {WHY}"
 
 
 def test_a_different_reason_still_comments() -> None:
