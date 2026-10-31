@@ -75,6 +75,7 @@ from omnigent_factory.core.projection import (
     bundle_member_refusal,
     bundle_note,
     holds_pr_slot,
+    is_start_retry_note,
     pr_capacity_available,
     project_bot,
     project_note,
@@ -82,6 +83,7 @@ from omnigent_factory.core.projection import (
     ready_bot_ok,
     running_text,
     startable_build,
+    starting_session,
     sync_red_note,
     triage_queued_note,
     work_live,
@@ -796,7 +798,8 @@ def _create_session(
     )
     old_current = ctx.p.current_session
     if old_current is not None and old_current.create_unconfirmed:
-        ctx.note("Starting: retrying unconfirmed session create")
+        s = replace(s, create_retry_note="Starting: retrying session start")
+        ctx.note("")
     ctx.update(sessions=(*ctx.p.sessions, s), current_session_id=sid)
     if reuse is not None:
         for old in ctx.p.sessions:
@@ -5002,6 +5005,21 @@ def _issue_close_candidate(ctx: _Ctx, session_id: str) -> None:
     )
 
 
+def _h_create_deferred(ctx: _Ctx, body: ev.CreateDeferred) -> None:
+    s = _session(ctx, body.session_id)
+    if (
+        s.session_id != ctx.p.current_session_id
+        or s.lifecycle not in (Lifecycle.INTENT, Lifecycle.CREATING)
+        or s.root_id is not None
+        or s.fences
+    ):
+        raise Rejected("session-not-awaiting-create")
+    prefix = "Starting: retrying session start"
+    reason = " ".join(body.reason.split())[: NOTE_MAX - len(prefix) - 3]
+    # Session status is projected below all holds/decisions/checkpoints, never p.note.
+    ctx.put_session(replace(s, create_retry_note=f"{prefix} ({reason})" if reason else prefix))
+
+
 def _h_session_created(ctx: _Ctx, body: ev.SessionCreated) -> None:
     s = _session(ctx, body.session_id)
     _adopt(ctx, s, body.root_id, body.nonce)
@@ -6431,6 +6449,7 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.CONTRACT_PUBLISHED: _h_contract_published,
     EventKind.PUBLICATION_ACKED: _h_publication_acked,
     EventKind.SESSION_CREATED: _h_session_created,
+    EventKind.CREATE_DEFERRED: _h_create_deferred,
     EventKind.CREATE_REJECTED: _h_create_rejected,
     EventKind.ADOPTION_RESULT: _h_adoption_result,
     EventKind.EFFECT_UNKNOWN: _h_effect_unknown,
@@ -6889,6 +6908,18 @@ def _project_board(ctx: _Ctx) -> None:
     drain, Working -> Idle, keeps it: it explains why the card is idle), unless this
     event set it.
     """
+    # Repair deployed parcels whose old p.note survived creation and settlement.
+    # Active starts retain a normalised session status; settled runs retain none.
+    if is_start_retry_note(ctx.p.note):
+        cur = ctx.p.current_session
+        if starting_session(cur) and cur is not None and not cur.create_retry_note:
+            ctx.put_session(replace(cur, create_retry_note="Starting: retrying session start"))
+        ctx.update(note="")
+    for run in ctx.p.sessions:
+        if run.create_retry_note and (
+            run.session_id != ctx.p.current_session_id or not starting_session(run)
+        ):
+            ctx.put_session(replace(run, create_retry_note=""))
     # The card moved on (a parcel first seen now counts as coming from Inbox): the marks
     # served their purpose.
     if ctx.p.related_marks and ctx.p.stage not in (None, ctx.origin_stage or Stage.INBOX):

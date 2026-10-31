@@ -410,7 +410,26 @@ class EffectExecutor:
             self._recovery_max_backoff_us,
         )
         retry_at = self._clock.now_utc_us() + max(delay, outcome.retry_after_us or 0, 1)
-        # No reducer event: the run, authorization, normal Bot and note stay intact.
+        # Commit the proof and its visible note together. Keep the same run/nonce;
+        # a crash before this transaction still recovers the claim as unknown.
+        if effect.kind == EffectKind.CREATE_SESSION:
+            event = self._event(
+                effect,
+                ev.CreateDeferred(session_id=effect.target, reason=reason),
+                f"deferred:{stored.attempts}",
+            )
+            await self._db.call(
+                lambda store: store.record_effect_outcome(
+                    effect.effect_id,
+                    "pending",
+                    from_states=("claimed",),
+                    event=event,
+                    config=self._config,
+                    reason=reason,
+                    next_at_us=retry_at,
+                )
+            )
+            return
         await self._db.call(
             lambda store: store.fail_effect(effect.effect_id, reason, retry_at_us=retry_at)
         )

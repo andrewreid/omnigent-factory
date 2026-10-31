@@ -242,11 +242,31 @@ _EXTERNAL_ACTIVITY_NOTE = (
 )
 
 
+def is_start_retry_note(note: str) -> bool:
+    """Recognise both deployed legacy text and current pre-send status."""
+    return note.startswith(
+        (
+            "Starting: retrying unconfirmed session create",
+            "Starting: retrying session start",
+        )
+    )
+
+
+def starting_session(s: StageSession | None) -> bool:
+    return (
+        s is not None
+        and s.lifecycle in (Lifecycle.INTENT, Lifecycle.CREATING)
+        and s.root_id is None
+        and not s.execution_closed
+        and not s.fences
+    )
+
+
 def project_note(p: Parcel, bot: BotState) -> str:
     """The board's "Factory note": the latest status reason, else one derived from ``bot``."""
     if any(awaiting_create(s) for s in p.sessions):
         return "Blocked: session create unconfirmed (checking Omnigent)"
-    if p.note:
+    if p.note and not is_start_retry_note(p.note):
         return p.note[:NOTE_MAX]
     if bot == BotState.BLOCKED:
         why = [_HOLD_TEXT[h] for h in sorted(p.holds & BLOCKING_HOLDS) if h in _HOLD_TEXT]
@@ -284,6 +304,11 @@ def project_note(p: Parcel, bot: BotState) -> str:
         # one. Any status reason or derived Blocked/Needs you/Checkpoint/Queued note
         # above outranks it.
         text = p.epic_note or triage_stale_note(p) or related_note(p)
+        if not text and bot == BotState.WORKING and starting_session(p.current_session):
+            assert p.current_session is not None  # noqa: S101 - starting_session checks it
+            text = p.current_session.create_retry_note
+            if not text and is_start_retry_note(p.note):
+                text = "Starting: retrying session start"
     return text[:NOTE_MAX]
 
 

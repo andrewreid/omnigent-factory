@@ -859,17 +859,44 @@ starts; incomplete watch reads are retried within that window. After watching st
 a later explicit creation/adoption observation still archives the old root, but the
 factory no longer actively searches for it.
 
-A successor can bind a clean orphan worktree left by the failed create using
-`existing_worktree`. Under `CLONE_LOCK`, it verifies the exact factory issue branch and
-worktree name, owned location, clean files, no Git operation in progress, no commits
-ahead of the fetched base, and ancestry of that base. Fresh local ownership and complete
-remote inventory checks must show no live session uses it. The server has no workspace,
-branch or arbitrary-label list filter, so the check pages through all agents/projects,
-including children and archived sessions, in pages of up to 1,000 rows, with a
-15-second per-request timeout and a configurable overall budget
-(`orphan_ownership_timeout_seconds`, default 180 seconds).
+A current run without a reusable issue root can bind a clean orphan worktree using
+`existing_worktree`, including a first run or a reopened issue with a leftover branch;
+a preceding unconfirmed create is not required. Under `CLONE_LOCK`, it verifies the
+exact factory issue branch and worktree name, owned location, clean files, no Git
+operation in progress, no commits
+ahead of the fetched base, and ancestry of that base. Reference snapshots and symlinks
+cannot be reclaimed. Factory first checks its store and dispatch directory, including
+retired runs and dispatches whose aggregate is gone. Snapshot-less runs from unrelated
+parcels do not claim this worktree; missing or unreadable identity falls back to remote
+checks rather than a definitive refusal. A predecessor retired after the four complete
+empty nonce searches owns no worktree: its tombstone and late-session watch permit the
+successor to bind without inventory reads. A predecessor still searching keeps the
+create waiting with a pre-send retry. Known roots remain subject to the root checks,
+even if they arrived after retirement. When no other run references the path or branch,
+Factory is the sole owner and makes no Omnigent inventory request.
+This assumes exclusive Factory ownership of paths under `worktree_root`: external
+sessions using those paths are outside the supported ownership model. Factory never
+creates an unrecorded dispatch there.
+
+For other matching runs with known root IDs, fresh `GET /v1/sessions/<id>` reads must
+show each root archived and inactive, or absent (404). Live or busy roots refuse binding;
+incomplete reads retry. Except for concluded empty creates, a matching dispatch without
+a root ID or a missing legacy identity still requires the complete inventory across
+agents/projects, children and archives. These scans use `orphan_inventory_page_size`
+(default 200) and
+`orphan_inventory_request_timeout_seconds` (default 60 seconds), within
+`orphan_ownership_timeout_seconds` (default 180 seconds overall). The retired-nonce
+watches described above remain active: delayed empty creates are archived and never
+receive credentials or work, even after a successor binds the orphan.
+
 An incomplete or timed-out inventory is a pre-send retry, never evidence of no owner
-and never an ambiguous create. Binding is logged and keeps
+and never an ambiguous create. Pre-send retries show
+`Starting: retrying session start (<short reason>)`, capped at 120 characters, only
+when no higher-priority projected status note applies (Blocked, Needs you, Checkpoint
+and other specific notes retain precedence). The retry status belongs to the stage
+session and clears on creation, cancellation or settlement. On reconcile, legacy
+parcels with a stale retry note discard it and re-publish the derived note.
+`unconfirmed` is reserved for ambiguous POST outcomes. Binding is logged and keeps
 the worktree and branch intact; dirty, ahead, unowned or still-used worktrees retain the
 definitive `branch-already-exists` rejection. Ambiguous creates log bounded response
 error codes/messages alongside the HTTP status to diagnose reconnect failures.

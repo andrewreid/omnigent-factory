@@ -195,6 +195,8 @@ class OmnigentConfig:
     rescan_min_interval_s: float = 5.0
     #: Whole orphan ownership scan, including all pages and matching archived snapshots.
     orphan_ownership_timeout_s: float = 180.0
+    orphan_inventory_page_size: int = 200
+    orphan_inventory_request_timeout_s: float = 60.0
 
 
 def _message_texts(item: Mapping[str, Any]) -> list[str]:
@@ -589,20 +591,40 @@ class OmnigentExecutionAdapter:
         async def unused(path: Path) -> bool:
             if not await allowed(spec.session_id):
                 return False
-            # The server list API has no workspace/branch/label filter. Filtering by
-            # agent/project would miss other owners, so exhaust the paged inventory.
-            # Full inventory, including children and archived roots. Only a closed,
-            # inactive archived row may cease to own a worktree.
-            rows = await self.rest.paginate(
-                "/v1/sessions",
-                {"kind": "any", "include_archived": "true", "visibility": "all", "limit": 1000},
-            )
-            for row in rows:
-                if row.get("git_branch") != spec.branch and row.get("workspace") != str(path):
-                    continue
-                if row.get("archived") is not True:
-                    return False
-                snap = await self.rest.get_json(f"/v1/sessions/{row['id']}")
+            # Factory owns this namespace. An empty local owner set proves no other
+            # dispatch can use it; known roots need only targeted fresh snapshots.
+            owners = getattr(self.directory, "orphan_owners", None)
+            try:
+                roots = await owners(spec, path) if owners is not None else None
+            except (OSError, ValueError) as exc:
+                raise OmnigentReadError("factory ownership records unreadable") from exc
+            if roots is None:
+                # A matching dispatch without a root ID (e.g. an unknown POST)
+                # still requires the complete inventory, across agents and children.
+                rows = await self.rest.paginate(
+                    "/v1/sessions",
+                    {
+                        "kind": "any",
+                        "include_archived": "true",
+                        "visibility": "all",
+                        "limit": self.config.orphan_inventory_page_size,
+                    },
+                    timeout_s=self.config.orphan_inventory_request_timeout_s,
+                )
+                roots = []
+                for row in rows:
+                    if row.get("git_branch") != spec.branch and row.get("workspace") != str(path):
+                        continue
+                    if row.get("archived") is not True:
+                        return False
+                    roots.append(str(row["id"]))
+            for root in roots:
+                try:
+                    snap = await self.rest.get_json(f"/v1/sessions/{root}")
+                except OmnigentReadError as exc:
+                    if exc.status == 404:
+                        continue
+                    raise
                 if snap.get("archived") is not True or self._unexpected_turn(snap, reuse=True):
                     return False
             return True

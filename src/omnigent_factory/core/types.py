@@ -641,6 +641,8 @@ class StageSession:
     create_watch_stopped: bool = False
     #: Health-sweep stall episodes of this run (``StallWatch``).
     stall: StallWatch = field(default_factory=StallWatch)
+    #: Pre-send status, projected only while this run is awaiting its first POST.
+    create_retry_note: str = ""
 
 
 @dataclass(frozen=True, slots=True)

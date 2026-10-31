@@ -126,9 +126,7 @@ def test_conclusion_releases_triage_and_pending_authority_can_start(tmp_path, pe
         if pending_owner:
             assert h.cur(P).nonce != old.nonce
             assert h.cur(P).session_id != old.session_id
-            assert (
-                project_note(h.p(P), h.p(P).bot) == "Starting: retrying unconfirmed session create"
-            )
+            assert project_note(h.p(P), h.p(P).bot) == "Starting: retrying session start"
         else:
             assert "did not confirm the session" in project_note(h.p(P), h.p(P).bot)
             r = h.send(Q, ev.ReconcileDue())

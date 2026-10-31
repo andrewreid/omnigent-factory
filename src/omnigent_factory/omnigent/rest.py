@@ -139,10 +139,15 @@ class OmnigentRest:
     # ------------------------------------------------------------ reads
 
     async def get_json(
-        self, path: str, params: Mapping[str, str | int] | None = None
+        self,
+        path: str,
+        params: Mapping[str, str | int] | None = None,
+        *,
+        timeout_s: float | None = None,
     ) -> dict[str, Any]:
         try:
-            resp = await self._client.get(path, params=dict(params or {}))
+            timeout = self._client.timeout if timeout_s is None else httpx.Timeout(timeout_s)
+            resp = await self._client.get(path, params=dict(params or {}), timeout=timeout)
         except httpx.HTTPError as exc:
             raise OmnigentReadError(f"GET {path}: {type(exc).__name__}") from exc
         if resp.status_code != 200:
@@ -175,6 +180,7 @@ class OmnigentRest:
         params: Mapping[str, str | int] | None = None,
         *,
         restarts: int = 2,
+        timeout_s: float | None = None,
         until: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> list[dict[str, Any]]:
         """All rows of a cursor-paginated list, or :class:`OmnigentReadError`.
@@ -190,7 +196,11 @@ class OmnigentRest:
                     query: dict[str, str | int] = {"limit": self.page_limit, **(params or {})}
                     if after is not None:
                         query["after"] = after
-                    body = await self.get_json(path, query)
+                    body = (
+                        await self.get_json(path, query)
+                        if timeout_s is None
+                        else await self.get_json(path, query, timeout_s=timeout_s)
+                    )
                     data = body.get("data")
                     if not isinstance(data, list):
                         raise OmnigentReadError(f"GET {path}: missing data list")

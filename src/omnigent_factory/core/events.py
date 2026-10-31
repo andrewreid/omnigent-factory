@@ -98,6 +98,7 @@ class EventKind(enum.StrEnum):
     # observation: Omnigent / effects
     SESSION_CREATED = "SessionCreated"
     CREATE_REJECTED = "CreateRejected"
+    CREATE_DEFERRED = "CreateDeferred"
     ADOPTION_RESULT = "AdoptionResult"
     EFFECT_UNKNOWN = "EffectUnknown"
     EFFECT_RECOVERY_STARTED = "EffectRecoveryStarted"
@@ -771,6 +772,16 @@ class SessionCreated(_Body):
 
 
 @dataclass(frozen=True, slots=True)
+class CreateDeferred(_Body):
+    """A transient failure proven to precede the session POST; only updates the note."""
+
+    KIND: ClassVar[EventKind] = EventKind.CREATE_DEFERRED
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    session_id: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class CreateRejected(_Body):
     """Definitive pre-create rejection that the server proves had no side effect."""
 
@@ -1341,6 +1352,7 @@ EventBody = (
     | ContractPublished
     | PublicationAcked
     | SessionCreated
+    | CreateDeferred
     | CreateRejected
     | AdoptionResult
     | EffectUnknown
@@ -1435,6 +1447,7 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         ContractPublished,
         PublicationAcked,
         SessionCreated,
+        CreateDeferred,
         CreateRejected,
         AdoptionResult,
         EffectUnknown,
@@ -1560,6 +1573,7 @@ __all__ = [
     "ContractPublished",
     "ContractTampered",
     "CostSample",
+    "CreateDeferred",
     "CreateRejected",
     "Decide",
     "DecisionImpact",

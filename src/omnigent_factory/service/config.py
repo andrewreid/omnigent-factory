@@ -339,8 +339,10 @@ class ServiceConfig(BaseModel):
     #: net only (every committed change and each due timer wakes them at once).
     idle_fallback_seconds: float = Field(default=30.0, gt=0)
     effect_poll_seconds: float = Field(default=0.05, gt=0)
-    #: Overall budget for the paged orphan ownership inventory (each request: 15 s).
+    #: Overall orphan ownership budget, including local records and remote snapshots.
     orphan_ownership_timeout_seconds: float = Field(default=180.0, gt=0)
+    orphan_inventory_page_size: int = Field(default=200, ge=1, le=1000)
+    orphan_inventory_request_timeout_seconds: float = Field(default=60.0, gt=0)
     #: Proven-not-sent and ambiguous idempotent/verifiable writes share this budget. With
     #: the default exponential delay (2, 4, 8 and 16 minutes), escalation is about
     #: 30 minutes after the initial attempt.

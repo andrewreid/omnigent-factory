@@ -29,6 +29,7 @@ from omnigent_factory.core.effects import (
     ExecutionContext,
 )
 from omnigent_factory.core.events import AutoRetriage, EventKind
+from omnigent_factory.core.predicates import awaiting_create
 from omnigent_factory.core.protocol import (
     CLOSE_CANDIDATE_LABEL,
     CLOSURE_RECOMMENDATIONS,
@@ -55,6 +56,7 @@ from omnigent_factory.core.types import (
 from omnigent_factory.credentials.worktree import VerifiedWorktree, Workspaces, WorktreeError
 from omnigent_factory.github.adapter import ParcelBinding, TriageFields
 from omnigent_factory.omnigent.directory import FormValue, StageSpec, stale_branch_note
+from omnigent_factory.omnigent.rest import OmnigentReadError
 from omnigent_factory.ports.adapter import EffectAdapter
 from omnigent_factory.service.config import ServiceConfig
 from omnigent_factory.service.db import StoreWorker
@@ -108,6 +110,21 @@ def triage_base_oid(snapshot: Mapping[str, Any] | None) -> str:
             return oid
     oid = snapshot.get("base_oid")
     return oid if isinstance(oid, str) else ""
+
+
+def _concluded_empty_create(run: StageSession) -> bool:
+    """The bounded-search tombstone owns no workspace; late roots are archived.
+
+    Keep known roots in ownership checks even if they arrived after retirement.
+    """
+    return (
+        run.execution_closed
+        and run.lifecycle in SETTLED_LIFECYCLES
+        and run.create_unconfirmed
+        and run.create_searches >= 4
+        and not run.create_match_seen
+        and run.root_id is None
+    )
 
 
 class ServiceDispatchDirectory:
@@ -166,18 +183,102 @@ class ServiceDispatchDirectory:
         )
 
     async def orphan_repair_allowed(self, session_id: str) -> bool:
-        """Only a fresh successor of a concluded create can reclaim its orphan.
+        """Only the current run without a reusable root can reclaim its orphan.
 
-        Issue branches are parcel-specific. Any other unclosed local run, or reusable
-        issue root, keeps ownership; the adapter additionally checks remote roots.
+        Path/branch ownership is checked separately by orphan_owners, so an unrelated
+        run cannot turn missing identity into a definitive refusal.
         """
         parcel = await self._parcel_for_session(session_id)
         if parcel is None or parcel.current_session_id != session_id:
             return False
-        if parcel.issue_session is not None and parcel.issue_session.reusable:
-            return False
-        others = [s for s in parcel.sessions if s.session_id != session_id]
-        return any(s.create_unconfirmed for s in others) and all(s.execution_closed for s in others)
+        return parcel.issue_session is None or not parcel.issue_session.reusable
+
+    async def orphan_owners(self, spec: StageSpec, path: Path) -> tuple[str, ...] | None:
+        """Fresh local ownership evidence under CLONE_LOCK; None needs full inventory.
+
+        Stage roots live in the store; paths/branches live in immutable dispatch files.
+        Include retired runs and files whose aggregate is gone. Missing identity is
+        uncertainty, never permission to skip the remote check.
+        """
+        if not path.is_relative_to(self.config.worktree_root.resolve()):
+            raise WorktreeError("orphan is outside the factory worktree root")
+        parcels = await self.db.call(
+            lambda store: [
+                store.load_parcel(row[0]) for row in store.query("SELECT parcel_id FROM parcels")
+            ]
+        )
+        local_runs = {
+            run.session_id
+            for parcel in parcels
+            if parcel is not None and parcel.parcel_id == spec.parcel_id
+            for run in parcel.sessions
+        }
+        runs = {
+            run.session_id: run
+            for parcel in parcels
+            if parcel is not None
+            for run in parcel.sessions
+            if run.session_id != spec.session_id
+        }
+        roots: set[str] = set()
+        seen: set[str] = set()
+        incomplete = False
+        for entry in self.root.glob("*.json"):
+            try:
+                data = self._read(entry)
+            except (OSError, ValueError):
+                # Its identity is unknown, not evidence of a competing owner.
+                incomplete = True
+                continue
+            if data is None:
+                incomplete = True
+                continue
+            sid = str(data.get("session_id") or entry.stem)
+            if sid == spec.session_id:
+                continue
+            has_identity = data.get("workspace_kind") == "reference" or any(
+                isinstance(data.get(key), str) and data[key]
+                for key in ("branch", "workspace", "bind_worktree", "reference_reuse_workspace")
+            )
+            if not has_identity:
+                # A partial snapshot is no stronger than a missing one. For this
+                # parcel the run/root/tombstone below can resolve the uncertainty.
+                incomplete = incomplete or sid not in local_runs
+                continue
+            seen.add(sid)
+            matches = data.get("branch") == spec.branch or any(
+                isinstance(data.get(key), str) and Path(data[key]).resolve() == path
+                for key in ("workspace", "bind_worktree", "reference_reuse_workspace")
+            )
+            if not matches:
+                continue
+            run = runs.get(sid)
+            if run is not None and _concluded_empty_create(run):
+                continue
+            if run is not None and awaiting_create(run):
+                raise OmnigentReadError("prior session create is still being checked")
+            if run is not None and not run.execution_closed:
+                raise WorktreeError("orphan has an unclosed factory run")
+            root = run.root_id if run is not None else data.get("root_id")
+            if isinstance(root, str) and root:
+                roots.add(root)
+            else:
+                incomplete = True
+        # Missing snapshots on this parcel may concern this branch. Other parcels
+        # only participate when their dispatch actually names the branch or path.
+        for sid in local_runs - seen - {spec.session_id}:
+            run = runs[sid]
+            if _concluded_empty_create(run):
+                continue
+            if awaiting_create(run):
+                raise OmnigentReadError("prior session create is still being checked")
+            if run.execution_closed and run.root_id:
+                roots.add(run.root_id)
+            else:
+                # An unclosed tree has no drain proof: retain the full scan's child
+                # ownership checks rather than relying on its root snapshot alone.
+                incomplete = True
+        return None if incomplete else tuple(sorted(roots))
 
     async def _make_snapshot(self, parcel: Parcel, session: StageSession) -> dict[str, object]:
         issue = parcel.issue_number or 0

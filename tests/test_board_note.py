@@ -27,10 +27,12 @@ from omnigent_factory.core.effects import (
     RetryableReadFailure,
 )
 from omnigent_factory.core.preconditions import effect_still_valid
+from omnigent_factory.core.projection import project_bot, project_note
 from omnigent_factory.core.types import (
     MICROS_PER_HOUR,
     BotState,
     Hold,
+    Lifecycle,
     QueueStatus,
     Reservation,
     ReservationKind,
@@ -530,3 +532,125 @@ async def test_feedback_eyes_reaction_posts_and_unknown_content_is_refused():
         ("/repos/SA-Ambulance/timesheets/issues/comments/58/reactions", {"content": "eyes"})
     ]
     assert isinstance(refused, DefinitiveFailure)
+
+
+@pytest.mark.parametrize(
+    "hold", [Hold.STOP_UNVERIFIED, Hold.REWORK_CONTROL_REQUIRED, Hold.EXTERNAL_ACTIVITY]
+)
+@pytest.mark.parametrize("existing", ["", "Starting: retrying unconfirmed session create"])
+def test_create_deferred_preserves_projected_hold_note(hold, existing):
+    h = Harness()
+    h.eligible()
+    h.send(P, ev.RequestTriage(via=Via.DRAG))
+    held = replace(h.p(), holds=frozenset({hold}), note="")
+    bot = project_bot(held)
+    expected = project_note(held, bot)
+    h.parcels[P] = replace(held, bot=bot, note=existing, board_note=expected)
+    for _ in range(2):
+        result = h.send(
+            P, ev.CreateDeferred(session_id=h.cur().session_id, reason="read timed out")
+        )
+        assert result.audit.accepted
+        assert h.p().board_note == expected
+        assert h.p().bot == bot
+        assert not notes(result)
+
+
+def test_create_retry_status_clears_on_success_and_triage_settlement():
+    h = Harness()
+    h.eligible()
+    h.send(P, ev.RequestTriage(via=Via.DRAG))
+    s = h.cur()
+    h.send(P, ev.CreateDeferred(session_id=s.session_id, reason="read timed out"))
+    assert "retrying" in h.p().board_note
+    created = h.send(P, ev.SessionCreated(session_id=s.session_id, root_id="root", nonce=s.nonce))
+    assert "retrying" not in h.p().board_note
+    assert h.cur().create_retry_note == ""
+    assert notes(created) == [""]
+    h.create_ok()
+    result = h.send(P, result_candidate(s.session_id, "root", s.revision, ev.ResultKind.TRIAGE))
+    h.quiesce(P, s.session_id)
+    for publish in h.of(result, EffectKind.PUBLISH_TRIAGE):
+        h.send(
+            P,
+            ev.PublicationAcked(
+                effect_id=publish.effect_id,
+                effect_kind=publish.kind.value,
+                session_id=s.session_id,
+                comment_id="triage-comment",
+            ),
+        )
+    assert h.p().bot == BotState.IDLE
+    assert "retrying" not in h.p().board_note
+    assert h.cur().create_retry_note == ""
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [
+        "Starting: retrying unconfirmed session create",
+        "Starting: retrying session start (read timed out)",
+    ],
+)
+def test_reconcile_repairs_stale_retry_note_on_idle_parcel(legacy):
+    h = Harness()
+    h.triage()
+    assert h.p().bot == BotState.IDLE
+    expected = project_note(replace(h.p(), note=""), BotState.IDLE)
+    h.parcels[P] = replace(h.p(), note=legacy, board_note=legacy)
+    result = h.send(P, ev.ReconcileDue())
+    assert result.audit.accepted
+    assert h.p().note == ""
+    assert h.p().board_note == expected
+    assert notes(result) == [expected]
+    assert "retrying" not in expected
+    assert not notes(h.send(P, ev.ReconcileDue()))
+
+
+@pytest.mark.parametrize("end", ["reject", "cancel"])
+def test_create_retry_status_clears_on_exhaustion_or_cancellation(end):
+    h = Harness()
+    h.eligible()
+    result = h.send(P, ev.RequestTriage(via=Via.DRAG))
+    [create] = h.of(result, EffectKind.CREATE_SESSION)
+    s = h.cur()
+    h.send(P, ev.CreateDeferred(session_id=s.session_id, reason="read timed out"))
+    if end == "reject":
+        h.send(P, ev.CreateRejected(session_id=s.session_id, reason="read timed out"))
+    else:
+        h.send(P, ev.LeftwardMove(to_stage=Stage.INBOX))
+        h.send(
+            P,
+            ev.EffectCancelled(
+                effect_id=create.effect_id, effect_kind=create.kind.value, session_id=s.session_id
+            ),
+        )
+    assert h.p().session(s.session_id).create_retry_note == ""
+    assert "retrying" not in h.p().board_note
+
+
+def test_create_retry_status_does_not_override_checkpoint_projection():
+    h = Harness()
+    h.eligible()
+    h.send(P, ev.RequestTriage(via=Via.DRAG))
+    current = replace(
+        h.cur(),
+        lifecycle=Lifecycle.CHECKPOINT_WAIT,
+        create_retry_note="Starting: retrying session start (read timed out)",
+    )
+    parcel = replace(
+        h.p(), sessions=(current,), note="Starting: retrying unconfirmed session create"
+    )
+    assert project_bot(parcel) == BotState.CHECKPOINT
+    assert project_note(parcel, BotState.CHECKPOINT).startswith("Checkpoint:")
+
+
+def test_create_deferred_preserves_specific_working_note():
+    h = Harness()
+    h.eligible()
+    h.send(P, ev.RequestTriage(via=Via.DRAG))
+    note = "Waiting: source maintenance"
+    h.parcels[P] = replace(h.p(), note=note, board_note=note)
+    result = h.send(P, ev.CreateDeferred(session_id=h.cur().session_id, reason="read timed out"))
+    assert result.audit.accepted and h.p().bot == BotState.WORKING
+    assert h.p().board_note == note and not notes(result)

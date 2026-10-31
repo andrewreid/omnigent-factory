@@ -2229,6 +2229,7 @@ class SqliteStore:
         remote_id: str | None = None,
         reason: str | None = None,
         reducer: Reducer = transition,
+        next_at_us: int | None = None,
     ) -> EffectOutcomeResult:
         """Atomically move an effect to ``state`` and apply the event reporting it.
 
@@ -2237,7 +2238,9 @@ class SqliteStore:
         path already finished. The effect update and the reducer transition (with its
         projections, admission and new intents) commit in one transaction.
         """
-        if state not in ("done", "failed", "cancelled", "unknown"):
+        if state not in ("done", "failed", "cancelled", "unknown") and not (
+            state == "pending" and next_at_us is not None and from_states == ("claimed",)
+        ):
             raise StoreError(f"not an outcome state: {state}")
         with self._txn() as conn:
             row = conn.execute(
@@ -2266,6 +2269,7 @@ class SqliteStore:
                 from_states=from_states,
                 remote_id=remote_id,
                 reason=reason,
+                next_at_us=next_at_us,
             )
             if not updated:
                 raise StoreError(f"effect {effect_id} changed state inside its transaction")

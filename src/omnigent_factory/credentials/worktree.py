@@ -489,6 +489,8 @@ class Workspaces:
         ):
             return None
         verified = self.verify_worktree(path, branch)
+        if (self.admin_dir(path) / REFERENCE_META).exists():
+            return None
         if self._operations_in_progress(path) or not self.is_clean(path):
             return None
         if self.commits_ahead(path, base_branch):

@@ -397,6 +397,8 @@ async def build_production(
             project_id=_required_text(config.omnigent_project_id, "omnigent_project_id"),
             default_branch=config.default_branch,
             orphan_ownership_timeout_s=config.orphan_ownership_timeout_seconds,
+            orphan_inventory_page_size=config.orphan_inventory_page_size,
+            orphan_inventory_request_timeout_s=config.orphan_inventory_request_timeout_seconds,
             gh_wrapper=str(config.wrapper_bin_dir / "gh"),
             real_gh_path=str(config.real_gh_path),
         ),
