@@ -668,6 +668,7 @@ Requires [uv](https://docs.astral.sh/uv/) and Python 3.13 (pinned in `.python-ve
 ```sh
 uv sync --locked              # create .venv from uv.lock
 uv run pytest -q              # full test suite (no network)
+uv run pytest -q -n auto --dist worksteal  # recommended fast full suite (all tests)
 uv run ruff check             # lint
 uv run ruff format --check    # formatting
 uv run mypy                   # strict type check of src/omnigent_factory
@@ -675,6 +676,8 @@ uv run mypy                   # strict type check of src/omnigent_factory
 
 Hypothesis runs the `default` profile (200 examples, 40 stateful steps, derandomized).
 For a longer randomized search: `HYPOTHESIS_PROFILE=thorough uv run pytest -q tests/test_invariants_model.py`.
+The parallel command keeps targeted runs unchanged: use plain `uv run pytest -q path/to/test.py`
+for one file or test. Parallel workers use isolated temporary state, Git homes, sockets and ports.
 
 ### Layout
 

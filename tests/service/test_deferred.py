@@ -586,25 +586,17 @@ async def test_a_lost_tick_without_edit_history_is_ignored(service_config: Servi
 async def test_the_admitted_rework_is_briefed_with_exactly_the_ticked_items(
     service_config: ServiceConfig,
 ):
-    from omnigent_factory.core.events import Event
     from omnigent_factory.service.directory import ServiceDispatchDirectory
 
     async with rig(service_config) as r:
         await r.deferred.record_result(await r.parcel(), "s1", result(FU_A, FU_B))
         body = await report(r)
-        await r.deferred.on_comment_delivery(edited(r, body, ticked(body, action(FU_B))))
-        r.clock.advance(121 * S)
-        await r.deferred.tick()
-        await r.service.apply_event(
-            Event(
-                event_id="capacity-1",
-                repo_id=r.service.config.repo_id,
-                parcel_id=P,
-                source_time_us=r.clock.now_utc_us(),
-                provenance=Provenance.SCHEDULER,
-                body=ev.CapacityAvailable(),
-            )
+        assert (
+            await r.deferred.on_comment_delivery(edited(r, body, ticked(body, action(FU_B)))) == 1
         )
+        r.clock.advance(121 * S)
+        assert await r.deferred.tick() == 1
+        await r.service._admit_once()
         parcel = await r.parcel()
         run = parcel.current_session
         assert run is not None and parcel.authorization(run.authorization_id).rework

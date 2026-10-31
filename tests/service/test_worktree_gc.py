@@ -31,9 +31,9 @@ from omnigent_factory.service.worktree_gc import (
     read_state,
     state_path,
 )
+from omnigent_factory.testing.builders import OWNER_ID, REPO_ID
 from omnigent_factory.testing.harness import Harness
 from tests.credentials.repos import GitEnv, git
-from tests.service.conftest import OWNER_ID, REPO_ID
 from tests.service.test_devenv_lifecycle import CTX, TEMPLATES, _effect, _runs, _script
 from tests.service.test_followups import _Directory, _finished_parcel, _worktree, git_env
 

@@ -85,9 +85,12 @@ async def test_idle_delivery_loop_reads_the_inbox_only_at_the_idle_poll(
     try:
         await asyncio.sleep(0.1)
         start = reads[0]
-        await asyncio.sleep(1.0)
+        started_at = asyncio.get_running_loop().time()
+        await wait_for_async(lambda: reads[0] - start >= 3, timeout=2.0)
+        elapsed = asyncio.get_running_loop().time() - started_at
         # Previously a 0.05 s poll: ~20 full inbox reads per second while idle.
-        assert 3 <= reads[0] - start <= 5
+        assert elapsed >= 0.45
+        assert 3 <= reads[0] - start <= 4
     finally:
         await service.stop()
 

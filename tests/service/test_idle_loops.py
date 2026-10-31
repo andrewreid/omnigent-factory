@@ -122,20 +122,24 @@ def _production_cadence(config: ServiceConfig) -> ServiceConfig:
 
 @pytest.mark.asyncio
 async def test_an_idle_factory_makes_almost_no_db_calls(service_config: ServiceConfig) -> None:
-    """5 s idle at production cadence with 142 parcels, two builds parked.
+    """0.6 s idle with the production cadence, except a 0.5 s inbox safety poll.
 
     Before (base): the outbox read the store every 50 ms and the admission and clock
-    loops every second (plus one parcel load per clocked run): 141 DB calls in 5 s
-    (~28/s). Now: only the 5 s delivery-inbox safety poll (2 calls).
+    loops every second (plus one parcel load per clocked run): ~17 calls in this window.
+    Now: only the deliberately accelerated delivery-inbox safety poll (2 calls). The
+    shipped five-second setting is asserted separately below.
     """
-    config = _production_cadence(service_config)
+    config = _production_cadence(service_config).model_copy(
+        update={"delivery_idle_poll_seconds": 0.5}
+    )
+    assert ServiceConfig.model_fields["delivery_idle_poll_seconds"].default == 5.0
     async with idle_factory(config) as rig:
-        await asyncio.sleep(2.0)  # boot work (reads, board diff) settles
+        await asyncio.sleep(0.2)  # boot work (reads, board diff) settles
         before = len(rig.calls)
-        await asyncio.sleep(5.0)
+        await asyncio.sleep(0.6)
         idle_calls = rig.calls[before:]
-    print(f"idle DB calls in 5 s: {len(idle_calls)} by task {sorted(set(idle_calls))}")
-    assert len(idle_calls) <= 10, sorted(idle_calls)
+    print(f"idle DB calls in 0.6 s: {len(idle_calls)} by task {sorted(set(idle_calls))}")
+    assert len(idle_calls) <= 4, sorted(idle_calls)
     assert not {"outbox", "admission", "clock"} & set(idle_calls)
 
 

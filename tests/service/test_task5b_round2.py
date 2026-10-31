@@ -185,10 +185,14 @@ class BoardRig:
         await self.service.db.call(lambda store: store.append_delivery(record))
 
     async def run(self, seconds: int) -> None:
-        for _ in range(seconds):
+        deadline = self.clock.now_utc_us() + seconds * 1_000_000
+        while self.clock.now_utc_us() < deadline:
             for delivery in await self.service.db.call(lambda s: s.pending_deliveries()):
                 await self.processor.process(delivery)
-            self.clock.advance(1_000_000)
+            due = await self.service.db.call(lambda s: s.inbox_due())
+            retry_times = [retry_at for _guid, retry_at in due if retry_at is not None]
+            next_tick = min(retry_times, default=deadline)
+            self.clock.advance(max(1, min(next_tick, deadline) - self.clock.now_utc_us()))
 
     async def status(self, guid: str) -> tuple[str, int]:
         rows = await self.service.db.call(

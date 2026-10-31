@@ -2,19 +2,12 @@
 
 from __future__ import annotations
 
-import socket
 import stat
 
 import pytest
 
 from omnigent_factory import cli
 from omnigent_factory.service.config import ServiceConfig
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
 
 
 def test_setup_mcp_token_creates_a_private_token_once(
@@ -37,23 +30,23 @@ def test_setup_mcp_token_creates_a_private_token_once(
 def test_loopback_mcp_listener_is_added_beside_the_lan_listener(
     service_config: ServiceConfig,
 ) -> None:
-    lan_port, mcp_port = _free_port(), _free_port()
     config = service_config.model_copy(
-        update={"bind_host": "127.0.0.2", "bind_port": lan_port, "mcp_port": mcp_port}
+        update={"bind_host": "127.0.0.2", "bind_port": 0, "mcp_port": 0}
     )
     sockets = cli.listener_sockets(config)
     try:
-        assert [s.getsockname() for s in sockets] == [
-            ("127.0.0.2", lan_port),
-            ("127.0.0.1", mcp_port),
-        ]
+        addresses = [s.getsockname() for s in sockets]
+        assert [address[0] for address in addresses] == ["127.0.0.2", "127.0.0.1"]
+        assert all(address[1] > 0 for address in addresses)
+        assert addresses[0][1] != addresses[1][1]
     finally:
         for s in sockets:
             s.close()
-    same = service_config.model_copy(update={"bind_port": lan_port, "mcp_port": lan_port})
+    same = service_config.model_copy(update={"bind_port": 0, "mcp_port": 0})
     sockets = cli.listener_sockets(same)
     try:
-        assert [s.getsockname() for s in sockets] == [("127.0.0.1", lan_port)]
+        [address] = [s.getsockname() for s in sockets]
+        assert address[0] == "127.0.0.1" and address[1] > 0
     finally:
         for s in sockets:
             s.close()

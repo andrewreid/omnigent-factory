@@ -241,7 +241,12 @@ async def test_socket_rejects_foreign_uid_and_malformed_requests(stack: Stack) -
         foreign = cap.__class__(
             cap.capability_id, cap.session_id, cap.secret, other.socket_path, cap.repository
         )
-        reply = await asyncio.to_thread(client.request_token, foreign, REPO)
+        async with asyncio.timeout(5):
+            while True:
+                reply = await asyncio.to_thread(client.request_token, foreign, REPO)
+                if reply.reason != "broker-unreachable":
+                    break
+                await asyncio.sleep(0.01)
         assert not reply.ok and reply.reason == "peer-not-authorised"
     finally:
         await other.close()
