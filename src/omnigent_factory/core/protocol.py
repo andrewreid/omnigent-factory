@@ -131,6 +131,9 @@ CLOSURE_RECOMMENDATIONS = frozenset({"duplicate", "wont_fix", "already_fixed", "
 EVIDENCED_RECOMMENDATIONS = frozenset({"already_fixed", "obsolete"})
 #: The label the factory (never the agent) puts on a closure candidate's issue.
 CLOSE_CANDIDATE_LABEL = "factory:close-candidate"
+#: On every member issue of an open (pending or posted) bundle proposal, while the issue
+#: is in Triage or Planning (``EffectKind.SET_BUNDLE_PROPOSED``).
+BUNDLE_PROPOSED_LABEL = "factory:bundle-proposed"
 
 
 class TriageResult(_Strict):

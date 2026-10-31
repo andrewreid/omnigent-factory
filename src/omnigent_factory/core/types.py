@@ -1165,6 +1165,17 @@ class Parcel:
     close_candidate_at_us: int = 0
     #: The generation whose label the owner removed ("" = none): its add never runs.
     close_candidate_removed: str = ""
+    #: Open bundle proposals (pending, posting or posted) naming this issue, by proposal
+    #: key, as the bundling service last reported them (``BundleProposalsObserved``).
+    bundle_proposals: tuple[str, ...] = ()
+    #: Proposal keys whose ``factory:bundle-proposed`` label the owner removed: those
+    #: proposals never re-add it (dropped with the proposal).
+    bundle_proposed_removed: tuple[str, ...] = ()
+    #: The label's state the factory last converged to (``SET_BUNDLE_PROPOSED``).
+    bundle_proposed_label: bool = False
+    #: When the factory last decided to add it: an owner's removal before this was of an
+    #: earlier label.
+    bundle_proposed_at_us: int = 0
     applied_event_ids: frozenset[str] = frozenset()
 
     def session(self, session_id: str | None) -> StageSession | None:

@@ -37,6 +37,7 @@ from omnigent_factory.core.protocol import (
     ParsedResult,
     epic_plan_hash,
 )
+from omnigent_factory.core.reducer import CREATE_SEARCH_BUDGET
 from omnigent_factory.core.types import (
     MICROS_PER_MINUTE,
     SETTLED_LIFECYCLES,
@@ -121,7 +122,7 @@ def _concluded_empty_create(run: StageSession) -> bool:
         run.execution_closed
         and run.lifecycle in SETTLED_LIFECYCLES
         and run.create_unconfirmed
-        and run.create_searches >= 4
+        and run.create_searches >= CREATE_SEARCH_BUDGET
         and not run.create_match_seen
         and run.root_id is None
     )

@@ -33,7 +33,7 @@ from omnigent_factory.core.events import (
     ChecksState,
     FindingRef,
 )
-from omnigent_factory.core.protocol import CLOSE_CANDIDATE_LABEL
+from omnigent_factory.core.protocol import BUNDLE_PROPOSED_LABEL, CLOSE_CANDIDATE_LABEL
 from omnigent_factory.core.report_lines import keep_ticks
 from omnigent_factory.core.types import IssueLinks, IssueSnapshot, Stage
 from omnigent_factory.github.client import (
@@ -116,6 +116,7 @@ class TriageFields:
 
 #: Description of the ``factory:close-candidate`` label (created when absent).
 CLOSE_CANDIDATE_DESCRIPTION = "Triage suggests closing this issue; the owner decides"
+BUNDLE_PROPOSED_DESCRIPTION = "Named in an open bundle proposal; the owner decides"
 
 ParcelResolver = Callable[[str], Awaitable[ParcelBinding | None]]
 TriageFieldSource = Callable[[EffectIntent], Awaitable[TriageFields | None]]
@@ -1574,6 +1575,8 @@ class GitHubAPIAdapter:
                 return await self._ensure_project_item(effect)
             if effect.kind == EffectKind.SET_CLOSE_CANDIDATE:
                 return await self._close_candidate(effect)
+            if effect.kind == EffectKind.SET_BUNDLE_PROPOSED:
+                return await self._bundle_proposed(effect)
             if effect.kind == EffectKind.FETCH_PR_EVIDENCE:
                 read_started_us = self._now_us()  # before any read: covers earlier webhooks
                 not_before = effect.args.get("not_before_us")
@@ -1871,6 +1874,39 @@ class GitHubAPIAdapter:
                 return DefinitiveFailure(str(exc))
             return RetryableReadFailure(str(exc))
         return Ack(None, {"close_candidate": "added" if candidate else "removed"})
+
+    async def _bundle_proposed(self, effect: EffectIntent) -> AdapterOutcome:
+        """``SET_BUNDLE_PROPOSED``: add ``factory:bundle-proposed`` (creating the label
+        first) or remove it (absent is success). Idempotent, retried like
+        ``SET_CLOSE_CANDIDATE``; a 4xx is terminal."""
+        ref = await self._issue_ref(effect)
+        if ref is None:
+            return DefinitiveFailure("SET_BUNDLE_PROPOSED requires the parcel issue")
+        action = effect.args.get("action")
+        if action not in ("add", "remove"):
+            return DefinitiveFailure("SET_BUNDLE_PROPOSED action must be add or remove")
+        try:
+            if action == "add":
+                await ensure_label(
+                    self.client,
+                    self.repository,
+                    BUNDLE_PROPOSED_LABEL,
+                    BUNDLE_PROPOSED_DESCRIPTION,
+                )
+                await add_label(
+                    self.client, self.repository, ref.issue_number, BUNDLE_PROPOSED_LABEL
+                )
+            else:
+                await remove_label(
+                    self.client, self.repository, ref.issue_number, BUNDLE_PROPOSED_LABEL
+                )
+        except AmbiguousRequest as exc:
+            return RetryableReadFailure(f"label write uncertain: {exc}")
+        except GitHubRejected as exc:
+            if 400 <= exc.status_code < 500:
+                return DefinitiveFailure(str(exc))
+            return RetryableReadFailure(str(exc))
+        return Ack(None, {"bundle_proposed": "added" if action == "add" else "removed"})
 
     async def _single_select_fields(
         self, names: tuple[str, ...]

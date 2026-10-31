@@ -53,6 +53,10 @@ class EffectKind(enum.StrEnum):
     #: session``): an older one is superseded, so an owner's removal sticks until the next
     #: triage. Never closes the issue.
     SET_CLOSE_CANDIDATE = "set_close_candidate"
+    #: Converge the issue's ``factory:bundle-proposed`` label (idempotent add/remove,
+    #: ``args.action`` "add" or "remove") to ``Parcel.bundle_proposed_label``: an older
+    #: write the parcel no longer wants is superseded (latest wins).
+    SET_BUNDLE_PROPOSED = "set_bundle_proposed"
     ENSURE_PROJECT_ITEM = "ensure_project_item"
     FETCH_PR_EVIDENCE = "fetch_pr_evidence"
     RECONCILE_PARCEL = "reconcile_parcel"
@@ -118,6 +122,7 @@ VERIFIABLE_WRITE_KINDS = frozenset(
         EffectKind.REACT_COMMENT,
         EffectKind.EDIT_REPORT,
         EffectKind.SET_CLOSE_CANDIDATE,
+        EffectKind.SET_BUNDLE_PROPOSED,
         EffectKind.ENSURE_PROJECT_ITEM,
         EffectKind.INTERRUPT_TREE,
         EffectKind.REPLACE_COST_POLICY,

@@ -122,6 +122,8 @@ class EventKind(enum.StrEnum):
     EPIC_PROGRESS = "EpicProgress"
     TRIAGE_STALE = "TriageStale"
     CLOSE_CANDIDATE_BACKFILL = "CloseCandidateBackfill"
+    BUNDLE_PROPOSALS_OBSERVED = "BundleProposalsObserved"
+    BUNDLE_PROPOSED_REMOVED = "BundleProposedRemoved"
     BUNDLE_HOLD = "BundleHold"
     AGENT_BLOCKED_ON = "AgentBlockedOn"
     AUTOPILOT_STATUS = "AutopilotStatus"
@@ -238,6 +240,11 @@ class PlanFeedback(_Body):
     CLASS: ClassVar[EventClass] = EventClass.CONTROL
     text_digest: str = ""
     pr_number: int = 0
+    #: The issue comment clearly approves the plan (``core.approval_text``); in Scoped on
+    #: a published plan the reducer applies it as ``/approve`` (``effective_event``).
+    approves: bool = False
+    #: The plan hash the approving comment named (``approves`` only), else None.
+    approve_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -542,6 +549,8 @@ class ObservationFailed(_Body):
 
     KIND: ClassVar[EventKind] = EventKind.OBSERVATION_FAILED
     CLASS: ClassVar[EventClass] = EventClass.SAFETY
+    #: The violated invariant (for ``status``/``doctor``; "" in events recorded before it).
+    reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1069,6 +1078,28 @@ class CloseCandidateBackfill(_Body):
 
 
 @dataclass(frozen=True, slots=True)
+class BundleProposalsObserved(_Body):
+    """The bundling service's open proposals (pending, posting or posted) naming this
+    issue, by proposal key (empty: none any more: accepted, refused, stale, superseded
+    or gone). The ``factory:bundle-proposed`` label follows them while the card is in
+    Triage or Planning."""
+
+    KIND: ClassVar[EventKind] = EventKind.BUNDLE_PROPOSALS_OBSERVED
+    CLASS: ClassVar[EventClass] = EventClass.OBSERVATION
+    proposal_keys: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class BundleProposedRemoved(_Body):
+    """An owner removed the ``factory:bundle-proposed`` label (their own ``issues``
+    ``unlabeled`` webhook; never the factory's own write). The proposals open now never
+    re-add it; a later proposal may."""
+
+    KIND: ClassVar[EventKind] = EventKind.BUNDLE_PROPOSED_REMOVED
+    CLASS: ClassVar[EventClass] = EventClass.CONTROL
+
+
+@dataclass(frozen=True, slots=True)
 class BundleHold(_Body):
     """The bundling service's membership of this issue in bundle issue ``bundle``.
 
@@ -1377,6 +1408,8 @@ EventBody = (
     | EpicProgress
     | TriageStale
     | CloseCandidateBackfill
+    | BundleProposalsObserved
+    | BundleProposedRemoved
     | BundleHold
     | AgentBlockedOn
     | AutopilotStatus
@@ -1472,6 +1505,8 @@ BODY_TYPES: dict[EventKind, type[_Body]] = {
         EpicProgress,
         TriageStale,
         CloseCandidateBackfill,
+        BundleProposalsObserved,
+        BundleProposedRemoved,
         BundleHold,
         AgentBlockedOn,
         AutopilotStatus,
@@ -1561,6 +1596,8 @@ __all__ = [
     "BoardFieldsObserved",
     "BotEyes",
     "BundleHold",
+    "BundleProposalsObserved",
+    "BundleProposedRemoved",
     "CapacityAvailable",
     "CheckRef",
     "ChecksChanged",

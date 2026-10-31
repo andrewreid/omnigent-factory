@@ -325,6 +325,7 @@ _UNKNOWN_GITHUB_TARGETS = {
     EffectKind.PUBLISH_REPORT.value: "report comment",
     EffectKind.EDIT_REPORT.value: "report edit",
     EffectKind.SET_CLOSE_CANDIDATE.value: "close-candidate label",
+    EffectKind.SET_BUNDLE_PROPOSED.value: "bundle-proposed label",
     EffectKind.ENSURE_PROJECT_ITEM.value: "project item",
 }
 

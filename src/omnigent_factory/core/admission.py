@@ -75,6 +75,8 @@ ADMISSION: dict[EventKind, Admission] = {
     EventKind.AUTOPILOT_MARKED: _OWNER_CONTROL,
     # the owner removed the close-candidate label (their own issues webhook)
     EventKind.CLOSE_CANDIDATE_REMOVED: _OWNER_CONTROL,
+    # the owner removed the bundle-proposed label (their own issues webhook)
+    EventKind.BUNDLE_PROPOSED_REMOVED: _OWNER_CONTROL,
     # operator
     EventKind.PAUSE: Admission(_OPERATOR),
     EventKind.UNPAUSE: Admission(_OPERATOR),
@@ -153,6 +155,8 @@ ADMISSION: dict[EventKind, Admission] = {
     # the stale-triage pass: a pre-label triage's close-candidate label, once
     EventKind.CLOSE_CANDIDATE_BACKFILL: Admission(_ADAPTER),
     EventKind.BUNDLE_HOLD: Admission(_ADAPTER),
+    # the bundling service's open proposals naming the issue (its label follows them)
+    EventKind.BUNDLE_PROPOSALS_OBSERVED: Admission(_ADAPTER),
     EventKind.AGENT_BLOCKED_ON: Admission(_ADAPTER),
     EventKind.AUTOPILOT_STATUS: Admission(_ADAPTER),
     EventKind.AUTOPILOT_GATE_CREATED: Admission(_ADAPTER),

@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import signal
+import sys
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import replace
@@ -85,6 +86,8 @@ from omnigent_factory.store.sqlite import (
 )
 
 LOG = logging.getLogger(__name__)
+#: Characters of an observation failure's reason kept on its event.
+_OBSERVATION_REASON_CHARS = 300
 
 #: Effects an operator may requeue: comment publications adopt their effect marker, and
 #: their ack (PublicationAcked) clears the reducer's pending/failed/unknown state.
@@ -1463,13 +1466,18 @@ class FactoryService:
                 )
             )
 
-    async def hold_observation_failure(self, parcel_id: str) -> None:
+    async def hold_observation_failure(self, parcel_id: str, reason: str | None = None) -> None:
         """Contain a failed observation using the durable safety fence/drain path.
 
         Call only from per-parcel reconciliation, never from admission. Failure to
         persist the safety hold still propagates: startup must not reopen unsafe work.
+        ``reason`` defaults to the exception being handled; it is recorded on the event so
+        ``status`` and ``doctor`` list the parcel (``observation_holds``).
         """
         LOG.exception("observation invariant failed; holding parcel=%s", parcel_id)
+        if reason is None:
+            exc = sys.exc_info()[1]
+            reason = str(exc) if exc is not None else ""
         await self.apply_event(
             Event(
                 event_id=f"observation-failed:{parcel_id}:{uuid.uuid4()}",
@@ -1477,7 +1485,7 @@ class FactoryService:
                 parcel_id=parcel_id,
                 source_time_us=self.clock.now_utc_us(),
                 provenance=Provenance.ADAPTER,
-                body=ev.ObservationFailed(),
+                body=ev.ObservationFailed(reason=reason[:_OBSERVATION_REASON_CHARS]),
             )
         )
 
@@ -1506,11 +1514,13 @@ class FactoryService:
             errors = self.config.validate_paths()
             schema_version = await self.db.call(lambda store: store.schema_version())
             admission = await self.db.call(lambda store: store.load_admission(self.config.repo_id))
+            holds = await self.db.call(lambda store: store.observation_holds(self.config.repo_id))
             return {
                 **self._building_status(admission),
                 "healthy": not errors,
                 "errors": errors,
                 "schema_version": schema_version,
+                "observation_holds": holds,
             }
         if command in ("pause", "unpause"):
             body: ev.EventBody = ev.Pause() if command == "pause" else ev.Unpause()
@@ -1767,6 +1777,9 @@ class FactoryService:
             "health_sweep": (self.health_sweep.status() if self.health_sweep is not None else None),
             "worktrees": (
                 await self.worktree_gc.status() if self.worktree_gc is not None else None
+            ),
+            "observation_holds": await self.db.call(
+                lambda store: store.observation_holds(self.config.repo_id)
             ),
         }
 

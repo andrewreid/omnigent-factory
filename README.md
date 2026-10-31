@@ -41,11 +41,56 @@ otherwise S for triage and M for the rest).
 | `/triage` | Inbox; any column but Ready after a stop | Moves the card to Triage and starts a triage run. In Triage, re-run triage with a plain comment instead; a repeat while the same triage is still starting or running is ignored (😕, no note). |
 | `/plan`, `/replan` | Inbox, Triage, Planning, Building; not Ready | Starts a plan run; in Planning, `/plan` while the same plan is still unpublished is ignored (😕, no note). In Building, or with a build approved, it revokes the build and replans. |
 | `/approve [hash] [for <N>h]` | Planning or Building | Approves the latest published plan and queues the build. `hash` is a prefix (≥ 12 lowercase hex) that must identify the latest plan; without it, the plan must have been posted before the command. Refused while a question is open, a revision is pending or another build holds the parcel. `/approve` of the plan whose build is already queued or running is refused (😕, `Nothing new to approve: this plan is already approved`); a drag to Building of it only notes `Approved: build starts when capacity allows`. |
+| Approving comment (no `/`) | Planning, with a published plan | A short plain comment that clearly approves is applied exactly as `/approve` (same checks, 👍/😕 and refusal note) instead of as plan feedback; see [Approving in plain words](#approving-in-plain-words). |
 | `/continue [for <N>h]` | A card at `Bot: Checkpoint` | Grants another time block to the paused run. Refused when the run is not at a checkpoint, is stopped or revoked, or a question is still open. |
 | `/stop` | Any column | Stops all work: drains every run, drops any queued build and pending start. Note `Stopped: /stop`. Resume with a new control (`/triage`, `/plan`, a drag, or a plain comment in Triage or Planning); a comment never starts a rework on a stopped card. |
 | `/bundle #a #b [theme]` | Any issue that is to be a member | With [bundling](#bundling) on: builds the commented issue and the named ones (2 to `bundle_command_max_members`, default 8, in all) as one PR. Your explicit choice overrides the size rules (L or unsized members, size points) and may take sub-issues of an epic on autopilot (not one autopilot is driving right now), never the other protective ones; refused with a reply listing what breaks the rules. When it takes autopilot-epic sub-issues, a reply says the bundle builds them, not autopilot. |
 | `/unbundle` | A bundle issue, or one of its members | On the bundle issue: releases every member (the bundle issue stays an ordinary issue). On a member: releases only that member. |
 | `/decide <id> <answer>` | A card with an open question | Answers the open question `<id>` with `<answer>`. On a build, `/decide` revokes the build and replans (a plain reply is taken within the approval). The id is not shown in the question comment, so a plain reply is the normal answer. |
+
+### Approving in plain words
+
+In Planning, a plain owner comment is normally plan feedback: it revises the plan (and
+voids any approval). A comment that **clearly approves** is instead applied exactly like
+`/approve` (no hash, or with the hash it names), so "Plan approved per conversation
+in-session." approves rather than revises. It applies only to an owner's issue comment
+(not a PR comment or review), only while the card is in Planning and its plan is
+published; anywhere else the comment stays feedback, as before. The grammar is positive and fails closed: anything it does not explicitly allow stays
+feedback.
+
+1. **One safe line.** Trimmed, the comment is exactly one non-empty line made only of
+   ASCII letters, digits, spaces, `. , ! : - '` and the emoji 👍 (any skin tone), 🚀, ✅,
+   ✔️, 🎉, 👌, 💯, 🙏. Anything else keeps it feedback without further reading: code
+   (any backtick), a blockquote (`>`), HTML, links, Markdown marks (`*`, `_`, `~`, `#`,
+   list bullets), a question mark, tabs, a second non-empty line, smart quotes or
+   apostrophes (`don’t`), other Unicode punctuation, Unicode lookalike letters and
+   zero-width characters.
+2. **Words.** It must start with a letter or digit. It is lower-cased, trailing
+   `. , ! : - '`, spaces and the emoji above are dropped, and it is split into words at
+   spaces and `. , ! : -` (so `in-session` is `in session`).
+3. **Phrase, then allowlisted words only.** The first words must be one of: `approved`,
+   `approve`, `approving`, `i approve`, `approve plan`, `approve the plan`,
+   `approved plan`, `plan approved`, `plan is approved`, `plan looks good`, `lgtm`,
+   `looks good`, `looks good to me`, `ship it`, `go ahead`. At most 6 more words may
+   follow, each one of: `per`, `as`, `discussed`, `agreed`, `in`, `session`,
+   `conversation`, `our`, `the`, `this`, `plan`, `it`, `thanks`, `thank`, `you`,
+   `cheers`, `now`, `go`, `ahead`, `with`, `on`, `omnigent`, `chat`, `above`. Any other
+   word (`pending`, `merge`, `ci`, `don't`, `after`, `but`, ...) or an emoji before the
+   end keeps it feedback. `Plan approved per conversation in-session.`, `LGTM 🚀`,
+   `Approved, thanks!` and `Go ahead with the plan` approve; `Approved pending CI` and
+   `Approved, don't merge` do not.
+4. **Or with the plan's hash.** Exactly one word of 12 to 64 hex digits, anywhere; the
+   other words must satisfy rule 3 (which then also allows `hash`): `Approved
+   3f2a9c1b7d4e`, `3f2a9c1b7d4e lgtm`, `plan 3f2a9c1b7d4e approved`. The token must be a
+   prefix of one of this issue's published plans; a stale plan's hash is refused like
+   `/approve <stale hash>`, and a token naming no plan (a commit SHA, say) leaves the
+   comment as feedback. Two hex tokens keep it feedback.
+
+Because it is `/approve`, it is refused (😕 and the reason in the `Factory note`, never
+silently taken as feedback) while a question is open, a revision is pending, the plan is
+not current, the hash is stale or another build holds the parcel; re-approving the
+already-approved plan is refused as `Nothing new to approve`. Use `/approve` to be
+explicit, or add any change request to keep a comment as feedback.
 
 ### Labels
 
@@ -114,7 +159,11 @@ cap, new admissions and parked-build wakes wait for capacity. A complete idle sc
 releases the observed reservation. `status` and `doctor` show the total, cap and
 `building_observed_over_cap` count (for example, 5/4 with 1 observed over cap).
 A parcel observation that violates a store invariant is logged and safety-held during
-reconciliation; startup continues with the other parcels.
+reconciliation; startup continues with the other parcels. Each such hold is recorded on
+its `ObservationFailed` event (no extra table), so `status` lists them under
+`observation_holds` (up to 20 parcels, newest first: issue, how many times it was held,
+the last reason and time, and whether it is still safety-held) and `doctor` warns while
+any is still held (a parcel held again on every restart shows a growing count).
 
 `max_open_bot_prs` limits open factory-authored PRs plus builds which have reserved a PR
 slot but have not opened one yet. The periodic reconcile verifies a bounded batch of the
@@ -604,6 +653,19 @@ with `- [ ] Build these together as one PR`, and the ranking's status update nam
 The same member set proposed again is the same proposal (a hidden marker): never a second
 comment. If a member stops meeting the rules before you tick, the comment says the
 proposal is stale and nothing happens.
+
+Every member of an open proposal (pending or posted, not yet ticked) carries the
+`factory:bundle-proposed` label (created when absent) while its card is in Triage or
+Planning, so the proposed issues are easy to filter. It goes when the proposal is
+accepted (the members are then bundled), refused, goes stale or is superseded, or when
+the card leaves Triage/Planning; an issue named by several open proposals keeps it until
+none is left. If you remove it yourself (seen by its `unlabeled` webhook from an owner),
+the factory never re-adds it for the proposals open at that moment; a later proposal
+naming the issue may. The label is a durable effect (`set_bundle_proposed`), retried like
+`set_close_candidate` (removing an absent label is fine; a refused 4xx write shows under
+`recovery` for `retry-effect`). Each reconcile tick reports at most 10 changed issues to
+the reducer, so proposals posted before the label existed are labelled within a few
+ticks.
 
 **Confirmed.** Only your tick counts (the comment's `edited` webhook from an owner; a lost
 webhook is recovered from the comment's edit history only when it shows you made the
@@ -1270,6 +1332,18 @@ example `factory-issue-737-devenv-start.log`). It logs every removal. A stray Gi
 directory must still be readable, belong to the dedicated clone, be clean and have no
 commits beyond `origin/main`; a symlink, special file or unreadable Git directory is kept.
 A configured dev-environment teardown must succeed before a stray directory is removed.
+When the teardown names a repository script (the first relative argument containing `/`,
+such as `scripts/dev-environment.sh`, run directly or after an interpreter like `bash`)
+and the stray directory does not contain it, the teardown cannot apply there and is
+skipped (logged) instead of failing with `exit 127`; plain files never run it. The script
+the stray holds is opened without following any symlink (no `..`, no link anywhere on its
+path, a regular file) and that exact file is run through its descriptor by the shell
+(`bash`/`sh`/`dash` before it, or named by its `#!` line, directly or via `env`), with `$0`
+and the arguments as before, so swapping the path afterwards cannot change what runs. A
+script that is absent, reached through a symlink or `..`, or run by anything other than
+such a shell is skipped (logged) for a stray, never run. Teardown of a factory worktree
+being cleaned up, and a host (absolute) or pathless command, run as configured. Every
+other check above still applies.
 The last sweep result reports these decisions under `strays`; there is no worktree-sweep
 dry-run command.
 

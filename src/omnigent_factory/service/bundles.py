@@ -104,6 +104,8 @@ POINTS = {"S": 1, "M": 3}
 MAX_MEMBERS = 12
 #: Bundles one ranking may propose.
 MAX_PROPOSALS = 10
+#: Member issues whose ``factory:bundle-proposed`` state one reconcile tick updates.
+PROPOSED_LABEL_SYNC_LIMIT = 10
 DISCOVERY_PAGE_SIZE = 50
 THEME_MAX = 80
 REASON_MAX = 600
@@ -1960,10 +1962,57 @@ class Bundles:
     # -------------------------------------------------------------- operator
 
     async def tick(self) -> None:
-        """Every reconcile tick: post new proposals, advance bundles, mirror Bot."""
+        """Every reconcile tick: post new proposals, advance bundles, mirror Bot, and
+        converge the members' ``factory:bundle-proposed`` labels."""
         await self.post_pending()
         await self.sync()
         await self.mirror_bots()
+        await self.sync_proposed_labels()
+
+    async def sync_proposed_labels(self, *, limit: int = PROPOSED_LABEL_SYNC_LIMIT) -> int:
+        """Tell each member issue which open proposals (pending, posting or posted) name
+        it (``BundleProposalsObserved``); the reducer converges the
+        ``factory:bundle-proposed`` label through the durable ``SET_BUNDLE_PROPOSED``
+        effect. Issues whose recorded set already matches are skipped, and at most
+        ``limit`` issues are updated per pass (the next tick continues), so the first
+        pass after an upgrade backfills existing proposals gradually. Returns how many
+        issues it updated."""
+        repo_id = self._repo_id
+        wanted: dict[int, set[str]] = {}
+        for p in await self._db(
+            partial(bs.proposals_of, repo_id=repo_id, states=sorted(bs.OPEN_PROPOSAL_STATES))
+        ):
+            for number in p.members:
+                wanted.setdefault(number, set()).add(p.proposal_key)
+        rows = await self._db(
+            lambda store: store.query(
+                "SELECT issue_number, aggregate_json FROM parcels WHERE repo_id = ? AND "
+                "issue_number IS NOT NULL AND (issue_number IN (SELECT value FROM json_each(?)) "
+                "OR json_array_length(json_extract(aggregate_json, "
+                "'$.parcel.bundle_proposals')) > 0) ORDER BY issue_number",
+                (repo_id, json.dumps(sorted(wanted))),
+            )
+        )
+        updated = 0
+        for number, aggregate in rows:
+            if updated >= limit:
+                break
+            parcel = parcel_from_json(str(aggregate))
+            keys = tuple(sorted(wanted.get(int(number), ())))
+            if parcel.bundle_proposals == keys:
+                continue
+            digest = hashlib.sha256(",".join(keys).encode()).hexdigest()[:12]
+            now = self.service.clock.now_utc_us()
+            result = await self.service.apply_event(
+                self._event(
+                    parcel,
+                    f"bundle-proposed:{number}:{digest}:{now}",
+                    ev.BundleProposalsObserved(proposal_keys=keys),
+                )
+            )
+            if result.accepted:
+                updated += 1
+        return updated
 
     async def command(self, args: Mapping[str, object]) -> dict[str, object]:
         """``bundles status|on|off|list|propose-now`` over the operator socket."""

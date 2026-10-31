@@ -19,8 +19,9 @@ from types import MappingProxyType
 from typing import Any
 
 from omnigent_factory.core import events as ev
+from omnigent_factory.core.approval_text import classify_approval
 from omnigent_factory.core.events import Event, Provenance
-from omnigent_factory.core.protocol import CLOSE_CANDIDATE_LABEL
+from omnigent_factory.core.protocol import BUNDLE_PROPOSED_LABEL, CLOSE_CANDIDATE_LABEL
 from omnigent_factory.core.types import MICROS_PER_HOUR, IssueSnapshot, Stage, Via, is_leftward
 from omnigent_factory.github.client import GitHubClient
 from omnigent_factory.ports.github import STATUS_OPTION_IDS, stage_for_option
@@ -365,6 +366,15 @@ class DeliveryNormalizer:
         command = _COMMAND.match(stripped)
         if command is None:
             digest = hashlib.sha256(text.encode()).hexdigest()
+            # A clearly approving comment is marked; the reducer treats it as /approve
+            # only in Scoped on a published plan (``effective_event``).
+            approval = classify_approval(text)
+            if approval is not None:
+                return (
+                    ev.PlanFeedback(
+                        text_digest=digest, approves=True, approve_hash=approval.hash_text
+                    ),
+                )
             return (ev.PlanFeedback(text_digest=digest),)
         name, args = command.group("name"), command.group("args") or ""
         if name == "triage":
@@ -448,13 +458,17 @@ class DeliveryNormalizer:
         return (body,)
 
     def _unlabel(self, payload: dict[str, Any], actor_id: int) -> tuple[ev.EventBody, ...]:
-        """An owner's removal of ``factory:close-candidate`` (any other label, and anyone
-        else's removal, the factory's own included, is no transition)."""
+        """An owner's removal of ``factory:close-candidate`` or ``factory:bundle-proposed``
+        (any other label, and anyone else's removal, the factory's own included, is no
+        transition)."""
         if actor_id == self.identity.bot_user_id or actor_id not in self.identity.owner_ids:
             return ()
-        if label_name(payload) != CLOSE_CANDIDATE_LABEL:
-            return ()
-        return (ev.CloseCandidateRemoved(),)
+        name = label_name(payload)
+        if name == CLOSE_CANDIDATE_LABEL:
+            return (ev.CloseCandidateRemoved(),)
+        if name == BUNDLE_PROPOSED_LABEL:
+            return (ev.BundleProposedRemoved(),)
+        return ()
 
     def _project_move(self, payload: dict[str, Any], actor_id: int) -> tuple[ev.EventBody, ...]:
         item = payload.get("projects_v2_item")

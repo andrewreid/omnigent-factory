@@ -59,10 +59,16 @@ from omnigent_factory.core.events import (
 )
 from omnigent_factory.core.preconditions import effect_still_valid
 from omnigent_factory.core.predicates import RUNNING_LIFECYCLES
-from omnigent_factory.core.reducer import TransitionResult, build_parked, transition
+from omnigent_factory.core.reducer import (
+    TransitionResult,
+    build_parked,
+    effective_event,
+    transition,
+)
 from omnigent_factory.core.types import (
     FENCE_BITS,
     AdmissionSnapshot,
+    Hold,
     IssueSnapshot,
     Lifecycle,
     Parcel,
@@ -207,6 +213,73 @@ class PruneBatch:
     audit: int
     last_sequence: int
     done: bool
+
+
+#: Parcels :func:`observation_holds` lists (still held first, then newest first).
+OBSERVATION_HOLDS_LIMIT = 20
+
+#: One row per parcel with an accepted ``ObservationFailed``: its last failure (SQLite
+#: takes bare columns from the MAX() row), how many, and whether it is still
+#: safety-held now (``held``), so both callers rank and count held parcels in SQL.
+_OBSERVATION_HOLD_ROWS = (
+    "SELECT e.parcel_id, MAX(e.sequence) AS last_sequence, COUNT(*) AS failures, "
+    "e.source_time_us, "
+    "e.payload_json, p.issue_number, p.holds_json, "
+    "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(p.holds_json) "
+    "THEN p.holds_json ELSE '[]' END) WHERE value = ?) AS held "
+    "FROM events e LEFT JOIN parcels p ON p.parcel_id = e.parcel_id "
+    "WHERE e.kind = ? AND e.repo_id = ? AND e.accepted = 1 AND e.parcel_id IS NOT NULL "
+    "GROUP BY e.parcel_id"
+)
+
+
+def observation_held_count(conn: sqlite3.Connection, repo_id: str) -> int:
+    """How many parcels with a failed observation are safety-held now (no display limit:
+    a live hold is never hidden behind a longer released history)."""
+    row = conn.execute(
+        f"SELECT COUNT(*) FROM ({_OBSERVATION_HOLD_ROWS}) WHERE held",
+        (Hold.SAFETY.value, EventKind.OBSERVATION_FAILED.value, repo_id),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def observation_holds(
+    conn: sqlite3.Connection, repo_id: str, *, limit: int = OBSERVATION_HOLDS_LIMIT
+) -> list[dict[str, Any]]:
+    """Parcels safety-held because an observation failed a store invariant.
+
+    One row per parcel (at most ``limit``; parcels still safety-held first, then newest
+    failure first, so a live hold is listed however much released history there is):
+    how many accepted ``ObservationFailed`` events it has, the last one's reason and time,
+    and whether the parcel is still safety-held. Read from the event log (those events are
+    never pruned: their kind is not a prunable observation and the safety fence references
+    them), so it needs no table of its own. Works on any connection, including a read-only
+    one. :func:`observation_held_count` counts held parcels without the limit.
+    """
+    rows = conn.execute(
+        "SELECT parcel_id, failures, source_time_us, payload_json, issue_number, held "
+        f"FROM ({_OBSERVATION_HOLD_ROWS}) "
+        "ORDER BY held DESC, last_sequence DESC LIMIT ?",
+        (Hold.SAFETY.value, EventKind.OBSERVATION_FAILED.value, repo_id, limit),
+    ).fetchall()
+    holds: list[dict[str, Any]] = []
+    for parcel_id, failures, at_us, payload, issue, held in rows:
+        try:
+            body = json.loads(payload).get("body") or {}
+            reason = str(body.get("reason") or "")
+        except (ValueError, AttributeError):
+            reason = ""
+        holds.append(
+            {
+                "parcel": parcel_id,
+                "issue": issue,
+                "count": int(failures),
+                "last_reason": reason,
+                "last_at_us": int(at_us),
+                "held": bool(held),
+            }
+        )
+    return holds
 
 
 class StoreError(RuntimeError):
@@ -539,6 +612,10 @@ class SqliteStore:
 
     def load_admission(self, repo_id: str) -> AdmissionSnapshot:
         return self._load_admission(self._conn, repo_id)
+
+    def observation_holds(self, repo_id: str) -> list[dict[str, Any]]:
+        """See :func:`observation_holds`."""
+        return observation_holds(self._conn, repo_id)
 
     @staticmethod
     def _load_admission(conn: sqlite3.Connection, repo_id: str) -> AdmissionSnapshot:
@@ -1547,6 +1624,8 @@ class SqliteStore:
                 issue_number=event.issue_number,
             )
         old_parcel = parcel
+        # Stored as applied: an approving owner comment is recorded as the approval.
+        event = effective_event(parcel, event)
         result = reducer(State(parcel=parcel, admission=admission, config=config), event)
         new = result.state
         if new.parcel is not None:

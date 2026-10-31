@@ -34,6 +34,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import threading
 from collections.abc import Callable, Sequence
@@ -319,7 +320,8 @@ class WorkspaceCleaner:
         directory carrying Git metadata is removed only when it can still be verified as
         part of the dedicated clone, is clean and has no commits beyond the fetched base.
         Symlinks and special files are always kept.  A configured dev-environment teardown
-        must also succeed before a directory is removed.
+        must also succeed before a directory is removed, unless the directory lacks the
+        teardown's repository script (then it cannot apply and is skipped).
         """
         with self._lock:
             kept = self._stray_problem(path)
@@ -327,12 +329,29 @@ class WorkspaceCleaner:
                 LOG.info("stray worktree entry kept path=%s reason=%s", path, kept)
                 return f"kept: {kept}"
             if path.is_dir() and self.teardown:
-                failed = self._run_teardown(path)
-                if failed is not None:
-                    LOG.warning(
-                        "stray dev environment teardown failed path=%s reason=%s", path, failed
+                bound = self._bind_stray_teardown(path)
+                if isinstance(bound, str):
+                    # The teardown cannot apply here (or cannot be bound to the stray's
+                    # own script): skip it rather than run something the stray lacks.
+                    LOG.info(
+                        "stray dev environment teardown skipped path=%s reason=%s", path, bound
                     )
-                    return f"kept: dev environment teardown failed: {failed}"
+                else:
+                    argv, fd = bound
+                    try:
+                        failed = self._run_teardown(
+                            path, argv, pass_fds=() if fd is None else (fd,)
+                        )
+                    finally:
+                        if fd is not None:
+                            os.close(fd)
+                    if failed is not None:
+                        LOG.warning(
+                            "stray dev environment teardown failed path=%s reason=%s",
+                            path,
+                            failed,
+                        )
+                        return f"kept: dev environment teardown failed: {failed}"
             with CLONE_LOCK:
                 why_not = (guard() if guard is not None else None) or self._stray_problem(path)
                 if why_not is None and any(
@@ -421,15 +440,72 @@ class WorkspaceCleaner:
         with contextlib.suppress(OSError, WorktreeError):
             (self.workspaces.admin_dir(path) / TEARDOWN_DONE).unlink(missing_ok=True)
 
-    def _run_teardown(self, path: Path) -> str | None:
-        """None on exit 0; otherwise why it failed (exit code or timeout, last stderr line)."""
-        argv = list(self.teardown)
-        if "/" in argv[0] and not Path(argv[0]).is_absolute():
-            argv[0] = str(path / argv[0])  # a repository script, from this worktree
+    def _teardown_script_index(self) -> int | None:
+        """Where the teardown names its repository script: the first relative argument
+        with a ``/`` (``scripts/x.sh`` run directly, or after an interpreter such as
+        ``bash``). None: an absolute host program or no script path at all."""
+        for i, arg in enumerate(self.teardown):
+            if not arg.startswith("-") and "/" in arg and not Path(arg).is_absolute():
+                return i
+        return None
+
+    def _bind_stray_teardown(self, path: Path) -> tuple[list[str], int | None] | str:
+        """The stray teardown's argv, bound to the script the stray directory holds, and
+        the descriptor to pass; or why it is skipped.
+
+        A host or pathless command runs as configured (descriptor None). Otherwise the
+        script is opened beneath ``path`` with ``O_NOFOLLOW`` on every component (no
+        ``..``, no symlink anywhere, a regular file), and the shell runs exactly those
+        bytes through the descriptor: ``<shell> [flag] -c '. /dev/fd/N' <$0> <args>``
+        (``$0`` as before). A later swap of the path cannot change what runs. Only a
+        shell can be bound this way: ``bash``/``sh``/``dash`` before the script, or a
+        script whose ``#!`` names one (directly or via ``env``). Anything else, an
+        absent script (the teardown cannot apply: it would only exit 127) or a failed
+        open is skipped, never run.
+        """
+        index = self._teardown_script_index()
+        if index is None:
+            return list(self.teardown), None
+        arg = self.teardown[index]
+        parts = [part for part in arg.split("/") if part not in ("", ".")]
+        if not parts or ".." in parts:
+            return f"{arg} leaves the stray"
+        try:
+            fd = _open_beneath(path, parts)
+        except FileNotFoundError:
+            return f"no {arg} in it"
+        except OSError as exc:
+            return f"{arg} is not a regular file beneath it ({exc.strerror or exc})"
+        if fd is None:
+            return f"{arg} is not a regular file beneath it"
+        if index == 0:
+            shell = _shebang_shell(fd)
+            zeroth = str(path / arg)  # as the direct form ran it before
+        else:
+            prefix = self.teardown[:index]
+            ok = Path(prefix[0]).name in _SHELLS and all(a.startswith("-") for a in prefix[1:])
+            shell = list(prefix) if ok else None
+            zeroth = arg
+        if shell is None:
+            os.close(fd)
+            return f"{arg} is not run by a shell the teardown can bind"
+        rest = list(self.teardown[index + 1 :])
+        return [*shell, "-c", f". /dev/fd/{fd}", zeroth, *rest], fd
+
+    def _run_teardown(
+        self, path: Path, argv: list[str] | None = None, *, pass_fds: tuple[int, ...] = ()
+    ) -> str | None:
+        """None on exit 0; otherwise why it failed (exit code or timeout, last stderr line).
+        ``argv`` overrides the configured command (a stray's bound teardown)."""
+        if argv is None:
+            argv = list(self.teardown)
+            if "/" in argv[0] and not Path(argv[0]).is_absolute():
+                argv[0] = str(path / argv[0])  # a repository script, from this worktree
         try:
             proc = subprocess.Popen(  # noqa: S603 - argv from the host config, no shell
                 argv,
                 cwd=path,
+                pass_fds=pass_fds,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -451,6 +527,50 @@ class WorkspaceCleaner:
         lines = [line.strip() for line in (err or "").splitlines() if line.strip()]
         last = f": {lines[-1]}" if lines else ""
         return f"exit {proc.returncode}{last}"[:_REASON_CHARS]
+
+
+#: Interpreters a stray teardown can be bound to (they read the script from a descriptor).
+_SHELLS = frozenset({"bash", "sh", "dash"})
+_SHEBANG_FLAG = re.compile(r"-[A-Za-z]+")
+
+
+def _open_beneath(root: Path, parts: list[str]) -> int | None:
+    """A read descriptor for ``root/<parts>`` opened without following any symlink, or
+    None when it is not a regular file. ``OSError`` (``ELOOP`` for a link) propagates."""
+    nofollow = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    current = os.open(root, nofollow | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, nofollow | os.O_DIRECTORY, dir_fd=current)
+            os.close(current)
+            current = child
+        fd = os.open(parts[-1], nofollow | os.O_NONBLOCK, dir_fd=current)
+    finally:
+        os.close(current)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return None
+    return fd
+
+
+def _shebang_shell(fd: int) -> list[str] | None:
+    """The shell argv a directly run script names in its ``#!`` line (``/bin/bash``,
+    ``/bin/sh -e``, ``/usr/bin/env bash``), else None (not bindable)."""
+    head = os.pread(fd, 256, 0)
+    if not head.startswith(b"#!"):
+        return None
+    line = head[2:].split(b"\n", 1)[0].decode("ascii", "replace").strip()
+    words = line.split(None, 1)
+    if not words or not words[0].startswith("/"):
+        return None
+    interpreter, extra = words[0], (words[1].strip() if len(words) > 1 else "")
+    if Path(interpreter).name == "env":
+        return [interpreter, extra] if extra in _SHELLS else None
+    if Path(interpreter).name not in _SHELLS:
+        return None
+    if not extra:
+        return [interpreter]
+    return [interpreter, extra] if _SHEBANG_FLAG.fullmatch(extra) else None
 
 
 class CleanupAdapter:

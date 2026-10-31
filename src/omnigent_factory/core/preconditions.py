@@ -85,6 +85,12 @@ def effect_still_valid(
         ):
             # Left Triage since, or the owner removed this triage's label: never re-add.
             return "close-candidate-superseded"
+    if (
+        effect.kind == EffectKind.SET_BUNDLE_PROPOSED
+        and parcel is not None
+        and (effect.args.get("action") == "add") != parcel.bundle_proposed_label
+    ):
+        return "bundle-proposed-superseded"  # the parcel wants the other state now
     if parcel is not None and Hold.COMPLETED in parcel.holds:
         completed = _completed_invalid(effect)
         if completed is not None:

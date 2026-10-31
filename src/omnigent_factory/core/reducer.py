@@ -220,6 +220,7 @@ _DEFAULT_RETRY: dict[EffectKind, RetryClass] = {
     EffectKind.PUBLISH_REPORT: RetryClass.ADOPTABLE_WRITE,
     EffectKind.EDIT_REPORT: RetryClass.READ,  # idempotent PATCH of a marked comment
     EffectKind.SET_CLOSE_CANDIDATE: RetryClass.ADOPTABLE_WRITE,  # idempotent label add/remove
+    EffectKind.SET_BUNDLE_PROPOSED: RetryClass.ADOPTABLE_WRITE,  # idempotent label add/remove
     EffectKind.ENSURE_PROJECT_ITEM: RetryClass.ADOPTABLE_WRITE,
     EffectKind.FETCH_PR_EVIDENCE: RetryClass.READ,
     EffectKind.RECONCILE_PARCEL: RetryClass.READ,
@@ -1741,6 +1742,63 @@ def _h_close_candidate_backfill(ctx: _Ctx, body: ev.CloseCandidateBackfill) -> N
     if body.session_id == p.close_candidate_removed:
         raise Rejected("close-candidate-removal-recorded")
     _issue_close_candidate(ctx, body.session_id)
+
+
+#: Columns whose cards carry ``factory:bundle-proposed`` while a proposal names them.
+_BUNDLE_PROPOSED_STAGES = frozenset({Stage.TRIAGED, Stage.SCOPED})
+
+
+def _h_bundle_proposals_observed(ctx: _Ctx, body: ev.BundleProposalsObserved) -> None:
+    """The bundling service's open proposals naming this issue; the label follows them
+    (``_settle_bundle_proposed``). An owner's removal is kept only for proposals still
+    open, so the record stays bounded."""
+    keys = tuple(sorted(set(body.proposal_keys)))
+    if keys == ctx.p.bundle_proposals:
+        raise Rejected("bundle-proposals-unchanged")
+    ctx.update(
+        bundle_proposals=keys,
+        bundle_proposed_removed=tuple(k for k in ctx.p.bundle_proposed_removed if k in keys),
+    )
+
+
+def _h_bundle_proposed_removed(ctx: _Ctx, body: ev.BundleProposedRemoved) -> None:
+    """An owner removed ``factory:bundle-proposed``: the proposals open now never re-add
+    it (like ``factory:close-candidate``); a later proposal may. A removal clearly from
+    before the factory's latest add was of an earlier label."""
+    _ = body
+    e = ctx.event
+    if e.provenance not in ev.CONTROL_PROVENANCES:
+        raise Rejected("control-without-authenticated-source")
+    if e.actor_id is None or e.actor_id not in ctx.config.owners:
+        raise Rejected("control-from-non-owner")
+    if not ctx.p.bundle_proposed_label:
+        raise Rejected("bundle-proposed-not-added")
+    if ctx.now < ctx.p.bundle_proposed_at_us - GITHUB_TIME_SLACK_US:
+        raise Rejected("bundle-proposed-removal-before-add")
+    removed = tuple(sorted({*ctx.p.bundle_proposed_removed, *ctx.p.bundle_proposals}))
+    # The label is already gone: nothing to remove (the settle sees it as converged).
+    ctx.update(bundle_proposed_removed=removed, bundle_proposed_label=False)
+
+
+def _bundle_proposed_wanted(p: Parcel) -> bool:
+    return p.stage in _BUNDLE_PROPOSED_STAGES and any(
+        k not in p.bundle_proposed_removed for k in p.bundle_proposals
+    )
+
+
+def _settle_bundle_proposed(ctx: _Ctx) -> None:
+    """Converge ``factory:bundle-proposed`` (durable, retried ``SET_BUNDLE_PROPOSED``):
+    on while an open proposal names the issue (and the owner has not removed it for
+    that proposal) and the card is in Triage or Planning; off otherwise (the proposal
+    was accepted, refused, went stale or was superseded, or the card left)."""
+    wanted = _bundle_proposed_wanted(ctx.p)
+    if wanted == ctx.p.bundle_proposed_label:
+        return
+    if wanted:
+        ctx.update(bundle_proposed_label=True, bundle_proposed_at_us=ctx.now)
+    else:
+        ctx.update(bundle_proposed_label=False)
+    ctx.emit(EffectKind.SET_BUNDLE_PROPOSED, args={"action": "add" if wanted else "remove"})
 
 
 def _h_triage_stale(ctx: _Ctx, body: ev.TriageStale) -> None:
@@ -5138,6 +5196,9 @@ def _h_create_rejected(ctx: _Ctx, body: ev.CreateRejected) -> None:
 # Four complete empty searches spanning at least ten minutes. Read failures keep
 # the same outbox search pending and never advance this budget.
 _CREATE_SEARCH_DELAYS_US = (60_000_000, 180_000_000, 360_000_000)
+#: Complete empty searches after which an unconfirmed create is concluded absent
+#: (one immediate search plus one per delay). Single source of truth for readers.
+CREATE_SEARCH_BUDGET = len(_CREATE_SEARCH_DELAYS_US) + 1
 _CREATE_WATCH_US = 600_000_000
 _CREATE_WATCH_WINDOW_US = 7 * 24 * 60 * 60 * 1_000_000
 
@@ -6444,6 +6505,8 @@ HANDLERS: dict[EventKind, _Handler] = {
     EventKind.EPIC_PROGRESS: _h_epic_progress,
     EventKind.TRIAGE_STALE: _h_triage_stale,
     EventKind.CLOSE_CANDIDATE_BACKFILL: _h_close_candidate_backfill,
+    EventKind.BUNDLE_PROPOSALS_OBSERVED: _h_bundle_proposals_observed,
+    EventKind.BUNDLE_PROPOSED_REMOVED: _h_bundle_proposed_removed,
     EventKind.BUNDLE_HOLD: _h_bundle_hold,
     EventKind.AGENT_BLOCKED_ON: _h_agent_blocked_on,
     EventKind.CONTRACT_PUBLISHED: _h_contract_published,
@@ -6991,8 +7054,36 @@ def _reject(state: State, event: Event, reason: str) -> TransitionResult:
     )
 
 
+def effective_event(parcel: Parcel | None, event: Event) -> Event:
+    """The event as applied: an owner's issue comment that clearly approves the plan
+    (``PlanFeedback.approves``, see ``core.approval_text``) is ``/approve`` when the card
+    is in Scoped and its plan is published.
+
+    It then takes exactly the ``ApprovePlan`` path (every check, the refusal note, the
+    👍/😕 reaction), so a pending revision or an unapprovable plan is refused with its
+    reason instead of silently becoming feedback. A named hash must be a prefix of one of
+    the parcel's published plans (a stale one is refused like ``/approve <stale>``); a hex
+    token naming none of them (a commit SHA, say) leaves the comment as feedback, as does
+    any other column or a card without a published plan. Pure; idempotent.
+    """
+    body = event.body
+    if not isinstance(body, ev.PlanFeedback) or not body.approves or body.pr_number:
+        return event
+    if parcel is None or parcel.stage != Stage.SCOPED:
+        return event
+    latest = parcel.current_contract
+    if latest is None or not latest.published:
+        return event
+    if body.approve_hash is not None:
+        handle = body.approve_hash.lower()
+        if not any(c.published and c.full_hash.startswith(handle) for c in parcel.contracts):
+            return event
+    return replace(event, body=ev.ApprovePlan(via=Via.COMMAND, hash_text=body.approve_hash))
+
+
 def transition(state: State, event: Event) -> TransitionResult:
     """Apply one normalized event. Total: every input yields a result, never raises."""
+    event = effective_event(state.parcel, event)
     # ---- family 1: envelope / deduplication
     if event.repo_id != state.config.repo_id or event.repo_id != state.admission.repo_id:
         return _reject(state, event, "wrong-repository")
@@ -7064,6 +7155,7 @@ def transition(state: State, event: Event) -> TransitionResult:
         _settle_blockers(ctx)
         _settle_stall(ctx)
         _settle_build_slot(ctx)
+        _settle_bundle_proposed(ctx)
         if accepted:
             _feedback_note(ctx)
         _project_board(ctx)

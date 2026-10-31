@@ -37,6 +37,7 @@ from omnigent_factory.service.mcp import TOOL_NAMES, configured_host_authorities
 from omnigent_factory.service.omnigent_auth import expiry, expiry_message, omnigent_auth
 from omnigent_factory.service.status_comment import pin_status
 from omnigent_factory.service.worktree_gc import iso, read_state
+from omnigent_factory.store.sqlite import observation_held_count, observation_holds
 
 
 @dataclass(slots=True)
@@ -143,6 +144,7 @@ async def run_doctor(
     await asyncio.to_thread(_check_bundling, config, report)
     await asyncio.to_thread(_check_auto_retriage, config, report)
     await asyncio.to_thread(_check_build_slots, config, report)
+    await asyncio.to_thread(_check_observation_holds, config, report)
     _check_socket(config, report)
     await asyncio.to_thread(_check_bind, config, report)
     _check_mcp_token(config, report)
@@ -1153,6 +1155,47 @@ def _check_build_slots(config: ServiceConfig, report: DoctorReport) -> None:
         report.warn("building", detail)
     else:
         report.pass_check("building", detail)
+
+
+def _check_observation_holds(config: ServiceConfig, report: DoctorReport) -> None:
+    """Parcels safety-held because an observation failed a store invariant (startup
+    containment): warns while any is still held, read-only and without migrating."""
+    if not config.database_path.exists():
+        report.pass_check("observation_holds", "no database")
+        return
+    try:
+        conn = sqlite3.connect(f"file:{config.database_path}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = observation_holds(conn, config.repo_id)
+            held_count = observation_held_count(conn, config.repo_id)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        report.warn("observation_holds", f"unavailable: {exc}")
+        return
+    if not rows:
+        report.pass_check("observation_holds", "none")
+        return
+
+    def line(row: dict[str, Any]) -> str:
+        who = f"#{row['issue']}" if row["issue"] is not None else str(row["parcel"])
+        state = "held" if row["held"] else "released"
+        reason = row["last_reason"] or "reason not recorded"
+        return f"{who} {state} x{row['count']}: {reason}"
+
+    held = [row for row in rows if row["held"]]  # listed first, up to the display limit
+    if held_count:
+        more = held_count - len(held)
+        report.warn(
+            "observation_holds",
+            f"{held_count} parcel(s) safety-held after a failed observation "
+            f"(recover with the operator commands): {'; '.join(line(r) for r in held)}"
+            + (f"; and {more} more" if more > 0 else ""),
+        )
+    else:
+        report.pass_check(
+            "observation_holds", f"none held; earlier: {'; '.join(line(r) for r in rows)}"
+        )
 
 
 def _check_auto_retriage(config: ServiceConfig, report: DoctorReport) -> None:
