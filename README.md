@@ -758,8 +758,9 @@ Omnigent 0.21.0.dev0 so `doctor` can detect server/client version drift.
 
 ```sh
 uv sync --locked              # create .venv from uv.lock
-uv run pytest -q              # full test suite (no network)
-uv run pytest -q -n auto --dist worksteal  # recommended fast full suite (all tests)
+uv run pytest -q -p no:cacheprovider  # full serial suite (no network)
+uv run pytest -q -p no:cacheprovider -n auto --dist worksteal -m 'not slow'  # fast loop
+uv run pytest -q -p no:cacheprovider -n auto --dist worksteal  # full pre-deploy suite
 uv run ruff check             # lint
 uv run ruff format --check    # formatting
 uv run mypy                   # strict type check of src/omnigent_factory
@@ -769,6 +770,13 @@ Hypothesis runs the `default` profile (200 examples, 40 stateful steps, derandom
 For a longer randomized search: `HYPOTHESIS_PROFILE=thorough uv run pytest -q tests/test_invariants_model.py`.
 The parallel command keeps targeted runs unchanged: use plain `uv run pytest -q path/to/test.py`
 for one file or test. Parallel workers use isolated temporary state, Git homes, sockets and ports.
+The full/default run includes every case and the entire CEL corpus. `slow` marks the expensive
+legacy CEL parity comparisons, stateful invariant model, crash replay and measured long service
+tests; run just that subset with `-m slow`. The fast loop is not the pre-deploy gate.
+Each worker shares compiled CEL policies while evaluating every input normally. Ordinary fresh
+test databases copy a closed, session-scoped migrated template into their own temporary path.
+Existing databases, explicit migration versions and fault injection still use real migrations;
+`@pytest.mark.fresh_database` opts a test or module out of template copying entirely.
 
 ### Layout
 

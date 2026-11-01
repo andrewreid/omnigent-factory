@@ -36,6 +36,8 @@ from omnigent_factory.testing.builders import REPO_ID, config
 from omnigent_factory.testing.fakes import FakeClock
 from omnigent_factory.testing.harness import Harness
 
+pytestmark = pytest.mark.fresh_database
+
 LATEST = max(m.version for m in MIGRATIONS)
 P = "I_parcel_1"
 Q = "I_parcel_2"

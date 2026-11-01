@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 
+import pytest
 from hypothesis import event as hyp_event
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
@@ -1071,4 +1072,4 @@ class FactoryModel(RuleBasedStateMachine):
                 assert has_slot
 
 
-TestFactoryModel = FactoryModel.TestCase
+TestFactoryModel = pytest.mark.slow(FactoryModel.TestCase)

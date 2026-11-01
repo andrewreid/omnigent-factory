@@ -13,7 +13,6 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from omnigent.policies.builtins.cel import cel_policy
 from omnigent.policies.builtins.github import github_policy as builtin_github_policy
 
 from omnigent_factory.core.types import SessionKind
@@ -165,7 +164,7 @@ def _event(command: Any, tool: str = "sys_os_shell", key: str = "command") -> di
 
 
 @pytest.fixture(scope="module")
-def cel() -> Any:
+def cel(cel_policy) -> Any:
     spec = pol.factory_cel_policy("main")
     return cel_policy(**spec.factory_params)
 
@@ -204,7 +203,7 @@ ISSUE_READS = [
 
 @pytest.mark.parametrize("read_only", [False, True])
 @pytest.mark.parametrize("command", ISSUE_CREATE)
-def test_issue_creation_is_the_factorys(command: str, read_only: bool) -> None:
+def test_issue_creation_is_the_factorys(command: str, read_only: bool, cel_policy) -> None:
     spec = pol.factory_cel_policy("main", read_only=read_only)
     verdict = cel_policy(**spec.factory_params)(_event(command))
     assert _result(verdict) == "DENY", command

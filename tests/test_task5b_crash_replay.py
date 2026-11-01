@@ -65,6 +65,8 @@ from tests.omnigent.fake_server import FakeOmnigentServer, FakeSession, elicitat
 from tests.omnigent.support import AGENT, HOST, PROJECT
 from tests.store_driver import ISSUE, StoreDriver
 
+pytestmark = pytest.mark.slow
+
 ROOT = "root-1"
 BRANCH = "factory/issue-1"
 ITEM = "PVTI_1"

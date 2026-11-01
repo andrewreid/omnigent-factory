@@ -106,6 +106,7 @@ async def stack(git_env: GitEnv):
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_bot_identity_refresh_refusal_and_no_global_edits(stack: Stack) -> None:
     before = stack.env.home_digest()
     global_before = git("config", "--global", "--list", cwd=stack.env.source)

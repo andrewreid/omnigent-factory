@@ -567,6 +567,9 @@ def test_transitions_that_change_nothing_are_debug(
     store.ensure_repository(h.cfg)
     store.apply_event(h.f().make(ev.GitHubSnapshot(), evidence=snapshot(read_at_us=1)), h.cfg)
     store.apply_event(h.f().make(ev.Unpause(), parcel_id=None), h.cfg)
+    # Setup may log at INFO depending on the worker's earlier logging configuration.
+    # Measure only the two transitions whose levels this test asserts.
+    caplog.clear()
     caplog.set_level(logging.DEBUG, logger="omnigent_factory.store.sqlite")
     store.apply_event(
         h.f().make(ev.ReconcileDue(), provenance=Provenance.SCHEDULER, evidence=None), h.cfg
@@ -677,6 +680,7 @@ def test_a_stored_fenced_done_run_is_neither_scanned_nor_reconciled() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_ten_minutes_of_load_scale_with_live_work_not_parcels(
     service_config: ServiceConfig,
 ) -> None:

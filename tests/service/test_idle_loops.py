@@ -9,9 +9,9 @@ review bot are scanned on ``parked_observation_interval_seconds``.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, TypeVar
 
 import pytest
@@ -77,9 +77,46 @@ def _seed(config: ServiceConfig) -> CountingGitHub:
 
 
 @dataclass
+class IdleWaits:
+    """Observe real waits without replacing their timers or wake-up behavior."""
+
+    waiting: set[str] = field(default_factory=set)
+    events: dict[str, asyncio.Event] = field(default_factory=dict)
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def track(self, name: str, awaitable: Awaitable[T]) -> T:
+        self.waiting.add(name)
+        self.changed.set()
+        try:
+            return await awaitable
+        finally:
+            self.waiting.remove(name)
+            self.changed.set()
+
+    def watch(self, name: str, event: asyncio.Event) -> None:
+        self.events[name] = event
+        original = event.wait
+
+        async def wait() -> bool:
+            return await self.track(name, original())
+
+        event.wait = wait  # type: ignore[method-assign]
+
+    async def settled(self) -> None:
+        required = {"outbox", "admission", "clock", "deliveries", "reconcile"}
+        async with asyncio.timeout(10):
+            while not (
+                required <= self.waiting and not any(e.is_set() for e in self.events.values())
+            ):
+                self.changed.clear()
+                await self.changed.wait()
+
+
+@dataclass
 class Counted:
     service: FactoryService
     calls: list[str]
+    waits: IdleWaits
 
 
 @asynccontextmanager
@@ -89,6 +126,29 @@ async def idle_factory(config: ServiceConfig) -> AsyncIterator[Counted]:
         config, adapters=(github, FakeOmnigent(), FakeCredentialBroker()), clock=SystemClock()
     )
     service.board_diff = BoardDiff(service, github.board_cards)
+    waits = IdleWaits()
+    subscribe = service.db.subscribe
+
+    def watched_subscribe() -> asyncio.Event:
+        event = subscribe()
+        task = asyncio.current_task()
+        assert task is not None
+        waits.watch(task.get_name(), event)
+        return event
+
+    service.db.subscribe = watched_subscribe  # type: ignore[method-assign]
+    waits.watch("deliveries", service._delivery_wake)
+    wait = service._wait
+
+    async def watched_wait(seconds: float) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        if task.get_name() == "reconcile":
+            await waits.track("reconcile", wait(seconds))
+        else:
+            await wait(seconds)
+
+    service._wait = watched_wait  # type: ignore[method-assign]
     calls: list[str] = []
     inner = service.db.call
 
@@ -99,7 +159,7 @@ async def idle_factory(config: ServiceConfig) -> AsyncIterator[Counted]:
     service.db.call = counting  # type: ignore[method-assign]
     await service.start()
     try:
-        yield Counted(service, calls)
+        yield Counted(service, calls, waits)
     finally:
         await service.stop()
 
@@ -121,6 +181,7 @@ def _production_cadence(config: ServiceConfig) -> ServiceConfig:
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_an_idle_factory_makes_almost_no_db_calls(service_config: ServiceConfig) -> None:
     """0.6 s idle with the production cadence, except a 0.5 s inbox safety poll.
 
@@ -134,7 +195,8 @@ async def test_an_idle_factory_makes_almost_no_db_calls(service_config: ServiceC
     )
     assert ServiceConfig.model_fields["delivery_idle_poll_seconds"].default == 5.0
     async with idle_factory(config) as rig:
-        await asyncio.sleep(0.2)  # boot work (reads, board diff) settles
+        # All five loops have finished boot work and entered their real idle waits.
+        await rig.waits.settled()
         before = len(rig.calls)
         await asyncio.sleep(0.6)
         idle_calls = rig.calls[before:]
@@ -144,13 +206,15 @@ async def test_an_idle_factory_makes_almost_no_db_calls(service_config: ServiceC
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_a_new_effect_still_runs_at_once(service_config: ServiceConfig) -> None:
     """Idle loops still react within the busy cadence: an enqueued effect is executed
     and a deferred retry runs at its due time, not at the safety fallback."""
     config = _production_cadence(service_config).model_copy(update={"idle_fallback_seconds": 60.0})
     async with idle_factory(config) as rig:
-        await asyncio.sleep(1.5)
+        await rig.waits.settled()
         executed: list[tuple[str, float]] = []
+        completed = asyncio.Event()
         loop = asyncio.get_running_loop()
 
         class Recorder:
@@ -161,6 +225,8 @@ async def test_a_new_effect_still_runs_at_once(service_config: ServiceConfig) ->
                 from omnigent_factory.core.effects import Ack
 
                 executed.append((effect.effect_id, loop.time()))
+                if len(executed) == 2:
+                    completed.set()
                 return Ack()
 
         executor = rig.service.executor
@@ -200,10 +266,7 @@ async def test_a_new_effect_still_runs_at_once(service_config: ServiceConfig) ->
         await rig.service.db.call(enqueue("ef_now", None))
         due_us = SystemClock().now_utc_us() + 1_500_000
         await rig.service.db.call(enqueue("ef_later", due_us))
-        for _ in range(300):
-            if len(executed) == 2:
-                break
-            await asyncio.sleep(0.01)
+        await asyncio.wait_for(completed.wait(), timeout=3)
     times = dict(executed)
     assert times["ef_now"] - started_at < 0.1
     assert 1.4 < times["ef_later"] - started_at < 1.8

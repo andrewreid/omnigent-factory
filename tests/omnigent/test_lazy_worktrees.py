@@ -10,7 +10,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from omnigent.policies.builtins.cel import cel_policy
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.effects import Ack, AmbiguousWrite, DefinitiveFailure, EffectKind
@@ -403,7 +402,7 @@ async def test_gc_waits_for_selection_and_pin(git_env, monkeypatch):
 
 
 @pytest.fixture(scope="module")
-def reference_policy():
+def reference_policy(cel_policy):
     return cel_policy(**pol.factory_cel_policy(read_only=True, reference=True).factory_params)
 
 
@@ -437,7 +436,7 @@ def test_reference_cel_allows_reads(reference_policy, command):
     assert _result(reference_policy(_event(command))) == "ALLOW"
 
 
-def test_plan_policy_unchanged_and_snapshot_defaults_hot_reload():
+def test_plan_policy_unchanged_and_snapshot_defaults_hot_reload(cel_policy):
     plan = cel_policy(**pol.factory_cel_policy(read_only=True).factory_params)
     for command in ("git fetch origin main", "npm install", "./dev-environment.sh up"):
         assert _result(plan(_event(command))) == "ALLOW"

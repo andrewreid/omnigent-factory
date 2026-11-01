@@ -12,7 +12,6 @@ from dataclasses import replace
 from typing import Any
 
 import pytest
-from omnigent.policies.builtins.cel import cel_policy
 
 from omnigent_factory.core.effects import Ack, EffectKind
 from omnigent_factory.core.types import SessionKind
@@ -104,12 +103,12 @@ def _result(verdict: Any) -> str:
 
 
 @pytest.fixture(scope="module")
-def read_only() -> Any:
+def read_only(cel_policy) -> Any:
     return cel_policy(**pol.factory_cel_policy("main", read_only=True).factory_params)
 
 
 @pytest.fixture(scope="module")
-def build() -> Any:
+def build(cel_policy) -> Any:
     return cel_policy(**pol.factory_cel_policy("main").factory_params)
 
 

@@ -1,7 +1,6 @@
 """Exercise the actual CEL evaluator: abstention is never counted as ALLOW."""
 
 import pytest
-from omnigent.policies.builtins.cel import cel_policy
 
 from omnigent_factory.omnigent import policies as pol
 
@@ -11,7 +10,7 @@ WRAPPER = "/factory/bin/gh"
 @pytest.fixture(
     scope="module", params=[{}, {"read_only": True}, {"read_only": True, "reference": True}]
 )
-def policy(request):
+def policy(request, cel_policy):
     spec = pol.factory_cel_policy(
         gh_wrapper=WRAPPER, real_gh_path="/opt/github-cli", **request.param
     )
@@ -126,7 +125,7 @@ def test_configuration_changes_policy_version():
     assert first.name != pol.factory_cel_policy(real_gh_path="/opt/gh").name
 
 
-def test_adapter_uses_configured_paths_in_every_stage_policy(git_env):
+def test_adapter_uses_configured_paths_in_every_stage_policy(git_env, cel_policy):
     from tests.omnigent.support import make_rig
 
     wrapper = "/custom factory/bin/gh"
@@ -197,7 +196,7 @@ def test_explicit_git_credential_access_denied_in_every_stage(policy, command):
     ],
 )
 @pytest.mark.parametrize("read_only", [False, True])
-def test_implicit_git_helpers_still_allowed(command, read_only):
+def test_implicit_git_helpers_still_allowed(command, read_only, cel_policy):
     # The reference variant already denies network Git; retain that separate rule.
     check = cel_policy(**pol.factory_cel_policy(read_only=read_only).factory_params)
     assert check(event(command))["result"] == "ALLOW"

@@ -25,7 +25,6 @@ from typing import Any
 from unittest import mock
 
 import pytest
-from omnigent.policies.builtins.cel import cel_policy
 
 from omnigent_factory.omnigent import policies as pol
 from tests.omnigent.test_liberal_policies import (
@@ -66,7 +65,7 @@ Policy = Callable[[dict[str, Any]], Any]
 
 
 @pytest.fixture(scope="module", params=[False, True], ids=["build", "read_only"])
-def pair(request: pytest.FixtureRequest) -> tuple[Policy, Policy]:
+def pair(request: pytest.FixtureRequest, cel_policy) -> tuple[Policy, Policy]:
     read_only: bool = request.param
     legacy = _legacy_spec(read_only)
     current = pol.factory_cel_policy("main", read_only=read_only)
@@ -187,6 +186,7 @@ def _long_commands(size: int) -> list[str]:
     return out
 
 
+@pytest.mark.slow
 def test_identical_decisions_on_the_existing_corpus(pair: tuple[Policy, Policy]) -> None:
     legacy, current = pair
     for command in [*SHORT, CMD_677, CMD_462]:
@@ -194,6 +194,7 @@ def test_identical_decisions_on_the_existing_corpus(pair: tuple[Policy, Policy])
         assert _decision(current, event) == _decision(legacy, event), command
 
 
+@pytest.mark.slow
 def test_identical_decisions_on_every_argument_shape(pair: tuple[Policy, Policy]) -> None:
     legacy, current = pair
     for event in SHAPES:
@@ -205,6 +206,7 @@ def test_identical_decisions_on_every_argument_shape(pair: tuple[Policy, Policy]
                 assert _decision(current, event) == _decision(legacy, event), event
 
 
+@pytest.mark.slow
 def test_identical_decisions_on_long_commands(pair: tuple[Policy, Policy]) -> None:
     """~400-byte heredocs: long enough to exercise the change, short enough that the
     legacy rule (the slow side, ~4 ms per character) keeps this test reasonable."""
@@ -243,7 +245,7 @@ def test_scalar_command_values_no_longer_fail_open(
 
 
 @pytest.mark.parametrize("read_only", [False, True])
-def test_long_heredoc_evaluates_fast(read_only: bool) -> None:
+def test_long_heredoc_evaluates_fast(read_only: bool, cel_policy) -> None:
     """A 10 KB heredoc took ~20-45 CPU s before #1394; now ~20-30 ms. The 5 CPU s
     bound ignores time descheduled under parallel load and still catches the old cost."""
     check = cel_policy(**pol.factory_cel_policy("main", read_only=read_only).factory_params)

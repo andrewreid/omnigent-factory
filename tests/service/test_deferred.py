@@ -18,6 +18,7 @@ import pytest
 
 from omnigent_factory.core import events as ev
 from omnigent_factory.core import report_lines as rl
+from omnigent_factory.core.effects import EffectKind
 from omnigent_factory.core.events import Provenance
 from omnigent_factory.core.types import MICROS_PER_SECOND, Parcel, Stage
 from omnigent_factory.github.client import AmbiguousRequest
@@ -158,14 +159,21 @@ class Rig:
 
 
 @asynccontextmanager
-async def rig(config: ServiceConfig, h: Harness | None = None) -> AsyncIterator[Rig]:
+async def rig(
+    config: ServiceConfig, h: Harness | None = None, *, background: bool = True
+) -> AsyncIterator[Rig]:
     seed(config, h or ready())
     clock = FakeClock()
     clock.advance(10**9)  # after the seeded history
     service = FactoryService(
         config, adapters=(FakeGitHub(), FakeOmnigent(), FakeCredentialBroker()), clock=clock
     )
-    await service.start()
+    if background:
+        await service.start()
+    else:
+        # Explicitly stepped admission tests need the real store and startup recovery,
+        # without a concurrent admission/clock/outbox pass changing their snapshot.
+        await service.open()
     try:
         await service.operator_command("unpause", {})
         repo = FakeRepo({1: gh_issue(1, parent=40), 40: gh_issue(40), 5: gh_issue(5, parent=40)})
@@ -588,7 +596,7 @@ async def test_the_admitted_rework_is_briefed_with_exactly_the_ticked_items(
 ):
     from omnigent_factory.service.directory import ServiceDispatchDirectory
 
-    async with rig(service_config) as r:
+    async with rig(service_config, background=False) as r:
         await r.deferred.record_result(await r.parcel(), "s1", result(FU_A, FU_B))
         body = await report(r)
         assert (
@@ -596,6 +604,17 @@ async def test_the_admitted_rework_is_briefed_with_exactly_the_ticked_items(
         )
         r.clock.advance(121 * S)
         assert await r.deferred.tick() == 1
+        # Admission is gated on the Ready -> Building board move being acknowledged.
+        # Step the real executor before admission instead of racing its background loop.
+        moves = await r.service.db.call(
+            lambda store: [
+                row.effect
+                for row in store.pending_effects()
+                if row.effect.kind == EffectKind.MOVE_CARD
+            ]
+        )
+        assert len(moves) == 1
+        await r.service.executor._execute(moves[0].effect_id)
         await r.service._admit_once()
         parcel = await r.parcel()
         run = parcel.current_session
