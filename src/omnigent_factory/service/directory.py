@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -15,6 +16,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
+from omnigent_factory.core import report_lines as rl
 from omnigent_factory.core.codec import event_from_json, parcel_from_json
 from omnigent_factory.core.contract_view import (
     ContractViewError,
@@ -63,6 +65,7 @@ from omnigent_factory.service.config import ServiceConfig
 from omnigent_factory.service.db import StoreWorker
 from omnigent_factory.store.sqlite import SqliteStore
 
+LOG = logging.getLogger(__name__)
 _TOKEN = re.compile(
     r"(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
     r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)"
@@ -1098,10 +1101,11 @@ class PublicationRenderer:
                 if parcel.readiness is None
                 else await self._splits(parcel, parcel.readiness.session_id)
             )
+            deferred = ""
             if self.deferred_section is not None:
                 # Each line is made safe on its own: its hidden action marker must stay.
-                section += await self.deferred_section(parcel)
-            return _safe_publication(text, self.config) + section
+                deferred = await self.deferred_section(parcel)
+            return _fit_before(_safe_publication(text, self.config) + section, deferred)
         elif effect.kind in {EffectKind.PUBLISH_TRIAGE, EffectKind.PUBLISH_REPORT}:
             body = self._stored_result(effect)
             if body is None:
@@ -1786,6 +1790,33 @@ def _safe_publication(text: str, config: ServiceConfig) -> str:
     return text
 
 
+#: A Ready report's body at most: GitHub's 65,536-character comment limit, with room for
+#: the effect marker and the statuses the factory sets on checkbox lines later (at most
+#: about 150 characters each).
+_READY_LIMIT = 55_000
+
+
+def _fit_before(text: str, keep: str, limit: int = _READY_LIMIT) -> str:
+    """``text + keep`` (the report, then its Deferred section) within ``limit``, always.
+
+    A section within its budget stays whole and the report's end is cut (its title,
+    ELI5, PR and CI lines come first). An oversized section (items accumulated beyond
+    the budget) keeps as many whole checkbox lines as fit after the report, in number
+    order, and says how many more there are (logged as a warning)."""
+    if len(text) + len(keep) <= limit:
+        return text + keep
+    if len(keep) <= rl.SECTION_BUDGET:
+        return rl.cut_text(text, limit - len(keep)) + keep
+    text = rl.cut_text(text, limit - rl.SECTION_BUDGET)
+    section, left = rl.fit_section(keep, limit - len(text))
+    LOG.warning(
+        "ready report deferred section too long: %s checkbox lines left out (%s chars)",
+        left,
+        len(keep),
+    )
+    return text + section
+
+
 def safe_publication(text: str, config: ServiceConfig) -> str:
     """Agent text the factory posts itself outside a stage publication (e.g. a human-gate
     issue of an epic plan): credentials blocked, mentions neutralised, length bounded."""
@@ -1909,7 +1940,7 @@ _REFERENCE_TEMPLATES = {
 _FIRST_TEMPLATES = {
     SessionKind.TRIAGE: "triage-v13.txt",
     SessionKind.PLAN: "plan-v13.txt",
-    SessionKind.BUILD: "build-v19.txt",
+    SessionKind.BUILD: "build-v20.txt",
 }
 _ANSWER_TEMPLATE = "answer-v3.txt"
 _RETRIAGE_TEMPLATE = "triage-feedback-v10.txt"
@@ -1930,8 +1961,8 @@ _REWORK_TEMPLATE = "build-rework-v15.txt"
 #: A rework the owner started by ticking Ready report items: its brief is those items.
 _ITEMS_REWORK_TEMPLATE = "build-rework-items-v6.txt"
 #: Readiness wakes of a waiting build run (red checks and other gaps; findings only).
-_READINESS_WAKE_TEMPLATE = "readiness-wake-v14.txt"
-_FINDINGS_WAKE_TEMPLATE = "readiness-findings-wake-v6.txt"
+_READINESS_WAKE_TEMPLATE = "readiness-wake-v15.txt"
+_FINDINGS_WAKE_TEMPLATE = "readiness-findings-wake-v7.txt"
 #: A rework run, or a wake of the waiting build run, for a merge conflict with the base.
 _CONFLICT_TEMPLATE = "build-conflict-v6.txt"
 _CONFLICT_WAKE_TEMPLATE = "readiness-conflict-wake-v3.txt"

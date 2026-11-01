@@ -75,10 +75,14 @@ def test_migration_18_adds_splits_to_a_v17_database_and_keeps_its_rows(tmp_path:
         path, FakeClock(), migrations=tuple(m for m in MIGRATIONS if m.version < 18)
     )
     v17.ensure_repository(config())
-    item = ds.NewDeferred("k1", "P2", "a.ts", "t", "", "r", "follow_up")
-    ds.record_deferred(
-        v17, repo_id=REPO_ID, source_issue=7, pr_number=3, session_id="s", items=[item]
-    )
+    # As v17 recorded it (today's record_deferred writes later columns too).
+    with v17._txn() as conn:
+        conn.execute(
+            "INSERT INTO deferred_items (repo_id, source_issue, item_key, seq, pr_number, "
+            "session_id, severity, path, title, reason, outcome, created_at_us, updated_at_us) "
+            "VALUES (?, 7, 'k1', 1, 3, 's', 'P2', 'a.ts', 't', 'r', 'follow_up', 1, 1)",
+            (REPO_ID,),
+        )
     assert v17.schema_version() == 17
     v17.close()
     store = SqliteStore.open(path, FakeClock())

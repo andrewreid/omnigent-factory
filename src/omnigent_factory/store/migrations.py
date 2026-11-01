@@ -1022,6 +1022,26 @@ ALTER TABLE reservations ADD COLUMN observed_over_cap INTEGER NOT NULL DEFAULT 0
     CHECK (observed_over_cap IN (0, 1) AND (observed_over_cap = 0 OR kind = 'building'));
 """
 
+# Ready report follow-up ratings (``service.deferred``); additive only.
+#
+# * rating / why: the agent's optional rating of a deferred finding (bug, likely, edge,
+#   tidy; '' when the result gave none) and its one-line reason.
+# * report_order: the item's place in the repository's insertion order (the Ready report
+#   numbers its items F1, F2, ... in this order, so an item never changes number when
+#   later items are added). Existing rows are ordered as they were recorded.
+V24_SQL = """
+ALTER TABLE deferred_items ADD COLUMN rating TEXT NOT NULL DEFAULT ''
+    CHECK (rating IN ('', 'bug', 'likely', 'edge', 'tidy'));
+ALTER TABLE deferred_items ADD COLUMN why TEXT NOT NULL DEFAULT '';
+ALTER TABLE deferred_items ADD COLUMN report_order INTEGER NOT NULL DEFAULT 0;
+UPDATE deferred_items SET report_order = (
+    SELECT COUNT(*) FROM deferred_items AS d
+    WHERE d.repo_id = deferred_items.repo_id
+      AND (d.created_at_us, d.source_issue, d.seq)
+          <= (deferred_items.created_at_us, deferred_items.source_issue, deferred_items.seq)
+);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -1046,4 +1066,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(21, "issue-bundling", V21_SQL),
     Migration(22, "auto-retriage", V22_SQL),
     Migration(23, "observed-build-occupancy", V23_SQL),
+    Migration(24, "follow-up-ratings", V24_SQL),
 )

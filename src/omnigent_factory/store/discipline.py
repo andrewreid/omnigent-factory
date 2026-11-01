@@ -45,6 +45,13 @@ class DeferredItem:
     listed: bool
     #: That issue's line was updated after the item was fixed in a rework.
     closed_out: bool
+    #: The agent's rating (``bug``, ``likely``, ``edge``, ``tidy``; "": none given).
+    rating: str = ""
+    #: The agent's one line on how much it needs fixing ("": none given).
+    why: str = ""
+    #: The item's place in the repository's insertion order (the Ready report's F-number
+    #: order: later items only ever come after it).
+    report_order: int = 0
 
     @property
     def action_id(self) -> str:
@@ -54,7 +61,7 @@ class DeferredItem:
 
 _ITEM_COLUMNS = (
     "source_issue, item_key, seq, pr_number, session_id, severity, path, title, thread_url, "
-    "reason, outcome, blocks_json, issue_number, listed, closed_out"
+    "reason, outcome, blocks_json, issue_number, listed, closed_out, rating, why, report_order"
 )
 
 
@@ -75,6 +82,9 @@ def _item(row: Sequence[object]) -> DeferredItem:
         issue_number=None if row[12] is None else int(str(row[12])),
         listed=bool(row[13]),
         closed_out=bool(row[14]),
+        rating=str(row[15]),
+        why=str(row[16]),
+        report_order=int(str(row[17])),
     )
 
 
@@ -89,6 +99,8 @@ class NewDeferred:
     outcome: str
     blocks: tuple[int, ...] = ()
     issue_number: int | None = None
+    rating: str = ""
+    why: str = ""
 
 
 def record_deferred(
@@ -100,8 +112,10 @@ def record_deferred(
     session_id: str,
     items: Sequence[NewDeferred],
 ) -> list[DeferredItem]:
-    """Record the result's deferred items (an item already recorded keeps its row; only
-    its ``blocks`` grow). Returns the rows of ``items``."""
+    """Record the result's deferred items (an item already recorded keeps its row and
+    number; its ``blocks`` grow, and a rating or why the result gives replaces the earlier
+    one, marking the item not ``listed`` so its follow-up issue line is rewritten).
+    Returns the rows of ``items``."""
     now = store._clock.now_utc_us()
     with store._txn() as conn:
         row = conn.execute(
@@ -110,6 +124,12 @@ def record_deferred(
             (repo_id, source_issue),
         ).fetchone()
         seq = int(row[0])
+        order = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(report_order), 0) FROM deferred_items WHERE repo_id = ?",
+                (repo_id,),
+            ).fetchone()[0]
+        )
         for item in items:
             old = conn.execute(
                 "SELECT blocks_json FROM deferred_items WHERE repo_id = ? AND source_issue = ? "
@@ -123,13 +143,24 @@ def record_deferred(
                     "WHERE repo_id = ? AND source_issue = ? AND item_key = ?",
                     (json.dumps(blocks), now, repo_id, source_issue, item.item_key),
                 )
+                for column, value in (("rating", item.rating), ("why", item.why)):
+                    if value:
+                        # A changed line is listed again: its follow-up issue line is
+                        # rewritten (``service.deferred``).
+                        conn.execute(
+                            f"UPDATE deferred_items SET {column} = ?, listed = 0, "
+                            "updated_at_us = ? WHERE repo_id = ? AND source_issue = ? "
+                            f"AND item_key = ? AND {column} != ?",
+                            (value, now, repo_id, source_issue, item.item_key, value),
+                        )
                 continue
             seq += 1
+            order += 1
             conn.execute(
                 "INSERT INTO deferred_items (repo_id, source_issue, item_key, seq, pr_number, "
                 "session_id, severity, path, title, thread_url, reason, outcome, blocks_json, "
-                "issue_number, created_at_us, updated_at_us) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "issue_number, created_at_us, updated_at_us, rating, why, report_order) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     repo_id,
                     source_issue,
@@ -147,6 +178,9 @@ def record_deferred(
                     item.issue_number,
                     now,
                     now,
+                    item.rating,
+                    item.why,
+                    order,
                 ),
             )
     keys = {item.item_key for item in items}

@@ -106,7 +106,7 @@ def test_current_stage_templates_carry_the_sync_note_and_old_ones_are_kept() -> 
     assert current == {
         "triage-v13.txt",
         "plan-v13.txt",
-        "build-v19.txt",
+        "build-v20.txt",
         "triage-feedback-v10.txt",
         "epic-triage-v5.txt",
         "build-rework-v15.txt",
@@ -116,7 +116,7 @@ def test_current_stage_templates_carry_the_sync_note_and_old_ones_are_kept() -> 
     for name in current:
         assert "{base_note}" in (TEMPLATES / name).read_text("utf-8"), name
     for name in (
-        "build-v19.txt",
+        "build-v20.txt",
         "build-rework-v15.txt",
         "build-rework-items-v6.txt",
         "build-conflict-v6.txt",

@@ -290,13 +290,22 @@ FollowUps = Annotated[list[FollowUp], Field(max_length=20)]
 
 Severity = Literal["P0", "P1", "P2", "P3"]
 ShortText = Annotated[str, StringConstraints(max_length=300)]
+#: How much a deferred finding needs fixing (the Ready report sorts by it): ``bug`` a real
+#: defect that will hit or has hit, ``likely`` a plausible failure under real conditions,
+#: ``edge`` hypothetical (needs an unusual combination), ``tidy`` cleanup/docs/cosmetic.
+Rating = Literal["bug", "likely", "edge", "tidy"]
+RATINGS: tuple[str, ...] = ("bug", "likely", "edge", "tidy")
+#: One short line on how much a deferred finding actually needs fixing.
+MAX_WHY_CHARS = 160
+Why = Annotated[str, StringConstraints(min_length=1, max_length=MAX_WHY_CHARS)]
 
 
 class Deferred(_Strict):
     """A review finding not fixed in this PR, with its outcome: ``follow_up`` (a real
     defect outside the plan or too large for this PR: the factory files every one of a
     PR in one consolidated follow-up issue) or ``advisory`` (nothing to file). Each gets
-    a checkbox in the Ready report; the owner may tick it to have it fixed now."""
+    a checkbox in the Ready report; the owner may tick it to have it fixed now. The
+    optional ``rating`` and ``why`` say how much it needs fixing (the report's table)."""
 
     severity: Severity
     path: ShortText = ""
@@ -308,6 +317,8 @@ class Deferred(_Strict):
     blocks: Annotated[list[Annotated[int, Field(ge=1)]], Field(max_length=20)] = []
     #: A bundle run: the member issue the finding belongs to (None: the bundle issue).
     member: Annotated[int, Field(ge=1)] | None = None
+    rating: Rating | None = None
+    why: Why | None = None
 
 
 DeferredList = Annotated[list[Deferred], Field(max_length=50)]
@@ -425,6 +436,12 @@ _SPLIT_SHAPE = (
     'blocks this one)","blocks"?:[int(issues the new issue blocks)],"member"?:int(bundle '
     "runs: the member it comes from)}]}"
 )
+#: A deferred item's optional rating and one-line why (see :data:`Rating`).
+_RATING_SHAPE = (
+    '"rating"?:"bug(real defect: will hit or has hit)|likely(plausible under real '
+    "conditions)|edge(hypothetical: needs an unusual combination)|tidy(cleanup, docs, "
+    'cosmetic)","why"?:str(one short line: how much it needs fixing, at most 160 chars)'
+)
 #: Bundle runs only: members taken out of the bundle (plan, build_ready, blocked).
 _EJECTED_SHAPE = '"ejected"?:[{"issue":int(a bundle member),"reason":str}],'
 
@@ -461,8 +478,9 @@ RESULT_SHAPES: dict[str, str] = {
     '"severity":str,"disposition":str,"evidence":str}],"remediation_batches_used":0|1,'
     '"targeted_rechecks_used":0|1,"release_readiness":"ready|needs_owner","related"?:[...],'
     '"deferred"?:[{"severity":"P0|P1|P2|P3","path"?:str,"title":str,"thread_url"?:str,'
-    '"reason":str,"outcome"?:"follow_up|advisory","blocks"?:[int],"member"?:int}],'
-    '"dev_environment_url"?:str(http/https URL of a dev environment you left running),'
+    '"reason":str,"outcome"?:"follow_up|advisory","blocks"?:[int],"member"?:int,'
+    + _RATING_SHAPE
+    + '}],"dev_environment_url"?:str(http/https URL of a dev environment you left running),'
     + _EJECTED_SHAPE
     + _SPLIT_SHAPE,
     "checkpoint": '{"kind":"checkpoint","grant_id":str,"head_sha":sha40|null,"done":[str],'
@@ -470,8 +488,9 @@ RESULT_SHAPES: dict[str, str] = {
     "blocked": '{"kind":"blocked","reason":str,"done":[str],"related"?:[{"issue":int,'
     '"relation":"depends_on|blocks|...","note":str}],"deferred"?:[{"severity":'
     '"P0|P1|P2|P3","path"?:str,"title":str,"thread_url"?:str,"reason":str,'
-    '"outcome"?:"follow_up|advisory","blocks"?:[int],"member"?:int}],"replan_required"?:'
-    '{"reason":str,"changes":[str](build only: the plan must change)},'
+    '"outcome"?:"follow_up|advisory","blocks"?:[int],"member"?:int,'
+    + _RATING_SHAPE
+    + '}],"replan_required"?:{"reason":str,"changes":[str](build only: the plan must change)},'
     + _EJECTED_SHAPE
     + _SPLIT_SHAPE,
 }

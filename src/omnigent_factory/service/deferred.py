@@ -14,12 +14,16 @@ and the Ready report's Deferred checkboxes the owner ticks to have items done no
   ``creating`` before the create: a restart (or an unclear create) first looks for the
   marker among the newest issues, so the issue is never opened twice. Items a later
   result adds are appended to the same issue (re-read first; existing lines and ticks kept).
-* **Ticked.** The Ready report lists every item and advisory as ``- [ ] Fix now: ...``
+* **Ticked.** The Ready report numbers every item and advisory ``F1``, ``F2``, ... (in the
+  order they were recorded: an item keeps its number, later items get the next ones),
+  shows them in a table sorted by the agent's rating (bug, likely, edge, tidy; unrated
+  last, as "-") with its one-line why, then lists each as ``- [ ] F<n> Fix now: ...``
   (and ``One more <bot> review round`` once the issue's review rounds are used up), each
-  with a hidden ``factory-action`` marker. An ``issue_comment`` ``edited`` webhook of that
-  report (the bot's own comment) from an owner (numeric id) is diffed (``changes.body.from``
-  against the new body): each newly ticked box is recorded once. Anyone else's tick, an
-  untick, or a box already recorded does nothing. Ticks of one card within
+  with a hidden ``factory-action`` marker (the marker, never the text, names the box).
+  An ``issue_comment`` ``edited`` webhook of that report (the bot's own comment) from an
+  owner (numeric id) is diffed (``changes.body.from`` against the new body): each newly
+  ticked box is recorded once. Anyone else's tick, an untick, or a box already recorded
+  does nothing. Ticks of one card within
   ``BATCH_WINDOW_US`` of the first are one batch: one ``RequestRework`` (the owner's
   control, under the same approval; refused like any rework, e.g. once merged) whose brief
   is exactly the ticked items, and "one more round" raises the issue's review budget by one
@@ -53,6 +57,7 @@ from omnigent_factory.core import events as ev
 from omnigent_factory.core import report_lines as rl
 from omnigent_factory.core.codec import parcel_from_json
 from omnigent_factory.core.events import Event, Provenance
+from omnigent_factory.core.protocol import MAX_WHY_CHARS, RATINGS
 from omnigent_factory.core.types import MICROS_PER_SECOND, Parcel, Stage
 from omnigent_factory.github.client import GitHubAPIError, GitHubClient
 from omnigent_factory.service.follow_ups import FollowUps
@@ -89,6 +94,31 @@ def _one_line(text: str, limit: int = 300) -> str:
     # "→" separates the factory's status from the text: never part of agent text.
     text = " ".join(str(text).split()).replace("→", "->")
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+#: The Ready report's labels of the agent's ratings (unrated: "-"; sorted by ``RATINGS``).
+_RATING_LABELS = {"bug": "Bug", "likely": "Likely", "edge": "Edge", "tidy": "Tidy"}
+
+
+#: The Ready report's Deferred section at most (``core.report_lines``): beyond it only
+#: the comment's own fitting leaves checkbox lines out (``report_lines.fit_section``).
+SECTION_BUDGET = rl.SECTION_BUDGET
+#: Checkbox line text, longest first (path, title, advisory reason, whole text; 0: left
+#: out): the first whose lines fit the budget is used, the last always is.
+_LINE_TIERS: tuple[tuple[int, int, int, int], ...] = (
+    (200, 300, 200, 1000),
+    (60, 100, 80, 300),
+    (0, 40, 0, 120),
+    (0, 0, 0, 60),
+)
+#: Ratings table cells (item, why), longest first; (0, 0): number and rating only.
+_TABLE_TIERS: tuple[tuple[int, int], ...] = ((120, MAX_WHY_CHARS), (60, 60), (0, 0))
+_TABLE_LEFT_OUT = "_The ratings table is left out: the list is too long for one comment._"
+
+
+def _cell(text: str, limit: int) -> str:
+    """One table cell: a single line, ``|`` escaped."""
+    return _one_line(text, limit).replace("|", "\\|")
 
 
 def _time_us(value: object) -> int:
@@ -354,15 +384,28 @@ class Deferrals:
         )
         if body is None:
             body = await self._issue_text(number)
-        present = rl.ids(body, rl.ITEM)
+        present = rl.texts(body, rl.ITEM)
         missing = [i for i in items if i.item_key not in present]
-        if missing:
+        # A rated line whose rating or why changed since it was written: rewritten in
+        # place (its checkbox and any "→ fixed in ..." status kept).
+        stale = {
+            i.item_key: text
+            for i in items
+            if i.item_key in present
+            and (i.rating or i.why)
+            and present[i.item_key] != (text := self._issue_item_text(i))
+        }
+        if missing or stale:
+            new = rl.with_text(body, stale, rl.ITEM)
             new = rl.append_lines(
-                body, (self._issue_line(i) for i in missing), issue_marker(source, pr_number)
+                new, (self._issue_line(i) for i in missing), issue_marker(source, pr_number)
             )
             await self._write_issue(number, new)
             LOG.info(
-                "consolidated follow-up issue extended issue=#%s items=%s", number, len(missing)
+                "consolidated follow-up issue updated issue=#%s added=%s rewritten=%s",
+                number,
+                len(missing),
+                len(stale),
             )
         await self._db(
             partial(
@@ -387,12 +430,18 @@ class Deferrals:
         await self.follow_ups.link(number)
 
     def _issue_line(self, item: ds.DeferredItem) -> str:
+        return rl.line(rl.ITEM, item.item_key, self._issue_item_text(item))
+
+    def _issue_item_text(self, item: ds.DeferredItem) -> str:
         path = f" `{_one_line(item.path, 200).replace('`', chr(39))}`" if item.path else ""
         link = f" ([thread]({item.thread_url}))" if item.thread_url.startswith("https://") else ""
+        rated = f" ({_RATING_LABELS[item.rating]})" if item.rating in _RATING_LABELS else ""
+        why = f" Why: {_one_line(item.why, MAX_WHY_CHARS)}" if item.why else ""
         text = self.publish(
-            f"{item.severity}{path} {_one_line(item.title)}{link}: {_one_line(item.reason)}"
+            f"{item.severity}{rated}{path} {_one_line(item.title)}{link}: "
+            f"{_one_line(item.reason)}{why}"
         )
-        return rl.line(rl.ITEM, item.item_key, _one_line(text, 1000))
+        return _one_line(text, 1000)
 
     def _issue_body(self, source: int, pr_number: int, items: Sequence[ds.DeferredItem]) -> str:
         lines = "\n".join(self._issue_line(i) for i in items)
@@ -507,8 +556,11 @@ class Deferrals:
 
     # ------------------------------------------------------------------ Ready report
 
-    async def report_section(self, parcel: Parcel) -> str:
-        """The Ready report's Deferred section ("" when there is nothing to list)."""
+    async def report_section(self, parcel: Parcel, budget: int = SECTION_BUDGET) -> str:
+        """The Ready report's Deferred section ("" when there is nothing to list), within
+        ``budget`` characters: every checkbox line (its number, a short title and its
+        hidden marker) is always kept; the lines' text, then the ratings table, are what
+        shrinks (the table is left out, with a note, when nothing of it fits)."""
         if parcel.issue_number is None:
             return ""
         repo_id = self._repo_id
@@ -516,16 +568,10 @@ class Deferrals:
         actions = await self._db(
             partial(ds.report_actions, repo_id=repo_id, parcel_id=parcel.parcel_id)
         )
-        lines = [
-            rl.line(
-                rl.ACTION,
-                item.action_id,
-                self._report_text(item, issues),
-                ticked=item.action_id in actions,
-                status=_status(actions.get(item.action_id), round_line=False),
-            )
-            for item in items
-        ]
+        # Numbered in recording order: an item keeps its number when items are added.
+        items = sorted(items, key=lambda i: (i.report_order, i.source_issue, i.seq))
+        numbered = [(f"F{n}", item) for n, item in enumerate(items, start=1)]
+        extra: list[str] = []
         r = parcel.readiness
         if (
             r is not None
@@ -534,7 +580,7 @@ class Deferrals:
         ):
             ident = f"{ROUND_PREFIX}{r.review_rounds_budget}"
             name, _mention = self._bot()
-            lines.append(
+            extra.append(
                 rl.line(
                     rl.ACTION,
                     ident,
@@ -543,21 +589,93 @@ class Deferrals:
                     status=_status(actions.get(ident), round_line=True),
                 )
             )
-        if not lines:
+        if not numbered and not extra:
             return ""
-        return "\n\n**Deferred** (tick an item to have it done in this PR):\n" + "\n".join(lines)
+        head = "\n\n**Deferred** (tick an item to have it done in this PR):\n"
+        # The checkbox lines: the longest text that fits (the last tier always counts).
+        for tier in _LINE_TIERS:
+            lines = [
+                rl.line(
+                    rl.ACTION,
+                    item.action_id,
+                    f"{number} {self._report_text(item, issues, tier)}",
+                    ticked=item.action_id in actions,
+                    status=_status(actions.get(item.action_id), round_line=False),
+                )
+                for number, item in numbered
+            ] + extra
+            ticks = "\n".join(lines)
+            if len(head) + len(ticks) <= budget:
+                break
+        room = budget - len(head) - len(ticks) - 3  # "\n" before, "\n\n" after the table
+        table = ""
+        if numbered:
+            for cells in _TABLE_TIERS:
+                table = self._report_table(numbered, cells)
+                if len(table) <= room:
+                    break
+            else:
+                table = _TABLE_LEFT_OUT if len(_TABLE_LEFT_OUT) <= room else ""
+        return head + ("\n" + table + "\n\n" if table else "") + ticks
 
-    def _report_text(self, item: ds.DeferredItem, issues: Mapping[tuple[int, int], int]) -> str:
+    def _report_table(
+        self, numbered: Sequence[tuple[str, ds.DeferredItem]], cells: tuple[int, int]
+    ) -> str:
+        """The numbered items by rating (bug, likely, edge, tidy, then unrated), each
+        with the agent's one-line why. ``cells``: the item and why cells' length (0, 0:
+        number and rating only). Checkboxes do not work in table cells: the boxes stay in
+        the list below it."""
+        item_len, why_len = cells
+        rank = {rating: n for n, rating in enumerate(RATINGS)}
+        detail = bool(item_len or why_len)
+        rows = (
+            ["| # | Item | Rating | Why |", "| --- | --- | --- | --- |"]
+            if detail
+            else ["| # | Rating |", "| --- | --- |"]
+        )
+        # Stable sort: within a rating, items keep their number order.
+        for number, item in sorted(numbered, key=lambda e: rank.get(e[1].rating, len(rank))):
+            label = _RATING_LABELS.get(item.rating, "-")
+            if not detail:
+                rows.append(f"| {number} | {label} |")
+                continue
+            if item.outcome == "filed":
+                what = f"#{item.issue_number} (filed during the run)"
+            else:
+                what = f"{item.severity} {_one_line(item.title, item_len)}"
+            why = self.publish(item.why) if item.why else "-"
+            rows.append(
+                f"| {number} | {_cell(self.publish(what), item_len + 40)} | {label} | "
+                f"{_cell(why, why_len)} |"
+            )
+        return "\n".join(rows)
+
+    def _report_text(
+        self,
+        item: ds.DeferredItem,
+        issues: Mapping[tuple[int, int], int],
+        tier: tuple[int, int, int, int] = (200, 300, 200, 1000),
+    ) -> str:
+        """A checkbox line's text; ``tier``: the path, title, advisory reason and whole
+        text's length (0: left out)."""
+        path_len, title_len, reason_len, total = tier
         if item.outcome == "filed":
             return f"Fix now: #{item.issue_number} (filed during the run)"
-        path = f" `{_one_line(item.path, 200).replace('`', chr(39))}`" if item.path else ""
-        text = f"Fix now: {item.severity}{path} {_one_line(item.title)}"
+        path = (
+            f" `{_one_line(item.path, path_len).replace('`', chr(39))}`"
+            if item.path and path_len
+            else ""
+        )
+        title = f" {_one_line(item.title, title_len)}" if title_len else ""
+        text = f"Fix now: {item.severity}{path}{title}"
         if item.outcome == "advisory":
-            where = f"(advisory: {_one_line(item.reason, 200)})"
+            where = (
+                f"(advisory: {_one_line(item.reason, reason_len)})" if reason_len else "(advisory)"
+            )
         else:
             number = issues.get((item.source_issue, item.pr_number))
             where = f"(in #{number})" if number is not None else "(follow-up issue pending)"
-        return _one_line(self.publish(f"{text} {where}"), 1000)
+        return _one_line(self.publish(f"{text} {where}"), total)
 
     async def on_comment_delivery(self, body: bytes | str) -> int:
         """An authenticated ``issue_comment`` delivery: record the owner's newly ticked
@@ -1041,6 +1159,8 @@ def _deferred(raw: object) -> list[ds.NewDeferred]:
                 thread_url=url,
                 reason=str(item.get("reason") or ""),
                 outcome="advisory" if item.get("outcome") == "advisory" else "follow_up",
+                rating=str(item["rating"]) if item.get("rating") in RATINGS else "",
+                why=_one_line(str(item.get("why") or ""), MAX_WHY_CHARS),
                 blocks=tuple(
                     n
                     for n in item.get("blocks") or []

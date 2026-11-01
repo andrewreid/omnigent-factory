@@ -1007,6 +1007,21 @@
           "description": "Bundle runs only: the member issue it belongs to.",
           "type": "integer",
           "minimum": 1
+        },
+        "rating": {
+          "description": "How much it needs fixing: bug (real defect: will hit or has hit), likely (plausible under real conditions), edge (hypothetical: needs an unusual combination), tidy (cleanup, docs, cosmetic).",
+          "enum": [
+            "bug",
+            "likely",
+            "edge",
+            "tidy"
+          ]
+        },
+        "why": {
+          "description": "One short line: how much it actually needs fixing.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
         }
       }
     },

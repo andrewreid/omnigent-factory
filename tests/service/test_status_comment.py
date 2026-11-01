@@ -460,7 +460,7 @@ async def test_owner_ticks_on_the_status_comment_start_the_same_rework(
         assert written.comment_id is not None
         before = r.server.comments[written.comment_id]["body"]
         assert f"<!-- factory-action:{item.action_id} -->" in before
-        after = before.replace("- [ ] Fix now", "- [x] Fix now")
+        after = before.replace("- [ ] F1 Fix now", "- [x] F1 Fix now")
         r.server.comments[written.comment_id]["body"] = after
         stamp = datetime.fromtimestamp(r.clock.now_utc_us() / S, UTC).isoformat()
         delivery = {

@@ -373,9 +373,9 @@ async def test_the_report_lists_each_item_with_a_hidden_action_marker(
         assert "**Deferred**" in section
         lines = [line for line in section.splitlines() if line.startswith("- [ ]")]
         assert lines == [
-            "- [ ] Fix now: P2 `api/src/export.ts` Retry leaks the delivery row (in #100) "
+            "- [ ] F1 Fix now: P2 `api/src/export.ts` Retry leaks the delivery row (in #100) "
             f"{rl.marker(rl.ACTION, action(FU_A))}",
-            "- [ ] Fix now: P3 Clock going backwards (advisory: no realistic trigger here) "
+            "- [ ] F2 Fix now: P3 Clock going backwards (advisory: no realistic trigger here) "
             f"{rl.marker(rl.ACTION, action(ADV))}",
         ]
         assert "One more" not in section  # rounds not used up

@@ -1287,7 +1287,62 @@ class StatusComments:
 
 
 def _issue_body(view: IssueView, headline: str, history: Sequence[tuple[int, str]]) -> str:
-    return render_issue(view, history, headline)
+    return _fit_issue(view, headline, history)
+
+
+#: What a too-long status comment leaves out first, in order (each whole): everything
+#: but its heading and the current PR's block (ELI5, PR and CI lines, review rounds and
+#: the Deferred checkboxes).
+_TRIM_ORDER: tuple[dict[str, Any], ...] = (
+    {"history": True},
+    {"splits": ()},
+    {"checkpoint": ""},
+    {"triage": "", "triage_header": ""},
+    {"bundle": ""},
+    {"question": None},
+    {"plan": None},
+)
+
+
+def _fit_issue(
+    view: IssueView,
+    headline: str,
+    history: Sequence[tuple[int, str]],
+    limit: int = _BODY_LIMIT,
+) -> str:
+    """The issue's status body within ``limit``, always. Other and older parts go first
+    (:data:`_TRIM_ORDER`); the current PR's block stays. An oversized Deferred section
+    (items accumulated beyond its budget) then keeps as many whole checkbox lines as fit,
+    in number order, with a line saying how many more there are (logged as a warning);
+    only then is the PR text itself cut."""
+    body = render_issue(view, history, headline)
+    if len(body) <= limit:
+        return body
+    room = limit - len(rl.TRUNCATED)
+    for drop in _TRIM_ORDER:
+        if drop.get("history"):
+            history = ()
+        else:
+            view = replace(view, **drop)
+        body = render_issue(view, history, headline)
+        if len(body) <= room:
+            return body + rl.TRUNCATED
+    if len(view.deferred) > rl.SECTION_BUDGET:
+        rest = len(body) - len(view.deferred)
+        section, left = rl.fit_section(view.deferred, max(0, room - rest))
+        LOG.warning(
+            "status comment deferred section too long issue=#%s: %s checkbox lines left out",
+            view.issue,
+            left,
+        )
+        view = replace(view, deferred=section)
+        body = render_issue(view, history, headline)
+        if len(body) <= room:
+            return body + rl.TRUNCATED
+    excess = len(body) - room
+    view = replace(view, pr=rl.cut_text(view.pr, max(0, len(view.pr) - excess)))
+    body = render_issue(view, history, headline)
+    return body + rl.TRUNCATED if len(body) <= room else rl.cut_text(body, limit)
 
 
 def _epic_body(view: EpicView, headline: str, history: Sequence[tuple[int, str]]) -> str:

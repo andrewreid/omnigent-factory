@@ -184,12 +184,12 @@ def test_pr_writing_prompts_ask_for_a_pr_body_eli5_and_keep_old_versions():
         directory._CONFLICT_WAKE_TEMPLATE,
     }
     assert {opening, *updating} == {
-        "build-v19.txt",
+        "build-v20.txt",
         "build-rework-v15.txt",
         "build-rework-items-v6.txt",
         "build-conflict-v6.txt",
-        "readiness-wake-v14.txt",
-        "readiness-findings-wake-v6.txt",
+        "readiness-wake-v15.txt",
+        "readiness-findings-wake-v7.txt",
         "readiness-conflict-wake-v3.txt",
     }
     for name in {opening, *updating}:
@@ -198,10 +198,17 @@ def test_pr_writing_prompts_ask_for_a_pr_body_eli5_and_keep_old_versions():
         assert "after the `Closes` lines" in flat, name
         # The result-field ELI5 paragraph is kept as it was.
         assert "always fill eli5" in flat and "factory_ask_owner, always pass eli5" in flat
+        # Each released version only adds to the one before it, back to the version
+        # that introduced the ELI5 section (its predecessor is untouched).
         prefix, version = name.removesuffix(".txt").rsplit("-v", 1)
-        old = (root / f"{prefix}-v{int(version) - 1}.txt").read_text("utf-8")
-        assert "## ELI5" not in old  # the released template is untouched
-        assert (root / name).read_text("utf-8").startswith(old.rstrip() + "\n")
+        number = int(version)
+        while True:
+            text = (root / f"{prefix}-v{number}.txt").read_text("utf-8")
+            old = (root / f"{prefix}-v{number - 1}.txt").read_text("utf-8")
+            assert text.startswith(old.rstrip() + "\n"), (prefix, number)
+            if "## ELI5" not in old:
+                break
+            number -= 1
     flat = " ".join((root / opening).read_text("utf-8").split())
     assert "add a `## ELI5` section" in flat and "update it if what the PR does" in flat
     for name in updating:

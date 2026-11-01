@@ -500,7 +500,14 @@ plan, or one that would materially grow the PR) or **advisory** (no realistic tr
 this repository, a style preference, hardening against threats not in play: a one-line
 reply, nothing filed). She replies on the thread, resolves it and lists follow-ups and
 advisories in her build_ready or blocked result's `deferred` (severity, path, title, thread
-URL, reason, optional `blocks`).
+URL, reason, optional `blocks`), each with an optional **rating** of how much it needs
+fixing: `bug` (a real defect that will hit or has hit), `likely` (a plausible failure
+under real conditions), `edge` (hypothetical: needs an unusual combination) or `tidy`
+(cleanup, docs, cosmetic), and an optional `why` (one short line, at most 160 characters).
+Results without them stay valid; a later result that rates an item already recorded
+updates its rating. The consolidated issue's line shows the rating after the severity
+(`P2 (Likely) ...`) and the why at its end; a changed rating or why rewrites that line in
+place (its checkbox and any `→ fixed in ...` status kept).
 
 The factory files the follow-ups of one PR as **one** issue, `Follow-ups from #<PR>`: a
 checklist, one line per item, labelled `follow-up`, a sub-issue of the source issue's epic,
@@ -552,9 +559,26 @@ Ready when otherwise ready, with the note `Codex round 2/2`. `factory_get_status
 `review_rounds` (used, budget, strict_from_round).
 
 **Ready report checkboxes.** The status comment's Pull request section (the Ready report
-before status comments) ends with a **Deferred** list: one line per
-deferred item and advisory (``- [ ] Fix now: P2 `path` title (in #<issue>)`` or
-`(advisory: reason)`), plus `- [ ] One more Codex review round` once the rounds are used up. Tick lines
+before status comments) ends with a **Deferred** section. Every deferred item and advisory
+has a number, `F1`, `F2`, ... in the order they were recorded: an item keeps its number
+when the report is rewritten or later results add items (new items get the next numbers),
+so "F3" means the same thing throughout the discussion. First comes a table,
+`| # | Item | Rating | Why |`, sorted Bug, Likely, Edge, Tidy, then unrated items
+(rating `-`, as for results from before ratings existed). Then the checkbox list, one line
+per item in number order (``- [ ] F1 Fix now: P2 `path` title (in #<issue>)`` or
+`(advisory: reason)`), plus `- [ ] One more Codex review round` once the rounds are used up
+(GitHub checkboxes do not work inside table cells, so the boxes stay in the list). The
+section is kept to 40,000 characters so the comment stays within GitHub's limit: every
+checkbox line always stays (its text shortened to the number and a short title if need
+be); the table's cells shrink first, then it shows only numbers and ratings, then it is
+left out with a note, and the text before the section is cut before any checkbox (the
+status comment leaves out its history, splits, checkpoint, triage, bundle, question and
+plan first; the PR's ELI5, PR and CI lines stay). Limitation: an issue that piles up more
+items than that (several hundred, across many results) shows as many whole checkbox lines
+as fit, in number order, then `N more items - see the follow-up issue #X`; those items
+cannot be ticked from the comment (a warning is logged). A tick
+still means **fix this now, in this PR**: numbers and ratings change nothing about what a
+tick does or who may tick. The agent never ticks. Tick lines
 to have them done: only your ticks count (the comment's `edited` webhook from an owner,
 diffed against the previous body; a hidden marker per line, never its text). Ticks within
 2 minutes of the first become one rework (back to Building through the normal queue, same
