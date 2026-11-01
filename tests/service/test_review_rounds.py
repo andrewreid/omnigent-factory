@@ -29,6 +29,7 @@ from tests.github.test_review_bot_pending import (
     OPENED_US,
     PR,
     S,
+    codex_summary,
     comment,
     review,
     server,
@@ -274,3 +275,20 @@ async def test_findings_on_a_head_beyond_the_budget_neither_wake_nor_hold_ready(
     assert isinstance(evidence, PullRequestEvidence)
     assert not evidence.findings_dispositioned and evidence.open_findings == (ref_a,)
     await http.aclose()
+
+
+async def test_completed_summary_is_recorded_once_in_review_rounds(service_config: ServiceConfig):
+    handler = server(comments=[comment(codex_summary(), OPENED_US + 99 * S, CODEX)])
+    async with deferred_rig(service_config) as r:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            gh = adapter(http, review_bot_login=CODEX)
+            gh.review_rounds = r.rounds.observe
+            ref = IssueRef(r.service.config.repo_id, 1, "I_parcel_1")
+            for _ in range(2):
+                assert await gh._review_bot_pending_since(PR, 686, HEAD) == 0
+                rounds = await gh._review_rounds(ref, 686, HEAD, False)
+                assert rounds is not None and rounds.used == 1
+        stored = await r.service.db.call(
+            partial(ds.review_rounds, repo_id=r.service.config.repo_id, parcel_id="I_parcel_1")
+        )
+        assert stored == [(HEAD, OPENED_US + 99 * S)]

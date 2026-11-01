@@ -211,3 +211,52 @@ async def test_failing_checks_carry_the_newest_runs_page_for_the_needs_you_comme
             ev.CheckRef(name=audit, url="https://github.com/o/r/runs/22"),
             ev.CheckRef(name="ci/legacy", url="https://ci.example/legacy"),
         )
+
+
+@pytest.mark.parametrize(
+    ("older", "newer", "state"),
+    [
+        ("failure", "success", ChecksState.GREEN),
+        ("success", "failure", ChecksState.FAILED),
+    ],
+)
+@pytest.mark.asyncio
+async def test_required_rerun_uses_highest_id_within_name_and_app(older, newer, state):
+    name = "CI / Required"
+    base = server([], [name])
+
+    def handler(request):
+        if request.url.path.endswith("/check-runs"):
+            assert request.url.params["filter"] == "all"
+            # Newest comes first, times and suite IDs disagree with run ID order,
+            # and a different app's newer success cannot replace the required app.
+            return httpx.Response(
+                200,
+                json={
+                    "check_runs": [
+                        {
+                            "id": i,
+                            "name": name,
+                            "app": {"id": app},
+                            "status": "completed",
+                            "conclusion": conclusion,
+                            "check_suite": {"id": suite},
+                            "started_at": started,
+                        }
+                        for i, app, conclusion, suite, started in [
+                            (20, APP, newer, 1, "2026-11-01T09:00:00Z"),
+                            (10, APP, older, 2, "2026-11-01T10:00:00Z"),
+                            (30, APP + 1, "success", 3, "2026-11-01T11:00:00Z"),
+                        ]
+                    ]
+                },
+            )
+        return base(request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        gh = adapter(http)
+        assert await gh._checks_state(HEAD, "main") == state
+        assert gh._last_failing_checks == (name if state == ChecksState.FAILED else "")
+        assert gh._last_checks_summary == "3 checks: 2 success, 1 failure"
+        gh.required_checks = frozenset({(name, None)})
+        assert await gh._checks_state(HEAD) == state  # unpinned still considers each app

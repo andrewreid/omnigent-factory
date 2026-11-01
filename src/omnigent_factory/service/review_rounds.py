@@ -8,8 +8,9 @@ waiting for (and waking the run on) another one.
   Autopilot: a value seen on the board without such a webhook (someone else's edit, or a
   lost delivery) is not trusted and the default applies. A value below 1 is ignored.
 * **Rounds.** One round is one review-bot review of a PR head (a review of that commit,
-  a "Reviewed commit" verdict naming it, or its +1 on the PR after the push), counted per
-  issue across runs and reworks; owner comments and reworks do not reset it. A head that
+  a "Reviewed commit" verdict or completed Codex summary marker naming it, or its +1
+  on the PR after the push), counted per issue across runs and reworks; owner comments
+  and reworks do not reset it. A head that
   only syncs the base branch (the owner's "Update branch") is not counted.
 * **Exhausted** (rounds used >= budget): readiness no longer waits for a further review,
   findings the bot leaves on a head reviewed beyond the budget neither wake the run nor

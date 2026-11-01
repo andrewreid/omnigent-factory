@@ -1230,16 +1230,20 @@ administration. While the review bot
 (`review_bot_login`, default `chatgpt-codex-connector[bot]`) can still respond to the PR
 head, the card is not Ready, so late bot comments are handled by the build's findings
 wake instead of pulling a Ready card back. The bot can still respond until it has
-answered that head (a review of the commit, a verdict naming it, or a +1 on the PR after
-the push); once it has and nothing re-pinged it, readiness is judged on current evidence
-at once. Its trigger is the head push or PR opening, or a `review_bot_mention` re-ping
+answered that head (a review of the commit, a verdict or completed Codex summary marker
+naming it, or a +1 on the PR after the push); once it has and nothing re-pinged it,
+readiness is judged on current evidence at once. Its trigger is the head push or PR opening, or a `review_bot_mention` re-ping
 after its last answer. Codex shows it is reviewing with a 👀 reaction (on the PR, or on
 the re-ping comment), which sends no webhook, so each read (every reconcile, about every
-2 minutes, while it is waited for) looks again:
+2 minutes, while it is waited for) looks again. Codex summary markers count only for the
+configured bot's completed or finished code review, and count toward review rounds once
+per commit. PR creation time is capped at this adapter's first observation of the PR,
+so a future GitHub timestamp cannot move the reaction cutoff forward on later polls;
+the head commit time still applies:
 
 | Bot state on its latest trigger | Wait |
 |---|---|
-| Answered (review, `Reviewed commit` comment, +1 after the push) | none: judged at once (a review webhook triggers the read) |
+| Answered (review, `Reviewed commit` comment, completed Codex summary, +1 after the push) | none: judged at once (a review webhook triggers the read) |
 | 👀 taken at or after the trigger | until it answers, at most `review_bot_max_wait_minutes` (default 45) after the trigger; kept even if the 👀 is later removed |
 | No 👀 | `review_bot_ack_minutes` (default 5) after the trigger |
 | Unreadable | as for 👀: at most `review_bot_max_wait_minutes` after the trigger (or, with none known, after the first unreadable read) |

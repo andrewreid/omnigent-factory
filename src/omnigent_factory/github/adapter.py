@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import re
 import time
@@ -208,6 +209,8 @@ class GitHubAPIAdapter:
         self.required_checks = required_checks
         self.parcel_branch_prefix = parcel_branch_prefix
         self._now_us = now_us or (lambda: time.time_ns() // 1000)
+        #: Keep the first observation ceiling stable across readiness polls.
+        self._pr_observed_at_us: dict[int, int] = {}
         self.parcel_bindings = parcel_bindings or {}
         self.board_schema = board_schema
         self.status_options = _status_options(board_schema)
@@ -922,6 +925,7 @@ class GitHubAPIAdapter:
         pr: Any = await self.client.get_json(f"/repos/{self.repository}/pulls/{pr_number}")
         if not isinstance(pr, dict):
             raise GitHubAPIError("pull request response was malformed")
+        self._pr_observed_at_us.setdefault(pr_number, self._now_us())
         return pr
 
     async def pull_request_state(self, pr_number: int) -> PullRequestState | RetryableReadFailure:
@@ -966,7 +970,13 @@ class GitHubAPIAdapter:
         detail = commit.get("commit") if isinstance(commit, dict) else None
         committer = detail.get("committer") if isinstance(detail, dict) else None
         committed = self._parse_time_us(committer.get("date")) if isinstance(committer, dict) else 0
-        opened = self._parse_time_us(pr.get("created_at"))
+        observed_at = self._pr_observed_at_us.setdefault(pr_number, self._now_us())
+        opened = observed_github_time_us(
+            pr.get("created_at"),
+            observed_at,
+            logger=LOG,
+            context=f"repository={self.repository} pr={pr_number} field=created_at",
+        )
         if not committed or not opened:
             return None
         pushed = max(committed, opened)
@@ -994,13 +1004,15 @@ class GitHubAPIAdapter:
             author = user.get("login") if isinstance(user, dict) else None
             body = str(item.get("body") or "")
             at = self._parse_time_us(item.get(at_key))
-            if author == login and at:
-                reviewed = _reviewed_commit(item, body, head_sha)
-                if reviewed:
-                    rounds.append((reviewed, at))
             if author == login:
-                if at and (item.get("commit_id") == head_sha or self._names_commit(body, head_sha)):
-                    answers.append((at, kind))
+                reviewed = _reviewed_commit(item, body, head_sha)
+                if reviewed and kind == "comment":
+                    # Codex updates one summary comment when a later review finishes.
+                    at = self._parse_time_us(item.get("updated_at")) or at
+                if reviewed and at:
+                    rounds.append((reviewed, at))
+                    if reviewed == head_sha:
+                        answers.append((at, kind))
             elif self.review_bot_mention and self.review_bot_mention.lower() in body.lower():
                 if not at:
                     return None  # an undatable re-ping could be the latest one
@@ -1074,12 +1086,6 @@ class GitHubAPIAdapter:
         if not count:
             return f"reviewed `{short}`, no findings"
         return f"reviewed `{short}`, {count} finding{'s' if count != 1 else ''}, all with outcomes"
-
-    @staticmethod
-    def _names_commit(body: str, head_sha: str) -> bool:
-        """A verdict comment's "Reviewed commit: `<sha prefix>`" names ``head_sha``."""
-        match = _REVIEWED_COMMIT.search(body)
-        return match is not None and head_sha.startswith(match.group(1).lower())
 
     async def review_comments(
         self, pr_number: int, review_id: int
@@ -1255,7 +1261,8 @@ class GitHubAPIAdapter:
         page = 1
         while True:
             result: Any = await self.client.get_json(
-                f"/repos/{self.repository}/commits/{head_sha}/check-runs?per_page=100&page={page}"
+                f"/repos/{self.repository}/commits/{head_sha}/check-runs"
+                f"?filter=all&per_page=100&page={page}"
             )
             batch = result.get("check_runs") if isinstance(result, dict) else None
             if not isinstance(batch, list):
@@ -2438,16 +2445,44 @@ def _finding_ref(thread: dict[str, Any]) -> FindingRef:
 
 def _reviewed_commit(item: dict[str, Any], body: str, head_sha: str) -> str:
     """The commit a review-bot review (its ``commit_id``) or verdict comment ("Reviewed
-    commit: `<prefix>`") answered: the full head SHA when it names the head, else the
-    SHA or prefix as given ("" = neither)."""
+    commit: `<prefix>`" or a completed Codex state marker) answered: the full head SHA
+    when it names the head, else the SHA or prefix as given ("" = neither)."""
     commit = item.get("commit_id")
     if isinstance(commit, str) and commit:
         return commit
+    if body.find("<!-- codex-review-state:", 0, 65_536) >= 0:
+        # A marker's status must not be bypassed by prose or an unknown JSON field.
+        return _codex_reviewed_commit(body)
     match = _REVIEWED_COMMIT.search(body)
     if match is None:
         return ""
     prefix = match.group(1).lower()
     return head_sha if head_sha.startswith(prefix) else prefix
+
+
+def _codex_reviewed_commit(body: str) -> str:
+    """A completed code review in Codex's v1 summary marker; unknown shapes fail closed.
+
+    Bound both the search and JSON payload before parsing untrusted comment content.
+    Security-review state is independent and does not answer a code-review request.
+    """
+    marker = "<!-- codex-review-state:v1 "
+    start = body.find(marker, 0, 65_536)
+    if start < 0:
+        return ""
+    start += len(marker)
+    end = body.find("-->", start, start + 8_192)
+    if end < 0:
+        return ""
+    try:
+        state = json.loads(body[start:end])
+    except (ValueError, RecursionError):
+        return ""
+    review = state.get("code_review") if isinstance(state, dict) else None
+    if not isinstance(review, dict) or review.get("status") not in ("completed", "finished"):
+        return ""
+    sha = review.get("commit_sha")
+    return sha.lower() if isinstance(sha, str) and re.fullmatch(r"[0-9a-fA-F]{40}", sha) else ""
 
 
 def _bot_thread_commit(comments: object, bot_login: str) -> str | None:

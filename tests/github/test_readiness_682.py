@@ -257,3 +257,45 @@ async def test_bot_resolving_a_thread_without_a_reply_is_not_an_outcome():
     silent = [_thread(("Bot", 999), resolved=True)]
     outcome = await evidence(server(threads=silent))
     assert isinstance(outcome, Ack) and outcome.detail["findings_dispositioned"] is False
+
+
+@pytest.mark.asyncio
+async def test_all_check_runs_recovers_required_gate_and_paginates_to_verified_green():
+    base = server(protection=["CI / Required"])
+    pages = []
+
+    def handler(request):
+        if request.url.path.endswith("/check-runs"):
+            page = int(request.url.params["page"])
+            pages.append(page)
+            # GitHub's latest filter omitted the gate in PR #1654. Put it on page
+            # two as well, so both filter=all and complete pagination are necessary.
+            runs = [
+                {
+                    "id": i,
+                    "name": f"check-{i}",
+                    "app": {"id": 15368},
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+                for i in range(100)
+            ]
+            if request.url.params.get("filter") == "all":
+                runs.append(
+                    {
+                        "id": 101,
+                        "name": "CI / Required",
+                        "app": {"id": 15368},
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                )
+            return httpx.Response(200, json={"check_runs": runs[(page - 1) * 100 : page * 100]})
+        return base(request)
+
+    outcome = await evidence(handler)
+    assert isinstance(outcome, Ack)
+    assert outcome.detail["verified"] is True
+    assert outcome.detail["checks"] == ChecksState.GREEN.value
+    assert outcome.detail["checks_summary"] == "101 checks: 101 success"
+    assert pages == [1, 2]

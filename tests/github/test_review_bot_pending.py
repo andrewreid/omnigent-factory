@@ -6,6 +6,7 @@ or was explicitly re-pinged after its last answer; anything unreadable keeps the
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 
@@ -237,3 +238,116 @@ def test_codex_finding_threads_carry_path_severity_title_and_link():
         "Consider a guard here",
         "",
     )
+
+
+def codex_summary(commit: str = HEAD, status: object = "completed") -> str:
+    # Exact v1 shape from timesheets PR #1654, comment 6555823265.
+    state = {
+        "code_review": {
+            "commit_sha": commit,
+            "has_any_findings": False,
+            "has_unresolved_findings": False,
+            "status": status,
+        },
+        "security_review": {
+            "commit_sha": None,
+            "has_any_findings": None,
+            "has_unresolved_findings": None,
+            "status": None,
+        },
+    }
+    return (
+        "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 "
+        + json.dumps(state)
+        + " -->"
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "login", "answered", "round_commit"),
+    [
+        (codex_summary(), CODEX, True, HEAD),
+        (codex_summary(status="finished"), CODEX, True, HEAD),
+        (codex_summary(OLD), CODEX, False, OLD),
+        (codex_summary(), "someone-else", False, ""),
+        (codex_summary(status="in_progress"), CODEX, False, ""),
+        (codex_summary(status="in_progress") + f" Reviewed commit: `{HEAD}`", CODEX, False, ""),
+        (f"<!-- codex-review-state:v1 broken Reviewed commit: `{HEAD}` -->", CODEX, False, ""),
+        (codex_summary(OLD) + f" Reviewed commit: `{HEAD}`", CODEX, False, OLD),
+        (codex_summary(status=None), CODEX, False, ""),
+        (codex_summary(status={"bad": True}), CODEX, False, ""),
+        (codex_summary(HEAD[:7]), CODEX, False, ""),
+        ("<!-- codex-review-state:v1 {broken} -->", CODEX, False, ""),
+        ("<!-- codex-review-state:v1 [] -->", CODEX, False, ""),
+        ('<!-- codex-review-state:v1 {"code_review":null} -->', CODEX, False, ""),
+        ("<!-- codex-review-state:v1 " + "[" * 2000 + "0" + "]" * 2000 + " -->", CODEX, False, ""),
+        (codex_summary().replace(" -->", " " * 8192 + " -->"), CODEX, False, ""),
+        (
+            codex_summary().replace('"security_review":', '"unknown":42,"security_review":'),
+            CODEX,
+            True,
+            HEAD,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_codex_summary_answers_only_completed_reviews_by_configured_bot(
+    body, login, answered, round_commit
+):
+    when = OPENED_US + 99 * S
+    handler = server(comments=[comment(body, when, login)])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        gh = adapter(http, review_bot_login=CODEX)
+        assert await gh._review_bot_pending_since(PR, 686, HEAD) == (0 if answered else OPENED_US)
+        assert gh._last_bot_rounds == (((round_commit, when),) if round_commit else ())
+
+
+@pytest.mark.asyncio
+async def test_updated_codex_summary_answers_a_reping_after_comment_creation():
+    when = OPENED_US + 300 * S
+    summary = {**comment(codex_summary(), OPENED_US, CODEX), "updated_at": at(when)}
+    handler = server(comments=[summary, comment("@codex review", when - S)])
+    assert await pending(handler) == 0
+
+
+@pytest.mark.asyncio
+async def test_future_pr_creation_is_capped_at_first_observation_across_polls():
+    now = OPENED_US
+    skewed = {**PR, "created_at": at(OPENED_US + 3600 * S)}
+    reactions = []
+    base = server(reactions=reactions)
+
+    def handler(request):
+        if request.url.path.endswith("/pulls/686"):
+            return httpx.Response(200, json=skewed)
+        return base(request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        gh = adapter(http, review_bot_login=CODEX, now_us=lambda: now)
+        await gh._pull(686)  # First observation precedes the bot's reaction.
+        now += 120 * S
+        reactions.append({"user": {"login": CODEX}, "content": "+1", "created_at": at(now - S)})
+        assert await gh._review_bot_pending_since(await gh._pull(686), 686, HEAD) == 0
+        now += 120 * S
+        assert await gh._review_bot_pending_since(await gh._pull(686), 686, HEAD) == 0
+        # Neither an ordinary PR-open cutoff nor the head-commit cutoff is weakened.
+        reactions[0]["created_at"] = at(COMMITTED_US - S)
+        assert await gh._review_bot_pending_since(await gh._pull(686), 686, HEAD) == OPENED_US
+
+
+@pytest.mark.asyncio
+async def test_new_head_after_first_observation_still_requires_a_later_reaction():
+    now = COMMITTED_US - 60 * S
+    reactions = [{"user": {"login": CODEX}, "content": "+1", "created_at": at(COMMITTED_US - S)}]
+    base = server(reactions=reactions)
+
+    def handler(request):
+        if request.url.path.endswith("/pulls/686"):
+            return httpx.Response(200, json=PR)
+        return base(request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        gh = adapter(http, review_bot_login=CODEX, now_us=lambda: now)
+        await gh._pull(686)
+        now = OPENED_US + 120 * S
+        assert await gh._review_bot_pending_since(await gh._pull(686), 686, HEAD) == COMMITTED_US
