@@ -16,8 +16,8 @@ and the Ready report's Deferred checkboxes the owner ticks to have items done no
   result adds are appended to the same issue (re-read first; existing lines and ticks kept).
 * **Ticked.** The Ready report numbers every item and advisory ``F1``, ``F2``, ... (in the
   order they were recorded: an item keeps its number, later items get the next ones),
-  shows them in a table sorted by the agent's rating (bug, likely, edge, tidy; unrated
-  last, as "-") with its one-line why, then lists each as ``- [ ] F<n> Fix now: ...``
+  shows them in a table in number order with the agent's rating (bug, likely, edge,
+  tidy; unrated as "-") and its one-line why, then lists each as ``- [ ] F<n> Fix now: ...``
   (and ``One more <bot> review round`` once the issue's review rounds are used up), each
   with a hidden ``factory-action`` marker (the marker, never the text, names the box).
   An ``issue_comment`` ``edited`` webhook of that report (the bot's own comment) from an
@@ -96,7 +96,7 @@ def _one_line(text: str, limit: int = 300) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-#: The Ready report's labels of the agent's ratings (unrated: "-"; sorted by ``RATINGS``).
+#: The Ready report's labels of the agent's ratings (unrated: "-").
 _RATING_LABELS = {"bug": "Bug", "likely": "Likely", "edge": "Edge", "tidy": "Tidy"}
 
 
@@ -621,20 +621,18 @@ class Deferrals:
     def _report_table(
         self, numbered: Sequence[tuple[str, ds.DeferredItem]], cells: tuple[int, int]
     ) -> str:
-        """The numbered items by rating (bug, likely, edge, tidy, then unrated), each
-        with the agent's one-line why. ``cells``: the item and why cells' length (0, 0:
-        number and rating only). Checkboxes do not work in table cells: the boxes stay in
-        the list below it."""
+        """The numbered items in number order (as the list below), each with the
+        agent's rating (bug, likely, edge, tidy; unrated: "-") and one-line why.
+        ``cells``: the item and why cells' length (0, 0: number and rating only).
+        Checkboxes do not work in table cells: the boxes stay in the list below it."""
         item_len, why_len = cells
-        rank = {rating: n for n, rating in enumerate(RATINGS)}
         detail = bool(item_len or why_len)
         rows = (
             ["| # | Item | Rating | Why |", "| --- | --- | --- | --- |"]
             if detail
             else ["| # | Rating |", "| --- | --- |"]
         )
-        # Stable sort: within a rating, items keep their number order.
-        for number, item in sorted(numbered, key=lambda e: rank.get(e[1].rating, len(rank))):
+        for number, item in numbered:
             label = _RATING_LABELS.get(item.rating, "-")
             if not detail:
                 rows.append(f"| {number} | {label} |")

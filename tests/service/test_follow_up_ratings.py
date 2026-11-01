@@ -2,7 +2,7 @@
 
 Each deferred item gets a stable number (F1, F2, ... in recording order: an item never
 changes number, a new item gets the next one) and the agent's optional rating (bug,
-likely, edge, tidy) and one-line why. The report shows a table sorted by rating, then
+likely, edge, tidy) and one-line why. The report shows a table in number order, then
 the same checkbox list as before with each line prefixed by its number. A tick still
 means "fix this now in this PR": boxes are named by their hidden marker only, so tick
 reading is unchanged.
@@ -102,7 +102,7 @@ async def test_unrated_items_render_a_numbered_table_with_dashes_and_the_same_bo
 
 
 @pytest.mark.asyncio
-async def test_the_table_sorts_by_rating_and_keeps_numbers_in_recording_order(
+async def test_the_table_lists_items_in_number_order_with_their_ratings(
     service_config: ServiceConfig,
 ):
     async with rig(service_config) as r:
@@ -116,11 +116,11 @@ async def test_the_table_sorts_by_rating_and_keeps_numbers_in_recording_order(
         await r.deferred.record_result(await r.parcel(), "s1", result(*items))
         section = await r.deferred.report_section(await r.parcel())
         assert table(section) == [
-            ["F2", "P1 Unbounded retry loop", "Bug", "hits every outage"],
-            ["F5", "P3 Log line repeats the row id", "Likely", "every export logs it"],
             ["F1", "P2 Retry leaks the delivery row", "Edge", "needs two retries racing"],
+            ["F2", "P1 Unbounded retry loop", "Bug", "hits every outage"],
             ["F3", "P3 Clock going backwards", "Tidy", "-"],
             ["F4", "P2 Export skips archived rows", "-", "-"],
+            ["F5", "P3 Log line repeats the row id", "Likely", "every export logs it"],
         ]
         # The boxes stay in number order, one per item, each with its own marker.
         lines = boxes(section)
@@ -143,7 +143,7 @@ async def test_numbers_are_stable_across_re_renders_and_new_items_get_the_next_o
         second = await r.deferred.report_section(await r.parcel())
         numbers = {next(iter(rl.ids(line))): line.split(" ", 4)[3] for line in boxes(second)}
         assert numbers == {action(FU_A): "F1", action(ADV): "F2", action(EXTRA): "F3"}
-        assert table(second)[0] == ["F2", "P3 Clock going backwards", "Bug", "now seen live"]
+        assert table(second)[1] == ["F2", "P3 Clock going backwards", "Bug", "now seen live"]
         # Earlier boxes read exactly as before (only the newly rated table row changed).
         assert boxes(second)[:2] == boxes(first)
 

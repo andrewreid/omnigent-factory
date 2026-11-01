@@ -563,8 +563,9 @@ before status comments) ends with a **Deferred** section. Every deferred item an
 has a number, `F1`, `F2`, ... in the order they were recorded: an item keeps its number
 when the report is rewritten or later results add items (new items get the next numbers),
 so "F3" means the same thing throughout the discussion. First comes a table,
-`| # | Item | Rating | Why |`, sorted Bug, Likely, Edge, Tidy, then unrated items
-(rating `-`, as for results from before ratings existed). Then the checkbox list, one line
+`| # | Item | Rating | Why |`, in number order (`F1`, `F2`, ...) like the list below; the
+rating is Bug, Likely, Edge or Tidy, or `-` for an unrated item (as for results from
+before ratings existed). Then the checkbox list, one line
 per item in number order (``- [ ] F1 Fix now: P2 `path` title (in #<issue>)`` or
 `(advisory: reason)`), plus `- [ ] One more Codex review round` once the rounds are used up
 (GitHub checkboxes do not work inside table cells, so the boxes stay in the list). The
