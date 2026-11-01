@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -65,14 +67,24 @@ def payload(**overrides):
     return {**base, **overrides}
 
 
-def normalize(data, event="issue_comment", provenance=Provenance.WEBHOOK):
+def normalize(
+    data,
+    event="issue_comment",
+    provenance=Provenance.WEBHOOK,
+    *,
+    delivery_time_us=2_000_000_000_000_000,
+):
     return DeliveryNormalizer(IDENTITY).normalize(
         raw_body=json.dumps(data, separators=(",", ":")).encode(),
         event_name=event,
         delivery_guid="delivery-1",
-        delivery_time_us=2_000_000_000_000_000,
+        delivery_time_us=delivery_time_us,
         provenance=provenance,
     )
+
+
+def stamp(at_us: int) -> str:
+    return datetime.fromtimestamp(at_us / 1_000_000, UTC).isoformat().replace("+00:00", "Z")
 
 
 def test_signature_is_over_exact_raw_bytes():
@@ -150,6 +162,28 @@ def test_delayed_feedback_preserves_original_time_and_recovery_provenance():
     assert event.event_id == "github:comment:50:created"
 
 
+def test_future_comment_time_is_clamped_to_receipt_and_warned(caplog):
+    received = 1_800_000_000_000_000
+    data = payload(
+        comment={"id": 50, "body": "/plan", "created_at": stamp(received + 3_600_000_000)}
+    )
+    with caplog.at_level(logging.WARNING):
+        (event,) = normalize(data, delivery_time_us=received).events
+    assert event.source_time_us == received
+    assert "delivery_id=delivery-1" in caplog.text
+    assert "event=issue_comment" in caplog.text
+    assert "skew_us=3600000000" in caplog.text
+
+
+def test_small_future_comment_time_is_clamped_without_warning(caplog):
+    received = 1_800_000_000_000_000
+    data = payload(comment={"id": 50, "body": "/plan", "created_at": stamp(received + 4_000_000)})
+    with caplog.at_level(logging.WARNING):
+        (event,) = normalize(data, delivery_time_us=received).events
+    assert event.source_time_us == received
+    assert caplog.records == []
+
+
 def test_non_owner_and_bot_comments_cannot_control():
     assert normalize(payload(sender={"id": 222})).events == ()
     assert normalize(payload(sender={"id": IDENTITY.bot_user_id})).events == ()
@@ -177,13 +211,13 @@ def project_drag(actor=114979, old="Scoped", new="Building"):
     return result
 
 
-async def resolve_drag(data, *, guid="delivery-1"):
+async def resolve_drag(data, *, guid="delivery-1", delivery_time_us=2_000_000_000_000_000):
     raw = json.dumps(data, separators=(",", ":")).encode()
     unresolved = DeliveryNormalizer(IDENTITY).normalize(
         raw_body=raw,
         event_name="projects_v2_item",
         delivery_guid=guid,
-        delivery_time_us=2_000_000_000_000_000,
+        delivery_time_us=delivery_time_us,
     )
     target = data["changes"]["field_value"].get("to", {}).get("name", "Building")
 
@@ -230,7 +264,7 @@ async def resolve_drag(data, *, guid="delivery-1"):
             normalizer=DeliveryNormalizer(IDENTITY),
             unresolved=unresolved,
             raw_body=raw,
-            delivery_time_us=2_000_000_000_000_000,
+            delivery_time_us=delivery_time_us,
         )
 
 

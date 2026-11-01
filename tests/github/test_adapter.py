@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+from datetime import UTC, datetime
 
 import httpx
 import pytest
 
+from omnigent_factory.core import events as ev
 from omnigent_factory.core.contract_view import parcel_marker, render_contract_section
 from omnigent_factory.core.effects import (
     Ack,
@@ -17,7 +20,7 @@ from omnigent_factory.core.effects import (
     RetryableReadFailure,
 )
 from omnigent_factory.core.events import ChecksState
-from omnigent_factory.core.types import Stage
+from omnigent_factory.core.types import Size, Stage, Via
 from omnigent_factory.github.adapter import (
     BoardSchema,
     GitHubAPIAdapter,
@@ -25,6 +28,8 @@ from omnigent_factory.github.adapter import (
 )
 from omnigent_factory.github.client import GitHubClient
 from omnigent_factory.ports.github import IssueRef
+from omnigent_factory.testing.builders import contract_text, result_candidate
+from omnigent_factory.testing.harness import Harness
 
 REPOSITORY = "SA-Ambulance/timesheets"
 REPO_NODE = "R_kgDOTC12Fg"
@@ -32,11 +37,13 @@ PROJECT = "PVT_kwDOEanNes4BkJhb"
 STATUS_FIELD = "PVTSSF_lADOEanNes4BkJhbzhi7I9w"
 BOT_ID = 777
 CTX = ExecutionContext("boot", 1, 1, 1)
+TEST_NOW_US = 1_800_000_000_000_000
 
 
 def adapter(http: httpx.AsyncClient, checks=frozenset(), **kwargs):
     kwargs.setdefault("independent_reviewer_ids", frozenset({5}))
     kwargs.setdefault("owner_ids", frozenset({114979}))
+    now_us = kwargs.pop("now_us", lambda: TEST_NOW_US)
     return GitHubAPIAdapter(
         GitHubClient(http, "token"),
         repository=REPOSITORY,
@@ -45,7 +52,7 @@ def adapter(http: httpx.AsyncClient, checks=frozenset(), **kwargs):
         status_field_node_id=STATUS_FIELD,
         bot_user_id=BOT_ID,
         required_checks=checks,
-        now_us=lambda: 123_000_000,
+        now_us=now_us,
         **kwargs,
     )
 
@@ -152,7 +159,7 @@ async def test_fresh_issue_and_board_snapshot_verifies_identities():
     assert snapshot.stage == Stage.SCOPED
     assert snapshot.in_project is True
     assert snapshot.human_assigned is False
-    assert snapshot.read_at_us == 123_000_000
+    assert snapshot.read_at_us == TEST_NOW_US
 
 
 @pytest.mark.asyncio
@@ -497,6 +504,68 @@ async def test_contract_publication_adopts_exact_bot_fence():
     assert result.contract_section == render_contract_section(GOAL_X)
     assert result.marker_hash == "a" * 12
     assert result.author_is_bot is True
+
+
+@pytest.mark.asyncio
+async def test_future_contract_publication_is_capped_and_owner_drag_is_accepted(caplog):
+    pid = "I_1"
+    h = Harness()
+    h.eligible(pid)
+    h.send(pid, ev.RequestPlan(via=Via.COMMAND))
+    session = h.create_ok(pid)
+    assert session.root_id is not None
+    publication_effect = h.send(
+        pid,
+        result_candidate(
+            session.session_id,
+            session.root_id,
+            h.p(pid).revision,
+            ev.ResultKind.PLAN,
+            publication_kind=ev.PublicationKind.CONTRACT,
+            contract_canonical=contract_text("M", "Ship it"),
+            size=Size.M,
+            open_decision_ids=(),
+        ),
+    )
+    [publish] = Harness.of(publication_effect, EffectKind.PUBLISH_CONTRACT)
+    observed = h.f(pid).now
+    future = datetime.fromtimestamp((observed + 3_600_000_000) / 1_000_000, UTC)
+    marker = f"<!-- omnigent-factory effect={publish.effect_id} -->"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 55,
+                    "user": {"id": BOT_ID},
+                    "created_at": future.isoformat().replace("+00:00", "Z"),
+                    "body": f"{RENDERED_EMPTY}\n\n{marker}",
+                }
+            ],
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        with caplog.at_level(logging.WARNING):
+            found = await adapter(http, now_us=lambda: observed).find_contract_publication(
+                PARCEL_REF, publish.effect_id
+            )
+    assert found is not None and not isinstance(found, RetryableReadFailure)
+    assert found.posted_at_us == observed
+    assert "future GitHub timestamp clamped" in caplog.text
+
+    contract_id = str(publish.args["contract_id"])
+    h.send(
+        pid,
+        ev.ContractPublished(
+            contract_id=contract_id,
+            comment_id=found.comment_id,
+            verified=True,
+            posted_at_us=found.posted_at_us,
+        ),
+    )
+    approved = h.send(pid, ev.ApprovePlan(via=Via.DRAG))
+    assert approved.audit.accepted, approved.audit.reason
 
 
 @pytest.mark.asyncio

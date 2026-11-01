@@ -9,7 +9,6 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
 from typing import Any, Protocol
 
 from omnigent_factory.core.contract_view import extract_contract_section, marker_hash
@@ -52,6 +51,7 @@ from omnigent_factory.github.links import (
     parse_links,
     remove_label,
 )
+from omnigent_factory.github.time import observed_github_time_us
 from omnigent_factory.ports.github import (
     GITHUB_EFFECT_KINDS,
     STATUS_OPTION_IDS,
@@ -2391,14 +2391,13 @@ class GitHubAPIAdapter:
     def _effect_marker(effect_id: str) -> str:
         return f"<!-- omnigent-factory effect={effect_id} -->"
 
-    @staticmethod
-    def _parse_time_us(value: object) -> int:
-        if not isinstance(value, str):
-            return 0
-        try:
-            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1e6)
-        except ValueError:
-            return 0
+    def _parse_time_us(self, value: object) -> int:
+        return observed_github_time_us(
+            value,
+            self._now_us(),
+            logger=LOG,
+            context=f"repository={self.repository} timestamp={value!r}",
+        )
 
 
 #: Where a Ready report's factory lines begin (see ``service.directory._ready_text``).

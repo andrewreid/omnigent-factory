@@ -221,7 +221,7 @@ async def test_the_confirming_read_waits_for_its_time_without_a_request():
         return httpx.Response(500)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        a = adapter(http)  # its clock reads 123 s
+        a = adapter(http, now_us=lambda: 123_000_000)
         outcome = await a.execute(
             effect(
                 EffectKind.FETCH_PR_EVIDENCE,

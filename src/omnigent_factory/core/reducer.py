@@ -1693,8 +1693,9 @@ def _h_auto_retriage(ctx: _Ctx, body: ev.AutoRetriage) -> None:
     _start_stage(ctx, SessionKind.TRIAGE, ctx.config.block_us(p.size or Size.S))
 
 
-#: GitHub webhook times (``updated_at``) are whole seconds: one second of slack when they
-#: are compared with the factory's microsecond clock (as ``service.label_recovery``).
+#: GitHub webhook times (``updated_at``) are whole seconds and capped at receipt: one
+#: second of slack when they are compared with the factory's microsecond clock (as
+#: ``service.label_recovery``).
 GITHUB_TIME_SLACK_US = 1_000_000
 
 

@@ -27,7 +27,7 @@ from typing import Any
 
 from omnigent_factory.core.types import Parcel
 from omnigent_factory.github.client import GitHubAPIError
-from omnigent_factory.service.follow_ups import _time_us
+from omnigent_factory.github.time import observed_github_time_us
 from omnigent_factory.service.ranking import owner_edit
 from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.store import discipline as ds
@@ -119,7 +119,14 @@ class ReviewRounds:
         else:
             LOG.warning("review rounds edit without a value ignored node=%s", node_id)
             return
-        at_us = _time_us(item.get("updated_at") if isinstance(item, Mapping) else None)
+        observed_at_us = self.service.clock.now_utc_us()
+        at_us = observed_github_time_us(
+            item.get("updated_at") if isinstance(item, Mapping) else None,
+            observed_at_us,
+            fallback_us=observed_at_us,
+            logger=LOG,
+            context=f"review rounds node={node_id} field=updated_at",
+        )
         changed = await self.service.db.call(
             partial(
                 ds.set_round_budget,
@@ -127,7 +134,7 @@ class ReviewRounds:
                 issue_node_id=node_id,
                 value=value,
                 actor_id=int(actor) if isinstance(actor, int) else 0,
-                at_us=at_us or self.service.clock.now_utc_us(),
+                at_us=at_us,
             )
         )
         if changed:

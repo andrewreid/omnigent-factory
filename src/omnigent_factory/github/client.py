@@ -5,13 +5,17 @@ from __future__ import annotations
 import email.utils
 import inspect
 import json
+import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 
 import httpx
+
+from omnigent_factory.github.time import observed_github_time_us
+
+LOG = logging.getLogger(__name__)
 
 TokenSource = str | Callable[[], str] | Callable[[], Awaitable[str]]
 
@@ -246,12 +250,15 @@ class GitHubClient:
             raw_body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
         if not isinstance(delivered_at, str):
             raise GitHubAPIError("delivery recovery omitted original delivery time")
-        try:
-            delivered_at_us = int(
-                datetime.fromisoformat(delivered_at.replace("Z", "+00:00")).timestamp() * 1e6
-            )
-        except ValueError as exc:
-            raise GitHubAPIError("delivery recovery time was malformed") from exc
+        delivered_at_us = observed_github_time_us(
+            delivered_at,
+            time.time_ns() // 1000,
+            fallback_us=-1,
+            logger=LOG,
+            context=f"recovered delivery_id={delivery_id} field=delivered_at",
+        )
+        if delivered_at_us < 0:
+            raise GitHubAPIError("delivery recovery time was malformed")
         string_headers = {
             str(key): str(value) for key, value in headers.items() if isinstance(key, str)
         }

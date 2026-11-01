@@ -21,6 +21,9 @@ ignored, the factory bot's own actions never count, and a control older than the
 stop or safety barrier is refused. Columns below use the board's display names (Inbox,
 Triage, Planning, Building, Ready, from `[service.status_names]`).
 
+GitHub event and API timestamps are capped at the time Factory received or observed them;
+future skew over five seconds is logged as a warning and never advances ordering or safety barriers.
+
 Typing in the parcel's Omnigent session is not a control: it grants no approval, time or
 stage and does not answer the agent's questions. A native Omnigent prompt answered there
 only closes that prompt; no approval or time is inferred. Activity in a stopped run's

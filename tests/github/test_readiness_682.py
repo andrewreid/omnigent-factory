@@ -17,7 +17,7 @@ from omnigent_factory.core.effects import Ack, EffectKind
 from omnigent_factory.core.events import ChecksState
 from omnigent_factory.ports.github import IssueRef
 
-from .test_adapter import BOT_ID, CTX, REPO_NODE, adapter, closing_refs, effect
+from .test_adapter import BOT_ID, CTX, REPO_NODE, TEST_NOW_US, adapter, closing_refs, effect
 
 HEAD = "4950075d373b7db6c008a502da568ee73e0fdf03"
 REF = IssueRef(REPO_NODE, 677, "I_1")
@@ -155,7 +155,7 @@ async def test_pr_682_as_live_is_verified_without_owner_approval():
     assert outcome.detail["verified"] is True
     assert outcome.detail["checks_summary"] == "17 checks: 13 success, 4 skipped"
     # When the read began: check webhooks received before it are reflected (#745).
-    assert outcome.detail["read_started_us"] == 123_000_000
+    assert outcome.detail["read_started_us"] == TEST_NOW_US
 
 
 @pytest.mark.asyncio

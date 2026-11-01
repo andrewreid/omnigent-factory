@@ -11,10 +11,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
 from types import MappingProxyType
 from typing import Any
 
@@ -24,10 +24,12 @@ from omnigent_factory.core.events import Event, Provenance
 from omnigent_factory.core.protocol import BUNDLE_PROPOSED_LABEL, CLOSE_CANDIDATE_LABEL
 from omnigent_factory.core.types import MICROS_PER_HOUR, IssueSnapshot, Stage, Via, is_leftward
 from omnigent_factory.github.client import GitHubClient
+from omnigent_factory.github.time import observed_github_time_us
 from omnigent_factory.ports.github import STATUS_OPTION_IDS, stage_for_option
 
 _COMMAND = re.compile(r"^/(?P<name>[a-z-]+)(?:\s+(?P<args>.*))?$", re.DOTALL)
 _DURATION = re.compile(r"(?:^|\s)for\s+(?P<hours>\d+)h(?:\s|$)", re.IGNORECASE)
+LOG = logging.getLogger(__name__)
 
 
 #: Owner labels that are commands (any other label is no transition). The board diff's
@@ -108,15 +110,6 @@ class NormalizedDelivery:
     foreign_content: bool = False
 
 
-def _timestamp_us(value: object, fallback: int) -> int:
-    if not isinstance(value, str):
-        return fallback
-    try:
-        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1e6)
-    except ValueError:
-        return fallback
-
-
 def _duration(args: str) -> int | None:
     match = _DURATION.search(args)
     return None if match is None else int(match.group("hours")) * MICROS_PER_HOUR
@@ -188,7 +181,9 @@ class DeliveryNormalizer:
             item = payload.get("projects_v2_item")
             if isinstance(item, dict):
                 parcel_id = item.get("content_node_id")
-        source_time_us = self._source_time(payload, event_name, delivery_time_us)
+        source_time_us = self._source_time(
+            payload, event_name, delivery_time_us, delivery_guid=delivery_guid
+        )
         bodies = self._bodies(event_name, payload, actor_id)
         events = tuple(
             Event(
@@ -277,21 +272,37 @@ class DeliveryNormalizer:
             provenance=provenance,
         )
 
-    def _source_time(self, payload: dict[str, Any], event_name: str, fallback: int) -> int:
+    def _source_time(
+        self,
+        payload: dict[str, Any],
+        event_name: str,
+        fallback: int,
+        *,
+        delivery_guid: str = "",
+    ) -> int:
+        def timestamp(value: object) -> int:
+            return observed_github_time_us(
+                value,
+                fallback,
+                fallback_us=fallback,
+                logger=LOG,
+                context=f"delivery_id={delivery_guid or 'unknown'} event={event_name}",
+            )
+
         if event_name == "issue_comment":
             comment = payload.get("comment")
             if isinstance(comment, dict):
-                return _timestamp_us(comment.get("created_at"), fallback)
+                return timestamp(comment.get("created_at"))
         if event_name == "pull_request_review":
             review = payload.get("review")
             if isinstance(review, dict) and review.get("submitted_at"):
-                return _timestamp_us(review.get("submitted_at"), fallback)
+                return timestamp(review.get("submitted_at"))
         for key in ("projects_v2_item", "issue", "pull_request", "review", "check_suite"):
             value = payload.get(key)
             if isinstance(value, dict):
                 stamp = value.get("updated_at") or value.get("created_at")
                 if stamp is not None:
-                    return _timestamp_us(stamp, fallback)
+                    return timestamp(stamp)
         return fallback
 
     def _bodies(
@@ -831,7 +842,12 @@ async def resolve_project_delivery(
         read_at_us=delivery_time_us if read_at_us is None else read_at_us,
     )
     bodies = normalizer._bodies("projects_v2_item", payload, actor_id)
-    source_time_us = normalizer._source_time(payload, "projects_v2_item", delivery_time_us)
+    source_time_us = normalizer._source_time(
+        payload,
+        "projects_v2_item",
+        delivery_time_us,
+        delivery_guid=unresolved.delivery_guid,
+    )
     events = tuple(
         Event(
             event_id=normalizer._logical_id(

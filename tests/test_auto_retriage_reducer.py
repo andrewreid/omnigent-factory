@@ -447,13 +447,14 @@ def _owner_unlabel_at(updated_at_s: int, delivered_us: int):
 )
 def test_a_same_second_owner_unlabel_counts_for_the_new_generation(updated_at_s, accepted):
     """Publication acknowledged at ...8.5, the webhook delivered at ...8.9 with GitHub's
-    whole-second ``updated_at``."""
+    whole-second ``updated_at`` (capped to receipt when GitHub reports a future second)."""
     h = Harness()
     triaged(h, "I_1")
     published = 1_900_000_008_500_000
     h.parcels["I_1"] = replace(h.p("I_1"), close_candidate_at_us=published)
-    event = _owner_unlabel_at(updated_at_s, 1_900_000_008_900_000)
-    assert event.source_time_us == updated_at_s * 1_000_000  # second precision
+    delivered = 1_900_000_008_900_000
+    event = _owner_unlabel_at(updated_at_s, delivered)
+    assert event.source_time_us == min(updated_at_s * 1_000_000, delivered)
     r = h.apply(event)
     assert r.audit.accepted is accepted, r.audit.reason
     gen = h.p("I_1").close_candidate_session

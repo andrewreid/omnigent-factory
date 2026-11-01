@@ -8,6 +8,7 @@ auto-triage counted all of them as known to the factory (``eligible_inbox=0``).
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -110,6 +111,36 @@ async def test_replay_716_item_added_leaves_no_hold_and_the_issue_eligible():
     assert [i.number for i in eligible_candidates(board, {pid: p}, now_us=NOW, min_age_us=DAY)] == [
         716
     ]
+
+
+@pytest.mark.asyncio
+async def test_future_stamped_inbox_automation_is_stale_after_factory_scoped_write():
+    """#1652: a delivery received before the Scoped write stays stale despite +1h skew."""
+    pid = "I_1"
+    h = Harness()
+    h.eligible(pid)
+    h.send(pid, ev.RequestPlan(via=Via.COMMAND))
+    plan = h.create_ok(pid)
+    h.publish_plan(pid)
+    before = h.p(pid)
+    received = before.board_written_at_us - 1
+    future = datetime.fromtimestamp((received + 3_600_000_000) / 1_000_000, UTC)
+    data = item_added()
+    data["projects_v2_item"]["updated_at"] = future.isoformat().replace("+00:00", "Z")
+
+    (event,) = (await resolve_drag(data, delivery_time_us=received)).events
+    assert isinstance(event.body, ev.ColumnObserved)
+    assert event.source_time_us == received
+    result = h.apply(event)
+
+    after = h.p(pid)
+    assert result.audit.accepted
+    assert after.stage == Stage.SCOPED
+    assert after.holds == before.holds
+    assert after.barrier_time_us == before.barrier_time_us
+    assert after.current_session_id == plan.session_id
+    assert after.current_session == before.current_session
+    assert after.current_session is not None and after.current_session.issuance_enabled
 
 
 def test_a_legacy_leftward_move_with_no_column_anywhere_sets_no_hold():

@@ -60,6 +60,7 @@ from omnigent_factory.core.events import Event, Provenance
 from omnigent_factory.core.protocol import MAX_WHY_CHARS, RATINGS
 from omnigent_factory.core.types import MICROS_PER_SECOND, Parcel, Stage
 from omnigent_factory.github.client import GitHubAPIError, GitHubClient
+from omnigent_factory.github.time import observed_github_time_us
 from omnigent_factory.service.follow_ups import FollowUps
 from omnigent_factory.service.review_rounds import ReviewRounds
 from omnigent_factory.service.runtime import FactoryService
@@ -716,7 +717,14 @@ class Deferrals:
             return 0
         if not isinstance(parcel_id, str) or not isinstance(comment.get("id"), int):
             return 0
-        at_us = _time_us(comment.get("updated_at")) or self.service.clock.now_utc_us()
+        observed_at_us = self.service.clock.now_utc_us()
+        at_us = observed_github_time_us(
+            comment.get("updated_at"),
+            observed_at_us,
+            fallback_us=observed_at_us,
+            logger=LOG,
+            context=f"ready report comment={comment.get('id')} field=updated_at",
+        )
         return await self._record(
             parcel_id, int(comment["id"]), ticked, at_us=at_us, actor=actor, via="webhook"
         )
@@ -1044,11 +1052,13 @@ class Deferrals:
         return recovered
 
     async def _edits(self, node_id: str) -> list[tuple[int, int | None, str | None]] | None:
-        return await comment_edits(self.client, node_id)
+        return await comment_edits(
+            self.client, node_id, observed_at_us=self.service.clock.now_utc_us()
+        )
 
 
 async def comment_edits(
-    client: GitHubClient, node_id: str
+    client: GitHubClient, node_id: str, *, observed_at_us: int
 ) -> list[tuple[int, int | None, str | None]] | None:
     """The comment's edit history, oldest first: (time, editor's numeric id, the body
     after that edit). None when it cannot be read."""
@@ -1082,7 +1092,12 @@ async def comment_edits(
         text = item.get("diff")
         out.append(
             (
-                _time_us(item.get("editedAt")),
+                observed_github_time_us(
+                    item.get("editedAt"),
+                    observed_at_us,
+                    logger=LOG,
+                    context=f"comment node={node_id} field=editedAt",
+                ),
                 editor_id if isinstance(editor_id, int) else None,
                 text if isinstance(text, str) else None,
             )

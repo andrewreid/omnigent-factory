@@ -54,7 +54,6 @@ import logging
 import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
 from functools import partial
 from itertools import combinations
 from typing import Any, TypeVar
@@ -67,7 +66,6 @@ from omnigent_factory.core.events import Event, Provenance
 from omnigent_factory.core.projection import bundle_member_refusal
 from omnigent_factory.core.protocol import CLOSE_CANDIDATE_LABEL
 from omnigent_factory.core.types import (
-    MICROS_PER_SECOND,
     BotState,
     Hold,
     IssueSnapshot,
@@ -83,6 +81,7 @@ from omnigent_factory.github.links import (
     ensure_label,
     read_target,
 )
+from omnigent_factory.github.time import observed_github_time_us
 from omnigent_factory.github.webhook import label_name
 from omnigent_factory.ports.github import BoardIssue, IssueRef, RankingCard
 from omnigent_factory.service.deferred import comment_edits, find_marked_issue
@@ -146,16 +145,6 @@ def _refs(numbers: Iterable[int]) -> str:
     if len(items) <= 2:
         return " and ".join(items)
     return ", ".join(items[:-1]) + " and " + items[-1]
-
-
-def _time_us(value: object) -> int:
-    if not isinstance(value, str):
-        return 0
-    try:
-        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return 0
-    return int(stamp.timestamp() * MICROS_PER_SECOND)
 
 
 # ------------------------------------------------------------------ validation
@@ -951,7 +940,14 @@ class Bundles:
             )
             return 0
         assert isinstance(actor, int)  # noqa: S101 - owner checked
-        at_us = _time_us(comment.get("updated_at")) or self.service.clock.now_utc_us()
+        observed_at_us = self.service.clock.now_utc_us()
+        at_us = observed_github_time_us(
+            comment.get("updated_at"),
+            observed_at_us,
+            fallback_us=observed_at_us,
+            logger=LOG,
+            context=f"bundle comment={comment.get('id')} field=updated_at",
+        )
         return await self._tick(int(comment["id"]), ticked, actor, at_us, "webhook")
 
     async def _tick(
@@ -1012,7 +1008,14 @@ class Bundles:
         self, name: str, args: str, issue: int, comment: Mapping[str, Any], actor: int
     ) -> int:
         comment_id = comment.get("id")
-        at_us = _time_us(comment.get("created_at")) or self.service.clock.now_utc_us()
+        observed_at_us = self.service.clock.now_utc_us()
+        at_us = observed_github_time_us(
+            comment.get("created_at"),
+            observed_at_us,
+            fallback_us=observed_at_us,
+            logger=LOG,
+            context=f"bundle comment={comment_id} field=created_at",
+        )
         if name == "unbundle":
             done = await self.unbundle(issue, reason="/unbundle")
             await self._react(comment, "+1" if done else "confused")
@@ -1742,7 +1745,11 @@ class Bundles:
                 body = str(comment.get("body") or "") if isinstance(comment, dict) else ""
                 if not rl.checked(body, rl.BUNDLE).get(p.action_id):
                     continue
-                edits = await comment_edits(self.client, p.comment_node_id)
+                edits = await comment_edits(
+                    self.client,
+                    p.comment_node_id,
+                    observed_at_us=self.service.clock.now_utc_us(),
+                )
             except GitHubAPIError as exc:
                 LOG.warning("bundle tick catch-up failed key=%s reason=%s", p.proposal_key, exc)
                 continue

@@ -35,14 +35,13 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from datetime import datetime
 from functools import partial
 from typing import Any, TypeVar
 
 from omnigent_factory.core.codec import parcel_from_json
 from omnigent_factory.core.effects import RetryableReadFailure
 from omnigent_factory.core.predicates import run_closed
-from omnigent_factory.core.types import MICROS_PER_SECOND, Parcel
+from omnigent_factory.core.types import Parcel
 from omnigent_factory.github.client import GitHubAPIError, GraphQLErrors
 from omnigent_factory.github.links import (
     LinkTarget,
@@ -51,6 +50,7 @@ from omnigent_factory.github.links import (
     ensure_label,
     read_target,
 )
+from omnigent_factory.github.time import observed_github_time_us
 from omnigent_factory.github.webhook import label_name
 from omnigent_factory.ports.github import IssueRef, LabelEvent
 from omnigent_factory.service.links import NativeLinks
@@ -383,7 +383,14 @@ class FollowUps:
         if not isinstance(number, int) or not isinstance(issue, dict):
             return
         labeled = payload.get("action") == "labeled"
-        at_us = _time_us(issue.get("updated_at")) or self.service.clock.now_utc_us()
+        observed_at_us = self.service.clock.now_utc_us()
+        at_us = observed_github_time_us(
+            issue.get("updated_at"),
+            observed_at_us,
+            fallback_us=observed_at_us,
+            logger=LOG,
+            context=f"follow-up issue={number} field=updated_at",
+        )
         owner = isinstance(actor, int) and actor in self.service.config.owners
         await self._apply_label(
             number, label, labeled=labeled, owner=owner, at_us=at_us, actor=actor
@@ -567,17 +574,6 @@ class FollowUps:
 def _run_open(parcel: Parcel) -> bool:
     run = parcel.current_session
     return run is not None and not run_closed(parcel, run)
-
-
-def _time_us(value: object) -> int:
-    if not isinstance(value, str):
-        return 0
-    try:
-        return int(
-            datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * MICROS_PER_SECOND
-        )
-    except ValueError:
-        return 0
 
 
 __all__ = [
