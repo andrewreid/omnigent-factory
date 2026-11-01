@@ -2,10 +2,10 @@
 
 Created once and adopted by its marker after an unclear create or a restart, edited only
 when its text changes and at most once per ``status_comment_edit_seconds`` (a burst is
-coalesced), owner ticks kept and acted on as in the Ready report, pinned once (a refusal
-recorded and never retried; never on a pull request), the triage result and checkpoint
-report folded into it (their side effects unchanged), the Ready report reduced to one
-line linking to it, and the epic variant.
+coalesced), owner ticks kept and acted on as in the Ready report, pinned with verification
+and retry for uncertain outcomes (never on a pull request), the triage result and
+checkpoint report folded into it (their side effects unchanged), the Ready report reduced
+to one line linking to it, and the epic variant.
 """
 
 from __future__ import annotations
@@ -98,6 +98,10 @@ class GitHubServer:
     lose_post: bool = False
     #: GraphQL errors answering pinIssueComment (None: it succeeds).
     pin_error: str | None = None
+    pin_error_type: str = "FORBIDDEN"
+    #: HTTP failures answering pinIssueComment: (status, headers, mutation landed).
+    pin_failures: list[tuple[int, dict[str, str], bool]] = field(default_factory=list)
+    pinned: dict[int, str] = field(default_factory=dict)
     #: Comments are created under /pull/ (a pull request's conversation).
     as_pull: bool = False
 
@@ -141,6 +145,11 @@ class GitHubServer:
         if path.endswith("/labels"):
             return httpx.Response(200, json=[])
         if path == "/graphql":
+            if "pinIssueComment" in body["query"] and self.pin_failures:
+                status, headers, landed = self.pin_failures.pop(0)
+                if landed:
+                    self._record_pin(str(body["variables"]["id"]))
+                return httpx.Response(status, headers=headers)
             return httpx.Response(200, json=self._graphql(body))
         return httpx.Response(404)
 
@@ -148,8 +157,17 @@ class GitHubServer:
         query = body["query"]
         if "pinIssueComment" in query:
             if self.pin_error is not None:
-                return {"data": None, "errors": [{"type": "FORBIDDEN", "message": self.pin_error}]}
+                return {
+                    "data": None,
+                    "errors": [{"type": self.pin_error_type, "message": self.pin_error}],
+                }
+            self._record_pin(str(body["variables"]["id"]))
             return {"data": {"pinIssueComment": {"clientMutationId": None}}}
+        if "pinnedIssueComment" in query:
+            number = int(body["variables"]["number"])
+            node_id = self.pinned.get(number)
+            pinned = None if node_id is None else {"issueComment": {"id": node_id}}
+            return {"data": {"repository": {"issue": {"pinnedIssueComment": pinned}}}}
         if "updateProjectV2ItemFieldValue" in query:
             return {"data": {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "PVTI"}}}}
         if "fields(first: 100)" in query:
@@ -168,6 +186,10 @@ class GitHubServer:
                 }
             }
         }
+
+    def _record_pin(self, node_id: str) -> None:
+        comment = next(c for c in self.comments.values() if c.get("node_id") == node_id)
+        self.pinned[int(comment["issue"])] = node_id
 
     def posts(self) -> list[str]:
         return [
@@ -484,6 +506,124 @@ async def test_pinned_once_after_it_is_created(service_config: ServiceConfig):
         assert settings.pin_state == "supported"
 
 
+async def test_a_pin_that_lands_before_a_504_is_verified_as_pinned(
+    service_config: ServiceConfig,
+):
+    async with rig(service_config) as r:
+        r.server.pin_failures.append((504, {}, True))
+        await r.status.publish(P)
+        row = await r.service.db.call(
+            partial(st.status_row, repo_id=service_config.repo_id, parcel_id=P)
+        )
+        settings = await r.service.db.call(
+            partial(st.status_settings, repo_id=service_config.repo_id)
+        )
+        assert row is not None and row.pin == "pinned"
+        assert settings.pin_state == "supported"
+        assert r.server.pins() == 1
+
+
+async def test_an_unlanded_504_retries_through_the_unchanged_body_fast_path(
+    service_config: ServiceConfig,
+):
+    async with rig(service_config) as r:
+        r.server.pin_failures.append((504, {}, False))
+        await r.status.publish(P)
+        row = await r.service.db.call(
+            partial(st.status_row, repo_id=service_config.repo_id, parcel_id=P)
+        )
+        settings = await r.service.db.call(
+            partial(st.status_settings, repo_id=service_config.repo_id)
+        )
+        assert row is not None and row.pin == "failed"
+        assert settings.pin_state != "unsupported"
+
+        await r.status.refresh(P)
+        assert r.server.pins() == 1  # bounded backoff, with no body edit to prompt the retry
+        r.clock.advance(int(service_config.effect_recovery_backoff_seconds * S) + 1)
+        await r.status.refresh(P)
+        row = await r.service.db.call(
+            partial(st.status_row, repo_id=service_config.repo_id, parcel_id=P)
+        )
+        assert row is not None and row.pin == "pinned"
+        assert r.server.pins() == 2
+        assert r.server.patches() == []
+
+
+async def test_pin_rate_limit_retry_after_wins_over_the_default_backoff(
+    service_config: ServiceConfig,
+):
+    async with rig(service_config) as r:
+        # GitHub's secondary limit is also a 403; Retry-After distinguishes it from a
+        # capability refusal.
+        r.server.pin_failures.append((403, {"Retry-After": "300"}, False))
+        await r.status.publish(P)
+        r.clock.advance(299 * S)
+        await r.status.refresh(P)
+        assert r.server.pins() == 1
+        r.clock.advance(2 * S)
+        await r.status.refresh(P)
+        assert r.server.pins() == 2
+
+
+async def test_transient_persisted_refusal_and_legacy_rows_heal_in_bounded_batches(
+    service_config: ServiceConfig,
+):
+    async with rig(service_config) as r:
+        await r.service.db.call(partial(st.status_settings, repo_id=service_config.repo_id))
+        await r.service.db.call(
+            partial(
+                st.set_pin_state,
+                repo_id=service_config.repo_id,
+                state="unsupported",
+                message="GitHub POST /graphql returned HTTP 504",
+            )
+        )
+        for issue in range(1, 13):
+            comment_id = 10_000 + issue
+            node_id = f"IC_{comment_id}"
+            r.server.comments[comment_id] = {
+                "id": comment_id,
+                "node_id": node_id,
+                "html_url": f"https://github.com/{service_config.repository}/issues/{issue}"
+                f"#issuecomment-{comment_id}",
+                "body": status_marker(issue),
+                "user": {"id": service_config.github_bot_user_id},
+                "issue": issue,
+            }
+            await r.service.db.call(
+                partial(
+                    st.put_status,
+                    repo_id=service_config.repo_id,
+                    row=st.StatusRow(
+                        f"legacy_{issue}",
+                        issue,
+                        state="posted",
+                        comment_id=comment_id,
+                        node_id=node_id,
+                        url=r.server.comments[comment_id]["html_url"],
+                        pin="failed" if issue == 1 else "skipped",
+                    ),
+                )
+            )
+        # The 504 mutation for the failed row had actually landed before the old process
+        # persisted its repository-wide refusal.
+        r.server.pinned[1] = "IC_10001"
+
+        await r.status.tick()
+        rows = await r.service.db.call(partial(st.status_rows, repo_id=service_config.repo_id))
+        assert sum(row.pin == "pinned" for row in rows) == 10
+        assert r.server.pins() == 9  # failed row was verified; nine skipped rows were pinned
+        report = DoctorReport()
+        _check_status_pin(service_config, report)
+        assert report.checks["status_comment_pin"] == "status comments are pinned"
+
+        await r.status.tick()
+        rows = await r.service.db.call(partial(st.status_rows, repo_id=service_config.repo_id))
+        assert all(row.pin == "pinned" for row in rows)
+        assert r.server.pins() == 11
+
+
 async def test_a_pin_refusal_is_recorded_once_and_never_retried(
     service_config: ServiceConfig, caplog: pytest.LogCaptureFixture
 ):
@@ -506,6 +646,42 @@ async def test_a_pin_refusal_is_recorded_once_and_never_retried(
         report = DoctorReport()
         _check_status_pin(service_config, report)
         assert "Resource not accessible by integration" in report.checks["status_comment_pin"]
+
+
+async def test_an_http_403_pin_refusal_is_installation_wide(service_config: ServiceConfig):
+    async with rig(service_config) as r:
+        r.server.pin_failures.append((403, {}, False))
+        await r.status.publish(P)
+        settings = await r.service.db.call(
+            partial(st.status_settings, repo_id=service_config.repo_id)
+        )
+        assert settings.pin_state == "unsupported"
+
+
+async def test_a_missing_pin_field_is_a_definite_capability_refusal(
+    service_config: ServiceConfig,
+):
+    async with rig(service_config) as r:
+        r.server.pin_error_type = "NOT_FOUND"
+        r.server.pin_error = "Field 'pinIssueComment' doesn't exist on type 'Mutation'"
+        await r.status.publish(P)
+        settings = await r.service.db.call(
+            partial(st.status_settings, repo_id=service_config.repo_id)
+        )
+        assert settings.pin_state == "unsupported"
+
+
+async def test_an_internal_graphql_pin_error_remains_retryable(
+    service_config: ServiceConfig,
+):
+    async with rig(service_config) as r:
+        r.server.pin_error_type = "INTERNAL"
+        r.server.pin_error = "Something went wrong while executing your query"
+        await r.status.publish(P)
+        settings = await r.service.db.call(
+            partial(st.status_settings, repo_id=service_config.repo_id)
+        )
+        assert settings.pin_state != "unsupported"
 
 
 async def test_a_pull_request_comment_is_never_pinned(service_config: ServiceConfig):

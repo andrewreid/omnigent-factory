@@ -16,9 +16,10 @@
   that used to be its own comment (triage, the checkpoint report) and the Ready notification
   (with ELI5 when supplied, also shown in this dashboard) are
   written at once (``publish``): the owner never gets a link to a stale dashboard.
-* **Pinned** once after it is created (``pinIssueComment``, issues only, never a pull
-  request). A refusal is logged once with GitHub's message and recorded for the
-  installation: pinning is not tried again. ``doctor`` shows the state.
+* **Pinned** after it is created (``pinIssueComment``, issues only, never a pull request).
+  Ambiguous writes are verified and transient failures retried with capped backoff. A
+  definite capability refusal is logged once and recorded for the installation;
+  ``doctor`` shows the state.
 * **Shows** (built only from stored state, no extra GitHub reads): a headline (stage and
   state, or what the factory waits on you for), the triage result, the plan (a link, the
   approved hash, a newer revision), the PR (link, checks, review rounds, the agent's
@@ -59,6 +60,7 @@ from omnigent_factory.github.client import (
     GitHubAPIError,
     GitHubClient,
     GitHubRejected,
+    GraphQLErrors,
     RateLimited,
 )
 from omnigent_factory.service.directory import (
@@ -86,10 +88,79 @@ _BODY_LIMIT = 60_000
 _UP_NEXT = 3
 #: Characters of a question kept in a headline.
 _QUESTION_HEADLINE = 100
+#: Legacy/transient pin outcomes retried per reconcile pass.
+_PIN_RECONCILE_MAX = 10
 
 _PIN = """
 mutation($id: ID!) { pinIssueComment(input: {issueCommentId: $id}) { clientMutationId } }
 """
+
+_PINNED = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) { pinnedIssueComment { issueComment { id } } }
+  }
+}
+"""
+
+_PIN_FIELD_REFUSALS = (
+    "does not exist on type",
+    "doesn't exist on type",
+    "field is not available",
+    "feature is not available",
+    "unknown field",
+)
+_PIN_AUTH_REFUSALS = (
+    "resource not accessible by integration",
+    "not authorized to pin",
+    "not authorised to pin",
+)
+_PIN_TRANSIENT_REASONS = (
+    "internal:",
+    "rate_limited:",
+    "rate limit",
+    "service_unavailable:",
+    "timeout",
+    "timed out",
+    "returned http 5",
+)
+
+
+def _pin_field_refusal(message: str) -> bool:
+    lowered = message.lower()
+    names_pin_field = "pinissuecomment" in lowered or "pinnedissuecomment" in lowered
+    return names_pin_field and any(part in lowered for part in _PIN_FIELD_REFUSALS)
+
+
+def _graphql_pin_refusal(kind: str | None, message: str) -> bool:
+    lowered = message.lower()
+    return (
+        (kind or "").upper() == "FORBIDDEN"
+        or _pin_field_refusal(message)
+        or any(part in lowered for part in _PIN_AUTH_REFUSALS)
+    )
+
+
+def _definite_pin_refusal(exc: GitHubAPIError) -> bool:
+    """Whether this error proves that this installation cannot use comment pinning."""
+    if isinstance(exc, GitHubRejected):
+        return exc.status_code == 403
+    if isinstance(exc, GraphQLErrors):
+        return bool(exc.errors) and all(_graphql_pin_refusal(*error) for error in exc.errors)
+    return False
+
+
+def _stored_pin_refusal(message: str) -> bool:
+    """Recognise definite refusals written by older versions from their text only."""
+    lowered = message.lower()
+    if any(part in lowered for part in _PIN_TRANSIENT_REASONS):
+        return False
+    return (
+        "returned http 403" in lowered
+        or "forbidden:" in lowered
+        or _pin_field_refusal(message)
+        or any(part in lowered for part in _PIN_AUTH_REFUSALS)
+    )
 
 
 def status_marker(issue_number: int) -> str:
@@ -474,6 +545,8 @@ class StatusComments:
     #: Per epic, the sub-issue stamp (``_epic_stamps``) last rendered by ``tick`` (in
     #: memory: after a restart each finished epic is rendered once more).
     _shown_stamps: dict[str, object] = field(default_factory=dict)
+    #: Per-comment transient retry deadline and consecutive failure count (microseconds).
+    _pin_backoff: dict[str, tuple[int, int]] = field(default_factory=dict)
 
     @property
     def _repo_id(self) -> str:
@@ -535,6 +608,10 @@ class StatusComments:
         rows = {
             r.parcel_id: r for r in await self._db(partial(st.status_rows, repo_id=self._repo_id))
         }
+        await self._reconcile_pins(rows.values())
+        rows = {
+            r.parcel_id: r for r in await self._db(partial(st.status_rows, repo_id=self._repo_id))
+        }
         candidates = [
             _Candidate.of(r)
             for r in await self._db(
@@ -566,7 +643,9 @@ class StatusComments:
             ):
                 continue  # finished and shown (an epic: its sub-issues unchanged too)
             try:
-                outcome = await self.refresh(c.parcel_id)
+                async with self._lock(c.parcel_id):
+                    # Legacy pin backfill is handled in the bounded pass above.
+                    outcome = await self._refresh(c.parcel_id, False, retry_pin=False)
             except Exception:
                 LOG.warning("status comment failed parcel=%s", c.parcel_id, exc_info=True)
                 continue
@@ -608,7 +687,9 @@ class StatusComments:
         async with self._lock(parcel_id):
             return await self._refresh(parcel_id, urgent)
 
-    async def _refresh(self, parcel_id: str, urgent: bool) -> StatusWrite:
+    async def _refresh(
+        self, parcel_id: str, urgent: bool, *, retry_pin: bool = True
+    ) -> StatusWrite:
         parcel = await self._db(lambda store: store.load_parcel(parcel_id))
         if parcel is None or parcel.issue_number is None:
             return StatusWrite(ok=False, reason="no issue")
@@ -629,7 +710,10 @@ class StatusComments:
         row = replace(row, seen_version=parcel.version, issue_number=parcel.issue_number)
         if row.state == "posted" and row.comment_id is not None and row.digest == digest:
             if row.pending or stale:
-                await self._put(replace(row, pending=False))
+                row = replace(row, pending=False)
+                await self._put(row)
+            if retry_pin and row.pin != "pinned" and self._pin_retry_due(row):
+                row = await self._pin(row)
             return self._ok(row, written=False)
         interval = int(self.service.config.status_comment_edit_seconds * 1_000_000)
         if (
@@ -741,32 +825,135 @@ class StatusComments:
         return self._ok(row, written=True)
 
     async def _pin(self, row: st.StatusRow) -> st.StatusRow:
-        """Pin a new status comment once; a refusal is recorded for the installation."""
-        if row.pin:
+        """Pin a status comment, verifying uncertain writes before a bounded-backoff retry."""
+        if row.pin == "pinned":
             return row
-        settings = await self._db(partial(st.status_settings, repo_id=self._repo_id))
-        if settings.pin_state == "unsupported" or not row.node_id or "/issues/" not in row.url:
-            # Never on a pull request (its comments are under /pull/), never retried.
-            row = replace(row, pin="skipped")
-            await self._put(row)
+        if not row.node_id or "/issues/" not in row.url:
+            # Never on a pull request (its comments are under /pull/).
+            if row.pin != "skipped":
+                row = replace(row, pin="skipped")
+                await self._put(row)
             return row
+        settings = await self._pin_settings()
+        if settings.pin_state == "unsupported":
+            if row.pin != "skipped":
+                row = replace(row, pin="skipped")
+                await self._put(row)
+            return row
+        if not self._pin_retry_due(row):
+            return row
+        if row.pin == "failed":
+            try:
+                if await self._pin_matches(row):
+                    return await self._pin_succeeded(row)
+            except GitHubAPIError as exc:
+                return await self._pin_deferred(row, exc)
         try:
             await self.client.graphql(_PIN, {"id": row.node_id})
-        except (GitHubAPIError, AmbiguousRequest) as exc:
-            row = replace(row, pin="failed")
-            await self._put(row)
-            first = await self._db(
-                partial(
-                    st.set_pin_state, repo_id=self._repo_id, state="unsupported", message=str(exc)
+        except GitHubAPIError as exc:
+            if _definite_pin_refusal(exc):
+                self._pin_backoff.pop(row.parcel_id, None)
+                row = replace(row, pin="failed")
+                await self._put(row)
+                first = await self._db(
+                    partial(
+                        st.set_pin_state,
+                        repo_id=self._repo_id,
+                        state="unsupported",
+                        message=str(exc),
+                    )
                 )
-            )
-            if first:
-                LOG.warning(
-                    "status comment pinning unsupported, not tried again issue=#%s reason=%s",
-                    row.issue_number,
-                    exc,
+                if first:
+                    LOG.warning(
+                        "status comment pinning unsupported, not tried again issue=#%s reason=%s",
+                        row.issue_number,
+                        exc,
+                    )
+                return row
+            retry_error: GitHubAPIError = exc
+            if not isinstance(exc, RateLimited):
+                try:
+                    if await self._pin_matches(row):
+                        return await self._pin_succeeded(row)
+                except GitHubAPIError as verify_exc:
+                    if isinstance(verify_exc, RateLimited):
+                        retry_error = verify_exc
+            return await self._pin_deferred(row, retry_error)
+        return await self._pin_succeeded(row)
+
+    async def _pin_settings(self) -> st.StatusSettings:
+        """Discard repository-wide refusals that do not prove pinning is unavailable."""
+        settings = await self._db(partial(st.status_settings, repo_id=self._repo_id))
+        if settings.pin_state != "unsupported" or _stored_pin_refusal(settings.pin_message):
+            return settings
+        cleared = await self._db(
+            partial(st.clear_pin_refusal, repo_id=self._repo_id, message=settings.pin_message)
+        )
+        if cleared:
+            LOG.info("cleared transient status comment pin refusal: %s", settings.pin_message)
+        return await self._db(partial(st.status_settings, repo_id=self._repo_id))
+
+    async def _reconcile_pins(self, rows: Iterable[st.StatusRow]) -> None:
+        """Heal and retry at most a fixed batch of existing issue-comment pin outcomes."""
+        settings = await self._pin_settings()
+        if settings.pin_state == "unsupported":
+            return
+        attempted = 0
+        for row in rows:
+            if attempted >= _PIN_RECONCILE_MAX:
+                break
+            if (
+                row.pin == "pinned"
+                or not row.node_id
+                or "/issues/" not in row.url
+                or not self._pin_retry_due(row)
+            ):
+                continue
+            async with self._lock(row.parcel_id):
+                current = await self._db(
+                    partial(st.status_row, repo_id=self._repo_id, parcel_id=row.parcel_id)
                 )
-            return row
+                if current is not None and current.pin != "pinned":
+                    await self._pin(current)
+                    attempted += 1
+
+    def _pin_retry_due(self, row: st.StatusRow) -> bool:
+        retry = self._pin_backoff.get(row.parcel_id)
+        return retry is None or self.service.clock.now_utc_us() >= retry[0]
+
+    async def _pin_deferred(self, row: st.StatusRow, exc: GitHubAPIError) -> st.StatusRow:
+        now = self.service.clock.now_utc_us()
+        failures = self._pin_backoff.get(row.parcel_id, (0, 0))[1] + 1
+        base = int(self.service.config.effect_recovery_backoff_seconds * 1_000_000)
+        cap = int(self.service.config.effect_recovery_max_backoff_seconds * 1_000_000)
+        delay = min(base * 2 ** min(failures - 1, 30), cap)
+        if isinstance(exc, RateLimited):
+            delay = max(delay, exc.retry_after_us)
+        self._pin_backoff[row.parcel_id] = (now + max(delay, 1), failures)
+        row = replace(row, pin="failed")
+        await self._put(row)
+        LOG.warning(
+            "status comment pin deferred issue=#%s retry_in_us=%s reason=%s",
+            row.issue_number,
+            max(delay, 1),
+            exc,
+        )
+        return row
+
+    async def _pin_matches(self, row: st.StatusRow) -> bool:
+        owner, name = self._repo.split("/", 1)
+        data = await self.client.graphql(
+            _PINNED,
+            {"owner": owner, "name": name, "number": row.issue_number},
+        )
+        repository = data.get("repository")
+        issue = repository.get("issue") if isinstance(repository, dict) else None
+        pinned = issue.get("pinnedIssueComment") if isinstance(issue, dict) else None
+        comment = pinned.get("issueComment") if isinstance(pinned, dict) else None
+        return isinstance(comment, dict) and comment.get("id") == row.node_id
+
+    async def _pin_succeeded(self, row: st.StatusRow) -> st.StatusRow:
+        self._pin_backoff.pop(row.parcel_id, None)
         row = replace(row, pin="pinned")
         await self._put(row)
         await self._db(partial(st.set_pin_state, repo_id=self._repo_id, state="supported"))

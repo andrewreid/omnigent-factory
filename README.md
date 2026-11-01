@@ -241,10 +241,12 @@ Each issue the factory works on gets one factory-owned **status comment**, its d
 edited in place instead of new comments. It is created when the first stage starts (an
 issue the factory handled before status comments got one at its first change since; there
 is no bulk sweep), found again by its hidden marker after a retry or restart (never a
-second one), and pinned once after it is created. If GitHub refuses the pin (e.g. the App
-installation may not pin comments) the factory logs GitHub's message once, records that
-pinning is unsupported and never tries again; `doctor` shows the pin status
-(`status_comment_pin`). Comments on pull requests are never pinned.
+second one), and pinned after it is created. A timeout or server/rate-limit response is
+verified against the issue's current pinned comment, then retried with capped backoff if
+it did not land (`Retry-After` wins). Reconcile also repairs legacy failed/skipped pins in
+bounded batches. Only a definite capability refusal (for example HTTP 403/FORBIDDEN) is
+recorded installation-wide as unsupported and shown by `doctor`; obsolete transient
+refusals self-heal. Comments on pull requests are never pinned.
 
 It shows a headline with the stage and state (`Building · PR #1148 · checks running ·
 Codex round 1/2`, or `Waiting on you: <the question>`), the **Triage** result (with its
@@ -726,6 +728,8 @@ merged (no closing reference) stays held until you close or `/unbundle` it.
 ## Development
 
 Requires [uv](https://docs.astral.sh/uv/) and Python 3.13 (pinned in `.python-version`).
+The lockfile pins `omnigent`, `omnigent-client` and `omnigent-ui-sdk` together at
+Omnigent 0.21.0.dev0 so `doctor` can detect server/client version drift.
 
 ```sh
 uv sync --locked              # create .venv from uv.lock

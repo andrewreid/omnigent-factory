@@ -327,12 +327,28 @@ async def ensure_label(client: GitHubClient, repository: str, name: str, descrip
     except GitHubRejected as exc:
         if exc.status_code != 404:
             raise
-    await client.request(
+    path = f"/repos/{repository}/labels"
+    response = await client.request(
         "POST",
-        f"/repos/{repository}/labels",
+        path,
         json_body={"name": name, "color": _LABEL_COLOR, "description": description},
-        expected=frozenset({201}),
+        expected=frozenset({201, 422}),
     )
+    if response.status_code == 422:
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        errors = body.get("errors") if isinstance(body, dict) else None
+        if isinstance(errors, list) and any(
+            isinstance(error, dict)
+            and error.get("code") == "already_exists"
+            and error.get("field") == "name"
+            for error in errors
+        ):
+            # Another concurrent label effect won the create race.
+            return False
+        raise GitHubRejected(422, "POST", path)
     return True
 
 

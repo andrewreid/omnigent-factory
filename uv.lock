@@ -817,8 +817,8 @@ wheels = [
 
 [[package]]
 name = "omnigent"
-version = "0.20.0.dev0"
-source = { git = "https://github.com/omnigent-ai/omnigent.git?rev=866ea4ac99590487cf8737d41b71f6cdf6db76a7#866ea4ac99590487cf8737d41b71f6cdf6db76a7" }
+version = "0.21.0.dev0"
+source = { git = "https://github.com/omnigent-ai/omnigent.git?rev=51aef3cdf2cfe644db0e542954293ada43378862#51aef3cdf2cfe644db0e542954293ada43378862" }
 dependencies = [
     { name = "alembic" },
     { name = "anyio" },
@@ -864,8 +864,8 @@ dependencies = [
 
 [[package]]
 name = "omnigent-client"
-version = "0.20.0.dev0"
-source = { git = "https://github.com/omnigent-ai/omnigent.git?subdirectory=sdks%2Fpython-client&rev=866ea4ac99590487cf8737d41b71f6cdf6db76a7#866ea4ac99590487cf8737d41b71f6cdf6db76a7" }
+version = "0.21.0.dev0"
+source = { git = "https://github.com/omnigent-ai/omnigent.git?subdirectory=sdks%2Fpython-client&rev=51aef3cdf2cfe644db0e542954293ada43378862#51aef3cdf2cfe644db0e542954293ada43378862" }
 dependencies = [
     { name = "httpx" },
     { name = "omnigent" },
@@ -905,9 +905,9 @@ requires-dist = [
     { name = "cryptography", specifier = ">=46,<51" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "mcp", specifier = ">=1.30,<2" },
-    { name = "omnigent", git = "https://github.com/omnigent-ai/omnigent.git?rev=866ea4ac99590487cf8737d41b71f6cdf6db76a7" },
-    { name = "omnigent-client", git = "https://github.com/omnigent-ai/omnigent.git?subdirectory=sdks%2Fpython-client&rev=866ea4ac99590487cf8737d41b71f6cdf6db76a7" },
-    { name = "omnigent-ui-sdk", git = "https://github.com/omnigent-ai/omnigent.git?subdirectory=sdks%2Fui&rev=866ea4ac99590487cf8737d41b71f6cdf6db76a7" },
+    { name = "omnigent", git = "https://github.com/omnigent-ai/omnigent.git?rev=51aef3cdf2cfe644db0e542954293ada43378862" },
+    { name = "omnigent-client", git = "https://github.com/omnigent-ai/omnigent.git?subdirectory=sdks%2Fpython-client&rev=51aef3cdf2cfe644db0e542954293ada43378862" },
+    { name = "omnigent-ui-sdk", git = "https://github.com/omnigent-ai/omnigent.git?subdirectory=sdks%2Fui&rev=51aef3cdf2cfe644db0e542954293ada43378862" },
     { name = "pydantic", specifier = ">=2.11,<3" },
     { name = "starlette", specifier = ">=1.0.1,<2" },
     { name = "uvicorn", specifier = ">=0.35,<1" },
@@ -927,8 +927,8 @@ dev = [
 
 [[package]]
 name = "omnigent-ui-sdk"
-version = "0.20.0.dev0"
-source = { git = "https://github.com/omnigent-ai/omnigent.git?subdirectory=sdks%2Fui&rev=866ea4ac99590487cf8737d41b71f6cdf6db76a7#866ea4ac99590487cf8737d41b71f6cdf6db76a7" }
+version = "0.21.0.dev0"
+source = { git = "https://github.com/omnigent-ai/omnigent.git?subdirectory=sdks%2Fui&rev=51aef3cdf2cfe644db0e542954293ada43378862#51aef3cdf2cfe644db0e542954293ada43378862" }
 dependencies = [
     { name = "omnigent-client" },
     { name = "prompt-toolkit" },

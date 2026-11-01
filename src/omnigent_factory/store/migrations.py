@@ -887,11 +887,11 @@ ALTER TABLE split_issues_v19 RENAME TO split_issues;
 # * status_comments: per parcel, the comment (``creating`` while a create may have landed:
 #   its marker is searched for before any second create), the digest of the body last
 #   written and when (the per-issue edit rate limit), ``pending`` (a changed body waiting
-#   for that limit), the pin attempt's outcome (tried at most once per comment), the
+#   for that limit), the pin attempt's outcome, the
 #   parcel version last rendered, the headline and the bounded stage history it shows.
 # * status_settings: per repository, when status comments started (a parcel unchanged
 #   since gets none until it changes: no bulk sweep) and whether the installation may pin
-#   comments (``unsupported`` is recorded once, with GitHub's message, and never retried).
+#   comments (only a definite capability refusal is ``unsupported``).
 V20_SQL = """
 CREATE TABLE status_comments (
     repo_id TEXT NOT NULL,

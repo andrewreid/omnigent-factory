@@ -244,22 +244,23 @@ def test_scalar_command_values_no_longer_fail_open(
 
 @pytest.mark.parametrize("read_only", [False, True])
 def test_long_heredoc_evaluates_fast(read_only: bool) -> None:
-    """A 10 KB heredoc took ~20-45 s before #1394; now ~20-30 ms. The 1 s bound is
-    generous for a loaded host and still far below the old cost."""
+    """A 10 KB heredoc took ~20-45 CPU s before #1394; now ~20-30 ms. The 5 CPU s
+    bound ignores time descheduled under parallel load and still catches the old cost."""
     check = cel_policy(**pol.factory_cel_policy("main", read_only=read_only).factory_params)
     clean = _heredoc(10_000)
     assert len(clean) >= 10_000
-    started = time.perf_counter()
+    started = time.thread_time()
     verdict = check(_call({"command": clean}))
-    elapsed = time.perf_counter() - started
+    elapsed = time.thread_time() - started
     assert verdict["result"] == "ALLOW"
-    assert elapsed < 1.0, f"{elapsed:.2f}s for a 10 KB heredoc"
+    assert elapsed < 5.0, f"{elapsed:.2f} CPU s for a 10 KB heredoc"
     # Size does not hide an embedded operation, and stays cheap with it.
     for command in (
         _heredoc(50_000, after="gh pr merge 12"),
         _heredoc(50_000, inside="git push origin main"),
         _heredoc(50_000, before="bash -lc 'gh workflow run ci.yml'"),
     ):
-        started = time.perf_counter()
+        started = time.thread_time()
         assert check(_call({"command": command}))["result"] == "DENY"
-        assert time.perf_counter() - started < 1.0
+        elapsed = time.thread_time() - started
+        assert elapsed < 5.0, f"{elapsed:.2f} CPU s for a 50 KB heredoc"

@@ -83,6 +83,6 @@ module = "tests.*"
 disallow_untyped_defs = false
 
 [tool.uv.sources]
-omnigent-client = { git = "https://github.com/omnigent-ai/omnigent.git", rev = "866ea4ac99590487cf8737d41b71f6cdf6db76a7", subdirectory = "sdks/python-client" }
-omnigent = { git = "https://github.com/omnigent-ai/omnigent.git", rev = "866ea4ac99590487cf8737d41b71f6cdf6db76a7" }
-omnigent-ui-sdk = { git = "https://github.com/omnigent-ai/omnigent.git", rev = "866ea4ac99590487cf8737d41b71f6cdf6db76a7", subdirectory = "sdks/ui" }
+omnigent-client = { git = "https://github.com/omnigent-ai/omnigent.git", rev = "51aef3cdf2cfe644db0e542954293ada43378862", subdirectory = "sdks/python-client" }
+omnigent = { git = "https://github.com/omnigent-ai/omnigent.git", rev = "51aef3cdf2cfe644db0e542954293ada43378862" }
+omnigent-ui-sdk = { git = "https://github.com/omnigent-ai/omnigent.git", rev = "51aef3cdf2cfe644db0e542954293ada43378862", subdirectory = "sdks/ui" }

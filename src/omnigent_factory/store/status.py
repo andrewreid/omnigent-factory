@@ -6,7 +6,8 @@ IMMEDIATE`` transaction.
 
 * One row per parcel: its status comment, what was last written there and when, and the
   stage history the comment shows (``service.status_comment``).
-* One row per repository: when status comments started and whether pinning works.
+* One row per repository: when status comments started and whether pinning was definitely
+  refused.
 """
 
 from __future__ import annotations
@@ -37,7 +38,8 @@ class StatusRow:
     written_at_us: int = 0
     #: A changed body is waiting for the per-issue edit rate limit.
     pending: bool = False
-    #: Pin attempt: "" not tried, "pinned", "failed" (GitHub refused) or "skipped".
+    #: Pin attempt: "" not tried, "pinned", "failed" (retryable unless the repository
+    #: has a definite refusal) or "skipped".
     pin: str = ""
     #: The parcel version last rendered.
     seen_version: int = 0
@@ -50,7 +52,7 @@ class StatusRow:
 class StatusSettings:
     #: Parcels unchanged since this time get no status comment until they change.
     baseline_us: int
-    #: "unknown" (never tried), "supported" or "unsupported" (recorded once, never retried).
+    #: "unknown" (never tried), "supported" or "unsupported" (a definite refusal).
     pin_state: str = "unknown"
     pin_message: str = ""
 
@@ -163,6 +165,19 @@ def set_pin_state(store: SqliteStore, *, repo_id: str, state: str, message: str 
         return cur.rowcount == 1
 
 
+def clear_pin_refusal(store: SqliteStore, *, repo_id: str, message: str) -> bool:
+    """Clear one obsolete ``unsupported`` result if its recorded reason still matches."""
+    now = store._clock.now_utc_us()
+    with store._txn() as conn:
+        cur = conn.execute(
+            "UPDATE status_settings SET pin_state = 'unknown', pin_message = '', "
+            "updated_at_us = ? WHERE repo_id = ? AND pin_state = 'unsupported' "
+            "AND pin_message = ?",
+            (now, repo_id, message),
+        )
+        return cur.rowcount == 1
+
+
 def with_event(row: StatusRow, at_us: int, headline: str) -> StatusRow:
     """``row`` with ``headline`` as its newest stage event (unchanged when it is already)."""
     if headline == row.headline:
@@ -175,6 +190,7 @@ __all__ = [
     "HISTORY_MAX",
     "StatusRow",
     "StatusSettings",
+    "clear_pin_refusal",
     "put_status",
     "set_pin_state",
     "status_row",
