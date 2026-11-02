@@ -571,8 +571,17 @@ epic's value applies to its sub-issues without their own. Only your own board ed
 (as for `Auto-build`): a value without your webhook is not trusted. One round is one review
 of a head the bot pushed, counted per issue across runs; comments and reworks do not reset
 it. From round `max(2, budget)` on, only P1 findings with real impact must be fixed; P2/P3
-take the outcome rule. Once the rounds are used up the run wraps up (fixes remaining
-in-scope P1s, defers the rest, stops asking the bot), the factory neither waits for another
+take the outcome rule. Each review round allows one fix batch and one targeted recheck,
+including the last allowed round: a budget of 4 permits 4 batches, not 3. Result counters
+are cumulative for the build and bounded by its review budget and the schema maximum of
+12 each. Each new round within budget gets a findings wake, at most once per head/round,
+with receipts preserved across restarts. A repeated read or push without a new review
+round does not earn another findings wake. Owner-ticked rework keeps its fresh allowance;
+it does not reset the issue's review-round count.
+An in-scope P1 or P2 with a small, local fix is never deferred because of the allowance:
+if it is truly spent, submit blocked/needs-owner instead. Once the rounds are used up the
+run finishes fixes from the last allowed round, applies the outcome rule, and stops
+asking the bot. The factory neither waits for another
 review nor wakes the run for findings on heads beyond the budget, and the card goes to
 Ready when otherwise ready, with the note `Codex round 2/2`. `factory_get_status` shows
 `review_rounds` (used, budget, strict_from_round).
@@ -1090,14 +1099,16 @@ that ends its turn without re-submitting is `Needs you`, never left `Working`. A
 had submitted build_ready and is reopened by `/continue` may re-submit (the same head
 included); if it ends the continued turn without a new result, its build_ready stands for
 the head it attested and the card goes to Ready on the usual terms. Review-bot
-findings without an outcome get a wake of their own (once per build or rework, separate
-from the check wake, so findings that arrive after the check wake still reach the run);
-findings still without an outcome after it are `Needs you`. Findings that arrive on the
-head after the card reached Ready (the bot answered after its wait ended) still get that
-wake when it is unused: the card goes back to Building, its closed build run is re-opened
-once (same authorization and approval, a free build slot needed) and woken; with the
-wake spent, no slot free or on an owner sync head, they are `Needs you` as before (a
-withdrawn card is re-checked on each read, so a slot freed later still gets the wake). Whenever readiness puts the
+findings without an outcome get a wake for each new review round within the budget,
+separate from the check wake, with one fix batch allowed per round. Each head/round gets
+at most one findings wake; findings still without an outcome after that wake are
+`Needs you`. Findings that arrive on the head after the card reached Ready (the bot
+answered after its wait ended) still get that round's wake when it is unused: the card
+goes back to Building, its closed build run is re-opened under the same authorization
+and approval (a free build slot is needed) and woken. Each new round within budget can
+re-open the run again. With that round's wake spent, no slot free or on an owner sync
+head, findings are `Needs you` as before (a withdrawn card is re-checked on each read,
+so a slot freed later still gets the wake). Whenever readiness puts the
 card at `Needs you`, one comment says why and lists each open review-bot thread (path,
 `P0`-`P3` badge, title, link), noting a further review round after a fix commit; it is
 not posted again while that state stands. A blocked report for a defect in the change stays with the owner. An owner drag

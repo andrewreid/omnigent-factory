@@ -477,3 +477,44 @@ def test_late_findings_on_an_owner_sync_head_keep_the_existing_rule():
     p = h.p()
     assert p.stage == Stage.BUILDING and p.bot == BotState.NEEDS_YOU and not sends(r)
     assert len(comments(r)) == 1
+
+
+def test_late_findings_can_reopen_the_run_for_each_new_round_within_budget():
+    h = harness()
+    ready_after_silent_grace(h)
+    for round_number in range(1, 5):
+        head = FIX if round_number == 1 else f"{round_number:040x}"
+        body = late_findings(h, head, review_rounds_used=round_number, review_rounds_budget=4)
+        h.send(P, body)  # reopen; the move must land before the wake
+        [wake] = sends(h.send(P, body))
+        assert wake.args["rounds_used"] == round_number
+        assert h.p().findings_wakes == round_number
+        assert not sends(h.send(P, body))
+        # Fix and push; grace expires before Codex answers the new head.
+        next_head = f"{round_number + 1:040x}"
+        submit(h, next_head)
+        h.f(P).tick(11 * MIN)
+        h.send(
+            P,
+            green(
+                h,
+                next_head,
+                review_bot_pending_since_us=h.f(P).now - 11 * MIN,
+                review_rounds_used=round_number,
+                review_rounds_budget=4,
+            ),
+        )
+        assert h.p().stage == Stage.READY
+        h.parcels[P] = parcel_from_json(parcel_to_json(h.p()))
+    result = h.send(
+        P,
+        late_findings(
+            h,
+            "0000000000000000000000000000000000000005",
+            review_rounds_used=5,
+            review_rounds_budget=4,
+        ),
+    )
+    assert not sends(result)
+    assert h.p().findings_wakes == 4
+    assert h.p().current_session.lifecycle == Lifecycle.RETIRED

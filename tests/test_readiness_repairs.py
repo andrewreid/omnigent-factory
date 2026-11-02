@@ -738,3 +738,102 @@ def test_pr_without_a_closing_reference_is_not_ready_and_the_wake_names_it():
     [blocked] = comments(r, "ready-blocked")
     assert "does not close issue #1" in str(blocked.args["reason"])
     assert h.p().bot == BotState.NEEDS_YOU
+
+
+def test_budget_four_wakes_each_reviewed_fix_once_and_stops_after_budget():
+    """F19: a push after round one must permit round two's findings wake."""
+    h = Harness()
+    h.to_building()
+    for round_number in range(1, 6):
+        head = f"{round_number:040x}"
+        _idle_build_ready(h, head)
+        body = evidence(
+            h,
+            head,
+            checks=ev.ChecksState.GREEN,
+            findings_open=True,
+            review_rounds_used=round_number,
+            review_rounds_budget=4,
+            review_bot_pending_since_us=0,
+        )
+        result = h.send(P, body)
+        if round_number <= 4:
+            [wake] = sends(result)
+            assert wake.args["rounds_used"] == round_number
+            assert wake.args["rounds_budget"] == 4
+            assert h.p().findings_wakes == round_number
+            assert h.p().findings_wake_rounds == tuple(
+                (f"{n:040x}", n) for n in range(1, round_number + 1)
+            )
+            # A duplicate read, even after a result and persistence round-trip, never
+            # buys another wake for this head/round.
+            _idle_build_ready(h, head)
+            h.parcels[P] = parcel_from_json(parcel_to_json(h.p()))
+            assert not sends(h.send(P, body))
+        else:
+            assert not sends(result)
+            assert h.p().findings_wakes == 4
+
+
+def test_a_new_push_without_a_new_review_round_does_not_earn_a_findings_wake():
+    h = Harness()
+    h.to_building()
+    _idle_build_ready(h)
+    for head in (OLD, NEW):
+        _idle_build_ready(h, head)
+        result = h.send(
+            P,
+            evidence(
+                h,
+                head,
+                checks=ev.ChecksState.GREEN,
+                findings_open=True,
+                review_rounds_used=1,
+                review_rounds_budget=4,
+            ),
+        )
+        assert bool(sends(result)) == (head == OLD)
+    assert h.p().findings_wakes == 1
+
+
+def test_old_spent_findings_wake_allows_the_next_known_round_only():
+    h = Harness()
+    h.to_building()
+    _idle_build_ready(h)
+    data = json.loads(parcel_to_json(replace(h.p(), findings_wakes=1)))
+    del data["parcel"]["findings_wake_rounds"]
+    h.parcels[P] = parcel_from_json(json.dumps(data))
+    for round_number in (1, 2):
+        _idle_build_ready(h, f"{round_number:040x}")
+        result = h.send(
+            P,
+            evidence(
+                h,
+                f"{round_number:040x}",
+                checks=ev.ChecksState.GREEN,
+                findings_open=True,
+                review_rounds_used=round_number,
+                review_rounds_budget=4,
+            ),
+        )
+        assert bool(sends(result)) == (round_number == 2)
+
+
+def test_findings_past_budget_cannot_spend_an_unused_wake():
+    for budget in (1, 4):
+        h = Harness()
+        h.to_building()
+        _idle_build_ready(h)
+        result = h.send(
+            P,
+            evidence(
+                h,
+                OLD,
+                checks=ev.ChecksState.GREEN,
+                findings_open=True,
+                review_rounds_used=budget + 1,
+                review_rounds_budget=budget,
+            ),
+        )
+        assert not sends(result)
+        assert h.p().findings_wakes == 0

@@ -342,6 +342,17 @@ async def test_build_ready_must_echo_the_plan_hash_it_fetched(service_config: Se
             await rig.submit(root, "build_ready", build_ready(), plan_hash="0" * 64)
         receipt = await rig.submit(root, "build_ready", build_ready(), plan_hash=plan_hash)
         assert receipt["accepted"] is True and receipt["slot"] == f"build-{SHA}"
+        assert receipt["next"] == (
+            "End your turn; the factory verifies CI and review evidence and wakes you if "
+            "something needs fixing (once for red checks, and once per new review-bot round "
+            "within the review budget). You may push one fix batch per round."
+        )
+        status = await rig.tools.get_status(root)
+        assert status["expected_next"] == (
+            "Wait: CI and review evidence are being checked; you may be woken once for "
+            "red checks and once per new review-bot round within the review budget. "
+            "You may push one fix batch per round."
+        )
         parcel = await rig.parcel()
         assert parcel.readiness is not None and parcel.readiness.head_sha == SHA
         # The same issue session carried triage, plan and build.

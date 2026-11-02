@@ -106,7 +106,7 @@ def test_current_stage_templates_carry_the_sync_note_and_old_ones_are_kept() -> 
     assert current == {
         "triage-v13.txt",
         "plan-v13.txt",
-        "build-v20.txt",
+        "build-v21.txt",
         "triage-feedback-v10.txt",
         "epic-triage-v5.txt",
         "build-rework-v15.txt",
@@ -116,7 +116,7 @@ def test_current_stage_templates_carry_the_sync_note_and_old_ones_are_kept() -> 
     for name in current:
         assert "{base_note}" in (TEMPLATES / name).read_text("utf-8"), name
     for name in (
-        "build-v20.txt",
+        "build-v21.txt",
         "build-rework-v15.txt",
         "build-rework-items-v6.txt",
         "build-conflict-v6.txt",
@@ -135,3 +135,27 @@ def test_current_stage_templates_carry_the_sync_note_and_old_ones_are_kept() -> 
         "build-conflict-v1.txt",
     ):
         assert "{base_note}" not in (TEMPLATES / old).read_text("utf-8"), old
+
+
+@pytest.mark.asyncio
+async def test_first_build_message_pins_the_rendered_review_round_allowance(
+    service_config: ServiceConfig,
+) -> None:
+    from omnigent_factory.service.review_rounds import RoundsView
+
+    async with started(service_config) as rig:
+
+        async def rounds(_parcel):
+            return RoundsView(1, 4)
+
+        rig.tools.directory.review_rounds = rounds
+        await building(rig)
+        run = await rig.run()
+        await eventually(lambda: _first(rig, run.session_id) is not None)
+        directory = rig.tools.directory
+        text = await directory.message_text(_first(rig, run.session_id))
+        assert text is not None
+        assert "Review rounds: 1 of 4 used; you may push one fix batch" in text
+        assert "up to 4 of each" in text
+        restarted = ServiceDispatchDirectory(rig.service.db, service_config)
+        assert await restarted.message_text(_first(rig, run.session_id)) == text

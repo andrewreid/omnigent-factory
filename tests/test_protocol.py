@@ -349,3 +349,45 @@ def test_schema_file_declares_optional_eli5_outside_contract():
         assert "eli5" not in model["required"]
         assert '"eli5"?:str|null' in RESULT_SHAPES["build_ready" if kind == "build" else kind]
     assert "eli5" not in schema["$defs"]["contract"]["properties"]
+
+
+@pytest.mark.parametrize("used", [0, 1, 2, 3, 4])
+def test_build_fix_allowance_accepts_each_batch_up_to_round_budget(used):
+    corr = Correlation("P1", "S1", "N1", 3, "build", review_rounds_budget=4)
+    parsed = validate_result(
+        build_result(remediation_batches_used=used, targeted_rechecks_used=used), corr
+    )
+    assert parsed.result.result.remediation_batches_used == used
+
+
+@pytest.mark.parametrize("field", ["remediation_batches_used", "targeted_rechecks_used"])
+def test_build_fix_allowance_rejects_above_run_budget(field):
+    corr = Correlation("P1", "S1", "N1", 3, "build", review_rounds_budget=4)
+    with pytest.raises(ResultError, match=f"{field}.*review-round budget.*4") as error:
+        validate_result(build_result(**{field: 5}), corr)
+    assert str(error.value) == (
+        f"{field}: exceeds this run's review-round budget (4); "
+        'submit kind "blocked" (Needs you) if a required local fix cannot be completed '
+        "within the allowance"
+    )
+
+
+@pytest.mark.parametrize("field", ["remediation_batches_used", "targeted_rechecks_used"])
+def test_build_fix_allowance_has_a_bounded_schema(field):
+    from omnigent_factory.core.protocol import BuildResult
+
+    schema = json.loads(
+        (Path(core_pkg.__file__).parent / "result_schema_v1.json").read_text("utf-8")
+    )
+    assert schema["$defs"]["build"]["properties"][field]["maximum"] == 12
+    assert BuildResult.model_json_schema()["properties"][field]["maximum"] == 12
+    corr = Correlation("P1", "S1", "N1", 3, "build", review_rounds_budget=20)
+    with pytest.raises(ResultError):
+        validate_result(build_result(**{field: 13}), corr)
+
+
+def test_legacy_one_batch_result_still_validates_without_budget_context():
+    assert validate_result(
+        build_result(remediation_batches_used=1, targeted_rechecks_used=1),
+        Correlation("P1", "S1", "N1", 3, "build"),
+    )

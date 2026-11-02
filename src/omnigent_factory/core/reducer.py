@@ -737,7 +737,7 @@ def _yield_to_rework(ctx: _Ctx, s: StageSession | None) -> bool:
         # The rework starts afresh (as it would have, queued on a finished build): the
         # old run's readiness and Needs you no longer stand.
         ctx.unhold(*_READY_CLEARED_HOLDS)
-        ctx.update(readiness=None, readiness_wakes=0, findings_wakes=0)
+        ctx.update(readiness=None, readiness_wakes=0, findings_wakes=0, findings_wake_rounds=())
         _begin_drain(ctx, replace(s, comment_pending=False), interrupt=False)
         ctx.note(HANDOVER_NOTE)
     return True
@@ -1514,7 +1514,8 @@ def _build_blocked_by_live(ctx: _Ctx) -> bool:
 def _after_approval(ctx: _Ctx, approval: Approval, duration_us: int, via: Via | None) -> None:
     ctx.unhold(*CONTROL_CLEARED_HOLDS)
     _end_blocker_wait(ctx)
-    ctx.update(readiness_wakes=0, findings_wakes=0)  # a new approved deliverable: own wakes
+    # A new approved deliverable has its own wake allowance.
+    ctx.update(readiness_wakes=0, findings_wakes=0, findings_wake_rounds=())
     _cancel_pending(ctx)
     _move(ctx, Stage.BUILDING, via)
     _enqueue_build(ctx, approval, duration_us)
@@ -3347,7 +3348,7 @@ def _rework(ctx: _Ctx, via: Via | None, *, conflict: str = "") -> None:
     a = ctx.p.current_approval
     assert a is not None  # noqa: S101 - approval_ok checked by the caller
     ctx.unhold(*CONTROL_CLEARED_HOLDS, Hold.REMEDIATION_EXHAUSTED)
-    ctx.update(readiness=None, readiness_wakes=0, findings_wakes=0)
+    ctx.update(readiness=None, readiness_wakes=0, findings_wakes=0, findings_wake_rounds=())
     _cancel_pending(ctx)
     _move(ctx, Stage.BUILDING, via)
     _enqueue_build(
@@ -4464,6 +4465,25 @@ def _settle_at(ctx: _Ctx, head: str) -> int:
     return ctx.now + ctx.config.review_grace_us
 
 
+def _findings_wake_available(parcel: Parcel, readiness: Readiness) -> bool:
+    """One findings wake per new reviewed head/round, within the owner's budget.
+
+    Unknown round evidence keeps the legacy single wake. Legacy aggregates with a
+    spent wake but no receipts conservatively count it as the first round's wake.
+    """
+    used, budget = readiness.review_rounds_used, readiness.review_rounds_budget
+    if budget <= 0:
+        return parcel.findings_wakes < 1
+    if used > budget or parcel.findings_wakes >= budget:
+        return False
+    receipts = parcel.findings_wake_rounds
+    if (readiness.head_sha, used) in receipts:
+        return False
+    if receipts:
+        return used > max(round_number for _, round_number in receipts)
+    return parcel.findings_wakes == 0 or used > parcel.findings_wakes
+
+
 def _reopen_for_late_findings(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> bool:
     """Review-bot findings without an outcome arrived on the current head after the card
     reached Ready (#799: Codex answered 2 minutes after the grace), and this round's
@@ -4474,7 +4494,7 @@ def _reopen_for_late_findings(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidenc
     re-reserved, and the read after the move lands wakes it (``_not_ready``). A card the
     earlier rule already withdrew to Building for those findings (``readiness_failed`` +
     ``rework_control_required``) is re-opened in place and woken by this read. Anything
-    else (the wake spent, the run re-opened before, no free building slot, a closed gate)
+    else (the round wake spent, no free building slot, a closed gate)
     stays with the owner as before. Returns whether the run was re-opened.
     """
     s = ctx.p.session(r.session_id)
@@ -4496,13 +4516,12 @@ def _reopen_for_late_findings(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidenc
         and body.review_accepted
         and not body.base_sync  # an owner sync head keeps its existing rule
         and not body.remediation_exhausted
-        and ctx.p.findings_wakes < 1
+        and _findings_wake_available(ctx.p, r)
         and s is not None
         and s.kind == SessionKind.BUILD
         and s.session_id == ctx.p.current_session_id
         and s.lifecycle == Lifecycle.RETIRED
         and s.execution_closed
-        and not s.reopened
         and not s.fences
         and s.root_id is not None
         and not s.external_active
@@ -4569,7 +4588,7 @@ def _late_findings_wake_due(ctx: _Ctx) -> bool:
         and s.session_id == ctx.p.current_session_id
         and s.lifecycle == Lifecycle.WAITING
         and s.quiescent
-        and ctx.p.findings_wakes < 1
+        and _findings_wake_available(ctx.p, r)
         and not board_pending(ctx.p)
     )
 
@@ -4696,10 +4715,10 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
     """Current-head evidence is not green: wait, wake the idle build, or Needs you.
 
     Pending checks are waiting, never a failure. A genuine failure wakes the idle build
-    session within its existing fix-batch/recheck allowance, at most once per approval
-    (or rework) for each kind: the check wake for red checks and other gaps (no accepted
-    review of this head, no closing reference), the findings wake for review-bot findings
-    without an outcome. Findings that arrive after the check wake was spent still get
+    session within its fix-batch/recheck allowance: one check wake per approval/rework
+    for red checks and other gaps (no accepted review of this head, no closing reference),
+    and one findings wake per new review round within budget for findings without an
+    outcome. Findings that arrive after the check wake was spent still get
     their wake (#745). With the applicable wake spent the owner decides with the reason
     recorded. Only red required checks with the check wake spent (or not applicable: a
     base-sync head) put the card in Ready, Bot Blocked.
@@ -4738,7 +4757,7 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
     if s is not None and _ended_without_result(ctx, s) and not _wake_answered(ctx, s):
         reason += f"; {_NO_NEW_RESULT}"
     check_wake = _check_gap(body) and ctx.p.readiness_wakes < 1
-    findings_wake = body.findings_open and ctx.p.findings_wakes < 1
+    findings_wake = body.findings_open and _findings_wake_available(ctx.p, r)
     waiting = (
         (check_wake or findings_wake)
         and s is not None
@@ -4757,6 +4776,11 @@ def _not_ready(ctx: _Ctx, r: Readiness, body: ev.ReadinessEvidence) -> None:
         ctx.update(
             readiness_wakes=ctx.p.readiness_wakes + int(check_wake),
             findings_wakes=ctx.p.findings_wakes + int(findings_wake),
+            findings_wake_rounds=(
+                (*ctx.p.findings_wake_rounds, (r.head_sha, r.review_rounds_used))
+                if findings_wake
+                else ctx.p.findings_wake_rounds
+            ),
         )
         # The run works again: a Needs you from an earlier gap (the findings wake can come
         # after the check wake's Needs you) no longer stands.

@@ -334,8 +334,8 @@ class BuildResult(_Strict):
     verification: Annotated[list[Verification], Field(min_length=1, max_length=100)]
     review: Review
     findings: Annotated[list[Finding], Field(max_length=200)]
-    remediation_batches_used: Annotated[int, Field(ge=0, le=1)]
-    targeted_rechecks_used: Annotated[int, Field(ge=0, le=1)]
+    remediation_batches_used: Annotated[int, Field(ge=0, le=12)]
+    targeted_rechecks_used: Annotated[int, Field(ge=0, le=12)]
     release_readiness: Literal["ready", "needs_owner"]
     related: Annotated[list[Related], Field(max_length=20)] = []
     #: Issues the run filed itself (kept for compatibility: the factory now files them).
@@ -475,8 +475,8 @@ RESULT_SHAPES: dict[str, str] = {
     '"outcome":"passed|failed|not_run","evidence":str}],"review":{"implementation_vendor":str,'
     '"review_vendor":str,"reviewed_head":sha40,"artifact_reference":str,'
     '"artifact_sha256":sha256,"accepted":bool},"findings":[{"id":str,"source":str,'
-    '"severity":str,"disposition":str,"evidence":str}],"remediation_batches_used":0|1,'
-    '"targeted_rechecks_used":0|1,"release_readiness":"ready|needs_owner","related"?:[...],'
+    '"severity":str,"disposition":str,"evidence":str}],"remediation_batches_used":int(0..min(12,review_rounds.budget)),'
+    '"targeted_rechecks_used":int(0..min(12,review_rounds.budget)),"release_readiness":"ready|needs_owner","related"?:[...],'
     '"deferred"?:[{"severity":"P0|P1|P2|P3","path"?:str,"title":str,"thread_url"?:str,'
     '"reason":str,"outcome"?:"follow_up|advisory","blocks"?:[int],"member"?:int,'
     + _RATING_SHAPE
@@ -541,6 +541,8 @@ class Correlation:
     #: bundle run may eject members or attribute findings and splits to one, and its
     #: plan names each member in an acceptance criterion.
     bundle_members: frozenset[int] | None = None
+    #: Trusted run context, never supplied by the agent. Legacy callers retain one batch.
+    review_rounds_budget: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -774,6 +776,13 @@ def validate_result(result: Mapping[str, object], expected: Correlation) -> Pars
     else:
         if expected.stage != "build":
             raise ResultError("build result from non-build stage")
+        for field in ("remediation_batches_used", "targeted_rechecks_used"):
+            if getattr(r, field) > expected.review_rounds_budget:
+                raise ResultError(
+                    f"{field}: exceeds this run's review-round budget "
+                    f'({expected.review_rounds_budget}); submit kind "blocked" (Needs you) '
+                    "if a required local fix cannot be completed within the allowance"
+                )
         _check_ids([f.id for f in r.findings], "finding")
         if any(f.disposition == "unresolved" for f in r.findings):
             raise ResultError("build-ready findings must all be dispositioned")

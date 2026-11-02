@@ -259,11 +259,15 @@ def test_a_readiness_wake_tells_the_run_its_rounds():
 def test_ticked_items_start_one_rework_the_factory_moves_the_card_for():
     h = ready()
     approval = h.p().current_approval_id
+    h.parcels[P] = replace(
+        h.p(), findings_wakes=4, findings_wake_rounds=((FIX, 4),), readiness_wakes=1
+    )
     r = h.send(P, ev.RequestRework(batch_id="b1"), actor=OWNER_ID, event_id="report-items:b1")
     assert r.audit.accepted
     p = h.p()
     assert p.stage == Stage.BUILDING and p.note == "Rework: Ready report items ticked"
     assert p.current_approval_id == approval  # the plan approval stands
+    assert (p.readiness_wakes, p.findings_wakes, p.findings_wake_rounds) == (0, 0, ())
     [move] = Harness.of(r, EffectKind.MOVE_CARD)  # not a drag: the factory moves the card
     assert move.args["to"] == "Building"
     assert h.admission.queue_entry(P).status == QueueStatus.QUEUED
@@ -317,8 +321,8 @@ def test_rounds_line_scales_the_strict_round_with_the_budget():
     from omnigent_factory.service.directory import rounds_line
 
     assert rounds_line(0, 0) == ""
-    assert "from round 2 on only P1" in rounds_line(1, 2)
-    assert "from round 4 on only P1" in rounds_line(1, 4)  # a raised budget stays strict late
+    assert "From round 2 on only P1" in rounds_line(1, 2)
+    assert "From round 4 on only P1" in rounds_line(1, 4)  # a raised budget stays strict late
     spent = rounds_line(2, 2)
     assert "budget is spent" in spent and "do not ask the review bot" in spent
 
@@ -331,3 +335,27 @@ def test_the_findings_wake_renders_with_its_rounds_line():
     )
     text = " ".join(text.split())
     assert f"PR #{PR} at head `{FIX}`" in text and "Review rounds: x" in text
+
+
+def test_per_round_fix_templates_are_new_pins_and_protect_small_p2_fixes():
+    from omnigent_factory.service import directory as d
+
+    assert d._FIRST_TEMPLATES[d.SessionKind.BUILD] == "build-v21.txt"
+    assert d._READINESS_WAKE_TEMPLATE == "readiness-wake-v16.txt"
+    assert d._FINDINGS_WAKE_TEMPLATE == "readiness-findings-wake-v8.txt"
+    for name in ("build-v21.txt", "readiness-wake-v16.txt", "readiness-findings-wake-v8.txt"):
+        text = template(name)
+        assert "one fix batch and run one targeted recheck per review round" in text
+        assert "{rounds}" in text
+        assert (
+            "An in-scope P1 or P2 finding with a small, local fix is never deferred because "
+            "of the fix allowance; if the allowance is truly spent, submit blocked/needs-owner "
+            "instead of deferring it" in text
+        )
+        assert "at most one fix batch" not in text
+        assert 'use kind "blocked" and name the required fix in reason' in text
+    for old in ("readiness-wake-v15.txt", "readiness-findings-wake-v7.txt"):
+        assert "at most one fix batch" in template(old)
+    assert "{rounds}" not in template("build-v20.txt")
+    assert "up to 4 of each" in d.rounds_line(1, 4)
+    assert "last allowed round" in d.rounds_line(4, 4)

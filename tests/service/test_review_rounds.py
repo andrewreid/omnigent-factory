@@ -292,3 +292,32 @@ async def test_completed_summary_is_recorded_once_in_review_rounds(service_confi
             partial(ds.review_rounds, repo_id=r.service.config.repo_id, parcel_id="I_parcel_1")
         )
         assert stored == [(HEAD, OPENED_US + 99 * S)]
+
+
+async def test_submit_result_uses_the_owner_budget_for_both_fix_counters(
+    service_config: ServiceConfig,
+):
+    from omnigent_factory.service.mcp import FactoryToolError
+    from tests.service.test_mcp import P, build_ready, building, started
+
+    async with started(rounds_config(service_config)) as r:
+        rounds = ReviewRounds(r.service)
+        r.tools.review_rounds = rounds
+        r.tools.directory.review_rounds = rounds.current
+        await rounds.note_owner_field(field_edit(P, 4))
+        root, plan_hash = await building(r)
+        await r.tools.get_plan(root)
+        status = await r.tools.get_status(root)
+        assert status["review_rounds"]["budget"] == status["findings_wakes_max"] == 4
+        for field in ("remediation_batches_used", "targeted_rechecks_used"):
+            with pytest.raises(FactoryToolError, match=f"{field}.*review-round budget.*4"):
+                await r.submit(
+                    root, "build_ready", {**build_ready(), field: 5}, plan_hash=plan_hash
+                )
+        receipt = await r.submit(
+            root,
+            "build_ready",
+            {**build_ready(), "remediation_batches_used": 4, "targeted_rechecks_used": 4},
+            plan_hash=plan_hash,
+        )
+        assert receipt["accepted"]

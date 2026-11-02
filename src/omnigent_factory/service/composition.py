@@ -471,6 +471,7 @@ async def build_production(
     service.follow_ups = follow_ups
     rounds = ReviewRounds(service, partial(read_item_number, github.client))
     github.review_rounds = rounds.observe
+    directory.review_rounds = rounds.current
     deferred = Deferrals(
         service,
         github.client,

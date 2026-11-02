@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from functools import partial
 from importlib.resources import files
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from omnigent_factory.core import report_lines as rl
 from omnigent_factory.core.codec import event_from_json, parcel_from_json
@@ -64,6 +64,9 @@ from omnigent_factory.ports.adapter import EffectAdapter
 from omnigent_factory.service.config import ServiceConfig
 from omnigent_factory.service.db import StoreWorker
 from omnigent_factory.store.sqlite import SqliteStore
+
+if TYPE_CHECKING:
+    from omnigent_factory.service.review_rounds import RoundsView
 
 LOG = logging.getLogger(__name__)
 _TOKEN = re.compile(
@@ -144,6 +147,8 @@ class ServiceDispatchDirectory:
         #: rework's source event (``service.deferred.Deferrals.rework_brief``); None: not
         #: wired. Pinned in the dispatch snapshot, so a restart sends the same text.
         self.rework_brief: Callable[[Parcel, str], Awaitable[str | None]] | None = None
+        #: Trusted round counts and owner budget, pinned with the first build message.
+        self.review_rounds: Callable[[Parcel], Awaitable[RoundsView]] | None = None
 
     async def stage_spec(self, session_id: str) -> StageSpec | None:
         existing = self._read(self.root / f"{_safe(session_id)}.json")
@@ -336,6 +341,10 @@ class ServiceDispatchDirectory:
         )
         template = _template(template_name)
         evidence = await self.issue_evidence(parcel)
+        rounds_text = rounds_line(0, self.config.review_rounds_default)
+        if session.kind == SessionKind.BUILD and self.review_rounds is not None:
+            rounds = await self.review_rounds(parcel)
+            rounds_text = rounds_line(rounds.used, rounds.budget)
         return {
             "version": 1,
             "session_id": session.session_id,
@@ -356,6 +365,7 @@ class ServiceDispatchDirectory:
             ).hexdigest(),
             "untrusted_boundary": _new_boundary(),
             "brief": brief,
+            "rounds": rounds_text,
             "guidance": (
                 self.config.triage_guidance
                 if session.kind == SessionKind.TRIAGE
@@ -614,6 +624,7 @@ class ServiceDispatchDirectory:
                 snapshot.get("base_sync") or snapshot.get("reference_reuse_base_sync"), spec.kind
             ),
             "brief": str(snapshot.get("brief") or ""),
+            "rounds": str(snapshot.get("rounds") or ""),
             "reference_note": (
                 "This is a shared read-only reference snapshot, not an issue worktree. "
                 "Put scratch files in $TMPDIR. Do not install dependencies, run "
@@ -1940,7 +1951,7 @@ _REFERENCE_TEMPLATES = {
 _FIRST_TEMPLATES = {
     SessionKind.TRIAGE: "triage-v13.txt",
     SessionKind.PLAN: "plan-v13.txt",
-    SessionKind.BUILD: "build-v20.txt",
+    SessionKind.BUILD: "build-v21.txt",
 }
 _ANSWER_TEMPLATE = "answer-v3.txt"
 _RETRIAGE_TEMPLATE = "triage-feedback-v10.txt"
@@ -1961,8 +1972,8 @@ _REWORK_TEMPLATE = "build-rework-v15.txt"
 #: A rework the owner started by ticking Ready report items: its brief is those items.
 _ITEMS_REWORK_TEMPLATE = "build-rework-items-v6.txt"
 #: Readiness wakes of a waiting build run (red checks and other gaps; findings only).
-_READINESS_WAKE_TEMPLATE = "readiness-wake-v15.txt"
-_FINDINGS_WAKE_TEMPLATE = "readiness-findings-wake-v7.txt"
+_READINESS_WAKE_TEMPLATE = "readiness-wake-v16.txt"
+_FINDINGS_WAKE_TEMPLATE = "readiness-findings-wake-v8.txt"
 #: A rework run, or a wake of the waiting build run, for a merge conflict with the base.
 _CONFLICT_TEMPLATE = "build-conflict-v6.txt"
 _CONFLICT_WAKE_TEMPLATE = "readiness-conflict-wake-v3.txt"
@@ -1993,15 +2004,28 @@ def rounds_line(used: int, budget: int) -> str:
     if budget <= 0:
         return ""
     strict = max(2, budget)
+    allowance = (
+        f"Review rounds: {used} of {budget} used; you may push one fix batch and run "
+        f"one targeted recheck per round, up to {min(12, budget)} of each in this build "
+        "(the result schema caps each counter at 12). "
+    )
+    rule = (
+        f"From round {strict} on only P1 findings with real impact must be fixed; "
+        "P2/P3 take the outcome rule. "
+    )
     if used >= budget:
-        return (
-            f"Review rounds: {used} of {budget} used, the budget is spent: fix remaining "
-            "in-scope P1 findings, defer the rest by the outcome rule and do not ask the "
-            "review bot for another review."
+        rule += (
+            "The review budget is spent: finish fixes from the last allowed round, "
+            "apply the outcome rule and do not ask the review bot for another review. "
         )
     return (
-        f"Review rounds: {used} of {budget} used; from round {strict} on only P1 findings "
-        "with real impact must be fixed, P2/P3 take the outcome rule."
+        allowance
+        + rule
+        + (
+            "An in-scope P1 or P2 finding with a small, local fix is never deferred because "
+            "of the fix allowance; if the allowance is truly spent, submit blocked/needs-owner "
+            "instead of deferring it."
+        )
     )
 
 

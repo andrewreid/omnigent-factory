@@ -13,6 +13,13 @@ from omnigent_factory.service.directory import (
     agent_display_name,
 )
 
+# These versions replace the fix allowance; their ELI5 and rating suffix stays verbatim.
+ROUND_ALLOWANCE_TEMPLATES = {
+    "build-v21.txt",
+    "readiness-wake-v16.txt",
+    "readiness-findings-wake-v8.txt",
+}
+
 
 def test_agent_name_comes_from_config():
     base = {"repo_id": "R", "owners": frozenset({1})}
@@ -148,7 +155,12 @@ def test_live_result_and_question_prompts_request_eli5_and_keep_old_versions():
         # Issue-worktree and reference families each grow from their own predecessor.
         previous = PREDECESSORS.get(name, f"{prefix}-v{int(version) - 1}.txt")
         old = (root / previous).read_text("utf-8")
-        if name == "triage-refresh-v2.txt":
+        if name in ROUND_ALLOWANCE_TEMPLATES:
+            assert (
+                text.split("For triage, epic_triage", 1)[1]
+                == old.split("For triage, epic_triage", 1)[1]
+            )
+        elif name == "triage-refresh-v2.txt":
             # The reference variant of the refresh run: its snapshot note only.
             assert text.replace("{reference_note}\n", "", 1) == old
         elif name in {
@@ -184,12 +196,12 @@ def test_pr_writing_prompts_ask_for_a_pr_body_eli5_and_keep_old_versions():
         directory._CONFLICT_WAKE_TEMPLATE,
     }
     assert {opening, *updating} == {
-        "build-v20.txt",
+        "build-v21.txt",
         "build-rework-v15.txt",
         "build-rework-items-v6.txt",
         "build-conflict-v6.txt",
-        "readiness-wake-v15.txt",
-        "readiness-findings-wake-v7.txt",
+        "readiness-wake-v16.txt",
+        "readiness-findings-wake-v8.txt",
         "readiness-conflict-wake-v3.txt",
     }
     for name in {opening, *updating}:
@@ -198,14 +210,20 @@ def test_pr_writing_prompts_ask_for_a_pr_body_eli5_and_keep_old_versions():
         assert "after the `Closes` lines" in flat, name
         # The result-field ELI5 paragraph is kept as it was.
         assert "always fill eli5" in flat and "factory_ask_owner, always pass eli5" in flat
-        # Each released version only adds to the one before it, back to the version
-        # that introduced the ELI5 section (its predecessor is untouched).
+        # ELI5 additions stay verbatim back to their introduction. The round-allowance
+        # revisions replace earlier instructions but keep the entire ELI5 suffix.
         prefix, version = name.removesuffix(".txt").rsplit("-v", 1)
         number = int(version)
         while True:
             text = (root / f"{prefix}-v{number}.txt").read_text("utf-8")
             old = (root / f"{prefix}-v{number - 1}.txt").read_text("utf-8")
-            assert text.startswith(old.rstrip() + "\n"), (prefix, number)
+            if f"{prefix}-v{number}.txt" in ROUND_ALLOWANCE_TEMPLATES:
+                assert (
+                    text.split("For triage, epic_triage", 1)[1]
+                    == old.split("For triage, epic_triage", 1)[1]
+                )
+            else:
+                assert text.startswith(old.rstrip() + "\n"), (prefix, number)
             if "## ELI5" not in old:
                 break
             number -= 1

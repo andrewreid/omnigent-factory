@@ -735,6 +735,7 @@ class FactoryTools:
         if readiness is not None and not readiness.verified and evidence is not None:
             gaps = _gaps(evidence, parcel.issue_number)
         approval = parcel.current_approval
+        rounds = await self._review_rounds(parcel)
         return {
             **self._header(caller),
             "board_column": parcel.stage.value if parcel.stage else None,
@@ -761,8 +762,8 @@ class FactoryTools:
             "fix_wakes_used": parcel.readiness_wakes,
             "fix_wakes_max": 1,
             "findings_wakes_used": parcel.findings_wakes,
-            "findings_wakes_max": 1,
-            "review_rounds": await self._review_rounds(parcel),
+            "findings_wakes_max": rounds["budget"] if rounds else self.config.review_rounds_default,
+            "review_rounds": rounds,
             "follow_up_depth": await self._follow_up_depth(parcel),
         }
 
@@ -951,12 +952,16 @@ class FactoryTools:
             if kind in ("build_ready", "blocked") and parcel.issue_number is not None
             else (0, None)
         )
+        rounds = await self._review_rounds(parcel) if kind == "build_ready" else None
         corr = Correlation(
             parcel.parcel_id,
             run.session_id,
             run.nonce,
             run.revision,
             run.kind.value,
+            review_rounds_budget=(
+                rounds["budget"] if rounds else self.config.review_rounds_default
+            ),
             waiver_build=waiver,
             in_checkpoint=in_checkpoint,
             issue_number=parcel.issue_number,
@@ -1445,8 +1450,8 @@ def _after_submit(kind: str, in_checkpoint: bool) -> str:
         "the blocked-by links you listed.",
         "plan": "End your turn; the factory publishes the plan for owner approval.",
         "build_ready": "End your turn; the factory verifies CI and review evidence and "
-        "wakes you if something needs fixing (once for red checks, once for review-bot "
-        "findings).",
+        "wakes you if something needs fixing (once for red checks, and once per new "
+        "review-bot round within the review budget). You may push one fix batch per round.",
         "blocked": "End your turn; the owner has been told.",
     }.get(kind, "End your turn.")
 
@@ -1471,7 +1476,11 @@ def _expected_next(parcel: Parcel, run: StageSession | None) -> str:
         if run.wait_reason == WaitReason.PLAN_APPROVAL:
             return "Wait: the plan is with the owner for approval or feedback."
         if run.wait_reason == WaitReason.CHECKS:
-            return "Wait: CI and review evidence are being checked; you may be woken once."
+            return (
+                "Wait: CI and review evidence are being checked; you may be woken once for "
+                "red checks and once per new review-bot round within the review budget. "
+                "You may push one fix batch per round."
+            )
     if Hold.AGENT_BLOCKED in parcel.holds:
         return "Blocked reported: wait for the owner or operator."
     if Hold.BLOCKERS in parcel.holds:

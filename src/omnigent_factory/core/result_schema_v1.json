@@ -760,12 +760,12 @@
         "remediation_batches_used": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 1
+          "maximum": 12
         },
         "targeted_rechecks_used": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 1
+          "maximum": 12
         },
         "release_readiness": {
           "enum": [

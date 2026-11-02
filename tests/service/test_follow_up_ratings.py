@@ -258,20 +258,25 @@ def test_reporting_prompts_carry_the_rating_rubric_and_old_versions_are_kept():
     from omnigent_factory.service import directory as d
 
     pairs = {
-        d._FIRST_TEMPLATES[d.SessionKind.BUILD]: "build-v19.txt",
-        d._READINESS_WAKE_TEMPLATE: "readiness-wake-v14.txt",
-        d._FINDINGS_WAKE_TEMPLATE: "readiness-findings-wake-v6.txt",
+        d._FIRST_TEMPLATES[d.SessionKind.BUILD]: ("build-v20.txt", "build-v19.txt"),
+        d._READINESS_WAKE_TEMPLATE: ("readiness-wake-v15.txt", "readiness-wake-v14.txt"),
+        d._FINDINGS_WAKE_TEMPLATE: (
+            "readiness-findings-wake-v7.txt",
+            "readiness-findings-wake-v6.txt",
+        ),
     }
     assert set(pairs) == {
-        "build-v20.txt",
-        "readiness-wake-v15.txt",
-        "readiness-findings-wake-v7.txt",
+        "build-v21.txt",
+        "readiness-wake-v16.txt",
+        "readiness-findings-wake-v8.txt",
     }
-    for name, old_name in pairs.items():
+    for name, (rated_name, old_name) in pairs.items():
         text = (TEMPLATES / name).read_text("utf-8")
         old = (TEMPLATES / old_name).read_text("utf-8")
         assert "Deferred ratings" not in old  # the released template is untouched
-        assert text.startswith(old.rstrip() + "\n"), name
+        rated = (TEMPLATES / rated_name).read_text("utf-8")
+        assert rated.startswith(old.rstrip() + "\n"), rated_name
+        assert text.split("Deferred ratings:", 1)[1] == rated.split("Deferred ratings:", 1)[1]
         flat = " ".join(text.split())
         for word in ('"bug"', '"likely"', '"edge"', '"tidy"', "why is one short line"):
             assert word in flat, (name, word)

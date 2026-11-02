@@ -626,8 +626,8 @@ class StageSession:
     #: When the current drain began (0: not draining, or a drain recorded before this
     #: field existed). The scheduler ends a drain still waiting after the drain timeout.
     drain_started_us: int = 0
-    #: A build run retired for Ready was re-opened once for review-bot findings that
-    #: arrived after Ready (#799). Never again: a later late finding is the owner's.
+    #: A build run retired for Ready has been re-opened for late review-bot findings
+    #: (#799). Each new review round within budget can reopen it; wake receipts dedupe.
     reopened: bool = False
     #: Durable nonce-search progress; defaults recover records predating the budget.
     create_searches: int = 0
@@ -1059,10 +1059,11 @@ class Parcel:
     #: for red required checks and other gaps besides review-bot findings (the check wake;
     #: a wake recorded before the split counts as this one).
     readiness_wakes: int = 0
-    #: Readiness fix wakes sent for review-bot findings without an outcome (at most 1 per
-    #: approval or rework), separate so findings that arrive after the check wake was
-    #: spent still reach the build once (#745).
+    #: Findings wakes in this approval/rework, bounded by the review-round budget.
     findings_wakes: int = 0
+    #: Persisted (head SHA, round) wake receipts. New rounds may wake again; a duplicate
+    #: read or a re-submission cannot. Empty on legacy parcels and fresh owner rework.
+    findings_wake_rounds: tuple[tuple[str, int], ...] = ()
     pr_number: int | None = None
     #: "<PR head>:<base head>" of the last merge-conflict wake (a wake of the build run or
     #: a conflict rework): at most one per pair, never re-sent after a restart.
