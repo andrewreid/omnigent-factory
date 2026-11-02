@@ -12,8 +12,14 @@ and the Ready report's Deferred checkboxes the owner ticks to have items done no
   ``follow-up``, joins the source issue's epic and gets the native blocked-by links the
   items name, through ``service.follow_ups`` (each once, never undone). The row is set to
   ``creating`` before the create: a restart (or an unclear create) first looks for the
-  marker among the newest issues, so the issue is never opened twice. Items a later
-  result adds are appended to the same issue (re-read first; existing lines and ticks kept).
+  marker among the newest issues, so the issue is never opened twice. Its body is laid out
+  like the Ready report's Deferred section, between ``factory-follow-ups:begin``/``end``
+  markers: a ``| # | Item | Rating | Why |`` table in the report's numbers (``F3`` is the
+  same item in both), a ``### F3 · <title>`` details block per item, then the checklist.
+  Each sync re-reads the issue and re-renders that region (items a later result adds, a
+  changed rating), keeping each line's checkbox and status and every line outside it; an
+  issue from before the region is migrated (its checklist lines replaced by the region).
+  Within GitHub's body limit the details shrink first, then the table; no box is dropped.
 * **Ticked.** The Ready report numbers every item and advisory ``F1``, ``F2``, ... (in the
   order they were recorded: an item keeps its number, later items get the next ones),
   shows them in a table in number order with the agent's rating (bug, likely, edge,
@@ -115,6 +121,27 @@ _LINE_TIERS: tuple[tuple[int, int, int, int], ...] = (
 #: Ratings table cells (item, why), longest first; (0, 0): number and rating only.
 _TABLE_TIERS: tuple[tuple[int, int], ...] = ((120, MAX_WHY_CHARS), (60, 60), (0, 0))
 _TABLE_LEFT_OUT = "_The ratings table is left out: the list is too long for one comment._"
+
+#: GitHub's issue body limit.
+ISSUE_LIMIT = 65_536
+#: The consolidated issue's factory-managed region (table, details, checklist): rewritten
+#: on each sync; text outside it (the owner's) is kept as it is.
+REGION_BEGIN = "<!-- factory-follow-ups:begin -->"
+REGION_END = "<!-- factory-follow-ups:end -->"
+#: The issue's checklist line title, longest first (0: number, severity, rating only).
+_ISSUE_TICK_TIERS: tuple[int, ...] = (120, 40, 0)
+#: The issue's per-item details (title, path, reason, why), longest first.
+_ISSUE_DETAIL_TIERS: tuple[tuple[int, int, int, int], ...] = (
+    (300, 300, 1000, MAX_WHY_CHARS),
+    (120, 120, 200, 120),
+    (60, 60, 100, 60),
+    (40, 40, 60, 40),
+)
+#: Room kept per checklist line without a status for the "→ fixed in #N (`sha`)" the
+#: factory later writes in place (``_close_out``, which does not re-fit the body).
+_ISSUE_STATUS_ROOM = 40
+_ISSUE_TABLE_LEFT_OUT = "_The ratings table is left out: the list is too long for one issue._"
+_ISSUE_DETAILS_LEFT_OUT = "_Item details are left out: the list is too long for one issue._"
 
 
 def _cell(text: str, limit: int) -> str:
@@ -348,6 +375,7 @@ class Deferrals:
         )
         row = rows[0] if rows else None
         number = row.issue_number if row is not None else None
+        numbers = await self._numbers(source, pr_number, items)
         body: str | None = None
         if number is None and row is not None and row.state == "creating":
             found = await self._find(source, pr_number, row.updated_at_us)
@@ -364,7 +392,7 @@ class Deferrals:
                     state="creating",
                 )
             )
-            body = self._issue_body(source, pr_number, items)
+            body = self._issue_body(source, pr_number, items, numbers)
             number = await self._create(source, pr_number, body)
             LOG.info(
                 "consolidated follow-up issue created issue=#%s source=#%s pr=#%s items=%s",
@@ -385,28 +413,24 @@ class Deferrals:
         )
         if body is None:
             body = await self._issue_text(number)
-        present = rl.texts(body, rl.ITEM)
-        missing = [i for i in items if i.item_key not in present]
-        # A rated line whose rating or why changed since it was written: rewritten in
-        # place (its checkbox and any "→ fixed in ..." status kept).
-        stale = {
-            i.item_key: text
-            for i in items
-            if i.item_key in present
-            and (i.rating or i.why)
-            and present[i.item_key] != (text := self._issue_item_text(i))
-        }
-        if missing or stale:
-            new = rl.with_text(body, stale, rl.ITEM)
-            new = rl.append_lines(
-                new, (self._issue_line(i) for i in missing), issue_marker(source, pr_number)
+        # The factory-managed region re-rendered (new items, changed ratings, an old
+        # layout migrated); each line's checkbox and "→ fixed in ..." status kept.
+        missing = len({i.item_key for i in items} - rl.ids(body, rl.ITEM))
+        new = self._issue_layout(body, source, pr_number, items, numbers)
+        if new is None:
+            LOG.warning(
+                "consolidated follow-up issue too long to update issue=#%s items=%s",
+                number,
+                len(items),
             )
+            return
+        if new != body:
             await self._write_issue(number, new)
             LOG.info(
-                "consolidated follow-up issue updated issue=#%s added=%s rewritten=%s",
+                "consolidated follow-up issue updated issue=#%s added=%s migrated=%s",
                 number,
-                len(missing),
-                len(stale),
+                missing,
+                REGION_BEGIN not in body,
             )
         await self._db(
             partial(
@@ -430,29 +454,159 @@ class Deferrals:
         )
         await self.follow_ups.link(number)
 
-    def _issue_line(self, item: ds.DeferredItem) -> str:
-        return rl.line(rl.ITEM, item.item_key, self._issue_item_text(item))
-
-    def _issue_item_text(self, item: ds.DeferredItem) -> str:
-        path = f" `{_one_line(item.path, 200).replace('`', chr(39))}`" if item.path else ""
-        link = f" ([thread]({item.thread_url}))" if item.thread_url.startswith("https://") else ""
-        rated = f" ({_RATING_LABELS[item.rating]})" if item.rating in _RATING_LABELS else ""
-        why = f" Why: {_one_line(item.why, MAX_WHY_CHARS)}" if item.why else ""
-        text = self.publish(
-            f"{item.severity}{rated}{path} {_one_line(item.title)}{link}: "
-            f"{_one_line(item.reason)}{why}"
+    async def _numbers(
+        self, source: int, pr_number: int, items: Sequence[ds.DeferredItem]
+    ) -> dict[str, str]:
+        """Item key -> its number in the Ready report that shows it (``F3`` here is
+        ``F3`` there): the report of the PR's card (a bundle's, for a member's items),
+        else of the source issue's card; else numbered among the source's items alike."""
+        rows = await self._db(
+            lambda store: store.query(
+                "SELECT aggregate_json FROM parcels WHERE repo_id = ? AND ("
+                "(? > 0 AND json_extract(aggregate_json, '$.parcel.pr_number') = ?) OR "
+                "json_extract(aggregate_json, '$.parcel.issue_number') = ?) "
+                "ORDER BY json_extract(aggregate_json, '$.parcel.pr_number') = ? DESC",
+                (self._repo_id, pr_number, pr_number, source, pr_number),
+            )
         )
-        return _one_line(text, 1000)
+        keys = {i.item_key for i in items}
+        for row in rows:
+            shown, _issues = await self._parcel_items(parcel_from_json(str(row[0])))
+            numbers = _numbered(shown, source)
+            if keys <= numbers.keys():
+                return numbers
+        own = await self._db(partial(ds.deferred_items, repo_id=self._repo_id, source_issue=source))
+        return _numbered(own, source)
 
-    def _issue_body(self, source: int, pr_number: int, items: Sequence[ds.DeferredItem]) -> str:
-        lines = "\n".join(self._issue_line(i) for i in items)
-        return (
+    def _issue_body(
+        self,
+        source: int,
+        pr_number: int,
+        items: Sequence[ds.DeferredItem],
+        numbers: Mapping[str, str],
+    ) -> str:
+        intro = (
             f"Review findings deferred from {f'PR #{pr_number}' if pr_number else 'the run'} "
-            f"(issue #{source}): real defects "
-            "outside that change, or too large for it. The factory ticks an item here when a "
-            f"later rework of #{source} fixes it; close this issue when nothing is left.\n\n"
-            f"{lines}\n\n{issue_marker(source, pr_number)}"
+            f"(issue #{source}): real defects outside that change, or too large for it. "
+            f"Numbers match the Ready report's Deferred section on #{source}. The factory "
+            f"ticks an item below when a later rework of #{source} fixes it; close this "
+            "issue when nothing is left."
         )
+        body = f"{intro}\n\n{issue_marker(source, pr_number)}"
+        return self._issue_layout(body, source, pr_number, items, numbers) or body
+
+    def _issue_layout(
+        self,
+        body: str,
+        source: int,
+        pr_number: int,
+        items: Sequence[ds.DeferredItem],
+        numbers: Mapping[str, str],
+    ) -> str | None:
+        """``body`` with its factory-managed region rendered for ``items`` (None: not
+        even the shortest checklist fits). Text outside the region is kept; each item's
+        checkbox and status are taken from ``body``. A body from before the region (lines
+        only) is migrated: its checklist lines are replaced by the region, and any other
+        line between them is kept just after it."""
+        begin, end = body.find(REGION_BEGIN), body.find(REGION_END)
+        if 0 <= begin < end:
+            head, old, tail = body[:begin], body[begin:end], body[end + len(REGION_END) :]
+        elif (found := rl.span(body, rl.ITEM)) is not None:
+            start, stop = found
+            head, old, tail = body[:start], body[start:stop], body[stop:]
+            kept = [text for text in old.splitlines() if text.strip() and not rl.ids(text, rl.ITEM)]
+            if kept:
+                tail = "\n\n" + "\n".join(kept) + tail
+        else:
+            marker = issue_marker(source, pr_number)
+            cut = body.find(marker)
+            if cut < 0:
+                head, old, tail = body.rstrip() + "\n\n", "", "\n"
+            else:
+                head, old, tail = body[:cut].rstrip() + "\n\n", "", "\n\n" + body[cut:]
+        known = {i.item_key for i in items}
+        # Lines of items not (or no longer) listed here: kept as they are.
+        others = [
+            text for text in old.splitlines() if (ids := rl.ids(text, rl.ITEM)) and not ids & known
+        ]
+        room = ISSUE_LIMIT - len(head) - len(tail) - len(REGION_BEGIN) - len(REGION_END) - 3
+        region = self._issue_region(items, numbers, old, others, room)
+        if region is None:
+            return None
+        return f"{head}{REGION_BEGIN}\n{region}\n\n{REGION_END}{tail}"
+
+    def _issue_region(
+        self,
+        items: Sequence[ds.DeferredItem],
+        numbers: Mapping[str, str],
+        old: str,
+        others: Sequence[str],
+        room: int,
+    ) -> str | None:
+        """The table, the per-item details and the checklist within ``room`` characters:
+        the details shrink (then are left out) first, then the table, then the checklist
+        lines' text; every checklist line always stays (None: not even that fits)."""
+        ticks = rl.checked(old, rl.ITEM)
+        states = rl.statuses(old, rl.ITEM)
+        room -= _ISSUE_STATUS_ROOM * sum(1 for i in items if not states.get(i.item_key))
+        ordered = sorted(items, key=lambda i: _number_key(numbers.get(i.item_key, "")))
+        numbered = [(numbers.get(i.item_key, "F?"), i) for i in ordered]
+        tables = [self._report_table(numbered, cells) for cells in _TABLE_TIERS]
+        tables.append(_ISSUE_TABLE_LEFT_OUT)
+        details = [
+            "\n\n".join(self._issue_detail(n, i, tier) for n, i in numbered)
+            for tier in _ISSUE_DETAIL_TIERS
+        ]
+        details.append(_ISSUE_DETAILS_LEFT_OUT)
+        for title_len in _ISSUE_TICK_TIERS:
+            lines = [
+                rl.line(
+                    rl.ITEM,
+                    item.item_key,
+                    self._issue_tick_text(number, item, title_len),
+                    ticked=ticks.get(item.item_key, False),
+                    status=states.get(item.item_key, ""),
+                )
+                for number, item in numbered
+            ]
+            checklist = "**Checklist**\n\n" + "\n".join([*lines, *others])
+            for table in tables:
+                for detail in details:
+                    region = f"{table}\n\n{detail}\n\n{checklist}"
+                    if len(region) <= room:
+                        return region
+            if len(checklist) <= room:
+                return checklist
+        return None
+
+    def _issue_tick_text(self, number: str, item: ds.DeferredItem, title_len: int) -> str:
+        rated = f" ({_RATING_LABELS[item.rating]})" if item.rating in _RATING_LABELS else ""
+        title = f" {_one_line(item.title, title_len)}" if title_len else ""
+        return _one_line(self.publish(f"{number} {item.severity}{rated}{title}"), 1000)
+
+    def _issue_detail(
+        self, number: str, item: ds.DeferredItem, tier: tuple[int, int, int, int]
+    ) -> str:
+        """One item's details: its heading, then severity, rating and why, and path, the
+        reason it was deferred and its review thread (what is known, nothing more)."""
+        title_len, path_len, reason_len, why_len = tier
+        facts = [f"**{_one_line(item.severity, 40)}**" if item.severity else ""]
+        if item.rating in _RATING_LABELS:
+            why = f": {_one_line(item.why, why_len)}" if item.why else ""
+            facts.append(f"{_RATING_LABELS[item.rating]}{why}")
+        elif item.why:
+            facts.append(f"Why: {_one_line(item.why, why_len)}")
+        if item.path:
+            facts.append(f"`{_one_line(item.path, path_len).replace('`', chr(39))}`")
+        title = _one_line(self.publish(_one_line(item.title, title_len)), title_len)
+        parts = [f"### {number} · {title}"]
+        if line := " · ".join(f for f in facts if f):
+            parts.append(line)
+        if item.reason:
+            parts.append(f"Deferred: {_one_line(item.reason, reason_len)}")
+        if item.thread_url.startswith("https://"):
+            parts.append(f"[Review thread]({_one_line(item.thread_url, 600)})")
+        return "\n\n".join([parts[0], *(_one_line(self.publish(p), 2000) for p in parts[1:])])
 
     async def _create(self, source: int, pr_number: int, body: str) -> int:
         """Open the consolidated issue using the source title already stored locally."""
@@ -1134,6 +1288,23 @@ async def find_marked_issue(
         if isinstance(last, dict) and 0 < _time_us(last.get("created_at")) < floor:
             return None
     return None
+
+
+def _numbered(items: Iterable[ds.DeferredItem], source: int) -> dict[str, str]:
+    """Item key -> ``F<n>`` of ``source``'s items, numbered as the Ready report numbers
+    ``items`` (recording order)."""
+    ordered = sorted(items, key=lambda i: (i.report_order, i.source_issue, i.seq))
+    return {
+        item.item_key: f"F{n}"
+        for n, item in enumerate(ordered, start=1)
+        if item.source_issue == source
+    }
+
+
+def _number_key(number: str) -> tuple[int, str]:
+    """``F3`` sorts before ``F10``; anything else after every number."""
+    digits = number[1:]
+    return (int(digits), "") if number.startswith("F") and digits.isdigit() else (1 << 62, number)
 
 
 def _status(action: ds.ReportAction | None, *, round_line: bool) -> str:

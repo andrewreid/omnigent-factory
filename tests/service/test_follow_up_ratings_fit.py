@@ -169,10 +169,12 @@ async def test_a_changed_rating_rewrites_open_and_fixed_issue_lines_in_place(
         )
         text = r.repo.issues[100]["body"]
         lines = {next(iter(rl.ids(ln, rl.ITEM))): ln for ln in text.splitlines() if "item:" in ln}
-        assert lines[key_a].startswith("- [ ] P2 (Bug) `api/src/export.ts` Retry leaks")
-        assert lines[key_a].endswith(f"Why: seen live {rl.marker(rl.ITEM, key_a)}")
-        assert lines[key_b].startswith("- [x] P1 (Tidy) `api/src/retry.ts` Unbounded")
-        assert lines[key_b].endswith(f"→ {fixed} {rl.marker(rl.ITEM, key_b)}")
+        assert lines[key_a] == rl.line(rl.ITEM, key_a, "F1 P2 (Bug) Retry leaks the delivery row")
+        assert lines[key_b] == rl.line(
+            rl.ITEM, key_b, "F2 P1 (Tidy) Unbounded retry loop", ticked=True, status=fixed
+        )
+        assert "| F1 | P2 Retry leaks the delivery row | Bug | seen live |" in text
+        assert "**P2** · Bug: seen live · `api/src/export.ts`" in text
         assert rl.checked(text, rl.ITEM) == before and text.endswith("Owner note.")
         assert r.repo.creates == 1
 

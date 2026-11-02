@@ -508,12 +508,28 @@ fixing: `bug` (a real defect that will hit or has hit), `likely` (a plausible fa
 under real conditions), `edge` (hypothetical: needs an unusual combination) or `tidy`
 (cleanup, docs, cosmetic), and an optional `why` (one short line, at most 160 characters).
 Results without them stay valid; a later result that rates an item already recorded
-updates its rating. The consolidated issue's line shows the rating after the severity
-(`P2 (Likely) ...`) and the why at its end; a changed rating or why rewrites that line in
-place (its checkbox and any `→ fixed in ...` status kept).
+updates its rating. The consolidated issue shows the rating in its table, details and
+checklist line (`F3 P2 (Likely) ...`); a changed rating or why rewrites them in place
+(each checkbox and any `→ fixed in ...` status kept).
 
-The factory files the follow-ups of one PR as **one** issue, `Follow-ups from #<PR>`: a
-checklist, one line per item, labelled `follow-up`, a sub-issue of the source issue's epic,
+The factory files the follow-ups of one PR as **one** issue, `Follow-ups from #<PR>`, laid
+out like the Ready report's Deferred section and numbered the same way (`F3` there is
+`F3` here; advisories are not filed, so numbers can skip): a `| # | Item | Rating | Why |`
+table in number order, then one `### F3 · <title>` block per item (severity, rating and
+why, path, the reason it was deferred, the review thread link: only what is known), then
+the **Checklist**, one line per item in number order (``- [ ] F3 P2 (Likely) <title>``
+with its hidden `factory-item` marker). These sit between hidden
+`factory-follow-ups:begin`/`end` markers: the factory re-renders that region whenever it
+syncs the issue (items added, a rating changed), keeping each line's checkbox and status;
+text outside it (the intro, your notes) is never touched. An issue written before the
+region existed is migrated on its next sync: its checklist lines are replaced by the
+region, and any other line you put between them is kept just below it. The body stays
+within GitHub's 65,536-character limit, with room for every later `→ fixed in` status:
+every checklist line always stays; the details shrink first (then are left out with a
+note), then the table (cells, then numbers and ratings only, then left out), then the
+checklist lines' titles. If even the shortest checklist cannot fit beside your own text,
+the issue is not rewritten (and a warning is logged) rather than cutting your text. The
+issue is labelled `follow-up`, a sub-issue of the source issue's epic,
 with a native blocked-by link for every `blocks` issue. Items a later result adds go into
 the same issue. A hidden marker makes the create restart-safe: an unclear create is looked
 up by its marker before any retry, so the issue is never opened twice. When a rework fixes
@@ -1145,6 +1161,18 @@ The endpoint is plaintext HTTP protected only by the bearer token: ingress must 
 forward `/mcp`, and serving it on a LAN `bind_host` is the operator's choice (point
 `FACTORY_MCP_URL` at either address). The factory clone's `info/exclude` ignores
 `/.molly/`.
+
+The MCP transport is stateless Streamable HTTP with JSON responses. It issues no
+`mcp-session-id` and accepts requests carrying an old transport session ID, including
+one issued before a deploy. Once a restarted daemon is ready, existing clients can
+call tools without reinitializing or restarting their agent session. Requests during
+the outage can still fail; authenticated calls while the daemon is starting receive 503.
+Every request still requires the bearer token, and caller binding still uses the
+Omnigent `session_id` argument and `factory-caller` policy. Caller/run state and mutation
+receipts live in SQLite, not the MCP transport; owner questions use durable factory
+events rather than MCP elicitation. The SDK's “StreamableHTTP session manager
+started/shutting down” messages also appear in stateless mode and do not indicate
+that transport sessions are being retained.
 
 `/mcp` checks the `Host` header (DNS-rebinding protection): by default it accepts only the
 loopback names and `bind_host:bind_port`, and answers any other name with

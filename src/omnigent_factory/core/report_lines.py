@@ -1,7 +1,7 @@
 """Checkbox lines the factory writes into GitHub text: the Ready report's Deferred section
-(``- [ ] ... <!-- factory-action:<id> -->``) and the consolidated follow-up issue's
-checklist (``<!-- factory-item:<key> -->``) and a bundle proposal's confirmation box
-(``<!-- factory-bundle:<id> -->``).
+(``- [ ] ... <!-- factory-action:<id> -->``), the consolidated follow-up issue's checklist
+(``<!-- factory-item:<key> -->``, in its factory-managed region) and a bundle proposal's
+confirmation box (``<!-- factory-bundle:<id> -->``).
 
 Pure text helpers. A line is identified by its hidden marker, never by its text, so the
 factory can rewrite a line's status while keeping the owner's ticks: every write merges
@@ -101,6 +101,24 @@ def texts(body: str, kind: str = ACTION) -> dict[str, str]:
         for m in _LINE.finditer(body or "")
         if m.group("kind") == kind
     }
+
+
+def statuses(body: str, kind: str = ACTION) -> dict[str, str]:
+    """Marker id -> the status the factory appended to the line ("" when none), for every
+    ``kind`` line."""
+    out: dict[str, str] = {}
+    for m in _LINE.finditer(body or ""):
+        if m.group("kind") == kind:
+            text = m.group("text")
+            found = _STATUS.search(text)
+            out[m.group("id")] = found.group(0)[len(" → ") :] if found else ""
+    return out
+
+
+def span(body: str, kind: str = ACTION) -> tuple[int, int] | None:
+    """(start of the first, end of the last) ``kind`` line of ``body``; None: none."""
+    found = [m for m in _LINE.finditer(body or "") if m.group("kind") == kind]
+    return (found[0].start(), found[-1].end()) if found else None
 
 
 def with_text(body: str, new: Mapping[str, str], kind: str = ACTION) -> str:
@@ -211,6 +229,8 @@ __all__ = [
     "line",
     "marker",
     "newly_ticked",
+    "span",
+    "statuses",
     "texts",
     "with_status",
     "with_text",

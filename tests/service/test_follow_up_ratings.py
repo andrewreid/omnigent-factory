@@ -169,9 +169,9 @@ async def test_the_follow_up_issue_line_carries_the_rating_and_keeps_its_marker(
             await r.parcel(), "s1", result(rated(FU_A, "likely", "seen in staging"), FU_B)
         )
         body = r.repo.issues[100]["body"]
-        assert "- [ ] P2 (Likely) `api/src/export.ts` Retry leaks" in body
-        assert "outside the plan Why: seen in staging <!-- factory-item:" in body
-        assert "- [ ] P1 `api/src/retry.ts` Unbounded retry loop" in body  # unrated
+        assert "- [ ] F1 P2 (Likely) Retry leaks the delivery row <!-- factory-item:" in body
+        assert "**P2** · Likely: seen in staging · `api/src/export.ts`" in body
+        assert "- [ ] F2 P1 Unbounded retry loop <!-- factory-item:" in body  # unrated
         assert len(rl.ids(body, rl.ITEM)) == 2
 
 

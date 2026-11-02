@@ -1538,6 +1538,8 @@ def build_mcp_server(tools: FactoryTools, config: ServiceConfig) -> FastMCP:
         "factory",
         instructions="Omnigent factory tools for the issue session's current stage run. "
         "Pass your own Omnigent session id as session_id to every tool.",
+        # Keep transport sessions out of process memory: calls (including stale MCP
+        # session headers) must survive deploys. Caller identity is resolved from SQLite.
         stateless_http=True,
         json_response=True,
         streamable_http_path="/",
