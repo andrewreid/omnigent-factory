@@ -1152,7 +1152,7 @@ Preparing a run switches a worktree found off its recorded branch back to it whe
 is clean and nothing is in progress; otherwise the card's note says why, e.g.
 `Blocked: worktree off branch factory/issue-761 (detached at 469e2af, uncommitted changes)`.
 
-Stage messages are short pointers; the agent works through eight MCP tools served by the
+Stage messages are short pointers; the agent works through MCP tools served by the
 daemon at `http://<bind_host>:<bind_port>/mcp/` and `http://127.0.0.1:<mcp_port>/mcp/`
 (bearer token; any other listener address gets 404):
 `factory_get_issue`, `factory_get_plan`, `factory_get_feedback`, `factory_get_status`,
@@ -1161,7 +1161,15 @@ pass `offset=next_offset` until `next_offset` is null, for ranking and triage du
 checks alike, so later Triage, Planning, Building and Ready cards are included; read from GitHub
 through a one-minute cache), `factory_ask_owner`, `factory_submit_result` and
 `factory_submit_ranking` (triage ranking sessions only, which may also read any issue with
-`factory_get_issue`). Each takes the caller's own Omnigent
+`factory_get_issue`), plus the typed per-kind submits `factory_submit_triage`,
+`factory_submit_epic_triage`, `factory_submit_plan`, `factory_submit_build_ready` and
+`factory_submit_blocked`: their input schema is the result model itself (fields, allowed
+values, limits) and they run exactly `factory_submit_result`'s validation, gates and
+receipts (an agent allowlist without them still works; `doctor` warns). Stage prompts and
+`factory_get_status` (`result_fields`) carry each allowed kind's shape and a minimal valid
+example generated from the validator's models, and a re-run's prompt echoes its stage's
+last accepted result. A rejected result lists every schema error grouped by field. Each
+takes the caller's own Omnigent
 `session_id`; a per-session CEL policy (`factory-caller@…`) denies factory tool calls
 carrying any other id, and the daemon resolves issue, run and stage from its own store.
 Create the token once with `omnigent-factory setup mcp-token` (written to

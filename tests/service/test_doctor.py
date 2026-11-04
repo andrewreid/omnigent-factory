@@ -22,7 +22,7 @@ from omnigent_factory.service.doctor import (
     missing_factory_tools,
     run_doctor,
 )
-from omnigent_factory.service.mcp import TOOL_NAMES
+from omnigent_factory.service.mcp import TOOL_NAMES, TYPED_SUBMIT_TOOLS
 
 
 @pytest.fixture(autouse=True)
@@ -195,7 +195,9 @@ async def test_doctor_resolves_live_ids_and_does_not_create_local_state(tmp_path
     assert report.checks["mcp_listener"].endswith("requires the bearer token")
     assert report.checks["mcp_token"].endswith("is private (mode 0600)")
     assert report.checks["caller_policy"].startswith("compiles")
-    assert report.checks["agent_factory_tools"] == "the agent can call all 8 factory tools"
+    assert report.checks["agent_factory_tools"] == (
+        f"the agent can call all {len(TOOL_NAMES)} factory tools"
+    )
     assert report.resolved["omnigent_agent_id"] == "agent-1"
     assert any(
         w.startswith("omnigent_version: server 0.0.0-other differs") for w in report.warnings
@@ -371,11 +373,12 @@ def test_missing_factory_tools_compares_the_allowlist_with_the_served_tools():
     assert missing_factory_tools([("factory", url, ROSIE_ALLOWLIST)], 8787) == [
         "factory_list_issues",
         "factory_submit_ranking",
+        *TYPED_SUBMIT_TOOLS,
     ]
     assert missing_factory_tools([("factory", url, None)], 8787) == []  # no allowlist: all
     assert missing_factory_tools([("factory", url, list(TOOL_NAMES))], 8787) == []
     # Prefixed names count; the server is found by its loopback URL under another name.
-    prefixed = [f"mcp__factory__{t}" for t in TOOL_NAMES[:-1]]
+    prefixed = [f"mcp__factory__{t}" for t in TOOL_NAMES if t != "factory_submit_ranking"]
     assert missing_factory_tools([("fac", "http://127.0.0.1:9999/mcp/", prefixed)], 9999) == [
         "factory_submit_ranking"
     ]
@@ -428,8 +431,22 @@ async def test_doctor_names_factory_tools_the_agent_cannot_call():
     assert not report.ok
     assert report.errors == [
         "agent_factory_tools: the agent's factory MCP allowlist lacks factory_list_issues, "
-        "factory_submit_ranking (add them to the agent's `tools:` list for the factory server)"
+        "factory_submit_ranking, "
+        + ", ".join(TYPED_SUBMIT_TOOLS)
+        + " (add them to the agent's `tools:` list for the factory server)"
     ]
+    # Only the typed submits missing: a warning (factory_submit_result takes every kind).
+    full = [*ROSIE_ALLOWLIST, "factory_list_issues", "factory_submit_ranking"]
+    inline = {"factory": {"type": "mcp", "url": "${FACTORY_MCP_URL}", "tools": full}}
+    rest = _agent_rest(
+        httpx.Response(200, content=bundle(inline=inline)),
+        [{"id": "conv_1", "agent_id": "agent-1"}],
+    )
+    report = _resolved_report()
+    await _check_agent_factory_tools(config, rest, report)
+    await rest.aclose()
+    assert report.ok
+    assert "typed submit tools factory_submit_triage" in report.checks["agent_factory_tools"]
     # No factory server declared at all: also an error.
     rest = _agent_rest(httpx.Response(200, content=bundle()), [])
     report = _resolved_report()

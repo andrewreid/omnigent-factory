@@ -266,9 +266,9 @@ def test_reporting_prompts_carry_the_rating_rubric_and_old_versions_are_kept():
         ),
     }
     assert set(pairs) == {
-        "build-v21.txt",
-        "readiness-wake-v16.txt",
-        "readiness-findings-wake-v8.txt",
+        "build-v22.txt",
+        "readiness-wake-v17.txt",
+        "readiness-findings-wake-v9.txt",
     }
     for name, (rated_name, old_name) in pairs.items():
         text = (TEMPLATES / name).read_text("utf-8")

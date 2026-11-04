@@ -401,7 +401,23 @@ class _Ctx:
             and parcel is not None
         ):
             self.update(sent_effects=(*self.p.sent_effects, (effect_id, session.session_id)))
+        if (
+            kind == EffectKind.SEND_MESSAGE
+            and session is not None
+            and parcel is not None
+            and effect.args.get("purpose") == MessagePurpose.ANSWER_RELAY.value
+        ):
+            self._bind_relay(effect_id, session.session_id, str(effect.args.get("decision_id")))
         return effect
+
+    def _bind_relay(self, effect_id: str, session_id: str, decision_id: str) -> None:
+        """Every ``answer_relay`` emission (the first send, and each replay of a relay held
+        for build capacity under a fresh effect id) rebinds its decision to that exact
+        effect: only its acknowledgement, for the decision's own run, marks the answer read
+        (``_answer_relay_acked``)."""
+        d = self.p.decision(decision_id)
+        if d is not None and d.session_id == session_id:
+            self.put_decision(replace(d, relay_effect_id=effect_id, relay_acked=False))
 
     def comment(self, template: str, **args: JsonValue) -> None:
         """An issue comment: only for what the owner must read or act on (it notifies)."""
@@ -1386,7 +1402,9 @@ def _relay_answers(ctx: _Ctx, s: StageSession) -> None:
     for d in ctx.p.decisions:
         if d.session_id != s.session_id or d.status != DecisionStatus.ANSWERED:
             continue
+        ctx.put_decision(replace(d, status=DecisionStatus.RELAYED))
         if d.prompt_lost or d.source == DecisionSource.MCP:
+            # ``emit`` binds the decision to this relay (and to any later replay of it).
             ctx.emit(
                 EffectKind.SEND_MESSAGE,
                 session=s,
@@ -1399,7 +1417,6 @@ def _relay_answers(ctx: _Ctx, s: StageSession) -> None:
                 args={"elicitation_id": d.elicitation_id, "decision_id": d.decision_id},
                 target=s.root_id or s.session_id,
             )
-        ctx.put_decision(replace(d, status=DecisionStatus.RELAYED))
     s = ctx.p.session(s.session_id) or s
     if (
         s.lifecycle == Lifecycle.WAITING
@@ -2960,10 +2977,15 @@ def _h_feedback_read(ctx: _Ctx, body: ev.FeedbackRead) -> None:
     (the 👍 supersedes the bot's 👀, which the adapter then removes), and drop the
     "Feedback received" note once none is left unread."""
     _session(ctx, body.session_id)
-    read = set(body.event_ids)
+    if not _mark_feedback_read(ctx, set(body.event_ids)):
+        raise Rejected("nothing-unread")
+
+
+def _mark_feedback_read(ctx: _Ctx, read: set[str]) -> bool:
+    """👍 each 👀-marked comment in ``read`` (False: none of them was unread)."""
     done = [e for e in ctx.p.unread_feedback if e in read]
     if not done:
-        raise Rejected("nothing-unread")
+        return False
     ctx.update(unread_feedback=tuple(e for e in ctx.p.unread_feedback if e not in read))
     for event_id in done:
         match = _COMMENT_EVENT_ID.fullmatch(event_id)
@@ -2974,6 +2996,24 @@ def _h_feedback_read(ctx: _Ctx, body: ev.FeedbackRead) -> None:
             )
     if not ctx.p.unread_feedback and ctx.p.note.startswith("Feedback received"):
         ctx.note("")
+    return True
+
+
+def _answer_relay_acked(ctx: _Ctx, effect_id: str, session_id: str | None) -> None:
+    """An ``answer_relay`` message reached its run: the run has been shown its answer.
+
+    The relay carries the answering comment verbatim, so when that comment is the only
+    unread (👀) one it is now read (👍, like ``FeedbackRead``); any other unread comment
+    still needs ``factory_get_feedback``, so then nothing is marked here. The submit gate
+    applies the same rule per run (``service.mcp``), keyed by ``relay_acked``.
+    """
+    d = next((x for x in ctx.p.decisions if x.relay_effect_id == effect_id), None)
+    if d is None or d.relay_acked or d.session_id != session_id:
+        return
+    ctx.put_decision(replace(d, relay_acked=True))
+    comment = d.answer_event_id
+    if comment and ctx.p.unread_feedback == (comment,):
+        _mark_feedback_read(ctx, {comment})
 
 
 def _answer_questions(ctx: _Ctx) -> bool:
@@ -5528,6 +5568,7 @@ def _h_message_ack(ctx: _Ctx, body: ev.MessageAck) -> None:
     if (body.effect_id, body.session_id) not in ctx.p.sent_effects:
         raise Rejected("ack-for-unissued-effect")
     _resolve_unknown(ctx, body.effect_id, body.session_id, body.item_id)
+    _answer_relay_acked(ctx, body.effect_id, body.session_id)
 
 
 def _h_effect_reconciled(ctx: _Ctx, body: ev.EffectReconciled) -> None:
@@ -5543,6 +5584,8 @@ def _h_effect_reconciled(ctx: _Ctx, body: ev.EffectReconciled) -> None:
             _retire_move(ctx, move, landed=body.delivered)
         return
     _resolve_unknown(ctx, body.effect_id, body.session_id, body.item_id if body.delivered else "")
+    if body.delivered:
+        _answer_relay_acked(ctx, body.effect_id, body.session_id)
 
 
 def _resolve_unknown(ctx: _Ctx, effect_id: str, session_id: str | None, item_id: str) -> None:

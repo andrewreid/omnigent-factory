@@ -13,11 +13,31 @@ from omnigent_factory.service.directory import (
     agent_display_name,
 )
 
-# These versions replace the fix allowance; their ELI5 and rating suffix stays verbatim.
+# These versions replace the fix allowance, or add the generated result shapes and the
+# typed submit tools (R1/R2/R7); their ELI5 and rating suffix stays verbatim.
 ROUND_ALLOWANCE_TEMPLATES = {
     "build-v21.txt",
     "readiness-wake-v16.txt",
     "readiness-findings-wake-v8.txt",
+    "build-v22.txt",
+    "readiness-wake-v17.txt",
+    "readiness-findings-wake-v9.txt",
+    "build-rework-v16.txt",
+    "build-rework-items-v7.txt",
+    "build-conflict-v7.txt",
+    "plan-v14.txt",
+    "plan-autopilot-v6.txt",
+    "plan-replan-v4.txt",
+    "triage-v15.txt",
+    "triage-v16.txt",
+    "triage-feedback-v12.txt",
+    "triage-feedback-v13.txt",
+    "triage-refresh-v3.txt",
+    "triage-refresh-v4.txt",
+    "epic-triage-v7.txt",
+    "epic-triage-v8.txt",
+    "epic-plan-v6.txt",
+    "epic-plan-v7.txt",
 }
 
 
@@ -114,6 +134,17 @@ PREDECESSORS = {
     "triage-v14.txt": "triage-v12.txt",
     "triage-feedback-v11.txt": "triage-feedback-v9.txt",
     "triage-comment-v5.txt": "triage-comment-v3.txt",
+    # Schema-aware versions: each family (issue worktree, reference) from its own.
+    "triage-v15.txt": "triage-v13.txt",
+    "triage-v16.txt": "triage-v14.txt",
+    "triage-feedback-v12.txt": "triage-feedback-v10.txt",
+    "triage-feedback-v13.txt": "triage-feedback-v11.txt",
+    "triage-refresh-v3.txt": "triage-refresh-v1.txt",
+    "triage-refresh-v4.txt": "triage-refresh-v2.txt",
+    "epic-triage-v7.txt": "epic-triage-v5.txt",
+    "epic-triage-v8.txt": "epic-triage-v6.txt",
+    "epic-plan-v6.txt": "epic-plan-v4.txt",
+    "epic-plan-v7.txt": "epic-plan-v5.txt",
 }
 
 
@@ -196,12 +227,12 @@ def test_pr_writing_prompts_ask_for_a_pr_body_eli5_and_keep_old_versions():
         directory._CONFLICT_WAKE_TEMPLATE,
     }
     assert {opening, *updating} == {
-        "build-v21.txt",
-        "build-rework-v15.txt",
-        "build-rework-items-v6.txt",
-        "build-conflict-v6.txt",
-        "readiness-wake-v16.txt",
-        "readiness-findings-wake-v8.txt",
+        "build-v22.txt",
+        "build-rework-v16.txt",
+        "build-rework-items-v7.txt",
+        "build-conflict-v7.txt",
+        "readiness-wake-v17.txt",
+        "readiness-findings-wake-v9.txt",
         "readiness-conflict-wake-v3.txt",
     }
     for name in {opening, *updating}:

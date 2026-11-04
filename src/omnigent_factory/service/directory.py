@@ -36,8 +36,13 @@ from omnigent_factory.core.protocol import (
     CLOSE_CANDIDATE_LABEL,
     CLOSURE_RECOMMENDATIONS,
     DEV_ENVIRONMENT_URL_PATTERN,
+    RESULT_SHAPES,
+    SHAPE_LEGEND,
+    Correlation,
     ParsedResult,
+    context_requirements,
     epic_plan_hash,
+    run_example,
 )
 from omnigent_factory.core.reducer import CREATE_SEARCH_BUDGET
 from omnigent_factory.core.types import (
@@ -149,6 +154,33 @@ class ServiceDispatchDirectory:
         self.rework_brief: Callable[[Parcel, str], Awaitable[str | None]] | None = None
         #: Trusted round counts and owner budget, pinned with the first build message.
         self.review_rounds: Callable[[Parcel], Awaitable[RoundsView]] | None = None
+        #: A bundle issue's members still in it (``service.bundles.Bundles.members_for``);
+        #: None: not wired (no bundle context in the prompts' result help).
+        self.bundle_members: Callable[[Parcel], Awaitable[frozenset[int] | None]] | None = None
+
+    async def correlation(
+        self, parcel: Parcel, run: StageSession, *, in_checkpoint: bool = False
+    ) -> Correlation:
+        """:func:`run_correlation` from this directory's own sources (the prompts)."""
+        number = parcel.issue_number
+        follow_up: tuple[int, int | None] = (0, None)
+        # Follow-up lineage restricts deferred items only (a build's concern).
+        if number is not None and run.kind == SessionKind.BUILD:
+            repo_id = self.config.repo_id
+            follow_up = await self.db.call(lambda store: store.follow_up_lineage(repo_id, number))
+        # The prompt quotes no budget (the shape names review_rounds.budget): render
+        # stable across restarts whatever the round counts.
+        budget = self.config.review_rounds_default
+        members = await self.bundle_members(parcel) if self.bundle_members is not None else None
+        return run_correlation(
+            parcel,
+            run,
+            in_checkpoint=in_checkpoint,
+            review_rounds_budget=budget,
+            follow_up=follow_up,
+            follow_up_max_depth=self.config.follow_up_max_depth,
+            bundle_members=members,
+        )
 
     async def stage_spec(self, session_id: str) -> StageSpec | None:
         existing = self._read(self.root / f"{_safe(session_id)}.json")
@@ -543,7 +575,7 @@ class ServiceDispatchDirectory:
             answer = await self.decision_answer(decision) if decision is not None else None
             if decision is None or answer is None:
                 return None
-            name = _ANSWER_TEMPLATE if spec.kind == SessionKind.PLAN else "answer-v2.txt"
+            name = _ANSWER_TEMPLATE if spec.kind == SessionKind.PLAN else _ANSWER_OTHER_TEMPLATE
             return _template(name).format(decision_id=decision.decision_id, answer=answer)
         if purpose == "feedback":
             if spec.kind == SessionKind.BUILD:
@@ -590,6 +622,8 @@ class ServiceDispatchDirectory:
                     _json_int(effect.args.get("rounds_used")),
                     _json_int(effect.args.get("rounds_budget")),
                 ),
+                # The shape only (the run has its last result in its own context).
+                result_contract=await self._wake_contract(parcel, sid, spec.kind),
             )
         if purpose == "blockers_closed":
             return _template("blockers-closed-v2.txt").format(
@@ -637,6 +671,13 @@ class ServiceDispatchDirectory:
             "gh_wrapper": self.config.wrapper_bin_dir / "gh",
             "capability_file": self.config.capability_dir / f"{_safe(sid)}.cap",
         }
+        run = parcel.session(sid)
+        if "{result_contract}" in template and run is not None:
+            common["result_contract"] = result_contract(
+                shown_result_kinds(parcel, spec.kind),
+                self.last_accepted_result(parcel, spec.kind),
+                await self.correlation(parcel, run),
+            )
         if spec.kind == SessionKind.BUILD:
             _authority_text, authority_hash = _authority(parcel)
             common.update(
@@ -647,7 +688,30 @@ class ServiceDispatchDirectory:
                 pr_number=parcel.pr_number or 0,
                 base_ref=self.config.default_branch,
             )
+            approval = parcel.current_approval
+            if (
+                "{plan_hash}" in template
+                and approval is not None
+                and approval.valid
+                and approval.full_hash == authority_hash
+            ):
+                # The approved hash this first-message effect carries, pending until that
+                # exact effect is delivered (``plan_hashes_given``, R6).
+                pending = snapshot.get("plan_hashes_pending")
+                pending = dict(pending) if isinstance(pending, dict) else {}
+                if pending.get(effect.effect_id) != authority_hash:
+                    pending[effect.effect_id] = authority_hash
+                    snapshot["plan_hashes_pending"] = pending
+                    _atomic_json(self.root / f"{_safe(sid)}.json", snapshot)
         return template.format(**common)
+
+    async def _wake_contract(self, parcel: Parcel, sid: str, kind: SessionKind) -> str:
+        run = parcel.session(sid)
+        if run is None:
+            return ""
+        return result_contract(
+            shown_result_kinds(parcel, kind), None, await self.correlation(parcel, run)
+        )
 
     def _handoff(self, parcel: Parcel, run_id: str) -> str:
         """Stored summary for the first run in a replacement issue session.
@@ -738,6 +802,37 @@ class ServiceDispatchDirectory:
                 paths=tuple(str(path) for path in (paths if isinstance(paths, list) else [])),
             )
         return None
+
+    def last_accepted_result(self, parcel: Parcel, kind: SessionKind) -> dict[str, Any] | None:
+        """The newest accepted result of a ``kind`` run of the parcel (its stage's own
+        kinds, never ``blocked``): what a re-run starts from. None: there is none."""
+        wanted = _STAGE_RESULT_KINDS[kind]
+        for session in reversed(parcel.sessions):
+            if session.kind != kind:
+                continue
+            stored = self.latest_result(session.session_id)
+            record = stored.get("factory_result") if stored is not None else None
+            body = record.get("result") if isinstance(record, dict) else None
+            if isinstance(body, dict) and body.get("kind") in wanted:
+                return body
+        return None
+
+    async def plan_hashes_given(self, session_id: str) -> tuple[str, ...]:
+        """Approved plan hashes this run's first message actually gave it (R6): each is
+        pinned to the exact first-message effect that rendered it, and counts only once
+        that effect was delivered (acknowledged or positively reconciled). A render alone,
+        a failed or refused send, or an unresolved one never counts."""
+        data = self._read(self.root / f"{_safe(session_id)}.json")
+        pending = data.get("plan_hashes_pending") if data is not None else None
+        if not isinstance(pending, dict):
+            return ()
+        given: list[str] = []
+        for effect_id, plan_hash in pending.items():
+            if not isinstance(plan_hash, str) or plan_hash in given:
+                continue
+            if await self.db.call(partial(_delivered, str(effect_id), session_id)):
+                given.append(plan_hash)
+        return tuple(given)
 
     def latest_triage(self, parcel: Parcel) -> dict[str, Any] | None:
         """The most recent accepted triage result of the parcel, if any."""
@@ -1941,6 +2036,12 @@ def _new_boundary() -> str:
 #: First-message template of each stage run (the dispatch snapshot pins name and bytes).
 # Only a pinned reference dispatch selects snapshot-specific prompt bytes.
 _REFERENCE_TEMPLATES = {
+    # Schema-aware versions (result shapes and examples, typed submit tools).
+    "triage-v15.txt": "triage-v16.txt",
+    "triage-feedback-v12.txt": "triage-feedback-v13.txt",
+    "triage-refresh-v3.txt": "triage-refresh-v4.txt",
+    "epic-triage-v7.txt": "epic-triage-v8.txt",
+    "epic-plan-v6.txt": "epic-plan-v7.txt",
     "triage-v13.txt": "triage-v14.txt",
     "triage-feedback-v10.txt": "triage-feedback-v11.txt",
     "triage-comment-v4.txt": "triage-comment-v5.txt",
@@ -1949,34 +2050,167 @@ _REFERENCE_TEMPLATES = {
     "epic-plan-v4.txt": "epic-plan-v5.txt",
 }
 _FIRST_TEMPLATES = {
-    SessionKind.TRIAGE: "triage-v13.txt",
-    SessionKind.PLAN: "plan-v13.txt",
-    SessionKind.BUILD: "build-v21.txt",
+    SessionKind.TRIAGE: "triage-v15.txt",
+    SessionKind.PLAN: "plan-v14.txt",
+    SessionKind.BUILD: "build-v22.txt",
 }
-_ANSWER_TEMPLATE = "answer-v3.txt"
-_RETRIAGE_TEMPLATE = "triage-feedback-v10.txt"
+#: An owner answer relayed to a plan run, and to any other run.
+_ANSWER_TEMPLATE = "answer-v4.txt"
+_ANSWER_OTHER_TEMPLATE = "answer-v5.txt"
+_RETRIAGE_TEMPLATE = "triage-feedback-v12.txt"
 _TRIAGE_COMMENT_TEMPLATE = "triage-comment-v4.txt"
 #: The factory's own re-run of a triage that may be stale (``AutoRetriage``; its brief:
 #: the signals that fired).
-_REFRESH_TEMPLATE = "triage-refresh-v1.txt"
+_REFRESH_TEMPLATE = "triage-refresh-v3.txt"
 #: The triage of an epic (an issue with sub-issues), first run and re-runs alike.
-_EPIC_TRIAGE_TEMPLATE = "epic-triage-v5.txt"
+_EPIC_TRIAGE_TEMPLATE = "epic-triage-v7.txt"
 #: The epic planning pass of an epic on autopilot (the epic triage plus the epic plan).
-_EPIC_PLAN_TEMPLATE = "epic-plan-v4.txt"
+_EPIC_PLAN_TEMPLATE = "epic-plan-v6.txt"
 #: A plan run of a sub-issue epic autopilot drives (keeps to its part of the epic plan).
-_AUTOPILOT_PLAN_TEMPLATE = "plan-autopilot-v5.txt"
+_AUTOPILOT_PLAN_TEMPLATE = "plan-autopilot-v6.txt"
 #: The plan run the factory started on a build's ``replan_required`` (its brief: what the
 #: build said must change).
-_REPLAN_TEMPLATE = "plan-replan-v3.txt"
-_REWORK_TEMPLATE = "build-rework-v15.txt"
+_REPLAN_TEMPLATE = "plan-replan-v4.txt"
+_REWORK_TEMPLATE = "build-rework-v16.txt"
 #: A rework the owner started by ticking Ready report items: its brief is those items.
-_ITEMS_REWORK_TEMPLATE = "build-rework-items-v6.txt"
+_ITEMS_REWORK_TEMPLATE = "build-rework-items-v7.txt"
 #: Readiness wakes of a waiting build run (red checks and other gaps; findings only).
-_READINESS_WAKE_TEMPLATE = "readiness-wake-v16.txt"
-_FINDINGS_WAKE_TEMPLATE = "readiness-findings-wake-v8.txt"
+_READINESS_WAKE_TEMPLATE = "readiness-wake-v17.txt"
+_FINDINGS_WAKE_TEMPLATE = "readiness-findings-wake-v9.txt"
 #: A rework run, or a wake of the waiting build run, for a merge conflict with the base.
-_CONFLICT_TEMPLATE = "build-conflict-v6.txt"
+_CONFLICT_TEMPLATE = "build-conflict-v7.txt"
 _CONFLICT_WAKE_TEMPLATE = "readiness-conflict-wake-v3.txt"
+
+
+#: The typed submit tool of each result kind (``factory_submit_result`` takes any kind).
+SUBMIT_TOOLS: dict[str, str] = {
+    kind: f"factory_submit_{kind}"
+    for kind in ("triage", "epic_triage", "plan", "build_ready", "blocked")
+}
+#: The accepted (non-blocked) result kinds a run of each stage produces.
+_STAGE_RESULT_KINDS = {
+    SessionKind.TRIAGE: ("triage", "epic_triage"),
+    SessionKind.PLAN: ("plan",),
+    SessionKind.BUILD: ("build_ready",),
+}
+#: Longest last-result echo quoted in a prompt (factory_get_status carries it whole).
+MAX_RESULT_ECHO_CHARS = 8000
+
+
+def shown_result_kinds(
+    parcel: Parcel, kind: SessionKind, *, in_checkpoint: bool = False
+) -> tuple[str, ...]:
+    """The result kinds this run may usefully submit (its shapes are shown up front):
+    an epic's triage is ``epic_triage``, any other ``triage``; a build's ``plan`` only
+    under a planning waiver; at a checkpoint only ``blocked``."""
+    if in_checkpoint:
+        return ("blocked",)
+    if kind == SessionKind.TRIAGE:
+        epic = parcel.links is not None and parcel.links.epic
+        return ("epic_triage" if epic else "triage", "blocked")
+    if kind == SessionKind.PLAN:
+        return ("plan", "blocked")
+    approval = parcel.current_approval
+    waiver = approval is not None and approval.kind == ApprovalKind.SKIP
+    return ("build_ready", "blocked", *(("plan",) if waiver else ()))
+
+
+def epic_sub_issues(parcel: Parcel) -> frozenset[int] | None:
+    """The epic's sub-issue numbers for result validation (None: not an epic; empty: the
+    list is incomplete, so membership is not checked)."""
+    links = parcel.links
+    if links is None or not links.epic:
+        return None
+    if links.sub_total > len(links.sub_issues):
+        return frozenset()
+    return frozenset(s.number for s in links.sub_issues if not s.repo)
+
+
+def run_correlation(
+    parcel: Parcel,
+    run: StageSession,
+    *,
+    in_checkpoint: bool,
+    review_rounds_budget: int,
+    follow_up: tuple[int, int | None],
+    follow_up_max_depth: int,
+    bundle_members: frozenset[int] | None,
+) -> Correlation:
+    """The validation context of a result from ``run``: what ``factory_submit_result``
+    validates against, and what the run's help (examples, requirements) is built for."""
+    approval = parcel.current_approval
+    return Correlation(
+        parcel.parcel_id,
+        run.session_id,
+        run.nonce,
+        run.revision,
+        run.kind.value,
+        review_rounds_budget=review_rounds_budget,
+        waiver_build=approval is not None and approval.kind == ApprovalKind.SKIP,
+        in_checkpoint=in_checkpoint,
+        issue_number=parcel.issue_number,
+        sub_issues=epic_sub_issues(parcel),
+        epic_plan=parcel.autopilot is not None,
+        epic_part=parcel.autopilot_claim is not None and parcel.autopilot_claim.active,
+        follow_up_depth=follow_up[0],
+        follow_up_source=follow_up[1],
+        follow_up_max_depth=follow_up_max_depth,
+        bundle_members=bundle_members,
+    )
+
+
+def result_fields(kinds: tuple[str, ...], expected: Correlation) -> dict[str, dict[str, Any]]:
+    """Per kind: its typed tool, field shape, what this run's context requires, and a
+    minimal example valid for this run (None, with the requirements, when none can be)."""
+    return {
+        kind: {
+            "tool": SUBMIT_TOOLS[kind],
+            "shape": RESULT_SHAPES[kind],
+            "requires": list(context_requirements(kind, expected)),
+            "example": run_example(kind, expected),
+        }
+        for kind in kinds
+    }
+
+
+def result_contract(
+    kinds: tuple[str, ...], last: Mapping[str, Any] | None, expected: Correlation
+) -> str:
+    """The prompt's result section: the exact shape of each kind (generated from the
+    validator's models), what this run's context adds, a minimal example validated for
+    this run, and the run's last accepted result."""
+    lines = [f"Result fields, exactly as the factory validates them ({SHAPE_LEGEND})"]
+    for kind in kinds:
+        lines.append(
+            f'- kind "{kind}": submit with {SUBMIT_TOOLS[kind]} (or factory_submit_result '
+            f'with kind "{kind}"). Fields: {RESULT_SHAPES[kind]}'
+        )
+        for note in context_requirements(kind, expected):
+            lines.append(f"  This run: {note}.")
+        example = run_example(kind, expected)
+        if example is not None:
+            lines.append(
+                "  Minimal valid example for this run (replace every <placeholder> and "
+                "example value): " + json.dumps(example, separators=(",", ":"))
+            )
+        else:
+            lines.append(
+                "  (No minimal example fits this run's context: follow the fields and the "
+                "requirements above.)"
+            )
+    if last is not None:
+        text = json.dumps(dict(last), separators=(",", ":"), ensure_ascii=False)
+        if len(text) <= MAX_RESULT_ECHO_CHARS:
+            lines.append(
+                "Your last accepted result for this stage (start from it and submit the "
+                "whole revised result): " + text
+            )
+        else:
+            lines.append(
+                "Your last accepted result for this stage is in factory_get_status "
+                "(last_accepted_result); start from it and submit the whole revised result."
+            )
+    return "\n".join(lines)
 
 
 def replan_request_for(parcel: Parcel, session: StageSession) -> ReplanRequest | None:
@@ -2010,8 +2244,8 @@ def rounds_line(used: int, budget: int) -> str:
         "(the result schema caps each counter at 12). "
     )
     rule = (
-        f"From round {strict} on only P1 findings with real impact must be fixed; "
-        "P2/P3 take the outcome rule. "
+        f"From round {strict} on only BLOCKING findings with real impact must be fixed; "
+        "SHOULD_FIX and lower take the outcome rule. "
     )
     if used >= budget:
         rule += (
@@ -2022,7 +2256,8 @@ def rounds_line(used: int, budget: int) -> str:
         allowance
         + rule
         + (
-            "An in-scope P1 or P2 finding with a small, local fix is never deferred because "
+            "An in-scope BLOCKING or SHOULD_FIX finding with a small, local fix is never "
+            "deferred because "
             "of the fix allowance; if the allowance is truly spent, submit blocked/needs-owner "
             "instead of deferring it."
         )
@@ -2069,6 +2304,10 @@ def base_note(record: object, kind: SessionKind) -> str:
             f"{behind} commits it lacks, so the code may be stale."
         )
     return ""
+
+
+def _delivered(effect_id: str, session_id: str, store: SqliteStore) -> bool:
+    return store.message_delivered(effect_id, session_id)
 
 
 def _template(name: str) -> str:

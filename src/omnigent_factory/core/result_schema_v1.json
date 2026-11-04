@@ -211,10 +211,7 @@
         "summary",
         "priority",
         "size",
-        "recommendation",
-        "duplicate_issue",
-        "labels",
-        "missing_information"
+        "recommendation"
       ],
       "properties": {
         "kind": {
@@ -249,7 +246,8 @@
             "integer",
             "null"
           ],
-          "minimum": 1
+          "minimum": 1,
+          "default": null
         },
         "labels": {
           "type": "array",
@@ -259,10 +257,12 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 100
-          }
+          },
+          "default": []
         },
         "missing_information": {
-          "$ref": "#/$defs/texts"
+          "$ref": "#/$defs/texts",
+          "default": []
         },
         "related": {
           "type": "array",
@@ -530,8 +530,7 @@
         "publication_kind",
         "approach",
         "risks",
-        "contract",
-        "open_decision_ids"
+        "contract"
       ],
       "properties": {
         "kind": {
@@ -553,7 +552,8 @@
           "$ref": "#/$defs/contract"
         },
         "open_decision_ids": {
-          "$ref": "#/$defs/texts"
+          "$ref": "#/$defs/texts",
+          "default": []
         },
         "related": {
           "type": "array",
@@ -718,8 +718,6 @@
         "verification",
         "review",
         "findings",
-        "remediation_batches_used",
-        "targeted_rechecks_used",
         "release_readiness"
       ],
       "properties": {
@@ -760,12 +758,14 @@
         "remediation_batches_used": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 12
+          "maximum": 12,
+          "default": 0
         },
         "targeted_rechecks_used": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 12
+          "maximum": 12,
+          "default": 0
         },
         "release_readiness": {
           "enum": [

@@ -702,6 +702,10 @@ class Decision:
     #: A deferred permission prompt's readable ask and target, for its comment.
     summary: str = ""
     detail: str = ""
+    #: The ``answer_relay`` message that carried the answer to the run ("" none yet), and
+    #: whether Omnigent acknowledged it (the run has been shown the answer's comment).
+    relay_effect_id: str = ""
+    relay_acked: bool = False
 
 
 @dataclass(frozen=True, slots=True)

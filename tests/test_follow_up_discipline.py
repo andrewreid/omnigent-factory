@@ -321,8 +321,10 @@ def test_rounds_line_scales_the_strict_round_with_the_budget():
     from omnigent_factory.service.directory import rounds_line
 
     assert rounds_line(0, 0) == ""
-    assert "From round 2 on only P1" in rounds_line(1, 2)
-    assert "From round 4 on only P1" in rounds_line(1, 4)  # a raised budget stays strict late
+    assert "From round 2 on only BLOCKING findings" in rounds_line(1, 2)
+    assert "From round 4 on only BLOCKING findings" in rounds_line(
+        1, 4
+    )  # a raised budget stays strict late
     spent = rounds_line(2, 2)
     assert "budget is spent" in spent and "do not ask the review bot" in spent
 
@@ -331,7 +333,12 @@ def test_the_findings_wake_renders_with_its_rounds_line():
     from omnigent_factory.service.directory import _FINDINGS_WAKE_TEMPLATE, _template
 
     text = _template(_FINDINGS_WAKE_TEMPLATE).format(
-        pr_number=PR, head_sha=FIX, reason="findings", run_id="r", rounds="Review rounds: x"
+        pr_number=PR,
+        head_sha=FIX,
+        reason="findings",
+        run_id="r",
+        rounds="Review rounds: x",
+        result_contract="",
     )
     text = " ".join(text.split())
     assert f"PR #{PR} at head `{FIX}`" in text and "Review rounds: x" in text
@@ -340,15 +347,28 @@ def test_the_findings_wake_renders_with_its_rounds_line():
 def test_per_round_fix_templates_are_new_pins_and_protect_small_p2_fixes():
     from omnigent_factory.service import directory as d
 
-    assert d._FIRST_TEMPLATES[d.SessionKind.BUILD] == "build-v21.txt"
-    assert d._READINESS_WAKE_TEMPLATE == "readiness-wake-v16.txt"
-    assert d._FINDINGS_WAKE_TEMPLATE == "readiness-findings-wake-v8.txt"
-    for name in ("build-v21.txt", "readiness-wake-v16.txt", "readiness-findings-wake-v8.txt"):
+    assert d._FIRST_TEMPLATES[d.SessionKind.BUILD] == "build-v22.txt"
+    assert d._READINESS_WAKE_TEMPLATE == "readiness-wake-v17.txt"
+    assert d._FINDINGS_WAKE_TEMPLATE == "readiness-findings-wake-v9.txt"
+    for name in (
+        "build-v21.txt",
+        "readiness-wake-v16.txt",
+        "readiness-findings-wake-v8.txt",
+        "build-v22.txt",
+        "readiness-wake-v17.txt",
+        "readiness-findings-wake-v9.txt",
+    ):
         text = template(name)
         assert "one fix batch and run one targeted recheck per review round" in text
         assert "{rounds}" in text
+        # The schema-aware versions name findings by their result severity (R2).
+        severity = (
+            "P1 or P2"
+            if name.endswith(("v21.txt", "v16.txt", "v8.txt"))
+            else ("BLOCKING or SHOULD_FIX")
+        )
         assert (
-            "An in-scope P1 or P2 finding with a small, local fix is never deferred because "
+            f"An in-scope {severity} finding with a small, local fix is never deferred because "
             "of the fix allowance; if the allowance is truly spent, submit blocked/needs-owner "
             "instead of deferring it" in text
         )

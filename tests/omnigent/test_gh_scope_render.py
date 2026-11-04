@@ -26,7 +26,7 @@ async def test_all_triage_templates_can_render_wrapper_values(
     if variant in ("epic", "epic_plan"):
         h.parcels[P] = replace(
             h.p(),
-            links=SimpleNamespace(epic=True),
+            links=SimpleNamespace(epic=True, sub_total=0, sub_issues=()),
             autopilot=SimpleNamespace() if variant == "epic_plan" else None,
         )
     # Simulate the other worker's new template wording without changing released files.

@@ -148,10 +148,10 @@ LEGACY_TEMPLATES = {
 #: The issue-worktree template of each variant new dispatches pin now (closure
 #: outcomes, closure_evidence, paths and the gh wrapper were added to the triage ones).
 CURRENT_TEMPLATES = {
-    "triage": "triage-v13.txt",
-    "feedback": "triage-feedback-v10.txt",
-    "epic": "epic-triage-v5.txt",
-    "autopilot": "epic-plan-v4.txt",
+    "triage": "triage-v15.txt",
+    "feedback": "triage-feedback-v12.txt",
+    "epic": "epic-triage-v7.txt",
+    "autopilot": "epic-plan-v6.txt",
 }
 
 
@@ -176,7 +176,7 @@ async def test_only_reference_dispatches_use_new_template_bytes(
     if variant in ("epic", "autopilot"):
         h.parcels[P] = replace(
             h.p(),
-            links=SimpleNamespace(epic=True),
+            links=SimpleNamespace(epic=True, sub_total=0, sub_issues=()),
             autopilot=SimpleNamespace() if variant == "autopilot" else None,
         )
     if mode == "live_issue":
@@ -208,6 +208,11 @@ async def test_only_reference_dispatches_use_new_template_bytes(
             granted_minutes=max(1, spec.granted_us // MICROS_PER_MINUTE),
             gh_wrapper=directory.config.wrapper_bin_dir / "gh",
             capability_file=capability,
+            result_contract=module.result_contract(
+                module.shown_result_kinds(h.p(), run.kind),
+                directory.last_accepted_result(h.p(), run.kind),
+                await directory.correlation(h.p(), run),
+            ),
         )
         assert "shared read-only reference snapshot" not in first_text
         # The legacy comment template's bytes are kept for in-flight dispatches.

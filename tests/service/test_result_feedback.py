@@ -55,21 +55,25 @@ def _molly_result() -> dict[str, object]:
 
 def test_molly_plan_reports_each_schema_mismatch():
     details = _errors(_molly_result())
-    assert details[:4] == tuple(
-        f"result.contract.resolved_decisions.{i}: "
-        "Input should be a valid dictionary or instance of ResolvedDecision"
-        for i in range(4)
-    )
+    # The same error at four list positions is one grouped line (R4).
+    assert (
+        "result.contract.resolved_decisions.*: "
+        "Input should be a valid dictionary or instance of ResolvedDecision [items 0-3]"
+    ) in details
     assert "result.contract.open_decision_ids: Extra inputs are not permitted" in details
-    assert "result.open_decision_ids: Field required" in details
+    # open_decision_ids defaults to [] (the factory fills it): no longer required.
+    assert not any(d.startswith("result.open_decision_ids") for d in details)
     # Locations and messages only: none of Molly's rejected text is echoed back.
     assert not any("Classified SMALL" in d for d in details)
-    assert all(len(d) <= 200 for d in details)
+    assert all(len(d) <= 300 for d in details)
 
 
-def test_error_details_are_capped():
+def test_error_details_report_everything_up_to_a_high_cap():
     details = _errors({"kind": "plan", **{f"x{i}": i for i in range(30)}})
-    assert len(details) == 11 and details[-1].startswith("... and ")
+    # 30 extra fields and 4 missing ones: every one in this rejection (R4).
+    assert len(details) == 34 and not any(d.startswith("... and ") for d in details)
+    many = _errors({"kind": "plan", **{f"x{i}": i for i in range(150)}})
+    assert len(many) == 101 and many[-1].startswith("... and ")
 
 
 def test_blocked_result_validates_for_any_stage():

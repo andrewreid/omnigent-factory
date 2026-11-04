@@ -33,7 +33,11 @@ from omnigent_factory.omnigent.rest import (
 from omnigent_factory.ports.credentials import TokenRefusal
 from omnigent_factory.service.composition import _private_file
 from omnigent_factory.service.config import ServiceConfig
-from omnigent_factory.service.mcp import TOOL_NAMES, configured_host_authorities
+from omnigent_factory.service.mcp import (
+    TOOL_NAMES,
+    TYPED_SUBMIT_TOOLS,
+    configured_host_authorities,
+)
 from omnigent_factory.service.omnigent_auth import expiry, expiry_message, omnigent_auth
 from omnigent_factory.service.status_comment import pin_status
 from omnigent_factory.service.worktree_gc import iso, read_state
@@ -952,12 +956,22 @@ async def _check_agent_factory_tools(
     missing = missing_factory_tools(servers, config.mcp_port, bind=bind)
     if missing is None:
         report.fail(name, "the agent declares no factory MCP server; it can call no factory tool")
-    elif missing:
+    elif any(tool not in TYPED_SUBMIT_TOOLS for tool in missing):
         report.fail(
             name,
             "the agent's factory MCP allowlist lacks "
             + ", ".join(missing)
             + " (add them to the agent's `tools:` list for the factory server)",
+        )
+    elif missing:
+        # The typed per-kind submits only add schemas: factory_submit_result still takes
+        # every kind, so an allowlist without them works (prompts name both).
+        report.warn(
+            name,
+            "the agent's factory MCP allowlist lacks the typed submit tools "
+            + ", ".join(missing)
+            + " (optional: factory_submit_result still works; add them to the agent's "
+            "`tools:` list so it sees each result kind's schema)",
         )
     else:
         report.pass_check(name, f"the agent can call all {len(TOOL_NAMES)} factory tools")

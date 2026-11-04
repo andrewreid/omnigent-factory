@@ -2402,6 +2402,24 @@ class SqliteStore:
             return False
         return self._close_unknown(conn, str(row["effect_id"]), exists, root)
 
+    def message_delivered(self, effect_id: str, session_id: str) -> bool:
+        """Delivery evidence for exactly ``effect_id`` to ``session_id``: an accepted
+        ``MessageAck`` or a delivered ``EffectReconciled`` (never a render, a send attempt,
+        a failure or a proof of absence). The same events mark an answer relay read."""
+        rows = self._conn.execute(
+            "SELECT payload_json FROM events WHERE accepted = 1 AND kind IN (?, ?) "
+            "AND json_extract(payload_json, '$.body.effect_id') = ?",
+            (EventKind.MESSAGE_ACK.value, EventKind.EFFECT_RECONCILED.value, effect_id),
+        ).fetchall()
+        for (payload,) in rows:
+            body = codec.event_from_json(payload).body
+            delivered = isinstance(body, MessageAck) or (
+                isinstance(body, EffectReconciled) and body.delivered
+            )
+            if delivered and getattr(body, "session_id", None) == session_id:
+                return True
+        return False
+
     def close_reconciled_unknown(self, effect_id: str) -> bool:
         """Startup: close an ``unknown`` row whose resolution event is already persisted.
 

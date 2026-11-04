@@ -18,7 +18,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
@@ -145,9 +145,11 @@ class TriageResult(_Strict):
     recommendation: Literal[
         "fix", "wont_fix", "duplicate", "needs_info", "already_fixed", "obsolete"
     ]
-    duplicate_issue: Annotated[int, Field(ge=1)] | None
-    labels: Annotated[list[Label], Field(max_length=20)]
-    missing_information: Texts
+    #: Defaults (R5): only a ``duplicate`` recommendation names an issue, and an empty
+    #: list is exactly "nothing missing" / "no labels": omitting them changes nothing.
+    duplicate_issue: Annotated[int, Field(ge=1)] | None = None
+    labels: Annotated[list[Label], Field(max_length=20)] = []
+    missing_information: Texts = []
     related: Annotated[list[Related], Field(max_length=20)] = []
     split_out: SplitOuts = []
     #: Required for ``already_fixed`` and ``obsolete``: the evidence the owner checks.
@@ -246,7 +248,8 @@ class PlanResult(_Strict):
     approach: Text
     risks: Texts
     contract: ContractModel
-    open_decision_ids: Texts
+    #: The service always replaces it with the parcel's open questions: never the agent's.
+    open_decision_ids: Texts = []
     related: Annotated[list[Related], Field(max_length=20)] = []
     epic_fit: EpicFit | None = None
     split_out: SplitOuts = []
@@ -334,8 +337,10 @@ class BuildResult(_Strict):
     verification: Annotated[list[Verification], Field(min_length=1, max_length=100)]
     review: Review
     findings: Annotated[list[Finding], Field(max_length=200)]
-    remediation_batches_used: Annotated[int, Field(ge=0, le=12)]
-    targeted_rechecks_used: Annotated[int, Field(ge=0, le=12)]
+    #: Cumulative fix batches / targeted rechecks: 0 (none used) is the safe default; a
+    #: value above the run's review-round budget is still refused.
+    remediation_batches_used: Annotated[int, Field(ge=0, le=12)] = 0
+    targeted_rechecks_used: Annotated[int, Field(ge=0, le=12)] = 0
     release_readiness: Literal["ready", "needs_owner"]
     related: Annotated[list[Related], Field(max_length=20)] = []
     #: Issues the run filed itself (kept for compatibility: the factory now files them).
@@ -423,88 +428,307 @@ class ResultError(ValueError):
 
 
 #: Bounds for error details relayed to the agent or published in a status comment.
-MAX_ERROR_DETAILS = 10
-MAX_ERROR_DETAIL_CHARS = 200
+MAX_ERROR_DETAILS = 100
+MAX_ERROR_DETAIL_CHARS = 300
 _RESULT_KINDS = frozenset({"triage", "epic_triage", "plan", "build_ready", "checkpoint", "blocked"})
 
 
-#: ``split_out`` items: ``relation`` is the new issue's to this issue (after_source: blocked
-#: by this issue; before_source: blocks it), ``blocks`` the issues the new issue blocks.
-_SPLIT_SHAPE = (
-    '"split_out"?:[{"title":str,"body":str,"reason":str,'
-    '"relation"?:"none|after_source(new issue blocked by this one)|before_source(new issue '
-    'blocks this one)","blocks"?:[int(issues the new issue blocks)],"member"?:int(bundle '
-    "runs: the member it comes from)}]}"
+#: Result model per ``kind`` (the validator's own models: shapes, examples and the typed
+#: submit tools' input schemas are all generated from these, so they cannot drift).
+RESULT_MODELS: dict[str, type[_Strict]] = {
+    "triage": TriageResult,
+    "epic_triage": EpicTriageResult,
+    "plan": PlanResult,
+    "build_ready": BuildResult,
+    "checkpoint": CheckpointResult,
+    "blocked": BlockedResult,
+}
+
+#: How to read a shape (quoted once wherever shapes are shown).
+SHAPE_LEGEND = (
+    '"field"?: optional (may be omitted); str: 1-16000 characters; str(<=N): at most N '
+    "characters; [T](<=N): a list of at most N items; a|b: exactly one of these values "
+    "(a note in parentheses explains a value, it is not part of it); |null: may be null."
 )
-#: A deferred item's optional rating and one-line why (see :data:`Rating`).
-_RATING_SHAPE = (
-    '"rating"?:"bug(real defect: will hit or has hit)|likely(plausible under real '
-    "conditions)|edge(hypothetical: needs an unusual combination)|tidy(cleanup, docs, "
-    'cosmetic)","why"?:str(one short line: how much it needs fixing, at most 160 chars)'
-)
-#: Bundle runs only: members taken out of the bundle (plan, build_ready, blocked).
-_EJECTED_SHAPE = '"ejected"?:[{"issue":int(a bundle member),"reason":str}],'
+
+#: Notes appended to a field's shape: (model, field) -> note.
+_FIELD_NOTES: dict[tuple[str, str], str] = {
+    ("TriageResult", "duplicate_issue"): "the issue to keep; set iff recommendation is duplicate",
+    ("TriageResult", "closure_evidence"): "required for already_fixed and obsolete",
+    ("TriageResult", "paths"): "repository paths the triage relied on, no duplicates",
+    ("TriageResult", "labels"): "no factory:* labels, no duplicates",
+    ("SplitOut", "blocks"): "issues the new issue blocks",
+    ("SplitOut", "member"): "bundle runs: the member it comes from",
+    ("Deferred", "member"): "bundle runs: the member it belongs to",
+    ("Deferred", "blocks"): "issues the follow-up must come before",
+    ("Deferred", "why"): "one short line: how much it needs fixing",
+    ("Ejected", "issue"): "a bundle member",
+    ("BuildResult", "remediation_batches_used"): "at most min(12, review_rounds.budget)",
+    ("BuildResult", "targeted_rechecks_used"): "at most min(12, review_rounds.budget)",
+    ("BuildResult", "dev_environment_url"): "a dev environment you left running",
+    ("Review", "review_vendor"): "must differ from implementation_vendor",
+    ("Finding", "severity"): "the findings scale; never P0-P3",
+    ("Finding", "disposition"): "build_ready: never unresolved",
+    ("Deferred", "severity"): "the deferred scale; never BLOCKING etc.",
+    ("ReplanRequired", "changes"): "build only: what the plan must change",
+    ("PlanResult", "open_decision_ids"): "the factory fills it",
+    ("EpicTriageResult", "plan"): "required when the epic is on autopilot",
+}
+#: Notes on individual enum values: (model, field) -> {value: note}.
+_VALUE_NOTES: dict[tuple[str, str], dict[str, str]] = {
+    ("SplitOut", "relation"): {
+        "after_source": "new issue blocked by this one",
+        "before_source": "new issue blocks this one",
+        "blocks": "legacy, read as after_source",
+        "blocked_by": "legacy, read as after_source",
+    },
+    ("Deferred", "rating"): {
+        "bug": "real defect: will hit or has hit",
+        "likely": "plausible under real conditions",
+        "edge": "hypothetical: needs an unusual combination",
+        "tidy": "cleanup, docs, cosmetic",
+    },
+}
+#: Named string formats (by pattern) shown instead of the raw pattern.
+_PATTERN_NAMES = {
+    Sha.__metadata__[0].pattern: "sha40",  # type: ignore[attr-defined]
+    Sha256.__metadata__[0].pattern: "sha256",  # type: ignore[attr-defined]
+    GateKey.__metadata__[0].pattern: "slug(a-z, 0-9, -; <=40)",  # type: ignore[attr-defined]
+    DEV_ENVIRONMENT_URL_PATTERN: "url(http/https, <=500)",
+}
+#: Example values where the first enum value or a placeholder would mislead.
+_EXAMPLE_VALUES: dict[tuple[str, str], object] = {
+    ("TriageResult", "priority"): "P2",
+    ("TriageResult", "size"): "S",
+    ("ContractModel", "size"): "S",
+    ("BuildResult", "head_sha"): "0123456789abcdef0123456789abcdef01234567",
+    ("Review", "reviewed_head"): "0123456789abcdef0123456789abcdef01234567",
+    ("Review", "artifact_sha256"): "0123456789abcdef" * 4,
+    ("BuildResult", "pr_number"): 1,
+}
+#: Optional fields every example shows anyway (the prompts ask for them).
+_EXAMPLE_ALWAYS = frozenset({"eli5"})
 
 
-#: Compact field types per result kind, quoted in tool errors and descriptions.
-RESULT_SHAPES: dict[str, str] = {
-    "triage": '{"kind":"triage","eli5"?:str|null,'
-    '"summary":str,"priority":"P0|P1|P2|P3","size":"S|M|L",'
-    '"recommendation":"fix|wont_fix|duplicate|needs_info|already_fixed|obsolete",'
-    '"duplicate_issue":int|null,"closure_evidence"?:str(required for already_fixed and '
-    'obsolete),"paths"?:[str(repository paths the triage relied on, at most 20)],'
-    '"labels":[str],"missing_information":[str],"related"?:[{"issue":int,'
-    '"relation":"duplicate|overlaps|conflicts|depends_on|blocks|supersedes","note":str}],'
-    + _SPLIT_SHAPE,
-    "epic_triage": '{"kind":"epic_triage","eli5"?:str|null,"summary":str,"coverage":{"gaps":[str],'
-    '"overlaps":[str]},"build_order":[{"issue":int,"reason":str}],"links"?:[{"issue":int,'
-    '"blocked_by":int,"reason":str}],"missing_information"?:[str],"related"?:[...],'
-    '"plan"?:{"parts":[{"issue":int,"scope":str}],"coordination":[str],"human_gates"?:'
-    '[{"key":"slug","title":str,"steps":str,"blocks":[int]}],"external_blockers"?:'
-    '[{"issue":int,"note":str}]},' + _SPLIT_SHAPE,
-    "plan": '{"kind":"plan","eli5"?:str|null,'
-    '"publication_kind":"contract|info","approach":str,"risks":[str],'
-    '"contract":{"goal":str,"acceptance_criteria":[{"id":str,"criterion":str,'
-    '"verification":str}],"non_goals":[str],"size":"S|M|L","resolved_decisions":'
-    '[{"decision_id":str,"answer":str,"source_event_id":str}]},"open_decision_ids":[str],"related"?:[{"issue":int,'
-    '"relation":"depends_on|blocks|duplicate|overlaps|conflicts|supersedes","note":str}],'
-    '"epic_fit"?:{"within":bool,"note":str},' + _EJECTED_SHAPE + _SPLIT_SHAPE,
-    "build_ready": '{"kind":"build_ready","eli5"?:str|null,'
-    '"pr_number":int>=1,"branch":str,"head_sha":sha40,'
-    '"summary":str,"verification":[{"command":str,"file_set":[str],'
-    '"outcome":"passed|failed|not_run","evidence":str}],"review":{"implementation_vendor":str,'
-    '"review_vendor":str,"reviewed_head":sha40,"artifact_reference":str,'
-    '"artifact_sha256":sha256,"accepted":bool},"findings":[{"id":str,"source":str,'
-    '"severity":str,"disposition":str,"evidence":str}],"remediation_batches_used":int(0..min(12,review_rounds.budget)),'
-    '"targeted_rechecks_used":int(0..min(12,review_rounds.budget)),"release_readiness":"ready|needs_owner","related"?:[...],'
-    '"deferred"?:[{"severity":"P0|P1|P2|P3","path"?:str,"title":str,"thread_url"?:str,'
-    '"reason":str,"outcome"?:"follow_up|advisory","blocks"?:[int],"member"?:int,'
-    + _RATING_SHAPE
-    + '}],"dev_environment_url"?:str(http/https URL of a dev environment you left running),'
-    + _EJECTED_SHAPE
-    + _SPLIT_SHAPE,
-    "checkpoint": '{"kind":"checkpoint","grant_id":str,"head_sha":sha40|null,"done":[str],'
-    '"remaining":[str],"risks":[str],"worktree_state":str,"elicitation_id":str|null}',
-    "blocked": '{"kind":"blocked","reason":str,"done":[str],"related"?:[{"issue":int,'
-    '"relation":"depends_on|blocks|...","note":str}],"deferred"?:[{"severity":'
-    '"P0|P1|P2|P3","path"?:str,"title":str,"thread_url"?:str,"reason":str,'
-    '"outcome"?:"follow_up|advisory","blocks"?:[int],"member"?:int,'
-    + _RATING_SHAPE
-    + '}],"replan_required"?:{"reason":str,"changes":[str](build only: the plan must change)},'
-    + _EJECTED_SHAPE
-    + _SPLIT_SHAPE,
+def _ref(
+    schema: Mapping[str, object], defs: Mapping[str, object]
+) -> tuple[str, Mapping[str, object]]:
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        name = ref.rsplit("/", 1)[-1]
+        target = defs[name]
+        assert isinstance(target, Mapping)  # noqa: S101 - pydantic's own schema
+        return name, target
+    return str(schema.get("title") or ""), schema
+
+
+def _bounds(low: object, high: object, unit: str = "") -> str:
+    if isinstance(high, int) and isinstance(low, int) and low > 1:
+        return f"{low}..{high}{unit}"
+    if isinstance(high, int):
+        return f"<={high}{unit}"
+    if isinstance(low, int) and low > 1:
+        return f">={low}{unit}"
+    return ""
+
+
+def _shape(
+    schema: Mapping[str, object], defs: Mapping[str, object], owner: str = "", field: str = ""
+) -> str:
+    """Compact type of one JSON-schema node (pydantic's schema of the result models)."""
+    if "$ref" in schema:
+        name, target = _ref(schema, defs)
+        return _object_shape(name, target, defs)
+    any_of = schema.get("anyOf")
+    if isinstance(any_of, list):
+        options = [o for o in any_of if isinstance(o, Mapping) and o.get("type") != "null"]
+        nullable = len(options) != len(any_of)
+        text = "|".join(_shape(o, defs, owner, field) for o in options)
+        return text + ("|null" if nullable else "")
+    if "const" in schema:
+        return json.dumps(schema["const"])
+    enum = schema.get("enum")
+    if isinstance(enum, list):
+        notes = _VALUE_NOTES.get((owner, field), {})
+        return '"' + "|".join(f"{v}({notes[v]})" if v in notes else str(v) for v in enum) + '"'
+    kind = schema.get("type")
+    if kind == "string":
+        pattern = schema.get("pattern")
+        if isinstance(pattern, str):
+            return _PATTERN_NAMES.get(pattern, f"str(matching {pattern})")
+        low, high = schema.get("minLength", 0), schema.get("maxLength")
+        if low == 1 and high == 16000:
+            return "str"
+        bound = _bounds(low, high)
+        return f"str({bound})" if bound else "str(may be empty)" if low == 0 else "str"
+    if kind == "integer":
+        low, high = schema.get("minimum"), schema.get("maximum")
+        if isinstance(low, int) and isinstance(high, int):
+            return f"int({low}..{high})"
+        return f"int>={low}" if isinstance(low, int) else "int"
+    if kind == "boolean":
+        return "bool"
+    if kind == "array":
+        items = schema.get("items")
+        inner = _shape(items, defs, owner, field) if isinstance(items, Mapping) else "any"
+        low, high = schema.get("minItems", 0), schema.get("maxItems")
+        bound = f"{low}..{high}" if isinstance(low, int) and low >= 1 else _bounds(low, high)
+        return f"[{inner}]" + (f"({bound})" if bound else "")
+    if kind == "object":
+        return _object_shape(owner, schema, defs)
+    return "any"
+
+
+def _object_shape(name: str, schema: Mapping[str, object], defs: Mapping[str, object]) -> str:
+    props = schema.get("properties")
+    required = schema.get("required")
+    req = set(required) if isinstance(required, list) else set()
+    parts: list[str] = []
+    for key, sub in props.items() if isinstance(props, Mapping) else ():
+        assert isinstance(sub, Mapping)  # noqa: S101 - pydantic's own schema
+        text = _shape(sub, defs, name, key)
+        note = _FIELD_NOTES.get((name, key))
+        if note:
+            text += f" ({note})"
+        parts.append(f'"{key}"{"" if key in req else "?"}:{text}')
+    return "{" + ",".join(parts) + "}"
+
+
+def result_shape(kind: str) -> str:
+    """The compact field shape of result ``kind``, generated from its model."""
+    model = RESULT_MODELS[kind]
+    schema = model.model_json_schema()
+    defs = schema.get("$defs", {})
+    return _object_shape(model.__name__, schema, defs)
+
+
+def _example(
+    schema: Mapping[str, object], defs: Mapping[str, object], owner: str, field: str
+) -> object:
+    if (owner, field) in _EXAMPLE_VALUES:
+        return _EXAMPLE_VALUES[(owner, field)]
+    if "$ref" in schema:
+        name, target = _ref(schema, defs)
+        return _object_example(name, target, defs)
+    any_of = schema.get("anyOf")
+    if isinstance(any_of, list):
+        return None
+    if "const" in schema:
+        return schema["const"]
+    enum = schema.get("enum")
+    if isinstance(enum, list):
+        return enum[0]
+    kind = schema.get("type")
+    if kind == "string":
+        if isinstance(schema.get("pattern"), str):
+            raise ValueError(f"{owner}.{field}: give a pattern field an example value")
+        return f"<{field}>"
+    if kind == "integer":
+        low = schema.get("minimum")
+        return low if isinstance(low, int) else 0
+    if kind == "boolean":
+        return True
+    if kind == "array":
+        items = schema.get("items")
+        count = schema.get("minItems", 0)
+        assert isinstance(items, Mapping) and isinstance(count, int)  # noqa: S101
+        return [_example(items, defs, owner, field) for _ in range(count)]
+    if kind == "object":
+        return _object_example(owner, schema, defs)
+    raise ValueError(f"{owner}.{field}: no example for {schema}")
+
+
+def _object_example(
+    name: str, schema: Mapping[str, object], defs: Mapping[str, object]
+) -> dict[str, object]:
+    props = schema.get("properties")
+    required = schema.get("required")
+    req = set(required) if isinstance(required, list) else set()
+    out: dict[str, object] = {}
+    for key, sub in props.items() if isinstance(props, Mapping) else ():
+        if key in req or key in _EXAMPLE_ALWAYS:
+            assert isinstance(sub, Mapping)  # noqa: S101 - pydantic's own schema
+            value = _example(sub, defs, name, key)
+            if key in _EXAMPLE_ALWAYS and value is None:
+                value = f"<{key}>"
+            out[key] = value
+    return out
+
+
+def result_example(kind: str) -> dict[str, object]:
+    """A minimal valid result of ``kind`` (its required fields, plus eli5), generated
+    from its model: every string value is a placeholder to replace."""
+    model = RESULT_MODELS[kind]
+    schema = model.model_json_schema()
+    return _object_example(model.__name__, schema, schema.get("$defs", {}))
+
+
+#: Compact field types per result kind, quoted in tool errors, prompts and status.
+RESULT_SHAPES: dict[str, str] = {kind: result_shape(kind) for kind in RESULT_MODELS}
+RESULT_EXAMPLES: dict[str, dict[str, object]] = {
+    kind: result_example(kind) for kind in RESULT_MODELS
 }
 
 
+#: Longest list of item positions quoted on one grouped error line (then "+N more").
+MAX_ERROR_INDEX_CHARS = 80
+
+
+def _positions(where: list[tuple[int, ...]]) -> str:
+    """Item positions as compact ranges (``0-67, 70``; nested ``3.1``), bounded, with
+    any positions left out counted explicitly."""
+    parts: list[str] = []
+    if all(len(w) == 1 for w in where):
+        values = sorted({w[0] for w in where})
+        start = prev = values[0]
+        for value in [*values[1:], None]:
+            if value is not None and value == prev + 1:
+                prev = value
+                continue
+            parts.append(str(start) if start == prev else f"{start}-{prev}")
+            if value is not None:
+                start = prev = value
+    else:
+        parts = [".".join(str(i) for i in w) for w in where]
+    shown: list[str] = []
+    for part in parts:
+        if len(", ".join([*shown, part])) > MAX_ERROR_INDEX_CHARS:
+            break
+        shown.append(part)
+    text = ", ".join(shown)
+    left = len(parts) - len(shown)
+    return text + (f", +{left} more" if left else "")
+
+
 def validation_details(exc: ValidationError) -> tuple[str, ...]:
-    """``loc: msg`` per error, without input values; discriminator tags dropped."""
-    lines: list[str] = []
+    """Every schema error in one rejection, grouped by field (R4), without input values.
+
+    ``loc: msg`` per field; the same message at several list positions is one line,
+    message first (``findings.*.severity: Input should be ... [items 0-67, 70]``), the
+    positions compressed into ranges and bounded with an explicit "+N more". Lines are
+    ordered by top-level field; discriminator tags are dropped. At most
+    :data:`MAX_ERROR_DETAILS` lines.
+    """
+    groups: dict[tuple[str, str], list[tuple[int, ...]]] = {}
     for error in exc.errors(include_input=False, include_url=False, include_context=False):
         loc = [str(part) for part in error["loc"]]
         if len(loc) > 1 and loc[0] == "result" and loc[1] in _RESULT_KINDS:
             del loc[1]
-        line = f"{'.'.join(loc) or '(root)'}: {error['msg']}"
-        lines.append(line[:MAX_ERROR_DETAIL_CHARS])
+        indices = tuple(int(part) for part in loc if part.isdigit())
+        pattern = ".".join("*" if part.isdigit() else part for part in loc) or "(root)"
+        groups.setdefault((pattern, error["msg"]), []).append(indices)
+    lines: list[str] = []
+    for (pattern, msg), where in sorted(groups.items(), key=lambda item: item[0][0].split(".")[:2]):
+        if len(where) == 1:
+            exact = iter(where[0])
+            name = ".".join(
+                str(next(exact)) if part == "*" else part for part in pattern.split(".")
+            )
+            line = f"{name}: {msg}"[:MAX_ERROR_DETAIL_CHARS]
+        else:
+            items = f" [items {_positions(where)}]"
+            line = f"{pattern}: {msg}"[: MAX_ERROR_DETAIL_CHARS - len(items)] + items
+        lines.append(line)
     extra = len(lines) - MAX_ERROR_DETAILS
     if extra > 0:
         lines = [*lines[:MAX_ERROR_DETAILS], f"... and {extra} more"]
@@ -684,6 +908,78 @@ def epic_plan_hash(result: Mapping[str, object]) -> str:
     """sha256 of an epic plan (a validated ``epic_triage`` result as JSON): binds approval."""
     text = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+#: Most sub-issues an epic example names (enough to show the form).
+_EXAMPLE_SUB_ISSUES = 3
+
+
+def context_requirements(kind: str, expected: Correlation) -> tuple[str, ...]:
+    """What this run's context adds to ``kind``'s shape, in the validator's own terms
+    (each line mirrors a check in :func:`validate_result` or its helpers)."""
+    notes: list[str] = []
+    if expected.in_checkpoint:
+        notes.append('at a checkpoint only kind "blocked" (done, and what remains as reason)')
+    if kind == "plan" and expected.stage == "build" and expected.waiver_build:
+        notes.append('under a planning waiver a build publishes publication_kind "info"')
+    if kind == "plan" and expected.stage == "plan" and expected.epic_part:
+        notes.append(
+            "part of an autopilot epic: include epic_fit (within: does the plan stay within "
+            "its part of the epic plan; note: why)"
+        )
+    if kind == "plan" and expected.stage == "plan" and expected.bundle_members:
+        members = ", ".join(f"#{n}" for n in sorted(expected.bundle_members))
+        notes.append(
+            f"a bundle plan gives each member ({members}) acceptance criteria naming it "
+            '(e.g. "#12: ...") unless it is in ejected'
+        )
+    if kind == "epic_triage" and expected.epic_plan:
+        notes.append(
+            "this epic is on autopilot: include plan (parts, coordination, human_gates, "
+            "external_blockers)"
+        )
+    if kind == "epic_triage" and expected.sub_issues:
+        notes.append("build_order, links and plan name only this epic's sub-issues")
+    if (
+        kind in ("build_ready", "blocked")
+        and expected.follow_up_depth >= expected.follow_up_max_depth
+    ):
+        notes.append(
+            'this issue is itself a follow-up: deferred items only with outcome "advisory", '
+            "and no follow_ups"
+        )
+    return tuple(notes)
+
+
+def run_example(kind: str, expected: Correlation) -> dict[str, object] | None:
+    """The minimal example of ``kind`` made valid for this run's context (the fields the
+    context requires, per :func:`context_requirements`), checked with
+    :func:`validate_result` under ``expected``; None when no valid example can be built
+    (the shape and the requirements are then shown instead)."""
+    example: dict[str, Any] = json.loads(json.dumps(RESULT_EXAMPLES[kind]))
+    if kind == "plan":
+        if expected.stage == "build" and expected.waiver_build:
+            example["publication_kind"] = "info"
+        if expected.stage == "plan" and expected.epic_part:
+            example["epic_fit"] = {"within": True, "note": "<note>"}
+        if expected.stage == "plan" and expected.bundle_members:
+            example["contract"]["acceptance_criteria"] = [
+                {"id": f"#{n}", "criterion": f"#{n}: <criterion>", "verification": "<verification>"}
+                for n in sorted(expected.bundle_members)
+            ]
+    if kind == "epic_triage":
+        subs = sorted(expected.sub_issues or ())[:_EXAMPLE_SUB_ISSUES]
+        example["build_order"] = [{"issue": n, "reason": "<reason>"} for n in subs]
+        if expected.epic_plan:
+            example["plan"] = {
+                "parts": [{"issue": n, "scope": "<scope>"} for n in subs],
+                "coordination": [],
+            }
+    try:
+        validate_result(example, expected)
+    except ResultError:
+        return None
+    return example
 
 
 def validate_result(result: Mapping[str, object], expected: Correlation) -> ParsedResult:

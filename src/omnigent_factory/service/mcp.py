@@ -1,4 +1,4 @@
-"""The factory MCP endpoint: eight tools for the issue session's current stage run.
+"""The factory MCP endpoint: tools for the issue session's current stage run.
 
 Served by the daemon's own Starlette app under ``/mcp`` (stateless Streamable HTTP, JSON
 responses), reachable through the configured ``bind_host`` listener and the loopback
@@ -46,7 +46,10 @@ from omnigent_factory.core.codec import event_from_json, parcel_from_json
 from omnigent_factory.core.events import Event, EventKind, Provenance
 from omnigent_factory.core.predicates import continued, work_allowed
 from omnigent_factory.core.protocol import (
+    RESULT_EXAMPLES,
+    RESULT_MODELS,
     RESULT_SHAPES,
+    SHAPE_LEGEND,
     BlockedResult,
     BuildResult,
     Correlation,
@@ -80,11 +83,15 @@ from omnigent_factory.core.types import (
 from omnigent_factory.service.board_index import BoardIndex, BoardUnavailable
 from omnigent_factory.service.config import ServiceConfig, parse_allowed_host
 from omnigent_factory.service.directory import (
+    SUBMIT_TOOLS,
     ServiceDispatchDirectory,
     approved_epic_plan,
     new_boundary,
     omnigent_link,
     replan_request_for,
+    result_fields,
+    run_correlation,
+    shown_result_kinds,
     untrusted_block,
 )
 from omnigent_factory.service.runtime import FactoryService
@@ -99,7 +106,11 @@ TOOL_NAMES = (
     "factory_ask_owner",
     "factory_submit_result",
     "factory_submit_ranking",
+    # Typed per-kind submits (R7): same validation, gates and mutation as submit_result.
+    *SUBMIT_TOOLS.values(),
 )
+#: The typed submits: optional for an agent (factory_submit_result takes every kind).
+TYPED_SUBMIT_TOOLS = tuple(SUBMIT_TOOLS.values())
 
 LOG = logging.getLogger(__name__)
 
@@ -118,6 +129,9 @@ _STAGE_KINDS: dict[SessionKind, frozenset[str]] = {
 _SUBMITTABLE = frozenset({Lifecycle.ACTIVE, Lifecycle.WAITING, Lifecycle.CHECKPOINT_GRACE})
 #: Results refused while the run has unread owner comments ("blocked" is always accepted).
 _FEEDBACK_GATED = frozenset({"triage", "epic_triage", "plan", "build_ready"})
+#: Unread comments quoted in a refusal (each cut to this many characters).
+_MAX_REFUSAL_COMMENTS = 5
+_MAX_REFUSAL_COMMENT_CHARS = 1500
 
 
 class FactoryToolError(ToolError):
@@ -622,7 +636,8 @@ class FactoryTools:
                 else {"reason": request.reason, "changes": list(request.changes)},
             },
             "note": (
-                "Echo plan_hash in factory_submit_result for build_ready."
+                "Echo plan_hash in factory_submit_build_ready (or factory_submit_result) "
+                "for build_ready."
                 if plan_hash is not None
                 else "There is no approved plan: do not build."
             ),
@@ -715,15 +730,50 @@ class FactoryTools:
         auth = caller.parcel.authorization(run.authorization_id)
         return auth.source_time_us if auth is not None else 0
 
-    async def _unread_feedback(self, parcel: Parcel, run: StageSession) -> bool:
-        """An owner feedback comment ``run`` has not been shown: judged on the same
+    async def _unread_feedback(self, parcel: Parcel, run: StageSession) -> list[dict[str, Any]]:
+        """The owner feedback comments ``run`` has not been shown: judged on the same
         comments factory_get_feedback serves, so a re-applied delivery (its first event
-        already read) or a control event with no comment text never gates."""
+        already read) or a control event with no comment text never gates.
+
+        R3: an owner answer relayed to this run verbatim (its ``answer_relay`` message
+        acknowledged) counts as read, but only when it is the one unread comment, matched
+        by event id; the read is then recorded like factory_get_feedback's."""
         run_id = run.session_id
         seen = await self.service.db.call(lambda store: store.feedback_read(run_id))
-        return any(
-            c["kind"] == EventKind.PLAN_FEEDBACK.value and int(c["sequence"]) > seen
+        unread = [
+            c
             for c in await self.directory.owner_comments(parcel)
+            if c["kind"] == EventKind.PLAN_FEEDBACK.value and int(c["sequence"]) > seen
+        ]
+        if len(unread) == 1 and any(
+            d.session_id == run_id and d.relay_acked and d.answer_event_id == unread[0]["event_id"]
+            for d in parcel.decisions
+        ):
+            sequence = int(unread[0]["sequence"])
+            await self.service.db.call(lambda store: store.record_feedback_read(run_id, sequence))
+            return []
+        return unread
+
+    async def _check_feedback(self, parcel: Parcel, run: StageSession) -> None:
+        """Refuse a gated result while owner comments are unread, quoting them."""
+        unread = await self._unread_feedback(parcel, run)
+        if not unread:
+            return
+        boundary = self._boundary(run)
+        quoted = [
+            f"- {c['event_id']} ({c.get('source', 'issue')}): "
+            + untrusted_block(
+                _cut(str(c["text"]), _MAX_REFUSAL_COMMENT_CHARS), boundary, "OWNER COMMENT"
+            )
+            for c in unread[-_MAX_REFUSAL_COMMENTS:]
+        ]
+        more = len(unread) - len(quoted)
+        raise FactoryToolError(
+            "the owner commented since you last read feedback: call factory_get_feedback, "
+            "apply the owner's directions, then submit again. Unread comment(s) "
+            "(untrusted owner text):\n"
+            + "\n".join(quoted)
+            + (f"\n(and {more} earlier unread comment(s))" if more > 0 else "")
         )
 
     async def get_status(self, session_id: str) -> dict[str, Any]:
@@ -765,6 +815,46 @@ class FactoryTools:
             "findings_wakes_max": rounds["budget"] if rounds else self.config.review_rounds_default,
             "review_rounds": rounds,
             "follow_up_depth": await self._follow_up_depth(parcel),
+            **await self._result_help(parcel, run),
+        }
+
+    async def _correlation(
+        self, parcel: Parcel, run: StageSession, *, in_checkpoint: bool
+    ) -> Correlation:
+        """The context a result from ``run`` is validated in: the one submission uses
+        and the run's help (examples, requirements) is built and checked for."""
+        follow_up: tuple[int, int | None] = (0, None)
+        if parcel.issue_number is not None:
+            number = parcel.issue_number
+            follow_up = await self.service.db.call(
+                lambda store: store.follow_up_lineage(self.config.repo_id, number)
+            )
+        rounds = await self._review_rounds(parcel) if run.kind == SessionKind.BUILD else None
+        return run_correlation(
+            parcel,
+            run,
+            in_checkpoint=in_checkpoint,
+            review_rounds_budget=rounds["budget"] if rounds else self.config.review_rounds_default,
+            follow_up=follow_up,
+            follow_up_max_depth=self.config.follow_up_max_depth,
+            bundle_members=(
+                await self.bundles.members_for(parcel) if self.bundles is not None else None
+            ),
+        )
+
+    async def _result_help(self, parcel: Parcel, run: StageSession | None) -> dict[str, Any]:
+        """The run's result kinds with their shapes, examples (valid for this run) and
+        typed tools (R1), and the last accepted result of its stage to start a re-run from."""
+        if run is None:
+            return {}
+        in_checkpoint = run.lifecycle == Lifecycle.CHECKPOINT_GRACE
+        kinds = shown_result_kinds(parcel, run.kind, in_checkpoint=in_checkpoint)
+        corr = await self._correlation(parcel, run, in_checkpoint=in_checkpoint)
+        return {
+            "result_kinds": list(kinds),
+            "result_fields": result_fields(kinds, corr),
+            "result_shape_legend": SHAPE_LEGEND,
+            "last_accepted_result": self.directory.last_accepted_result(parcel, run.kind),
         }
 
     async def _review_rounds(self, parcel: Parcel) -> dict[str, Any] | None:
@@ -926,10 +1016,10 @@ class FactoryTools:
                 + (" at a checkpoint" if in_checkpoint else "")
                 + f"; allowed: {', '.join(sorted(allowed))}"
             )
-        waiver = (
-            parcel.current_approval is not None
-            and parcel.current_approval.kind == ApprovalKind.SKIP
-        )
+        if kind in _FEEDBACK_GATED and not in_checkpoint:
+            # R3: before the plan-read and schema checks, so an agent that must re-read
+            # feedback learns it before fixing a payload it would then rewrite.
+            await self._check_feedback(parcel, run)
         if kind == "plan":
             payload.setdefault(
                 "publication_kind", "info" if run.kind == SessionKind.BUILD else "contract"
@@ -938,43 +1028,17 @@ class FactoryTools:
             payload["open_decision_ids"] = [d.decision_id for d in parcel.open_decisions]
         if kind == "build_ready":
             self._check_plan_echo(parcel, plan_hash)
-            if not await self.service.db.call(
+            # R6: the approved hash the run's first message gave it counts as read; any
+            # other (or absent) hash still needs factory_get_plan in this run.
+            given = plan_hash in await self.directory.plan_hashes_given(run.session_id)
+            if not given and not await self.service.db.call(
                 lambda store: store.plan_read(run.session_id, plan_hash or "")
             ):
                 raise FactoryToolError(
                     "call factory_get_plan in this run first, then echo its plan_hash"
                 )
             payload.setdefault("branch", f"factory/issue-{parcel.issue_number or 0}")
-        depth, source = (
-            await self.service.db.call(
-                lambda store: store.follow_up_lineage(self.config.repo_id, parcel.issue_number or 0)
-            )
-            if kind in ("build_ready", "blocked") and parcel.issue_number is not None
-            else (0, None)
-        )
-        rounds = await self._review_rounds(parcel) if kind == "build_ready" else None
-        corr = Correlation(
-            parcel.parcel_id,
-            run.session_id,
-            run.nonce,
-            run.revision,
-            run.kind.value,
-            review_rounds_budget=(
-                rounds["budget"] if rounds else self.config.review_rounds_default
-            ),
-            waiver_build=waiver,
-            in_checkpoint=in_checkpoint,
-            issue_number=parcel.issue_number,
-            sub_issues=epic_sub_issues(parcel),
-            epic_plan=parcel.autopilot is not None,
-            epic_part=parcel.autopilot_claim is not None and parcel.autopilot_claim.active,
-            follow_up_depth=depth,
-            follow_up_source=source,
-            follow_up_max_depth=self.config.follow_up_max_depth,
-            bundle_members=(
-                await self.bundles.members_for(parcel) if self.bundles is not None else None
-            ),
-        )
+        corr = await self._correlation(parcel, run, in_checkpoint=in_checkpoint)
         try:
             parsed = validate_result(payload, corr)
             if in_checkpoint:
@@ -982,9 +1046,9 @@ class FactoryTools:
         except ResultError as exc:
             shape = RESULT_SHAPES.get(kind, "")
             raise FactoryToolError(
-                "invalid result (fix these and resend):\n"
+                "invalid result (fix every one of these and resend):\n"
                 + "\n".join(f"- {d}" for d in exc.details)
-                + (f"\nexpected result fields: {shape}" if shape else "")
+                + (f"\nexpected result fields ({SHAPE_LEGEND}): {shape}" if shape else "")
             ) from None
         body = _candidate(run, parsed)
 
@@ -1173,11 +1237,8 @@ class FactoryTools:
             if current.run is None or current.run.session_id != run.session_id:
                 raise FactoryToolError("the run changed; call factory_get_status")
             self._check_gate(current, current.run)
-            if feedback_gate and await self._unread_feedback(current.parcel, current.run):
-                raise FactoryToolError(
-                    "the owner commented since you last read feedback: call "
-                    "factory_get_feedback, apply the owner's directions, then submit again"
-                )
+            if feedback_gate:
+                await self._check_feedback(current.parcel, current.run)
             previous_latest: dict[str, Any] | None = None
             if parsed is not None:
                 previous_latest = self.directory.save_result(run.session_id, *parsed)
@@ -1307,17 +1368,6 @@ def compact_links(links: IssueLinks | None) -> str:
     if links.blocking:
         parts.append("blocks " + ", ".join(b.ref for b in links.blocking))
     return "; ".join(parts)
-
-
-def epic_sub_issues(parcel: Parcel) -> frozenset[int] | None:
-    """The epic's sub-issue numbers for result validation (None: not an epic; empty: the
-    list is incomplete, so membership is not checked)."""
-    links = parcel.links
-    if links is None or not links.epic:
-        return None
-    if links.sub_total > len(links.sub_issues):
-        return frozenset()
-    return frozenset(s.number for s in links.sub_issues if not s.repo)
 
 
 def _question_keys(parcel: Parcel, run: StageSession, fingerprint: str) -> list[tuple[str, bool]]:
@@ -1513,6 +1563,10 @@ def _gaps(evidence: ev.ReadinessEvidence, issue_number: int | None) -> list[str]
     return gaps
 
 
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
 def _one_line(text: str, limit: int) -> str:
     text = " ".join(text.split())
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
@@ -1530,7 +1584,7 @@ def _digest(text: str) -> str:
 
 
 def build_mcp_server(tools: FactoryTools, config: ServiceConfig) -> FastMCP:
-    """Stateless Streamable HTTP, JSON responses; eight stable tools (discovery is cached)."""
+    """Stateless Streamable HTTP, JSON responses; stable tools (discovery is cached)."""
     port = config.mcp_port
     hosts = [f"127.0.0.1:{port}", f"localhost:{port}", "127.0.0.1", "localhost"]
     origins = [f"http://127.0.0.1:{port}", f"http://localhost:{port}"]
@@ -1648,7 +1702,11 @@ def build_mcp_server(tools: FactoryTools, config: ServiceConfig) -> FastMCP:
         name="factory_submit_result",
         description="Submit this run's outcome. kind: triage | epic_triage (an epic: an "
         "issue with sub-issues) | plan | build_ready | blocked "
-        "(stage-appropriate; at a checkpoint only blocked). run_id is required and must be "
+        "(stage-appropriate; at a checkpoint only blocked). Prefer the typed tools, whose "
+        "input schema lists every field and allowed value: "
+        + ", ".join(SUBMIT_TOOLS.values())
+        + " (same checks and receipts); factory_get_status result_fields shows each "
+        "kind's shape and a minimal valid example. run_id is required and must be "
         "your current run (start message or factory_get_status). result holds the fields "
         "for the kind; build_ready also needs plan_hash from factory_get_plan. Errors list "
         "exactly what to fix. Exact retries return the original receipt. Summaries and "
@@ -1699,7 +1757,78 @@ def build_mcp_server(tools: FactoryTools, config: ServiceConfig) -> FastMCP:
             session_id, run_id, ranking, summary, priority_changes, bundles=bundles
         )
 
+    for kind, tool_name in SUBMIT_TOOLS.items():
+        _add_typed_submit(server, tools, kind, tool_name)
     return server
+
+
+#: What each typed submit tool is for (its description's first sentence).
+_TYPED_PURPOSE = {
+    "triage": "A triage run's result for an ordinary issue (an epic uses "
+    "factory_submit_epic_triage).",
+    "epic_triage": "A triage run's result for an epic (an issue with sub-issues).",
+    "plan": "A plan run's plan (a build only under a planning waiver).",
+    "build_ready": "A build run's result once the PR is ready for verification; plan_hash "
+    "is the approved plan hash from your start message or factory_get_plan.",
+    "blocked": "Any run that cannot finish (at a checkpoint: the wrap-up report); never "
+    "refused for unread owner comments.",
+}
+
+
+def typed_submit_schema(kind: str) -> dict[str, Any]:
+    """The typed tool's input schema: ``result`` is the result model's own JSON schema
+    (fields, enums, limits); ``kind`` may be left out (the tool supplies it)."""
+    model = RESULT_MODELS[kind]
+    schema = model.model_json_schema()
+    defs: dict[str, Any] = dict(schema.pop("$defs", {}))
+    schema["required"] = [name for name in schema.get("required", []) if name != "kind"]
+    defs[model.__name__] = schema
+    properties: dict[str, Any] = {
+        "session_id": {"type": "string", "description": "Your own Omnigent session id."},
+        "run_id": {"type": "string", "description": "Your current run id."},
+        "result": {"$ref": f"#/$defs/{model.__name__}"},
+    }
+    required = ["session_id", "run_id", "result"]
+    if kind == "build_ready":
+        properties["plan_hash"] = {"type": "string", "description": "The approved plan hash."}
+        required.append("plan_hash")
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "$defs": defs,
+        "title": f"{SUBMIT_TOOLS[kind]}Arguments",
+    }
+
+
+def _add_typed_submit(server: FastMCP, tools: FactoryTools, kind: str, name: str) -> None:
+    """Register ``factory_submit_<kind>``: ``factory_submit_result`` with ``kind`` fixed.
+
+    The advertised schema is the result model's; arguments are passed through as given
+    (no transport-side coercion) so validation, gates, error grouping, idempotency and
+    receipts are exactly ``FactoryTools.submit_result``'s."""
+
+    async def submit(
+        session_id: str,
+        run_id: str,
+        result: dict[str, Any],
+        plan_hash: str | None = None,
+    ) -> dict[str, Any]:
+        return await tools.submit_result(
+            session_id, kind, result, run_id=run_id, plan_hash=plan_hash
+        )
+
+    server.add_tool(
+        submit,
+        name=name,
+        description=_TYPED_PURPOSE[kind]
+        + " Same checks, gates and receipts as factory_submit_result with kind "
+        + f'"{kind}"; errors list every field to fix. Minimal example result: '
+        + json.dumps(RESULT_EXAMPLES[kind], separators=(",", ":")),
+    )
+    tool = server._tool_manager.get_tool(name)
+    assert tool is not None  # noqa: S101 - just added
+    tool.parameters = typed_submit_schema(kind)
 
 
 def read_token(path: Path) -> str | None:
@@ -1850,6 +1979,7 @@ def build_endpoint(
 
 __all__ = [
     "TOOL_NAMES",
+    "TYPED_SUBMIT_TOOLS",
     "Caller",
     "FactoryToolError",
     "FactoryTools",

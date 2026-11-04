@@ -506,6 +506,7 @@ async def build_production(
         set_priority=ranking_board.set_priority,
     )
     service.bundles = bundles
+    directory.bundle_members = bundles.members_for
     github.bundle_members = bundles.required_closes
     status_comments.bundle_section = bundles.section
     deferred.bundles = bundles

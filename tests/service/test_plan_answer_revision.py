@@ -116,10 +116,11 @@ async def test_build_answer_keeps_authority_and_existing_relay_wording(
         message = await rig.tools.directory.message_text(relay)
         old = (files("omnigent_factory.service") / "templates" / "answer-v2.txt").read_text()
         assert message is not None
-        assert (
-            message.strip()
-            == old.format(decision_id=relay.args["decision_id"], answer="Keep it.").strip()
+        # answer-v5 keeps answer-v2 verbatim and adds the unread-feedback pointer (R3).
+        assert message.startswith(
+            old.format(decision_id=relay.args["decision_id"], answer="Keep it.").rstrip()
         )
+        assert "call factory_get_feedback first" in " ".join(message.split())
 
 
 @pytest.mark.parametrize("wait_reason", [None, *WaitReason])
@@ -163,9 +164,10 @@ async def test_pending_revision_status_mentions_remaining_owner_questions():
 
 
 async def test_answer_template_pin_preserves_released_version():
-    assert _ANSWER_TEMPLATE == "answer-v3.txt"
+    assert _ANSWER_TEMPLATE == "answer-v4.txt"
     templates = files("omnigent_factory.service") / "templates"
     old = (templates / "answer-v2.txt").read_text()
+    released = (templates / "answer-v3.txt").read_text()
     new = (templates / _ANSWER_TEMPLATE).read_text()
-    assert new.startswith(old)
+    assert released.startswith(old) and new.startswith(released)
     assert "Apply the owner's answer and resubmit kind plan" in new

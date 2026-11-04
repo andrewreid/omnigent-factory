@@ -160,9 +160,9 @@ async def test_a_sub_issue_autopilot_drives_must_say_whether_its_plan_fits(servi
         assert receipt["accepted"]
         claim = (await rig.parcel()).autopilot_claim
         assert claim is not None and claim.drift and claim.drift_hash == receipt["plan_hash"]
-    # Reused tools only (submit with epic_fit, get_issue with epic_plan): Rosie's tool
-    # allowlist needs no change.
-    assert TOOL_NAMES == (
+    # Reused tools only (submit with epic_fit, get_issue with epic_plan); the typed
+    # per-kind submits came later (they share factory_submit_result's path).
+    assert TOOL_NAMES[:8] == (
         "factory_get_issue",
         "factory_get_plan",
         "factory_get_feedback",

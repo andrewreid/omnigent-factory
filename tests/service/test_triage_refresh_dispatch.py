@@ -135,7 +135,7 @@ async def test_a_refresh_run_pins_the_refresh_template_with_its_signals(
         await directory.stage_spec(run.session_id)
         snapshot = directory.dispatch_snapshot(run.session_id)
         assert snapshot is not None
-        name = "triage-refresh-v2.txt" if lazy else "triage-refresh-v1.txt"
+        name = "triage-refresh-v4.txt" if lazy else "triage-refresh-v3.txt"
         assert snapshot["template"] == name
         assert snapshot["brief"] == "- cited paths changed: src/a.py\n- triaged 40 days ago"
         assert snapshot["triage_comment_template"] == (
@@ -186,7 +186,7 @@ async def test_an_owner_retriage_keeps_the_feedback_template(service_config: Ser
         directory = ServiceDispatchDirectory(t.r.service.db, service_config)
         await directory.stage_spec(run.session_id)
         snapshot = directory.dispatch_snapshot(run.session_id)
-        assert snapshot is not None and snapshot["template"] == "triage-feedback-v10.txt"
+        assert snapshot is not None and snapshot["template"] == "triage-feedback-v12.txt"
         assert snapshot["brief"] == ""
 
 
@@ -194,10 +194,10 @@ async def test_an_owner_retriage_keeps_the_feedback_template(service_config: Ser
 
 NEW = {
     # issue-worktree (flag off) -> reference snapshot variant
-    "triage-v13.txt": "triage-v14.txt",
-    "triage-feedback-v10.txt": "triage-feedback-v11.txt",
+    "triage-v15.txt": "triage-v16.txt",
+    "triage-feedback-v12.txt": "triage-feedback-v13.txt",
     "triage-comment-v4.txt": "triage-comment-v5.txt",
-    "triage-refresh-v1.txt": "triage-refresh-v2.txt",
+    "triage-refresh-v3.txt": "triage-refresh-v4.txt",
 }
 OLD = (
     "triage-v11.txt",
@@ -206,14 +206,20 @@ OLD = (
     "triage-feedback-v9.txt",
     "triage-comment-v2.txt",
     "triage-comment-v3.txt",
+    "triage-v13.txt",
+    "triage-v14.txt",
+    "triage-feedback-v10.txt",
+    "triage-feedback-v11.txt",
+    "triage-refresh-v1.txt",
+    "triage-refresh-v2.txt",
 )
 
 
 def test_constants_point_at_the_new_families_and_old_files_are_kept():
-    assert module._FIRST_TEMPLATES[SessionKind.TRIAGE] == "triage-v13.txt"
-    assert module._RETRIAGE_TEMPLATE == "triage-feedback-v10.txt"
+    assert module._FIRST_TEMPLATES[SessionKind.TRIAGE] == "triage-v15.txt"
+    assert module._RETRIAGE_TEMPLATE == "triage-feedback-v12.txt"
     assert module._TRIAGE_COMMENT_TEMPLATE == "triage-comment-v4.txt"
-    assert module._REFRESH_TEMPLATE == "triage-refresh-v1.txt"
+    assert module._REFRESH_TEMPLATE == "triage-refresh-v3.txt"
     for issue_name, reference in NEW.items():
         assert module._REFERENCE_TEMPLATES[issue_name] == reference
     for name in OLD:
@@ -257,6 +263,7 @@ def test_render_values_match_build_and_fill_every_placeholder(tmp_path: Path):
         "gh_wrapper": tmp_path / "gh",
         "capability_file": tmp_path / "ss.cap",
         "base_ref": "main",
+        "result_contract": "Result fields: ...",
     }
     build = (TEMPLATES / "build-v19.txt").read_text("utf-8")
     assert "{gh_wrapper}" in build and "{capability_file}" in build  # the same names
