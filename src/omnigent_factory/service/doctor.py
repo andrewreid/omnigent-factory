@@ -22,6 +22,7 @@ import httpx
 import yaml
 
 from omnigent_factory.credentials.worktree import REFERENCE_NAME
+from omnigent_factory.credentials.worktree_prepare import prepare_summary
 from omnigent_factory.github.auth import AppAuthenticator, InstallationTokenService
 from omnigent_factory.github.client import GitHubAPIError, GitHubClient
 from omnigent_factory.omnigent.rest import (
@@ -1078,6 +1079,30 @@ def _check_worktrees(config: ServiceConfig, report: DoctorReport) -> None:
         f"last sweep {iso(state.get('sweep_at_us')) or 'never'}; "
         f"last gc {iso(state.get('gc_at_us')) or 'never'}",
     )
+    _check_worktree_prepare(config, report)
+
+
+def _check_worktree_prepare(config: ServiceConfig, report: DoctorReport) -> None:
+    """The worktree prepare hook and the recorded state of each live worktree: a failed,
+    timed-out or interrupted prepare warns (the stage still started; the agent installs)."""
+    summary = prepare_summary(config.source_clone, configured=bool(config.worktree_prepare))
+    failed = summary["failed"] if isinstance(summary["failed"], list) else []
+    configured = (
+        f"configured ({' '.join(config.worktree_prepare)})" if config.worktree_prepare else "off"
+    )
+    running = summary["running"] if isinstance(summary["running"], list) else []
+    detail = (
+        f"{configured}; {summary['ok']} prepared, {len(running)} running, "
+        f"{len(failed)} failed/timed out/interrupted"
+    )
+    if failed:
+        shown = "; ".join(
+            f"{Path(str(row['path'])).name}: {row['status']} {row['reason']} (log {row['log']})"
+            for row in failed[:5]
+        )
+        report.warn("worktree_prepare", f"{detail}: {shown}")
+    else:
+        report.pass_check("worktree_prepare", detail)
 
 
 def _check_status_pin(config: ServiceConfig, report: DoctorReport) -> None:

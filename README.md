@@ -1388,6 +1388,84 @@ marked there too, so a restart between the teardown and the removal does not run
 twice; the effect and `cleanup` never run at once. The card's Done state never waits
 for any of this.
 
+**Worktree prepare (optional).** So PLAN and BUILD runs (and the reviewers they start)
+do not each reinstall dependencies, the daemon can run the repository's prepare command
+in an issue worktree before a PLAN or BUILD run in it starts:
+
+```toml
+worktree_prepare = ["scripts/factory-prepare.sh"]  # empty/absent: no prepare (restart)
+worktree_prepare_timeout_seconds = 600             # process group killed after this long (restart)
+worktree_prepare_inputs = ["pnpm-lock.yaml"]       # dependency inputs it prepares (restart)
+```
+
+Validation and the relative program path are as for `devenv_teardown` (a relative program
+path resolves in the worktree; cwd is the worktree). The default timeout is ~25x a cold
+`pnpm install --offline --frozen-lockfile` (22.8 s), leaving room for code generation on a
+busy host. `worktree_prepare_inputs` are paths relative to the worktree root (files or
+directories); list everything the prepare generates from (e.g. the Prisma schema and the
+renderer package) so a change to any of them counts.
+
+Each worktree's own Git directory holds one state per materialisation (it goes with the
+worktree, so a recreated worktree starts afresh): absent, `running`, `ok` (with a
+fingerprint of the inputs' contents read from the filesystem, tracked or not: every
+regular file of a declared directory except `node_modules/` and `.git`, a missing input
+as `missing`; an input that is, or sits under, a symlink, or is a FIFO, socket or device,
+makes the fingerprint invalid),
+`unverified`, `failed`, `timeout` or `interrupted`. A start runs the command when the state is absent,
+when an `ok` no longer matches the current inputs (a base fast-forward changed the
+lockfile: the repository script's own marker keeps a rerun cheap), or once more after an
+`interrupted` attempt; `failed`, `timeout` and a second interruption stand until the
+worktree is recreated. If the inputs cannot be read (an I/O or permission error, a symlinked
+or special input, or more than 20,000 files or 512 MiB) the fingerprint is invalid: it
+never matches, the command reruns at most once per stage start (the start is recorded
+with the attempt, so this holds across a daemon restart), and an exit 0 is recorded
+`unverified` (no line). A `running` marker is written before the command starts, so a
+daemon that dies mid-run leaves a visible `interrupted` (its process group is killed on
+recovery when it is provably the same process); a stopped run or a daemon shutdown
+kills the command and records `interrupted`. It is never run for TRIAGE runs or in a
+reference snapshot (`factory-ref-*`, which stays free of `node_modules`).
+
+The command runs as its own task, outside the issue's effect serializer: the stage's
+preparation starts it and checks back every 3 s, so an owner's Stop, feedback or an
+interrupt is applied meanwhile. When the run is no longer starting (stopped, fenced or
+superseded) the command's process group is killed and the stage never starts. No clone
+lock is held: preparations of different issues run in parallel; the worktree is never
+removed (Done cleanup, idle sweep) while its command runs.
+
+Its environment is an allowlist (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`,
+`LANGUAGE`, `LC_*`, `TZ`, `TMPDIR`, `XDG_*_HOME`, `XDG_RUNTIME_DIR`, `PNPM_HOME`,
+`COREPACK_HOME`, `NVM_DIR`, `VOLTA_HOME`) plus an isolated Git context: no system or
+global Git config (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`) and
+command-line resets of every credential helper and extra header (`credential.helper`,
+`credential.https://github.com.helper`, `http.extraHeader`,
+`http.https://github.com/.extraHeader` set empty), which apply after the worktree's own
+config, so neither the owner's helpers nor an earlier run's factory helper can answer;
+`GH_CONFIG_DIR` is an empty directory. A URL-scoped header can be more specific than any
+reset, so before launching the daemon enumerates every extra header the command's Git
+would see (local, worktree and included config, `git config --includes --get-regexp`
+under the command's environment): any non-empty one, or a failed enumeration, means the
+command is not run (`failed`, reason `unsafe git config: extraheader present` with the
+key names only, never values); the stage starts anyway. The command needs no
+repository authentication. The command is owner-trusted repository code run with the
+owner's HOME, like `devenv_teardown`: the Git/credential isolation and the extra-header
+refusal are defence in depth, not a sandbox, and a config change racing between the
+check and the launch is not prevented.
+Stdin is closed; stdout/stderr go to `<worktree_root>/factory-issue-<N>-prepare.log` (the
+devenv log convention; the sweep removes it with the issue's worktree), opened without
+following a symlink or blocking, a regular file only, forced to mode 0600 and truncated.
+
+Exit 0 is success. Any other exit, a timeout, a command that cannot start or a log that
+cannot be opened or written logs a warning and is recorded for that worktree (shown under
+`worktrees.prepare` in `status`, with `running` ones, and as a `worktree_prepare` warning
+in `doctor`, with the log path); the stage starts anyway, so the agent installs by itself.
+When the run's worktree is `ok` for the current inputs, the PLAN and BUILD first messages
+(including rework and conflict reworks) say on their own line: "Dependencies are
+installed and prisma/renderer are generated; reinstall only if you change the lockfile."
+The decision is recorded with the run's dispatch snapshot, refreshed by every
+preparation until the first message renders and then pinned, so a restart renders the
+same message. Without the hook, or when it failed, timed out, was interrupted or is
+stale, the first messages are byte-identical to before.
+
 ### Worktree housekeeping
 
 Worktrees the Done cleanup cannot see (issues closed before it existed, or while the

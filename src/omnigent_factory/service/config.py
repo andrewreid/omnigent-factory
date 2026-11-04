@@ -419,6 +419,19 @@ class ServiceConfig(BaseModel):
     #: Failed teardowns of one worktree before the cleanup stops retrying (the worktree is
     #: kept; ``cleanup`` by hand runs the teardown again).
     devenv_teardown_max_attempts: int = Field(default=5, ge=1, le=50)
+    #: The repository's worktree prepare command (argv; a relative program path resolves
+    #: in the worktree), run once with cwd = an issue worktree the factory created or
+    #: recreated, before its first PLAN/BUILD run starts (never in a reference snapshot).
+    #: Empty: none. A failure or timeout is logged, shown in ``status``/``doctor`` and
+    #: does not stop the stage. Output: ``<worktree>-prepare.log`` beside the worktree.
+    worktree_prepare: tuple[str, ...] = ()
+    #: Seconds one prepare run may take before its process group is killed (a failure).
+    #: 600: ~25x a cold ``pnpm install`` (22.8 s) plus code generation on a busy host.
+    worktree_prepare_timeout_seconds: float = Field(default=600.0, gt=0, le=3600)
+    #: Dependency inputs of the prepare (paths relative to the worktree root: files or
+    #: directories). A successful prepare counts only while they are unchanged; when a
+    #: base sync (or anything) changed one, the next PLAN/BUILD start runs it again.
+    worktree_prepare_inputs: tuple[str, ...] = ("pnpm-lock.yaml",)
     #: Worktree housekeeping (``service.worktree_gc``): hours between sweeps of the
     #: worktrees under ``worktree_root`` (closed issues cleaned up, idle early-stage
     #: worktrees removed). 0: no sweep.
@@ -457,6 +470,30 @@ class ServiceConfig(BaseModel):
     def devenv_teardown_valid(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if value and (not value[0].strip() or any("\0" in arg for arg in value)):
             raise ValueError("devenv_teardown must name a program first and hold no NUL bytes")
+        return value
+
+    @field_validator("worktree_prepare")
+    @classmethod
+    def worktree_prepare_valid(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if value and (not value[0].strip() or any("\0" in arg for arg in value)):
+            raise ValueError("worktree_prepare must name a program first and hold no NUL bytes")
+        return value
+
+    @field_validator("worktree_prepare_inputs")
+    @classmethod
+    def worktree_prepare_inputs_valid(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        for item in value:
+            parts = Path(item).parts
+            if (
+                not item.strip()
+                or "\0" in item
+                or Path(item).is_absolute()
+                or ".." in parts
+                or item.startswith("-")
+            ):
+                raise ValueError(
+                    "worktree_prepare_inputs must be relative paths inside the worktree"
+                )
         return value
 
     @field_validator("mcp_allowed_hosts")

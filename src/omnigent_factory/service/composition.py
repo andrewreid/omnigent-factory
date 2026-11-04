@@ -26,6 +26,7 @@ from omnigent_factory.credentials.git_helper import install_git_helper
 from omnigent_factory.credentials.push_guard import install_push_guard
 from omnigent_factory.credentials.server import BrokerServer, StageProvisioner
 from omnigent_factory.credentials.worktree import BotIdentity, Workspaces
+from omnigent_factory.credentials.worktree_prepare import WorktreePreparer
 from omnigent_factory.github.adapter import BoardSchema, GitHubAPIAdapter
 from omnigent_factory.github.auth import AppAuthenticator, InstallationTokenService
 from omnigent_factory.github.client import GitHubClient
@@ -254,6 +255,8 @@ class ProductionRuntime:
         return frozenset(observed)
 
     async def close(self) -> None:
+        if self.omnigent_adapter.preparer is not None:
+            await self.omnigent_adapter.preparer.close()  # kills running prepare commands
         await self.observer.close()
         await self.broker_server.close()
         await self.omnigent.aclose()
@@ -410,6 +413,16 @@ async def build_production(
         clock=clock,
         broker_socket=config.broker_socket,
         helper_command=helper_command,
+        preparer=(
+            WorktreePreparer(
+                config.worktree_prepare,
+                config.worktree_prepare_timeout_seconds,
+                admin_dir=workspaces.admin_dir,
+                inputs=config.worktree_prepare_inputs,
+            )
+            if config.worktree_prepare
+            else None
+        ),
     )
     omnigent_adapter.set_inventory_resync(config.session_inventory_resync_hours * 3600)
     recording_omnigent = RecordingOmnigentAdapter(omnigent_adapter, directory)
@@ -565,6 +578,7 @@ async def build_production(
         teardown=config.devenv_teardown,
         teardown_timeout_seconds=config.devenv_teardown_timeout_seconds,
         base_branch=config.default_branch,
+        busy=(omnigent_adapter.preparer.running if omnigent_adapter.preparer is not None else None),
     )
     service.workspace_cleaner = cleaner
     worktree_gc = WorktreeGC(

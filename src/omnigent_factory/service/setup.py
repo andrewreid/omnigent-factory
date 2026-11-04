@@ -136,6 +136,13 @@ auto_replan_limit = 1          # replans started by itself on a build's replan_r
 # devenv_teardown = ["scripts/dev-environment.sh", "--teardown"]
 devenv_teardown_timeout_seconds = 600
 devenv_teardown_max_attempts = 5
+# Worktree prepare (restart): run in an issue worktree the factory created or recreated
+# (again when its inputs change), before a PLAN/BUILD run (never in a reference
+# snapshot). A failure or timeout is logged and shown in status/doctor; the stage starts
+# anyway. Empty = none.
+# worktree_prepare = ["scripts/factory-prepare.sh"]
+worktree_prepare_timeout_seconds = 600
+worktree_prepare_inputs = ["pnpm-lock.yaml"]  # a success counts only while these are unchanged
 worktree_sweep_interval_hours = 24  # closed-issue and idle worktree sweep (0 = off)
 idle_worktree_days = 7         # remove untouched Inbox/Triage/Planning worktrees (0 = never)
 clone_gc_interval_days = 7     # git worktree prune + gc --auto on the clone (0 = never)

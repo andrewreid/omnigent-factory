@@ -517,7 +517,9 @@ class EffectExecutor:
             else:
                 delay = 1_000_000
             retry_at = self._clock.now_utc_us() + max(delay, 1)
-            LOG.warning(
+            LOG.log(
+                # An adapter waiting on its own local work (``waiting:``) is not a failure.
+                logging.INFO if outcome.reason.startswith("waiting:") else logging.WARNING,
                 "effect retry scheduled kind=%s effect_id=%s parcel=%s attempt=%s reason=%s",
                 effect.kind.value,
                 effect.effect_id,

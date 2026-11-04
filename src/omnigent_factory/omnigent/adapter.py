@@ -113,6 +113,11 @@ from omnigent_factory.credentials.worktree import (
     Workspaces,
     WorktreeError,
 )
+from omnigent_factory.credentials.worktree_prepare import (
+    PENDING,
+    PrepareOutcome,
+    WorktreePreparer,
+)
 from omnigent_factory.omnigent import policies as pol
 from omnigent_factory.omnigent.directory import (
     CredentialProvisioner,
@@ -155,6 +160,8 @@ ELICITATION_NOT_PENDING = "elicitation-not-pending"
 NONCE_LABEL = "factory.dispatch"
 #: Retry delay after a Git lock of the shared clone outlasted the short in-process retry.
 GIT_LOCK_RETRY_US = 5_000_000
+#: How soon a preparation waiting on the worktree prepare command looks again.
+PREPARE_POLL_US = 3_000_000
 #: Message purposes sent within a running stage: they never sync the worktree.
 _MID_STAGE = frozenset({"feedback", "readiness_wake", "blockers_closed"})
 _TURN_ITEM_TYPES = frozenset(
@@ -250,6 +257,7 @@ class OmnigentExecutionAdapter:
         broker_socket: Path,
         helper_command: str | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        preparer: WorktreePreparer | None = None,
     ) -> None:
         self.rest = rest
         self.config = config
@@ -262,6 +270,8 @@ class OmnigentExecutionAdapter:
         self.broker_socket = broker_socket
         self.helper_command = helper_command
         self._sleep = sleep
+        #: The optional worktree prepare hook (``worktree_prepare``); None: not configured.
+        self.preparer = preparer
         self._known_nodes: dict[str, set[str]] = {}
         #: Archive-inclusive parent map shared by every scan (one incremental read each).
         self._index = SessionIndex(rest, clock=clock)
@@ -884,6 +894,13 @@ class OmnigentExecutionAdapter:
                 )
                 if spec.bind_worktree is not None and verified.path != spec.bind_worktree.resolve():
                     return self._prepared(root, ok=False, reason="bound workspace differs")
+                if await self._prepare_worktree(spec, verified.path):
+                    # The command runs as its own task: nothing here (nor the parcel's
+                    # serializer) waits on it. Each poll re-checks the run is still
+                    # preparing (the executor's precondition) before anything else.
+                    return RetryableReadFailure(
+                        "waiting: worktree prepare running", PREPARE_POLL_US
+                    )
                 capability = await self.provisioner.provision(spec.session_id)
                 await asyncio.to_thread(self._wire, verified, spec, capability.path)
         except GitLockBusy as exc:
@@ -957,6 +974,36 @@ class OmnigentExecutionAdapter:
                 result.reason,
             )
         await record(spec.session_id, result.to_json())
+
+    async def _prepare_worktree(self, spec: StageSpec, path: Path) -> bool:
+        """The worktree prepare hook for a PLAN/BUILD run, before its first message.
+
+        Returns True while the command runs (the caller retries this preparation later;
+        no lock is held meanwhile). Always consults the current worktree's own state, so
+        a worktree recreated during this run is prepared too; the settled outcome (and
+        whether the first message may say the dependencies are installed) is recorded
+        with the run's dispatch snapshot, which pins it once the first message renders.
+        Never in a reference snapshot, never fatal, no clone lock.
+        """
+        if (
+            self.preparer is None
+            or not self.preparer.enabled
+            or spec.kind not in (SessionKind.PLAN, SessionKind.BUILD)
+            or spec.workspace_kind == "reference"
+        ):
+            return False
+        preparing = getattr(self.directory, "run_preparing", None)
+
+        async def still_wanted() -> bool:
+            return True if preparing is None else bool(await preparing(spec.session_id))
+
+        result = await self.preparer.poll(path, still_wanted=still_wanted, start=spec.session_id)
+        if result is PENDING:
+            return True
+        record = getattr(self.directory, "record_worktree_prepare", None)
+        if isinstance(result, PrepareOutcome) and record is not None:
+            await record(spec.session_id, result.to_json())
+        return False
 
     async def _mid_stage_note(self, effect: EffectIntent, spec: StageSpec) -> str:
         """A build run's mid-stage message (owner feedback, a findings/checks wake) only

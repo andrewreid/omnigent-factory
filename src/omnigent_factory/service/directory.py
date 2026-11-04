@@ -53,6 +53,7 @@ from omnigent_factory.core.types import (
     Decision,
     EpicAutopilot,
     IssueSnapshot,
+    Lifecycle,
     Parcel,
     ReplanRequest,
     ReplanStatus,
@@ -62,6 +63,7 @@ from omnigent_factory.core.types import (
     issue_session_title,
 )
 from omnigent_factory.credentials.worktree import VerifiedWorktree, Workspaces, WorktreeError
+from omnigent_factory.credentials.worktree_prepare import PREPARED_LINE
 from omnigent_factory.github.adapter import ParcelBinding, TriageFields
 from omnigent_factory.omnigent.directory import FormValue, StageSpec, stale_branch_note
 from omnigent_factory.omnigent.rest import OmnigentReadError
@@ -521,6 +523,31 @@ class ServiceDispatchDirectory:
         data["base_sync"] = dict(record)
         _atomic_json(path, data)
 
+    async def worktree_prepare(self, session_id: str) -> dict[str, Any] | None:
+        """What the worktree prepare hook found for this run (None: not recorded)."""
+        data = self._read(self.root / f"{_safe(session_id)}.json")
+        record = data.get("worktree_prepare") if data else None
+        return record if isinstance(record, dict) else None
+
+    async def record_worktree_prepare(self, session_id: str, record: Mapping[str, Any]) -> None:
+        """The current materialisation's prepare outcome for this run, and whether its
+        first message may say the dependencies are installed (``line_shown``). Refreshed
+        on every preparation until the first message renders; then pinned, so a restart
+        renders the same text."""
+        path = self.root / f"{_safe(session_id)}.json"
+        data = self._read(path)
+        if data is None or data.get("worktree_prepare_pinned") is True:
+            return
+        data["worktree_prepare"] = {**record, "line_shown": record.get("line_shown") is True}
+        _atomic_json(path, data)
+
+    async def run_preparing(self, session_id: str) -> bool:
+        """The run is still being prepared (not stopped, fenced or superseded): a
+        worktree prepare command running for it keeps going."""
+        parcel = await self._parcel_for_session(session_id)
+        run = parcel.session(session_id) if parcel is not None else None
+        return run is not None and run.lifecycle == Lifecycle.PREPARING and not run.fences
+
     async def stage_workspace(self, session_id: str) -> str | None:
         """The run's issue worktree as recorded at create or bound from an earlier run."""
         data = self._read(self.root / f"{_safe(session_id)}.json")
@@ -643,6 +670,12 @@ class ServiceDispatchDirectory:
             return None  # pinned to a template this release no longer ships
         if hashlib.sha256(template.encode()).hexdigest() != snapshot.get("template_sha256"):
             return None
+        if isinstance(snapshot.get("worktree_prepare"), dict) and not snapshot.get(
+            "worktree_prepare_pinned"
+        ):
+            # The first message now renders from this decision: never refreshed again.
+            snapshot["worktree_prepare_pinned"] = True
+            _atomic_json(self.root / f"{_safe(sid)}.json", snapshot)
         # A short pointer: the factory tools are the source of truth for the issue, plan,
         # feedback and status (no task data is copied into the conversation).
         common: dict[str, object] = {
@@ -654,8 +687,13 @@ class ServiceDispatchDirectory:
             "granted_minutes": max(1, spec.granted_us // MICROS_PER_MINUTE),
             "handoff": self._handoff(parcel, sid),
             # Templates before the base sync have no {base_note}: format ignores it.
-            "base_note": base_note(
-                snapshot.get("base_sync") or snapshot.get("reference_reuse_base_sync"), spec.kind
+            "base_note": prepared_note(
+                base_note(
+                    snapshot.get("base_sync") or snapshot.get("reference_reuse_base_sync"),
+                    spec.kind,
+                ),
+                snapshot,
+                spec.kind,
             ),
             "brief": str(snapshot.get("brief") or ""),
             "rounds": str(snapshot.get("rounds") or ""),
@@ -2304,6 +2342,21 @@ def base_note(record: object, kind: SessionKind) -> str:
             f"{behind} commits it lacks, so the code may be stale."
         )
     return ""
+
+
+def prepared_note(note: str, snapshot: Mapping[str, Any], kind: SessionKind) -> str:
+    """``note`` (the base-sync line) plus :data:`PREPARED_LINE` on its own line when the
+    run's snapshot says its worktree was prepared (PLAN/BUILD only). Otherwise ``note``
+    unchanged, so a first message without the hook is byte-identical to before."""
+    record = snapshot.get("worktree_prepare")
+    if (
+        kind not in (SessionKind.PLAN, SessionKind.BUILD)
+        or snapshot.get("workspace_kind", "issue") == "reference"
+        or not isinstance(record, dict)
+        or record.get("line_shown") is not True
+    ):
+        return note
+    return f"{note}\n{PREPARED_LINE}" if note else PREPARED_LINE
 
 
 def _delivered(effect_id: str, session_id: str, store: SqliteStore) -> bool:

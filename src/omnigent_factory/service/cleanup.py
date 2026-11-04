@@ -101,6 +101,7 @@ class WorkspaceCleaner:
         teardown: Sequence[str] = (),
         teardown_timeout_seconds: float = 600.0,
         base_branch: str = "main",
+        busy: Callable[[Path], bool] | None = None,
     ) -> None:
         self.directory = directory
         self.workspaces = workspaces
@@ -108,6 +109,8 @@ class WorkspaceCleaner:
         self.teardown = tuple(teardown)
         self.teardown_timeout_seconds = teardown_timeout_seconds
         self.base_branch = base_branch
+        #: A worktree prepare command runs in this worktree now: it is never removed.
+        self.busy = busy
         # The effect and the operator's ``cleanup`` never tear one worktree down at once.
         self._lock = threading.Lock()
 
@@ -204,6 +207,11 @@ class WorkspaceCleaner:
             if not self.under_root(path):
                 skipped.append(f"{path}: outside worktree_root")
                 continue
+            if self._preparing(path):
+                skipped.append(f"{path}: worktree prepare running")
+                if branch is not None:
+                    branches.discard(branch)
+                continue
             failed = self._teardown(path)
             if failed is not None:
                 count, why = failed
@@ -220,6 +228,8 @@ class WorkspaceCleaner:
                 continue
             with CLONE_LOCK:
                 why_not = guard() if guard is not None else None
+                if why_not is None and self._preparing(path):
+                    why_not = "worktree prepare running"
                 if why_not is not None:
                     self._forget_teardown(path)
                     skipped.append(f"{path}: {why_not}")
@@ -288,7 +298,7 @@ class WorkspaceCleaner:
         with self._lock:
             if not self.under_root(path):
                 return "kept: outside worktree_root"
-            kept = self._own_work(path)
+            kept = "worktree prepare running" if self._preparing(path) else self._own_work(path)
             if kept is not None:
                 LOG.info("idle worktree kept path=%s reason=%s", path, kept)
                 return f"kept: {kept}"
@@ -296,7 +306,11 @@ class WorkspaceCleaner:
             if failed is not None:
                 return f"kept: dev environment teardown failed: {failed[1]}"
             with CLONE_LOCK:
-                why_not = (guard() if guard is not None else None) or self._own_work(path)
+                why_not = (
+                    (guard() if guard is not None else None)
+                    or ("worktree prepare running" if self._preparing(path) else None)
+                    or self._own_work(path)
+                )
                 if why_not is not None:
                     self._forget_teardown(path)
                     LOG.info("idle worktree kept path=%s reason=%s", path, why_not)
@@ -370,6 +384,9 @@ class WorkspaceCleaner:
                     return f"kept: removal failed: {str(exc)[:_REASON_CHARS]}"
             LOG.info("stray worktree entry removed path=%s reason=%s", path, reason)
             return "removed"
+
+    def _preparing(self, path: Path) -> bool:
+        return self.busy is not None and self.busy(path.resolve())
 
     def _stray_problem(self, path: Path) -> str | None:
         """Why an unregistered root entry cannot safely be removed (None: it can)."""

@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any
 from omnigent_factory.core.effects import EffectKind
 from omnigent_factory.core.types import SETTLED_LIFECYCLES, Hold, Parcel, Stage
 from omnigent_factory.credentials.worktree import REFERENCE_NAME, Workspaces, WorktreeError
+from omnigent_factory.credentials.worktree_prepare import prepare_summary
 from omnigent_factory.github.client import GitHubAPIError, GitHubClient
 from omnigent_factory.service.cleanup import WorkspaceCleaner, issue_of
 from omnigent_factory.service.config import ServiceConfig
@@ -507,9 +508,13 @@ class WorktreeGC:
         except WorktreeError:
             count = reference_count = None
         cfg = self.config
+        prepare = await asyncio.to_thread(
+            prepare_summary, self.source_clone, configured=bool(cfg.worktree_prepare)
+        )
         return {
             "worktrees": count,
             "reference_snapshots": reference_count,
+            "prepare": prepare,
             "sweep_interval_hours": cfg.worktree_sweep_interval_hours,
             "idle_worktree_days": cfg.idle_worktree_days,
             "gc_interval_days": cfg.clone_gc_interval_days,
