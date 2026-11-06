@@ -31,7 +31,13 @@ from omnigent_factory.core.codec import parcel_from_json
 from omnigent_factory.core.projection import finished
 from omnigent_factory.core.types import Hold, IssueSessionStatus, Parcel, Stage
 from omnigent_factory.omnigent.adapter import NONCE_LABEL, OmnigentExecutionAdapter
-from omnigent_factory.omnigent.rest import OmnigentReadError, WriteClass, as_map, classify_write
+from omnigent_factory.omnigent.rest import (
+    LITE_SNAPSHOT,
+    OmnigentReadError,
+    WriteClass,
+    as_map,
+    classify_write,
+)
 from omnigent_factory.service.runtime import FactoryService
 from omnigent_factory.store import ranking as rs
 from omnigent_factory.store.sqlite import SqliteStore
@@ -43,6 +49,10 @@ ARCHIVED_AT_LABEL = "omnigent.archived_at"
 #: Sessions examined per sweep (each costs a snapshot read and a tree scan).
 BATCH = 10
 MICROS_PER_DAY = 86_400_000_000
+#: A root found not archived (or not a factory root) is read again after this long: it
+#: can only become eligible once archived and then retained for days, so a sweep every 15
+#: minutes need not re-read every finished issue's root every time (#push-observer).
+RECHECK_US = 6 * 3_600_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +133,9 @@ class SessionRetention:
     def __init__(self, service: FactoryService, adapter: OmnigentExecutionAdapter) -> None:
         self.service = service
         self.adapter = adapter
+        #: root -> (not before UTC us, verdict): roots not to re-read until then (in memory;
+        #: a restart re-reads each once).
+        self._recheck: dict[str, tuple[int, str]] = {}
 
     async def sweep(self, *, dry_run: bool = False, limit: int = BATCH) -> dict[str, object]:
         """Delete (or with ``dry_run`` list) at most ``limit`` sessions retention selects."""
@@ -164,19 +177,39 @@ class SessionRetention:
         }
 
     async def _eligible(self, candidate: Candidate, cutoff_us: int) -> str | None:
-        """None: delete it; "gone": already deleted; otherwise why it stays."""
+        """None: delete it; "gone": already deleted; otherwise why it stays.
+
+        A lite snapshot (no items: only the archive state, labels and timestamps are
+        used). A root that cannot become eligible before a known time is not re-read
+        until then: one archived too recently until its retention ends, one not archived
+        (or not the factory's) for ``RECHECK_US``.
+        """
+        now = self.service.clock.now_utc_us()
+        held = self._recheck.get(candidate.root_id)
+        if held is not None and now < held[0]:
+            return held[1]
+        self._recheck.pop(candidate.root_id, None)
         try:
-            snap = await self.adapter.rest.get_json(f"/v1/sessions/{candidate.root_id}")
+            snap = await self.adapter.rest.get_json(
+                f"/v1/sessions/{candidate.root_id}", LITE_SNAPSHOT
+            )
         except OmnigentReadError as exc:
             return "gone" if exc.status == 404 else f"unreadable: {exc.reason}"
+        verdict: str | None = None
         if snap.get("archived") is not True:
-            return "not archived"
-        if snap.get("parent_session_id") is not None:
-            return "not a root session"
-        if not as_map(snap.get("labels")).get(NONCE_LABEL):
-            return "no factory label"
+            verdict = "not archived"
+        elif snap.get("parent_session_id") is not None:
+            verdict = "not a root session"
+        elif not as_map(snap.get("labels")).get(NONCE_LABEL):
+            verdict = "no factory label"
+        if verdict is not None:
+            self._recheck[candidate.root_id] = (now + RECHECK_US, verdict)
+            return verdict
         archived = archived_at_us(snap)
         if archived is None or archived > cutoff_us:
+            if archived is not None:
+                eligible_at = archived + (now - cutoff_us)
+                self._recheck[candidate.root_id] = (eligible_at, "archived too recently")
             return "archived too recently"
         try:
             tree = await self.adapter.observe_tree(candidate.root_id)

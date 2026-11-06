@@ -27,7 +27,15 @@ from websockets.asyncio.server import ServerConnection, serve
 from omnigent_factory.core import events as ev
 from omnigent_factory.core.types import DecisionImpact, Parcel, Via
 from omnigent_factory.omnigent.directory import MemoryNonceLedger
-from omnigent_factory.omnigent.feed import SSE, TIMER, WS, ChangeFeed, DirtyMark
+from omnigent_factory.omnigent.feed import (
+    MAX_OPEN_FAILURES,
+    SSE,
+    STREAM_PARK_S,
+    TIMER,
+    WS,
+    ChangeFeed,
+    DirtyMark,
+)
 from omnigent_factory.omnigent.inventory import SessionIndex
 from omnigent_factory.omnigent.rest import FileTokenAuth, OmnigentReadError, OmnigentRest
 from omnigent_factory.omnigent.tree import (
@@ -41,6 +49,12 @@ from omnigent_factory.omnigent.tree import (
 )
 from omnigent_factory.service.durable import StoreNonceLedger
 from omnigent_factory.service.observer import OmnigentObserver
+from omnigent_factory.service.session_retention import (
+    ARCHIVED_AT_LABEL,
+    RECHECK_US,
+    Candidate,
+    SessionRetention,
+)
 from omnigent_factory.store.sqlite import SqliteStore
 from omnigent_factory.testing.fakes import FakeClock
 from omnigent_factory.testing.harness import Harness
@@ -70,15 +84,39 @@ class FakeStreams:
         self.queues: dict[str, asyncio.Queue[Mapping[str, Any] | None]] = {}
         self.opens: Counter[str] = Counter()
         self.refuse: int | None = None
+        #: Per-root refusal (overrides ``refuse``), and refusals of the next N opens.
+        self.refuse_for: dict[str, int | None] = {}
+        self.refuse_times: dict[str, int] = {}
+        self.refuse_status = 401
+        self.failed: Counter[str] = Counter()
+        #: The connect snapshot each open delivers first (the server's, routes_events.py:
+        #: 3956-4040): child summaries per root, then a changed-files invalidation. None:
+        #: a server without one (the stream goes live on its first live event).
+        self.snapshot: dict[str, list[dict[str, Any]]] | None = {}
 
     def connect(self, root: str, on_open: Callable[[], None]) -> AsyncIterator[dict[str, Any]]:
         async def gen() -> AsyncIterator[dict[str, Any]]:
-            if self.refuse is not None:
-                raise OmnigentReadError(f"stream {root}: HTTP {self.refuse}", self.refuse)
+            status = self.refuse_for.get(root, self.refuse)
+            if self.refuse_times.get(root, 0) > 0:
+                self.refuse_times[root] -= 1
+                status = self.refuse_status
+            if status is not None:
+                self.failed[root] += 1
+                raise OmnigentReadError(f"stream {root}: HTTP {status}", status)
             queue: asyncio.Queue[Mapping[str, Any] | None] = asyncio.Queue()
             self.queues[root] = queue
             self.opens[root] += 1
             on_open()
+            yield {"type": "session.heartbeat"}
+            if self.snapshot is not None:
+                for child in self.snapshot.get(root, []):
+                    yield {
+                        "type": "session.child_session.updated",
+                        "conversation_id": root,
+                        "child_session_id": child["id"],
+                        "child": child,
+                    }
+                yield {"type": "session.changed_files.invalidated", "session_id": root}
             while (event := await queue.get()) is not None:
                 yield dict(event)
 
@@ -420,6 +458,15 @@ class FakeFeed:
     def clear_before(self, root: str, started_us: int) -> None:
         del root, started_us
 
+    snapshot_ok: bool = True
+    gap: set[str] = field(default_factory=set)
+
+    def snapshot_complete(self, root: str) -> bool:
+        return self.snapshot_ok
+
+    def resuming(self, root: str) -> bool:
+        return root in self.gap
+
     def set_targets(self, sse_roots: Any, trees: Mapping[str, Any]) -> None:
         self.targets.append((frozenset(sse_roots), frozenset(trees)))
 
@@ -592,7 +639,7 @@ async def test_a_missed_event_is_repaired_by_the_scan_after_a_reconnect() -> Non
     clock.advance(5_000_000)
     await observer.observe_once()
     assert seen[-1].busy and len(adapter.calls) == 1  # no event, no read
-    feed.cover[root] = (SSE, 2)  # the stream reconnected
+    feed.cover[root] = (WS, 2)  # the stream is gone: the tree moved to the WebSocket
     await observer.observe_once()
     assert adapter.calls[-1] == ("full", (root,)) and seen[-1].quiescent
     assert observer.passes["full:reconnect"] == 1
@@ -1116,4 +1163,310 @@ async def test_a_worker_turn_ending_in_any_non_live_status_makes_the_tree_idle(
     assert seen[-1].nodes["w1"].task_status == task
     assert observer.passes["confirm"] == 1
     assert observer.passes.get("full:safety", 0) == 0
+    await rest.aclose()
+
+
+# ============================================================ live defect A: streams
+
+
+class _EndlessBody(httpx.AsyncByteStream):
+    """An SSE body that never ends (a live stream)."""
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b'event: session.heartbeat\ndata: {"type": "session.heartbeat"}\n\n'
+        await asyncio.Event().wait()
+
+
+class _BodyReadingAuth(httpx.Auth):
+    """Like ``CliStoreAuth``: ``requires_response_body`` (for a token refresh)."""
+
+    requires_response_body = True
+
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response]:
+        request.headers["Authorization"] = "Bearer sentinel-token"
+        yield request
+
+
+@pytest.mark.asyncio
+async def test_a_stream_opens_at_once_under_an_auth_that_reads_response_bodies() -> None:
+    """Live defect A: httpx reads the whole body of every response for an auth with
+    ``requires_response_body``; a stream's never ends, so the old ``stream()`` returned
+    nothing until the peer closed it (the live proxy, ~121 s): never connected."""
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("Authorization"))
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=_EndlessBody()
+        )
+
+    rest = OmnigentRest(
+        "http://omnigent.test", auth=_BodyReadingAuth(), transport=httpx.MockTransport(handler)
+    )
+    opened: list[bool] = []
+    events = rest.stream("r", on_open=lambda: opened.append(True))
+    first = await asyncio.wait_for(events.__anext__(), timeout=2)
+    assert first["type"] == "session.heartbeat" and opened == [True]
+    assert seen == ["Bearer sentinel-token"]  # still authenticated
+    await events.aclose()
+    await rest.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_stream_is_live_only_after_its_connect_snapshot() -> None:
+    streams = FakeStreams()
+    gate = asyncio.Event()
+    original = streams.connect
+
+    def slow(root: str, on_open: Callable[[], None]) -> AsyncIterator[dict[str, Any]]:
+        async def gen() -> AsyncIterator[dict[str, Any]]:
+            inner = original(root, on_open)
+            first = await inner.__anext__()  # opened, heartbeat
+            yield first
+            await gate.wait()  # the snapshot is still on its way
+            async for event in inner:
+                yield event
+
+        return gen()
+
+    streams.snapshot = {"r": [{"id": "c1", "busy": False, "updated_at": T0}]}
+    feed, _s, _socket, _rest = make_feed(streams)
+    feed._sse_connect = slow
+    feed.set_targets({"r"}, {"r": {"r": None, "c1": "r"}})
+    await eventually(lambda: feed.counters["sse_connects"] == 1)
+    assert feed.coverage("r")[0] != SSE  # open, but not live before the snapshot
+    gate.set()
+    await eventually(lambda: feed.coverage("r")[0] == SSE)
+    assert feed.snapshot_complete("r")
+    await feed.close()
+
+
+@pytest.mark.asyncio
+async def test_a_server_without_a_connect_snapshot_goes_live_on_its_first_event() -> None:
+    streams = FakeStreams()
+    streams.snapshot = None
+    feed, _s, _socket, _rest = make_feed(streams)
+    feed.set_targets({"r"}, {"r": {"r": None}})
+    await eventually(lambda: feed.counters["sse_connects"] == 1)
+    assert feed.coverage("r")[0] != SSE
+    streams.push("r", {"type": "session.status", "conversation_id": "r", "status": "idle"})
+    await eventually(lambda: feed.coverage("r")[0] == SSE)
+    assert not feed.snapshot_complete("r")  # its children must be re-listed on resume
+    await feed.close()
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_snapshot_marks_only_children_that_changed() -> None:
+    streams = FakeStreams()
+    kids = [
+        {"id": "c1", "busy": False, "current_task_status": "completed", "updated_at": T0},
+        {"id": "c2", "busy": False, "current_task_status": "completed", "updated_at": T0},
+    ]
+    streams.snapshot = {"r": kids}
+    feed, _s, _socket, _rest = make_feed(streams)
+    feed.set_targets({"r"}, {"r": {"r": None, "c1": "r", "c2": "r"}})
+    await eventually(lambda: feed.coverage("r")[0] == SSE)
+    feed.take_dirty("r")  # the first connect's (followed by a full scan anyway)
+    streams.snapshot = {"r": [kids[0], {**kids[1], "busy": True, "updated_at": T0 + 9}]}
+    first = feed.coverage("r")
+    streams.drop("r")
+    await eventually(lambda: feed.coverage("r")[0] == SSE and feed.coverage("r") != first)
+    marks = feed.take_dirty("r")
+    assert set(marks) == {"c2"} and marks["c2"].edge  # c1's identical row marks nothing
+    await feed.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_drops_are_warned_with_their_reason_at_most_every_ten_minutes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    feed, streams, _socket, _rest = make_feed()
+    clock: FakeClock = feed._clock  # type: ignore[assignment]
+    feed.set_targets({"r"}, {"r": {"r": None}})
+    with caplog.at_level(logging.WARNING, logger="omnigent_factory.omnigent.feed"):
+        for n in range(1, 4):
+            await eventually(lambda n=n: streams.opens["r"] == n and feed.coverage("r")[0] == SSE)
+            streams.drop("r")
+        await eventually(lambda: streams.opens["r"] == 4)
+        clock.advance(600_000_000)
+        await eventually(lambda: feed.coverage("r")[0] == SSE)
+        streams.drop("r")
+        await eventually(lambda: streams.opens["r"] == 5)
+    warnings = [r.getMessage() for r in caplog.records if "root stream drop" in r.getMessage()]
+    assert len(warnings) == 2
+    assert warnings[0].startswith("change feed: 1 root stream drop(s)")
+    assert "after connecting: closed by the server" in warnings[0]
+    assert warnings[1].startswith("change feed: 3 root stream drop(s)")
+    await feed.close()
+
+
+@pytest.mark.asyncio
+async def test_a_transient_401_on_every_root_never_disables_streams() -> None:
+    """40 roots whose first open is refused (an auth refresh, an outage): each backs off
+    on its own and reconnects; nothing is given up process-wide."""
+    streams = FakeStreams()
+    roots = [f"r{i:02d}" for i in range(40)]
+    streams.refuse_times = dict.fromkeys(roots, 1)
+    feed, _s, _socket, _rest = make_feed(streams)
+    feed.set_targets(set(roots), {r: {r: None} for r in roots})
+    await eventually(lambda: all(feed.coverage(r)[0] == SSE for r in roots), timeout=5)
+    assert feed.sse_supported is True
+    assert all(streams.failed[r] == 1 and streams.opens[r] == 1 for r in roots)
+    assert feed.status()["sse_parked"] == 0
+    await feed.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 405, 406, 415, 501])
+async def test_an_explicit_unsupported_status_disables_streams(status: int) -> None:
+    streams = FakeStreams()
+    streams.refuse = status
+    feed, _s, _socket, _rest = make_feed(streams)
+    feed.set_targets({"r"}, {"r": {"r": None}})
+    await eventually(lambda: feed.sse_supported is False)
+    await eventually(lambda: feed.coverage("r")[0] == WS)  # watched on the WebSocket
+    feed.set_targets({"r"}, {"r": {"r": None}})
+    await asyncio.sleep(0.05)
+    assert streams.failed["r"] == 1  # never reopened
+    await feed.close()
+
+
+@pytest.mark.asyncio
+async def test_a_200_that_is_not_an_event_stream_is_unsupported() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"html": "a login page"})
+
+    rest = OmnigentRest("http://omnigent.test", transport=httpx.MockTransport(handler))
+    with pytest.raises(OmnigentReadError) as raised:
+        await rest.stream("r").__anext__()
+    assert raised.value.status == 415  # one of the feed's explicit "unsupported" statuses
+    await rest.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_root_that_keeps_failing_is_parked_then_recovers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    streams = FakeStreams()
+    streams.refuse_for = {"a": 502}  # a gateway error on one root only
+    parked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def sleep(seconds: float) -> None:
+        if seconds == STREAM_PARK_S:
+            parked.set()
+            await release.wait()
+        else:
+            await asyncio.sleep(0.001)
+
+    feed = ChangeFeed(
+        OmnigentRest("http://omnigent.test"),
+        FakeClock(),
+        sse_connect=streams.connect,
+        ws_connect=FakeSocket().connect,
+        sleep=sleep,
+    )
+    with caplog.at_level(logging.WARNING, logger="omnigent_factory.omnigent.feed"):
+        feed.set_targets({"a"}, {"a": {"a": None}})
+        await parked.wait()
+    assert streams.failed["a"] == MAX_OPEN_FAILURES
+    assert feed.status()["sse_parked"] == 1 and feed.sse_supported is not False
+    assert any("retrying in 600s" in r.getMessage() for r in caplog.records)
+    await eventually(lambda: feed.coverage("a")[0] == WS)  # its tree is still watched
+    streams.refuse_for = {}
+    release.set()  # the park ends: it retries and recovers
+    await eventually(lambda: feed.coverage("a")[0] == SSE)
+    assert feed.status()["sse_parked"] == 0
+    await feed.close()
+
+
+@pytest.mark.asyncio
+async def test_another_roots_stream_opening_unparks_a_parked_root() -> None:
+    streams = FakeStreams()
+    streams.refuse_for = {"a": 503}
+
+    async def sleep(seconds: float) -> None:
+        if seconds == STREAM_PARK_S:
+            await asyncio.Event().wait()  # only an unpark ends it
+        await asyncio.sleep(0.001)
+
+    feed = ChangeFeed(
+        OmnigentRest("http://omnigent.test"),
+        FakeClock(),
+        sse_connect=streams.connect,
+        ws_connect=FakeSocket().connect,
+        sleep=sleep,
+    )
+    feed.set_targets({"a"}, {"a": {"a": None}})
+    await eventually(lambda: feed.status()["sse_parked"] == 1)
+    streams.refuse_for = {}
+    feed.set_targets({"a", "b"}, {"a": {"a": None}, "b": {"b": None}})
+    await eventually(lambda: feed.coverage("b")[0] == SSE)
+    await eventually(lambda: feed.coverage("a")[0] == SSE)  # retried without waiting
+    await feed.close()
+
+
+# ============================================================ live defect B: full reads
+
+
+@pytest.mark.asyncio
+async def test_a_stream_reconnect_resumes_with_a_root_read_not_a_full_scan() -> None:
+    """The live proxy ends every stream after ~121 s: each reconnect used to bump the
+    epoch into a full scan of its tree. A resume reads the root (and re-lists children
+    only when the connect snapshot did not)."""
+    _server, parcel, root, adapter = _parked_tree()
+    feed = FakeFeed(cover={root: (SSE, 1)})
+    clock = FakeClock()
+    observer, seen = _observer(adapter, feed, clock, parcel)  # type: ignore[arg-type]
+    await observer.observe_once()
+    adapter.rest.requests.clear()
+    feed.cover[root] = (TIMER, 0)  # the stream dropped: a pass in the gap waits
+    feed.gap.add(root)
+    clock.advance(5_000_000)
+    await observer.observe_once()
+    assert sum(adapter.rest.requests.values()) == 0
+    feed.cover[root] = (SSE, 2)
+    feed.gap.clear()
+    await observer.observe_once()
+    assert dict(adapter.rest.requests) == {"lite_read": 1}  # the root
+    assert observer.passes["resume"] == 1 and seen[-1].quiescent
+    assert observer.passes.get("full:reconnect", 0) == 0
+    adapter.rest.requests.clear()
+    feed.snapshot_ok = False
+    feed.cover[root] = (SSE, 3)
+    await observer.observe_once()
+    assert dict(adapter.rest.requests) == {"lite_read": 1, "children_page": 1}
+    await adapter.rest.aclose()
+
+
+@pytest.mark.asyncio
+async def test_retention_reads_lite_and_skips_roots_that_cannot_be_eligible_yet() -> None:
+    server = FakeOmnigentServer()
+    server.add(FakeSession(id="live", agent_id=AGENT))  # finished issue, not archived
+    server.add(
+        FakeSession(
+            id="fresh",
+            agent_id=AGENT,
+            archived=True,
+            labels={"factory.dispatch": "n", ARCHIVED_AT_LABEL: str(T0 - 86_400)},
+        )
+    )
+    rest = OmnigentRest("http://omnigent.test", transport=server.transport())
+    clock = FakeClock()
+    service = SimpleNamespace(clock=clock)
+    retention = SessionRetention(service, SimpleNamespace(rest=rest))  # type: ignore[arg-type]
+    cutoff = clock.now_utc_us() - 7 * 86_400_000_000
+    live, fresh = Candidate("live", "I_1"), Candidate("fresh", "I_2")
+    assert await retention._eligible(live, cutoff) == "not archived"
+    assert await retention._eligible(fresh, cutoff) == "archived too recently"
+    assert dict(rest.requests) == {"lite_read": 2}  # never the items
+    for _ in range(3):  # sweeps every 15 minutes re-read neither
+        clock.advance(900_000_000)
+        cutoff += 900_000_000
+        assert await retention._eligible(live, cutoff) == "not archived"
+        assert await retention._eligible(fresh, cutoff) == "archived too recently"
+    assert dict(rest.requests) == {"lite_read": 2}
+    clock.advance(RECHECK_US)  # the unarchived root is looked at again
+    assert await retention._eligible(live, cutoff + RECHECK_US) == "not archived"
+    assert dict(rest.requests) == {"lite_read": 3}
     await rest.aclose()

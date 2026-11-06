@@ -761,7 +761,8 @@ class OmnigentExecutionAdapter:
                     roots.append(str(row["id"]))
             for root in roots:
                 try:
-                    snap = await self.rest.get_json(f"/v1/sessions/{root}")
+                    # Archive and idle state only (``reuse=True``): no items needed.
+                    snap = await self.rest.get_json(f"/v1/sessions/{root}", LITE_SNAPSHOT)
                 except OmnigentReadError as exc:
                     if exc.status == 404:
                         continue
@@ -962,8 +963,11 @@ class OmnigentExecutionAdapter:
         reuse = effect.args.get("reuse") is True
         if spec is None or not isinstance(root, str):
             return DefinitiveFailure("stage-spec-missing")
+        # A reused root is checked without its items (status, pending, labels, workspace,
+        # usage); a new root's items prove no turn ran before the run's first message.
+        params = LITE_SNAPSHOT if reuse else None
         try:
-            snap = await self.rest.get_json(f"/v1/sessions/{root}")
+            snap = await self.rest.get_json(f"/v1/sessions/{root}", params)
         except OmnigentReadError as exc:
             if reuse and exc.status == 404:
                 return self._prepared(root, ok=False, unusable=True, reason="issue session gone")
@@ -1059,7 +1063,7 @@ class OmnigentExecutionAdapter:
                 return self._prepared(root, ok=False, reason=exc.reason)
             return RetryableReadFailure(f"policy preparation incomplete: {exc.reason}")
         try:
-            again = await self.rest.get_json(f"/v1/sessions/{root}")
+            again = await self.rest.get_json(f"/v1/sessions/{root}", params)
         except OmnigentReadError as exc:
             return RetryableReadFailure(f"root re-read: {exc.reason}")
         turn = self._unexpected_turn(again, reuse=reuse)
@@ -1265,7 +1269,8 @@ class OmnigentExecutionAdapter:
         marker = effect_marker(effect_id)
         try:
             items = await self.rest.paginate(f"/v1/sessions/{send.node_id}/items", {"order": "asc"})
-            snap = await self.rest.get_json(f"/v1/sessions/{send.node_id}")
+            # Pending inputs only (the history is read above).
+            snap = await self.rest.get_json(f"/v1/sessions/{send.node_id}", LITE_SNAPSHOT)
         except OmnigentReadError as exc:
             return RetryableReadFailure(f"history incomplete: {exc.reason}")
         exact = [
@@ -1389,7 +1394,8 @@ class OmnigentExecutionAdapter:
         if not isinstance(generation, int) or not isinstance(granted, int):
             return DefinitiveFailure("malformed cost policy intent")
         try:
-            snap = await self.rest.get_json(f"/v1/sessions/{spec.root_id}")
+            # Spend only: the lite snapshot keeps the subtree usage.
+            snap = await self.rest.get_json(f"/v1/sessions/{spec.root_id}", LITE_SNAPSHOT)
         except OmnigentReadError as exc:
             return RetryableReadFailure(f"spend read failed: {exc.reason}")
         spent = _cost(snap)

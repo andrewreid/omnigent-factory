@@ -59,14 +59,19 @@ async def test_reused_root_with_history_prepares_the_next_run(git_env: GitEnv) -
     root = await _root_with_triage_run(rig)
     _reuse_spec(rig, "B1", root, SessionKind.BUILD)
     prep = intent(EffectKind.PREPARE_SESSION, "B1", root_id=root, reuse=True)
+    rig.rest.requests.clear()
     outcome = await rig.adapter.execute(prep, CTX)
     assert isinstance(outcome, Ack) and outcome.detail["ok"] is True, outcome.detail
     assert outcome.detail["unexpected_turn"] is False and outcome.detail["unusable"] is False
+    # A reused root needs no items: both of its snapshot reads are lite (#push-observer).
+    assert rig.rest.requests["full_read"] == 0 and rig.rest.requests["lite_read"] == 2
     assert rig.broker.capabilities.get("B1") is not None  # the run's own capability
     # Without ``reuse`` the same history is an unexpected turn (fresh-root contract).
     _reuse_spec(rig, "B2", root, SessionKind.BUILD, generation=3)
+    rig.rest.requests.clear()
     fresh = await rig.adapter.execute(intent(EffectKind.PREPARE_SESSION, "B2", root_id=root), CTX)
     assert isinstance(fresh, Ack) and fresh.detail["unexpected_turn"] is True
+    assert rig.rest.requests["full_read"] == 1  # a fresh root's items are the evidence
 
 
 async def test_stage_switch_replaces_github_policy_add_before_delete(git_env: GitEnv) -> None:

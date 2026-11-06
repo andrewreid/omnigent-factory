@@ -366,7 +366,9 @@ class OmnigentObserver:
         """
         due: list[tuple[Parcel, StageSession, str]] = []
         keys: dict[str, tuple[str, int]] = {}
-        targeted: list[tuple[Parcel, StageSession, _FeedTree, dict[str, DirtyMark], bool]] = []
+        targeted: list[
+            tuple[Parcel, StageSession, _FeedTree, dict[str, DirtyMark], bool, bool]
+        ] = []
         parcels = await self._parcels()
         open_runs = {p.current_session_id for p in parcels}
         for stale in set(self._readings) - open_runs:  # closed runs: nothing watches them
@@ -407,6 +409,9 @@ class OmnigentObserver:
             key = self.feed.coverage(root)
             coverage[session.session_id] = key[0]
             reason = self._full_reason(session, cached, key, interval, parked)
+            resume = reason == "resume"
+            if resume:
+                reason = None
             if reason is not None:
                 if reason != "timer-skip":
                     due.append((parcel, session, root))
@@ -421,8 +426,8 @@ class OmnigentObserver:
             topology = (
                 key[0] != SSE and self.clock.monotonic_us() - cached.topology_at_us >= spacing * 1e6
             )
-            if marks or topology:
-                targeted.append((parcel, session, cached, marks, topology))
+            if marks or topology or resume:
+                targeted.append((parcel, session, cached, marks, topology, resume))
         if self.feed is not None:
             # Every tree keeps its root stream where the server has them (an idle stream
             # costs the server nothing); the feed watches the rest on the WebSocket.
@@ -434,9 +439,17 @@ class OmnigentObserver:
         inventory_error: str | None = None
         if any(t[4] for t in targeted):
             inventory_error = await self.adapter.refresh_inventory()  # one per pass
-        for parcel, session, cached, marks, topology in targeted:
+        for parcel, session, cached, marks, topology, resume in targeted:
+            if resume:
+                cached.key = self.feed.coverage(cached.root_id) if self.feed else cached.key
             if await self._refresh(
-                parcel, session, cached, marks, topology=topology, inventory_error=inventory_error
+                parcel,
+                session,
+                cached,
+                marks,
+                topology=topology,
+                inventory_error=inventory_error,
+                resume=resume,
             ):
                 observed.add(session.session_id)
         return frozenset(observed)
@@ -453,6 +466,20 @@ class OmnigentObserver:
         coverage and not due; None: no full scan, only dirty nodes are re-read)."""
         # Feed events wake passes often; a polled tree keeps at least the old spacing.
         spacing = interval if interval is not None else self.interval_seconds
+        if (
+            cached is not None
+            and cached.observation.complete
+            and cached.key[0] == SSE
+            and cached.key != key
+            and self.feed is not None
+        ):
+            if key[0] == SSE:
+                # The same root stream reconnected (the live proxy ends every stream after
+                # ~120 s): its connect snapshot re-lists the children; a resume re-reads
+                # the rest of what the gap made unknown, not the whole tree.
+                return "resume"
+            if self.feed.resuming(cached.root_id):
+                return "timer-skip"  # moments into a reconnect: wait for the resume
         if key[0] == TIMER:
             return "timer" if self._due(session.session_id, spacing) else "timer-skip"
         if cached is None:
@@ -558,6 +585,7 @@ class OmnigentObserver:
         *,
         topology: bool = False,
         inventory_error: str | None = None,
+        resume: bool = False,
     ) -> bool:
         """Re-read what is not proven fresh in a cached tree; confirm before idle.
 
@@ -576,6 +604,19 @@ class OmnigentObserver:
             n for n, m in marks.items() if m.marked_at_us >= cached.read_mono_us.get(n, -1)
         )
         spawned = sorted(n for n, m in marks.items() if m.spawn)
+        if resume and self.feed is not None:
+            # What the gap made unknown: the root (its own status and the prompts it
+            # mirrors), and the children of every inner node; the root's own children
+            # only when the connect snapshot did not re-list them.
+            self.passes["resume"] += 1
+            root = cached.root_id
+            inner = {n.parent_id for n in cached.observation.nodes.values() if n.parent_id}
+            if self.feed.snapshot_complete(root):
+                inner.discard(root)
+            else:
+                inner.add(root)
+            dirty = sorted({*dirty, root})
+            spawned = sorted({*spawned, *inner})
         if not dirty and not spawned and not topology:
             return True  # every mark predates its node's latest read
         self.passes["topology" if topology else "targeted"] += 1

@@ -70,6 +70,17 @@ MAX_WATCHED = 500
 WS_IDLE_TIMEOUT_S = 75.0
 #: A connection that stayed up this long resets the reconnect backoff.
 STABLE_CONNECTION_S = 60.0
+#: A stream that was live and dropped this recently is resuming (``ChangeFeed.resuming``).
+RESUME_GRACE_S = 10.0
+#: Consecutive failed opens of one root's stream (auth, gateway, network: anything but
+#: an explicit "unsupported") before that stream is parked for ``STREAM_PARK_S``; its tree
+#: is watched on the WebSocket (with topology polls) meanwhile. Never permanent.
+MAX_OPEN_FAILURES = 5
+STREAM_PARK_S = 600.0
+#: Stream drops are reported at WARNING at most this often (a summary line).
+DROP_WARN_INTERVAL_S = 600.0
+#: The server's connect snapshot lists at most this many children (``limit=100``).
+SNAPSHOT_CHILD_LIMIT = 100
 #: HTTP statuses on a stream open that mean "this server has no such stream".
 _UNSUPPORTED = frozenset({400, 405, 406, 415, 501})
 #: ``SessionListItem`` fields whose change is an edge (anything else, e.g. ``updated_at``
@@ -199,6 +210,19 @@ class ChangeFeed:
         self._sse_epoch: dict[str, int] = {}
         self._sse_up: set[str] = set()
         self._children_seen: dict[str, tuple[object, ...]] = {}
+        self._children_updated: dict[str, object] = {}
+        #: Roots whose stream is open but whose connect snapshot is still arriving:
+        #: (child summaries, heartbeats) seen so far.
+        self._pending_snapshot: dict[str, tuple[int, int]] = {}
+        self._snapshot_complete: dict[str, bool] = {}
+        self._dropped_at: dict[str, int] = {}
+        #: Consecutive failed opens per root (any successful open clears them all).
+        self._open_failures: dict[str, int] = {}
+        self._parked_streams: set[str] = set()
+        #: Set (and replaced) when any stream opens: wakes every parked stream early.
+        self._unpark = asyncio.Event()
+        self._drops_since_warn = 0
+        self._last_drop_warn: int | None = None
         # WS state.
         self._ws_task: asyncio.Task[None] | None = None
         self._ws_wanted = asyncio.Event()
@@ -287,6 +311,7 @@ class ChangeFeed:
             "subtree_push": self.subtree_push,
             "sse_streams": len(self._sse_tasks),
             "sse_connected": len(self._sse_up),
+            "sse_parked": len(self._parked_streams),
             "ws_connected": self._ws_up,
             "ws_watched": len(self._ws_acked),
             "ws_over_cap_trees": len(self._ws_overflow),
@@ -329,6 +354,34 @@ class ChangeFeed:
             return False
         return self.subtree_push or _depth_ok(root_id, self._trees.get(root_id))
 
+    def snapshot_complete(self, root_id: str) -> bool:
+        """Whether the current connection of ``root_id``'s stream delivered its connect
+        snapshot (every direct child's full summary) before going live."""
+        return self._snapshot_complete.get(root_id, False)
+
+    def resuming(self, root_id: str) -> bool:
+        """``root_id``'s stream was up and dropped moments ago, and is reconnecting: an
+        observer pass in that gap waits for the resume instead of re-scanning the tree."""
+        dropped = self._dropped_at.get(root_id)
+        task = self._sse_tasks.get(root_id)
+        return (
+            dropped is not None
+            and task is not None
+            and not task.done()
+            and self._clock.monotonic_us() - dropped < RESUME_GRACE_S * 1e6
+        )
+
+    def _went_live(self, root_id: str, *, complete: bool) -> None:
+        """The stream is live (its connect snapshot, if any, has been delivered)."""
+        self._pending_snapshot.pop(root_id, None)
+        self._snapshot_complete[root_id] = complete
+        self._dropped_at.pop(root_id, None)
+        self._epochs += 1
+        self._sse_epoch[root_id] = self._epochs
+        self._sse_up.add(root_id)
+        self._set_watch()  # a covered tree leaves the watch-set
+        self.wake.set()
+
     async def _sse_loop(self, root_id: str) -> None:
         backoff = self._backoff_initial
         while not self._closed:
@@ -337,37 +390,63 @@ class ChangeFeed:
             def on_open(root: str = root_id) -> None:
                 nonlocal opened_at
                 opened_at = self._clock.monotonic_us()
-                self._epochs += 1
-                self._sse_epoch[root] = self._epochs
-                self._sse_up.add(root)
+                self._open_failures.clear()  # the server serves streams: retry all
+                self._parked_streams.discard(root)
+                if self._parked_streams:
+                    self._unpark.set()
+                    self._unpark = asyncio.Event()
+                # Live only once the connect snapshot is through (or shown absent).
+                self._pending_snapshot[root] = (0, 0)
                 self.counters["sse_connects"] += 1
                 if self.sse_supported is not True:
                     self.sse_supported = True
                     LOG.info("change feed: root session streams available")
-                self._set_watch()  # a covered tree leaves the watch-set
-                self.wake.set()
 
             try:
                 async for event in self._sse_connect(root_id, on_open):
                     self._on_sse(root_id, event)
-                reason = "closed"
+                reason = "closed by the server"
             except asyncio.CancelledError:
                 self._sse_up.discard(root_id)
+                self._pending_snapshot.pop(root_id, None)
                 raise
             except OmnigentReadError as exc:
                 reason = exc.reason
                 if exc.status in _UNSUPPORTED and opened_at is None:
                     self._sse_up.discard(root_id)
-                    self._sse_unsupported(exc.status)
+                    self._sse_unsupported(f"HTTP {exc.status}")
                     return
             except Exception as exc:  # any transport failure: reconnect
-                reason = type(exc).__name__
+                reason = f"{type(exc).__name__}: {exc}"[:200]
+            was_live = root_id in self._sse_up
             self._sse_up.discard(root_id)
+            self._pending_snapshot.pop(root_id, None)
             self.counters["sse_drops"] += 1
-            if opened_at is not None:
-                LOG.debug("change feed: stream of %s dropped (%s)", root_id, reason)
+            self._warn_drop(root_id, reason, opened=opened_at is not None)
+            if was_live:
+                self._dropped_at[root_id] = self._clock.monotonic_us()
                 self._set_watch()
                 self.wake.set()
+            if opened_at is None:
+                failures = self._open_failures.get(root_id, 0) + 1
+                self._open_failures[root_id] = failures
+                if failures >= MAX_OPEN_FAILURES:
+                    # Transient (auth, outage): park this root's stream, never give up.
+                    if root_id not in self._parked_streams:
+                        LOG.warning(
+                            "change feed: stream of %s failed to open %d times (%s); "
+                            "retrying in %ds, watched on the WebSocket meanwhile",
+                            root_id,
+                            failures,
+                            reason,
+                            int(STREAM_PARK_S),
+                        )
+                    self._parked_streams.add(root_id)
+                    self._open_failures[root_id] = 0
+                    await self._park(self._unpark)
+                    self._parked_streams.discard(root_id)
+                    backoff = self._backoff_initial
+                    continue
             if (
                 opened_at is not None
                 and self._clock.monotonic_us() - opened_at >= STABLE_CONNECTION_S * 1e6
@@ -376,15 +455,47 @@ class ChangeFeed:
             await self._sleep(backoff)
             backoff = min(backoff * 2, self._backoff_max)
 
-    def _sse_unsupported(self, status: int | None) -> None:
+    async def _park(self, unpark: asyncio.Event) -> None:
+        """Until ``STREAM_PARK_S`` passes or another root's stream opens."""
+        waits = {
+            asyncio.ensure_future(self._sleep(STREAM_PARK_S)),
+            asyncio.ensure_future(unpark.wait()),
+        }
+        try:
+            await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for wait in waits:
+                wait.cancel()
+
+    def _warn_drop(self, root_id: str, reason: str, *, opened: bool) -> None:
+        """Stream drops at WARNING, at most one line per ``DROP_WARN_INTERVAL_S``
+        summarising the drops since the last (the first drop is reported at once)."""
+        self._drops_since_warn += 1
+        now = self._clock.monotonic_us()
+        if self._last_drop_warn is not None and now - self._last_drop_warn < (
+            DROP_WARN_INTERVAL_S * 1e6
+        ):
+            return
+        LOG.warning(
+            "change feed: %d root stream drop(s) since the last report; latest %s %s: %s",
+            self._drops_since_warn,
+            root_id,
+            "after connecting" if opened else "before connecting",
+            reason,
+        )
+        self._last_drop_warn = now
+        self._drops_since_warn = 0
+
+    def _sse_unsupported(self, why: str) -> None:
         if self.sse_supported is not False:
-            LOG.info("change feed: root session streams unsupported (HTTP %s); using ws", status)
+            LOG.warning("change feed: root session streams unusable (%s); using ws", why)
         self.sse_supported = False
         for root, task in list(self._sse_tasks.items()):
             if task is not asyncio.current_task():
                 task.cancel()
             self._sse_tasks.pop(root, None)
         self._sse_up.clear()
+        self._pending_snapshot.clear()
         self._set_watch()
         self.wake.set()
 
@@ -393,6 +504,22 @@ class ChangeFeed:
         if not isinstance(kind, str):
             return
         self.counters["sse_events"] += 1
+        pending = self._pending_snapshot.get(root_id)
+        if pending is not None:
+            # The connect snapshot (routes_events.py:3956-4040): every direct child's full
+            # summary (at most 100), terminals, then a changed-files invalidation and the
+            # presence list. Live events follow it.
+            children, beats = pending
+            if kind == "session.changed_files.invalidated":
+                self._went_live(root_id, complete=children < SNAPSHOT_CHILD_LIMIT)
+            elif kind == "session.child_session.updated":
+                self._pending_snapshot[root_id] = (children + 1, beats)
+            elif kind == "session.heartbeat" and beats == 0:
+                self._pending_snapshot[root_id] = (children, 1)  # one opens the stream
+            elif kind != "session.resource.created":
+                # No snapshot from this server (a live event, or a second heartbeat):
+                # live from here, its children not re-listed.
+                self._went_live(root_id, complete=False)
         if kind == "session.status":
             cid = event.get("conversation_id")
             self._mark(root_id, cid if isinstance(cid, str) else root_id, edge=True)
@@ -411,7 +538,15 @@ class ChangeFeed:
             )
             self._children_seen[child] = merged
             edge = seen is None or merged != seen
-            self._mark(root_id, child, edge=edge, spawn=child not in self._owner)
+            moved = summary.get("updated_at")
+            if "updated_at" in summary:
+                progress = moved != self._children_updated.get(child)
+                self._children_updated[child] = moved
+            else:
+                progress = True  # a partial delta (e.g. a new message preview)
+            # A full summary equal to what was seen (a reconnect's snapshot) marks nothing.
+            if edge or progress or child not in self._owner:
+                self._mark(root_id, child, edge=edge, spawn=child not in self._owner)
             if isinstance(parent, str) and parent not in self._owner:
                 self._mark(root_id, parent, edge=True, spawn=True)
         elif kind == "session.created":

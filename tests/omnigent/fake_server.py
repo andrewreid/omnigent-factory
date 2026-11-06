@@ -270,6 +270,8 @@ class FakeOmnigentServer:
             return httpx.Response(200, json={"id": sid, "object": "session", "deleted": True})
         if len(parts) == 3 and method == "GET":
             body = session.response()
+            if request.url.params.get("include_items") == "false":
+                body["items"] = []  # the lite snapshot (routes_core.py:1794-1855)
             body["pending_elicitations"] = self._snapshot_elicitations(session)
             return httpx.Response(200, json=body)
         sub = parts[3]

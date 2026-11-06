@@ -310,13 +310,30 @@ class OmnigentRest:
         the subscription is live, so a read that starts afterwards misses nothing.
         """
         self.requests["stream_open"] += 1
+        # The headers are signed first and the stream itself sent without the client's
+        # auth: an ``httpx.Auth`` with ``requires_response_body`` (``CliStoreAuth``, for
+        # its token refresh) makes httpx read the *whole* body before returning it, and a
+        # stream's body never ends: the caller would see nothing until the peer closes.
+        headers = await self.auth_headers()
         try:
             async with self._client.stream(
-                "GET", f"/v1/sessions/{session_id}/stream", timeout=httpx.Timeout(600.0)
+                "GET",
+                f"/v1/sessions/{session_id}/stream",
+                headers=headers,
+                auth=None,
+                timeout=httpx.Timeout(600.0),
             ) as resp:
                 if resp.status_code != 200:
                     raise OmnigentReadError(
                         f"stream {session_id}: HTTP {resp.status_code}", resp.status_code
+                    )
+                kind = resp.headers.get("content-type", "")
+                if not kind.lower().startswith("text/event-stream"):
+                    # A 200 that is not an event stream: this server has no such stream
+                    # (reported as 415, an explicit "unsupported").
+                    raise OmnigentReadError(
+                        f"stream {session_id}: not an event stream ({kind[:40] or 'none'})",
+                        415,
                     )
                 if on_open is not None:
                     on_open()

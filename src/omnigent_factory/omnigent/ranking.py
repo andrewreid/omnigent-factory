@@ -32,7 +32,13 @@ from omnigent_factory.omnigent.adapter import (
     _message_texts,
     effect_marker,
 )
-from omnigent_factory.omnigent.rest import OmnigentReadError, WriteClass, as_map, classify_write
+from omnigent_factory.omnigent.rest import (
+    LITE_SNAPSHOT,
+    OmnigentReadError,
+    WriteClass,
+    as_map,
+    classify_write,
+)
 
 #: Label naming the ranking run a root belongs to.
 RANKING_LABEL = "factory.ranking"
@@ -160,7 +166,7 @@ class RankingSessions:
         tag = effect_marker(key)
         try:
             items = await self.rest.paginate(f"/v1/sessions/{root_id}/items", {"order": "asc"})
-            snap = await self._snapshot(root_id)
+            snap = await self._snapshot(root_id, lite=True)  # pending inputs only
         except OmnigentReadError as exc:
             raise RankingSessionError(f"history read: {exc.reason}", retry=True) from exc
         pending = [p for p in snap.get("pending_inputs") or () if isinstance(p, dict)]
@@ -189,7 +195,8 @@ class RankingSessions:
     async def state(self, root_id: str) -> RootState | None:
         """The root's archive/idle state (None: the root is gone)."""
         try:
-            snap = await self.rest.get_json(f"/v1/sessions/{root_id}")
+            # Archive and idle state only (``reuse=True``): no items needed.
+            snap = await self.rest.get_json(f"/v1/sessions/{root_id}", LITE_SNAPSHOT)
         except OmnigentReadError as exc:
             if exc.status == 404:
                 return None
@@ -209,8 +216,11 @@ class RankingSessions:
             return
         raise RankingSessionError(f"archive failed: {resp.status or resp.error}", retry=True)
 
-    async def _snapshot(self, root_id: str) -> dict[str, Any]:
+    async def _snapshot(self, root_id: str, *, lite: bool = False) -> dict[str, Any]:
+        """The root's snapshot; ``lite`` without its items (``prepare`` needs them)."""
         try:
-            return await self.rest.get_json(f"/v1/sessions/{root_id}")
+            return await self.rest.get_json(
+                f"/v1/sessions/{root_id}", LITE_SNAPSHOT if lite else None
+            )
         except OmnigentReadError as exc:
             raise RankingSessionError(f"snapshot: {exc.reason}", retry=exc.status != 404) from exc
