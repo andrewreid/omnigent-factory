@@ -73,18 +73,21 @@ class RankingSessions:
             pol.cost_policy(1, pol.cost_threshold_usd(None, RANKING_COST_GRANT_US)),
         )
 
-    async def find(self, nonce: str) -> str | None:
-        """The root carrying ``nonce`` (archived included), None when none exists."""
-        rows = await self.adapter._nonce_rows(nonce)
+    async def find(self, nonce: str, *, minted_at_us: int | None = None) -> str | None:
+        """The root carrying ``nonce`` (archived included), None when none exists.
+        ``minted_at_us``: when the run minted it (lets an unsent nonce cost nothing)."""
+        rows = await self.adapter._nonce_rows(nonce, minted_at_us=minted_at_us)
         if not isinstance(rows, list):
             raise RankingSessionError(rows.reason, retry=True)
         if len(rows) > 1:
             raise RankingSessionError("several sessions carry this run's nonce", retry=False)
         return str(rows[0]["id"]) if rows else None
 
-    async def create(self, *, run_id: str, nonce: str, title: str) -> str:
+    async def create(
+        self, *, run_id: str, nonce: str, title: str, minted_at_us: int | None = None
+    ) -> str:
         """The run's root: adopted by nonce, else created (raises on failure)."""
-        rows = await self.adapter._nonce_rows(nonce)
+        rows = await self.adapter._nonce_rows(nonce, minted_at_us=minted_at_us)
         if not isinstance(rows, list):
             raise RankingSessionError(rows.reason, retry=True)
         if len(rows) > 1:
@@ -105,6 +108,7 @@ class RankingSessions:
         }
         if self.config.project_id is not None:
             body["project_id"] = self.config.project_id
+        await self.adapter.record_create_intent(nonce)
         resp = await self.rest.post_json("/v1/sessions", body)
         cls = classify_write(resp)
         if cls == WriteClass.DEFINITIVE:
@@ -113,6 +117,7 @@ class RankingSessions:
         if cls != WriteClass.OK or not isinstance(root, str) or not root:
             # Unclear: the next pass adopts the root by its nonce label (or creates it).
             raise RankingSessionError(f"create outcome unknown: {resp.status}", retry=True)
+        await self.adapter.record_created_root(nonce, root)
         return root
 
     def _identity_problem(self, row: Mapping[str, Any]) -> str | None:

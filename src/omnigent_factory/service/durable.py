@@ -4,6 +4,7 @@ Each class funnels its reads and writes through the service's serialized
 :class:`~omnigent_factory.service.db.StoreWorker`, so no SQLite work runs on the event
 loop and every write is committed before the protocol method returns:
 
+* :class:`StoreNonceLedger` - root ids created per nonce, recorded around each create POST;
 * :class:`StoreOwnItemLedger` - Omnigent own-send/resolve intents written BEFORE each POST
   (``own_sends``), replacing ``MemoryOwnItemLedger`` in production;
 * :class:`StoreCapabilityStore` - capability hashes, generations and worker bindings;
@@ -23,7 +24,7 @@ from omnigent_factory.core.types import Lifecycle, Parcel
 from omnigent_factory.credentials.broker import LocalCredentialBroker
 from omnigent_factory.credentials.capabilities import CapabilityRecord
 from omnigent_factory.credentials.server import WorkerGrant
-from omnigent_factory.omnigent.directory import OwnSend
+from omnigent_factory.omnigent.directory import NonceRecord, OwnSend
 from omnigent_factory.service.db import StoreWorker
 from omnigent_factory.store.sqlite import CapabilityRow, OwnSendRow, WorkerGrantRow
 
@@ -65,6 +66,26 @@ class StoreOwnItemLedger:
 
     async def own_item_ids(self, session_id: str) -> frozenset[str]:
         return await self._db.call(lambda store: store.own_item_ids(session_id))
+
+
+class StoreNonceLedger:
+    """Durable :class:`~omnigent_factory.omnigent.directory.NonceLedger` (``nonce_roots``)."""
+
+    def __init__(self, db: StoreWorker) -> None:
+        self._db = db
+
+    async def record_intent(self, nonce: str, at_us: int) -> None:
+        await self._db.call(lambda store: store.record_nonce_intent(nonce, at_us))
+
+    async def record_root(self, nonce: str, root_id: str) -> None:
+        await self._db.call(lambda store: store.record_nonce_root(nonce, root_id))
+
+    async def lookup(self, nonce: str) -> NonceRecord | None:
+        row = await self._db.call(lambda store: store.nonce_record(nonce))
+        return None if row is None else NonceRecord(nonce, row[0], row[1])
+
+    async def since_us(self) -> int | None:
+        return await self._db.call(lambda store: store.nonce_ledger_since_us())
 
 
 class StoreCapabilityStore:

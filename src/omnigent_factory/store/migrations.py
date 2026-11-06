@@ -1042,6 +1042,26 @@ UPDATE deferred_items SET report_order = (
 );
 """
 
+# Root ids the factory creates, by ``factory.dispatch`` nonce (``StoreNonceLedger``): a
+# nonce search reads only the recorded roots instead of paging every root session.
+#
+# * nonce_roots: one row per nonce; ``root_ids`` a JSON array, ``first_intent_at_us`` when
+#   the first create carrying it was attempted (NULL: adopted before the ledger existed).
+# * nonce_ledger_meta: when recording began (set once, on first use): a nonce minted after
+#   it with no row was never carried by any create.
+V25_SQL = """
+CREATE TABLE nonce_roots (
+    nonce TEXT PRIMARY KEY,
+    root_ids TEXT NOT NULL DEFAULT '[]',
+    first_intent_at_us INTEGER,
+    updated_at_us INTEGER NOT NULL
+);
+CREATE TABLE nonce_ledger_meta (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    since_us INTEGER NOT NULL
+);
+"""
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial-schema", V1_SQL),
     Migration(2, "durable-adapter-state", V2_SQL),
@@ -1067,4 +1087,5 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(22, "auto-retriage", V22_SQL),
     Migration(23, "observed-build-occupancy", V23_SQL),
     Migration(24, "follow-up-ratings", V24_SQL),
+    Migration(25, "nonce-ledger", V25_SQL),
 )

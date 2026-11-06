@@ -162,6 +162,8 @@ def propose(
     if reading is None or reading.observation.root_id != s.root_id:
         return Proposal(None, "no tree read yet")
     stale_us = int(max(600.0, 2 * config.parked_observation_interval_seconds) * 1_000_000)
+    # A tree on the change feed is re-read only on a change or at its reconcile.
+    stale_us = max(stale_us, reading.fresh_for_us)
     if now_us - reading.read_at_us > stale_us:
         return Proposal(None, "tree read stale")
     obs = reading.observation

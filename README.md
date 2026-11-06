@@ -1573,6 +1573,34 @@ prompts, its own and those Omnigent mirrors from every descendant: one request p
 tree. That probe opens prompts and posts due permission comments; only a full scan
 decides that a prompt is gone.
 
+Those cadences are now the fallback. With `observer_change_feed` (default `true`,
+restart-only) the observer watches each tree through a change feed and re-reads only what
+changed. Every tree (active, settled or parked) keeps its root session stream
+(`GET /v1/sessions/{root}/stream`), which announces spawns: a tree no deeper than the root's
+children always, a deeper one once the server is seen to publish every descendant's events
+there (Omnigent with `perf/repl-push-updates`, detected from the first deeper event, no
+setting). A tree the stream does not cover (no stream support, a stream down, a deep tree
+before that proof) is watched on the `WS /v1/sessions/updates` watch-set, which reports
+state edges of known ids but never a new child: its topology (root, child list, inventory)
+is polled on the tree's old cadence (5/60/300 s). Anything no read proved fresh is unknown,
+and unknown forces a read. Feed events only mark nodes dirty: each dirty node gets one lite
+snapshot read (no items, no liveness), a spawn or unknown node also its child list, a node
+whose cached task status is live while its snapshot is idle its parent's child list, and a
+tree last seen busy is reported idle only after a confirming pass (the root and every
+previously busy node re-read, their and their parents' child lists re-read, the inventory
+refreshed). Any failed read leaves the tree unknown until a full scan. A tree is fully scanned after every (re)connect or
+channel switch, and otherwise every `observer_reconcile_active_seconds` (`300`),
+`observer_reconcile_settled_seconds` (`900`) or `observer_reconcile_parked_seconds`
+(`1800`, all hot-reloadable), which also refreshes what is never pushed (background
+tasks, pending inputs, cost). A tree neither channel covers (both down, or past the
+watch cap of 500 ids) keeps the cadences above; the prompt probe only reads such trees.
+`omnigent-factory status` shows the feed mode (`sse`, `ws` or `timer`, the weakest of any
+tree), trees per mode, passes by reason and Omnigent requests by kind under `observer`.
+Nonce searches read only the roots created since the nonce's first create (newest
+first; every page when that window finds nothing, since it relies on this host's clock), or
+nothing at all for a ranking nonce never sent; the ledger of creates is in
+the state database (`nonce_roots`).
+
 ### Health sweep and stalled runs
 
 A run can go quiet without ever submitting a result: #891's build ended its turn waiting

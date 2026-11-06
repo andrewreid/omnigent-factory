@@ -166,6 +166,9 @@ class FactoryService:
         #: Busy node IDs of a root's latest tree scan, for the drain-timeout warning
         #: (composition).
         self.busy_nodes: Callable[[str], tuple[str, ...]] | None = None
+        #: The Omnigent observer's feed mode and request counters (``status``); None: not
+        #: wired.
+        self.observer_status: Callable[[], Mapping[str, object]] | None = None
         #: Idle-time auto-triage and its ``auto-triage`` operator command (composition;
         #: ``service.auto_triage.AutoTriager``). None: not wired.
         self.auto_triager: Any = None
@@ -1775,6 +1778,7 @@ class FactoryService:
             "parked_deliveries": len(parked),
             "boot_id": self.executor.boot_id,
             "health_sweep": (self.health_sweep.status() if self.health_sweep is not None else None),
+            "observer": self.observer_status() if self.observer_status is not None else None,
             "worktrees": (
                 await self.worktree_gc.status() if self.worktree_gc is not None else None
             ),

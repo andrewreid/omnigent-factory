@@ -214,7 +214,9 @@ class FakeSessions:
     gone: bool = False
     fail_create: RankingSessionError | None = None
 
-    async def create(self, *, run_id: str, nonce: str, title: str) -> str:
+    async def create(
+        self, *, run_id: str, nonce: str, title: str, minted_at_us: int | None = None
+    ) -> str:
         if nonce in self.roots:
             return self.roots[nonce]
         if self.fail_create is not None:
@@ -225,7 +227,7 @@ class FakeSessions:
         self.titles[root] = title
         return root
 
-    async def find(self, nonce: str) -> str | None:
+    async def find(self, nonce: str, *, minted_at_us: int | None = None) -> str | None:
         return self.roots.get(nonce)
 
     async def prepare(self, root_id: str, nonce: str) -> None:

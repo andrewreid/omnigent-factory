@@ -33,6 +33,7 @@ from omnigent_factory.github.client import GitHubClient
 from omnigent_factory.github.ranking import RankingBoard
 from omnigent_factory.github.webhook import DeliveryIdentity, DeliveryNormalizer
 from omnigent_factory.omnigent.adapter import OmnigentConfig, OmnigentExecutionAdapter
+from omnigent_factory.omnigent.feed import ChangeFeed
 from omnigent_factory.omnigent.policies import PolicyError
 from omnigent_factory.omnigent.ranking import RankingSessions
 from omnigent_factory.omnigent.rest import OmnigentReadError, OmnigentRest
@@ -59,6 +60,7 @@ from omnigent_factory.service.directory import (
 )
 from omnigent_factory.service.durable import (
     StoreCapabilityStore,
+    StoreNonceLedger,
     StoreOwnItemLedger,
     StoreWorkerGrantStore,
     reenable_issuance_after_boot,
@@ -407,6 +409,7 @@ async def build_production(
         ),
         directory=directory,
         ledger=StoreOwnItemLedger(service.db),
+        nonces=StoreNonceLedger(service.db),
         workspaces=workspaces,
         provisioner=StageProvisioner(broker, broker_server),
         identity=bot_identity,
@@ -434,7 +437,17 @@ async def build_production(
         interval_seconds=config.observation_interval_seconds,
         settled_interval_seconds=config.settled_observation_interval_seconds,
         parked_interval_seconds=config.parked_observation_interval_seconds,
+        feed=(
+            # An injected transport (tests) cannot carry the WebSocket: streams only.
+            ChangeFeed(omnigent, clock, ws_enabled=omnigent_transport is None)
+            if config.observer_change_feed
+            else None
+        ),
+        reconcile_active_seconds=config.observer_reconcile_active_seconds,
+        reconcile_settled_seconds=config.observer_reconcile_settled_seconds,
+        reconcile_parked_seconds=config.observer_reconcile_parked_seconds,
     )
+    service.observer_status = observer.status
     runtime = ProductionRuntime(
         service=service,
         broker=broker,
@@ -569,6 +582,9 @@ async def build_production(
         github.review_bot_mention = new.review_bot_mention
         omnigent_adapter.set_inventory_resync(new.session_inventory_resync_hours * 3600)
         observer.parked_interval_seconds = new.parked_observation_interval_seconds
+        observer.reconcile_active_seconds = new.observer_reconcile_active_seconds
+        observer.reconcile_settled_seconds = new.observer_reconcile_settled_seconds
+        observer.reconcile_parked_seconds = new.observer_reconcile_parked_seconds
 
     service.config_listeners.append(adopt_reloaded)
     cleaner = WorkspaceCleaner(

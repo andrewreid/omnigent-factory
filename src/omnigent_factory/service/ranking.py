@@ -757,7 +757,10 @@ class Ranker:
                 if now - run.created_at_us > SETUP_TIMEOUT_US:
                     return await self._fail(run, "the session could not be created")
                 root = await self.sessions.create(
-                    run_id=run.run_id, nonce=run.nonce, title=run.title
+                    run_id=run.run_id,
+                    nonce=run.nonce,
+                    title=run.title,
+                    minted_at_us=run.created_at_us,
                 )
                 await self._update(run, state="preparing", root_id=root)
                 run = replace(run, state="preparing", root_id=root)
@@ -937,7 +940,7 @@ class Ranker:
         for run in await self._db(rs.unresolved_runs, repo_id=self.repo_id):
             # The create's outcome was never learned: find the session by its nonce.
             try:
-                root = await self.sessions.find(run.nonce)
+                root = await self.sessions.find(run.nonce, minted_at_us=run.created_at_us)
             except RankingSessionError as exc:
                 LOG.info("ranking session lookup retried run=%s reason=%s", run.run_id, exc)
                 continue

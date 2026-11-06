@@ -29,18 +29,29 @@ an ``idle`` node with no active task (terminal or none) does not count them.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
 from omnigent_client import TERMINAL_TASK_STATUSES
 
 from omnigent_factory.omnigent.inventory import SessionIndex
-from omnigent_factory.omnigent.rest import OmnigentReadError, OmnigentRest
+from omnigent_factory.omnigent.rest import (
+    LITE_NODE_SNAPSHOT,
+    LITE_SNAPSHOT,
+    OmnigentReadError,
+    OmnigentRest,
+)
 from omnigent_factory.ports.omnigent import TreeScan
 
 DEFAULT_MAX_NODES = 500
 _BACKGROUND_TERMINAL = frozenset({"completed", "failed", "cancelled", "killed", "exited"})
+
+
+def snapshot_params(node_id: str, root_id: str) -> Mapping[str, str]:
+    """Every node is read lite (no items, no liveness); only the root keeps its usage
+    (the subtree-inclusive cost the observer samples)."""
+    return LITE_SNAPSHOT if node_id == root_id else LITE_NODE_SNAPSHOT
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,9 +69,15 @@ class NodeState:
     background_active: bool = False
     task_status: str | None = None
     total_cost_usd: float | None = None
+    #: ``len(items)`` of a full snapshot; 0 from the lite reads every scan now makes
+    #: (it only fed the unchanged-tree fingerprint; ``updated_at`` carries activity).
     items_hint: int = 0
-    #: The session's ``updated_at`` (UTC microseconds; 0 when the server sent none): it
-    #: moves with every new item, so it is the node's last activity.
+    #: The session's ``updated_at`` (UTC microseconds; 0 when the server sent none): the
+    #: node's last *conversation* activity. The server advances it only when a write
+    #: inserts at least one new item that is not a ``resource_event``; a pure stable-id
+    #: duplicate re-post and server bookkeeping (``resource_event``, e.g. a sub-agent
+    #: spawn marker) leave it unchanged (``sqlalchemy_store.py:2981-2987,3041-3048``
+    #: @42e17e47). So it is stall progress, never evidence of topology.
     updated_at_us: int = 0
     #: ``last_task_error.code`` of its latest turn (e.g. ``runner_failed_to_start``).
     last_error: str | None = None
@@ -360,7 +377,7 @@ async def finish_scan(
             break
         attempted.add(node_id)
         try:
-            snap = await rest.get_json(f"/v1/sessions/{node_id}")
+            snap = await rest.get_json(f"/v1/sessions/{node_id}", snapshot_params(node_id, root_id))
         except OmnigentReadError as exc:
             if exc.status == 404 and node_id in remembered:
                 gone.add(node_id)
@@ -442,3 +459,193 @@ def _close_over_index(index: SessionIndex, walk: ScanWalk, max_nodes: int) -> No
             if child not in walk.parents:
                 walk.parents[child] = current
                 stack.append(child)
+
+
+@dataclass(frozen=True, slots=True)
+class TreeRefresh:
+    """The result of :func:`refresh_tree`."""
+
+    observation: TreeObservation
+    #: Nodes whose snapshot this refresh read successfully.
+    read: frozenset[str]
+    #: Whether it confirmed the tree (``confirm``): every previously busy, unknown and
+    #: dirty node re-read, their task statuses re-listed, the inventory refreshed.
+    confirmed: bool = False
+
+
+#: Session statuses in which a turn is live. The server's public vocabulary is
+#: ``idle | running | waiting | failed`` for a snapshot or list row
+#: (``SessionResponse.status``, ``SessionListItem.status``: ``schemas.py:2450,3217``) plus
+#: ``launching`` on the stream (``SessionStatusEvent.status``, ``schemas.py:3571``)
+#: @42e17e47. Any other (``idle``, ``failed``, absent or unknown) says the turn is over.
+LIVE_SESSION_STATUSES = frozenset({"launching", "running", "waiting"})
+
+
+def _unresolved_task(node: NodeState) -> bool:
+    """A cached live task status on a node whose fresh snapshot says its turn is not live
+    (any status outside :data:`LIVE_SESSION_STATUSES`): not proof either way until its
+    parent's child list is re-read."""
+    return (
+        node.status not in LIVE_SESSION_STATUSES
+        and node.task_status is not None
+        and node.task_status not in TERMINAL_TASK_STATUSES
+    )
+
+
+async def refresh_tree(
+    rest: OmnigentRest,
+    cached: TreeObservation,
+    dirty: Iterable[str],
+    *,
+    spawned: Iterable[str] = (),
+    confirm: bool = False,
+    confirm_busy: Iterable[str] = (),
+    topology: bool = False,
+    index: SessionIndex | None = None,
+    inventory_ready: bool = False,
+    inventory_error: str | None = None,
+    max_nodes: int = DEFAULT_MAX_NODES,
+) -> TreeRefresh:
+    """Re-read what is not proven fresh in a complete cached scan.
+
+    The rule: anything no read in this refresh proved current is unknown, and unknown
+    forces a read.
+
+    * every ``dirty`` node gets one lite snapshot read; a node not in the cache is
+      *unknown*: it is read and its children listed;
+    * every ``spawned`` node (a feed spawn hint names the parent) has its children
+      listed; new children are unknown nodes;
+    * a node read without a fresh child-list row whose cached task status is still live
+      while its snapshot is idle is unresolved: its parent's child list (the only source
+      of ``current_task_status``) is re-read in the same refresh; a child the list no
+      longer shows (archived) gets no task status, as in a full scan;
+    * a mirrored prompt naming an unread owner reads that owner (as a full scan does);
+    * ``topology`` (a channel that cannot announce spawns): the root is re-read, its
+      children listed and the node set closed over the archive-inclusive inventory;
+    * ``confirm`` (before the tree may be declared idle) additionally re-reads the root,
+      every cached busy node and every node in ``confirm_busy`` (busy in the last emitted
+      state), lists the children of those nodes (they ran: they may have spawned) and of
+      their parents, and closes over the inventory.
+
+    The inventory is refreshed here unless the caller already did (``inventory_ready``,
+    or ``inventory_error`` when that failed). Any failed read makes the result
+    incomplete (never idle); the caller then falls back to a full scan. ``cached`` must
+    be complete.
+    """
+    root_id = cached.root_id
+    nodes: dict[str, NodeState] = dict(cached.nodes)
+    parents: dict[str, str | None] = {nid: n.parent_id for nid, n in nodes.items()}
+    errors: list[str] = []
+    summaries: dict[str, Mapping[str, Any]] = {}
+    reads: list[str] = list(dirty)
+    lists: list[str] = list(spawned)
+    if topology:
+        reads.append(root_id)
+        lists.append(root_id)
+    if confirm:
+        ran = [*confirm_busy, *(n.node_id for n in nodes.values() if n.busy)]
+        reads.extend(ran)
+        reads.append(root_id)
+        lists.extend(ran)
+        lists.extend(p for nid in reads if (p := parents.get(nid)) is not None)
+    lists.extend(nid for nid in reads if nid not in nodes)  # unknown: list its children
+    if topology or confirm:
+        inventory = index or SessionIndex(rest)
+        failure = inventory_error
+        if failure is None and not inventory_ready:
+            try:
+                await inventory.refresh()
+            except OmnigentReadError as exc:
+                failure = exc.reason
+        if failure is not None:
+            errors.append(f"inventory: {failure}")
+        else:
+            stack = list(parents)
+            while stack and len(parents) <= max_nodes:
+                current = stack.pop()
+                for child in inventory.children(current):
+                    if child not in parents:
+                        parents[child] = current
+                        reads.append(child)
+                        lists.append(child)
+                        stack.append(child)
+    listed: set[str] = set()
+    read_ok: set[str] = set()
+    attempted: set[str] = set()
+    #: Read nodes whose task status came from the cache, not a fresh child-list row.
+    carried: set[str] = set()
+    while lists or reads:
+        while lists:
+            parent = lists.pop(0)
+            if parent in listed:
+                continue
+            listed.add(parent)
+            try:
+                rows = await rest.paginate(
+                    f"/v1/sessions/{parent}/child_sessions", {"order": "asc"}
+                )
+            except OmnigentReadError as exc:
+                errors.append(f"children {parent}: {exc.reason}")
+                continue
+            for row in rows:
+                kid = row.get("id")
+                if not isinstance(kid, str):
+                    continue
+                summaries[kid] = row
+                if kid not in parents:
+                    parents[kid] = parent
+                    reads.append(kid)
+                    lists.append(kid)
+        if not reads:
+            break
+        node_id = reads.pop(0)
+        if node_id in attempted:
+            continue
+        if len(attempted) >= max_nodes or len(parents) > max_nodes:
+            errors.append("node-ceiling")
+            break
+        attempted.add(node_id)
+        try:
+            snap = await rest.get_json(f"/v1/sessions/{node_id}", snapshot_params(node_id, root_id))
+        except OmnigentReadError as exc:
+            errors.append(f"snapshot {node_id}: {exc.reason}")
+            continue
+        node = node_from_snapshot(node_id, parents.get(node_id), snap, summaries.get(node_id))
+        previous = nodes.get(node_id)
+        if node_id not in summaries and previous is not None:
+            node = replace(node, task_status=previous.task_status)
+            carried.add(node_id)
+            if _unresolved_task(node) and node.parent_id is not None:
+                lists.append(node.parent_id)  # unknown task status: re-list it now
+        nodes[node_id] = node
+        parents[node_id] = node.parent_id
+        read_ok.add(node_id)
+        for event in node.mirrored:
+            target = target_session_of(event)
+            if target is not None and target not in nodes and target not in attempted:
+                parents.setdefault(target, None)
+                reads.append(target)
+                lists.append(target)
+    for nid, known in list(nodes.items()):
+        summary = summaries.get(nid)
+        if summary is not None and (nid not in read_ok or nid in carried):
+            # A fresh child-list row refreshes the task status of a node not re-read, or
+            # of one read without its row.
+            status = summary.get("current_task_status")
+            nodes[nid] = replace(known, task_status=status if isinstance(status, str) else None)
+        elif (
+            summary is None
+            and nid in carried
+            and _unresolved_task(known)
+            and known.parent_id in listed
+        ):
+            # Its parent's (non-archived) child list no longer shows it: archived. A full
+            # scan reads such a node without a task status; so does this refresh.
+            nodes[nid] = replace(known, task_status=None)
+    errors.extend(f"mirrored prompt owner unread: {o}" for o in _unread_mirror_owners(nodes))
+    complete = cached.complete and not errors
+    return TreeRefresh(
+        TreeObservation(root_id, complete, nodes, tuple(errors)),
+        frozenset(read_ok),
+        confirmed=confirm and complete,
+    )

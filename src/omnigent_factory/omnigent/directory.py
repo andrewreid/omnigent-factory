@@ -145,6 +145,60 @@ class MemoryOwnItemLedger:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class NonceRecord:
+    """What this factory recorded about the root sessions carrying one nonce label."""
+
+    nonce: str
+    #: Every root id a create carrying this nonce returned (or a nonce search found).
+    root_ids: tuple[str, ...] = ()
+    #: When the first create carrying it was attempted (UTC us); None: never recorded
+    #: (a root adopted before the ledger existed).
+    first_intent_at_us: int | None = None
+
+
+@runtime_checkable
+class NonceLedger(Protocol):
+    """Root ids the factory creates, by nonce, so a nonce search reads only those.
+
+    ``record_intent`` runs BEFORE each create POST carrying the nonce; ``record_root``
+    once its root id is known. ``since_us`` is when recording began (None: never trust
+    the ledger's silence, e.g. an in-memory ledger after a restart).
+    """
+
+    async def record_intent(self, nonce: str, at_us: int) -> None: ...
+
+    async def record_root(self, nonce: str, root_id: str) -> None: ...
+
+    async def lookup(self, nonce: str) -> NonceRecord | None: ...
+
+    async def since_us(self) -> int | None: ...
+
+
+class MemoryNonceLedger:
+    """In-process nonce ledger: its silence proves nothing (``since_us`` is None), so a
+    nonce it never saw is searched for exactly as before (every root page)."""
+
+    def __init__(self) -> None:
+        self._records: dict[str, NonceRecord] = {}
+
+    async def record_intent(self, nonce: str, at_us: int) -> None:
+        old = self._records.get(nonce, NonceRecord(nonce))
+        first = old.first_intent_at_us if old.first_intent_at_us is not None else at_us
+        self._records[nonce] = NonceRecord(nonce, old.root_ids, first)
+
+    async def record_root(self, nonce: str, root_id: str) -> None:
+        old = self._records.get(nonce, NonceRecord(nonce))
+        ids = old.root_ids if root_id in old.root_ids else (*old.root_ids, root_id)
+        self._records[nonce] = NonceRecord(nonce, ids, old.first_intent_at_us)
+
+    async def lookup(self, nonce: str) -> NonceRecord | None:
+        return self._records.get(nonce)
+
+    async def since_us(self) -> int | None:
+        return None
+
+
 @runtime_checkable
 class CredentialProvisioner(Protocol):
     async def provision(self, session_id: str) -> CapabilityRecord:

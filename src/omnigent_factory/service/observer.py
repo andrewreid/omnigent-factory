@@ -9,8 +9,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from collections import Counter
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from omnigent_factory.core import events as ev
@@ -27,6 +28,7 @@ from omnigent_factory.core.types import (
 )
 from omnigent_factory.omnigent.activity import ActivityTracker
 from omnigent_factory.omnigent.adapter import OmnigentExecutionAdapter
+from omnigent_factory.omnigent.feed import SSE, TIMER, WS, ChangeFeed, DirtyMark
 from omnigent_factory.omnigent.observe import StreamNormalizer
 from omnigent_factory.omnigent.rest import OmnigentReadError
 from omnigent_factory.omnigent.tree import TreeObservation
@@ -51,6 +53,16 @@ COST_SAMPLE_INTERVAL_US = 5 * 60 * 1_000_000
 #: often for new prompts (Omnigent mirrors every descendant's pending prompt into it):
 #: one request per active tree, so a slow pass never hides a prompt for minutes.
 PROMPT_PROBE_INTERVAL_SECONDS = 15.0
+#: With a change feed, a tree is reconciled with a full scan at least this often (see
+#: ``ServiceConfig.observer_reconcile_*_seconds`` for the defaults' rationale).
+RECONCILE_ACTIVE_SECONDS = 300.0
+RECONCILE_SETTLED_SECONDS = 900.0
+RECONCILE_PARKED_SECONDS = 1800.0
+#: After a feed event wakes the observer it waits this long, so a burst of events (a
+#: turn ending in several nodes) costs one targeted pass.
+FEED_DEBOUNCE_SECONDS = 0.25
+#: A reading is never treated as stale before this (the health sweep's floor).
+_MIN_FRESH_US = 600 * 1_000_000
 
 
 def persisted_active_us(
@@ -80,6 +92,10 @@ class TreeReading:
     #: ``updated_at``): the fallback activity time when the server sends no
     #: ``updated_at`` (a restart starts it afresh: later, never earlier).
     unchanged_since_us: int
+    #: How long this reading stays usable when nothing changes (0: the sweep's default).
+    #: A tree on a change feed is only re-read on a change or at its reconcile, so its
+    #: reading is current for up to twice that interval.
+    fresh_for_us: int = 0
 
     @property
     def last_activity_us(self) -> int:
@@ -93,8 +109,37 @@ def _fingerprint(observation: TreeObservation) -> tuple[tuple[object, ...], ...]
     )
 
 
+@dataclass(slots=True)
+class _FeedTree:
+    """The cached tree of a run on a change feed (in memory only)."""
+
+    root_id: str
+    observation: TreeObservation
+    #: The feed coverage ``(channel, epoch)`` the last full scan started under: a change
+    #: (a (re)connect, a channel switch) means events may have been missed.
+    key: tuple[str, int]
+    #: When the last full scan started (monotonic us).
+    full_at_us: int
+    #: When each node was last read (the reading pass's start, UTC us and monotonic us).
+    read_at_us: dict[str, int] = field(default_factory=dict)
+    read_mono_us: dict[str, int] = field(default_factory=dict)
+    #: When its topology (root, child list, inventory) was last read (monotonic us): a
+    #: tree only the WebSocket watches is told about no spawn, so it is re-read on the
+    #: tree's old cadence.
+    topology_at_us: int = 0
+
+
 class OmnigentObserver:
-    """Feed tree, prompt, result, crash, cost and time observations through the service."""
+    """Feed tree, prompt, result, crash, cost and time observations through the service.
+
+    Without a :class:`~omnigent_factory.omnigent.feed.ChangeFeed` every due tree is fully
+    re-scanned on the timer cadence (5 s active, settled 60 s, parked 300 s). With one,
+    a tree the feed covers (``sse`` or ``ws``) is fully scanned only after a (re)connect
+    or channel switch and at its slow reconcile interval; in between only nodes the feed
+    marked dirty are re-read (lite), and a tree whose last emitted state was busy is
+    declared idle only after a confirming pass. A tree the feed does not cover (``timer``)
+    keeps the old cadence, so a dead feed degrades to polling, never to blindness.
+    """
 
     def __init__(
         self,
@@ -107,6 +152,11 @@ class OmnigentObserver:
         settled_interval_seconds: float | None = None,
         parked_interval_seconds: float = 300.0,
         prompt_probe_interval_seconds: float = PROMPT_PROBE_INTERVAL_SECONDS,
+        feed: ChangeFeed | None = None,
+        reconcile_active_seconds: float = RECONCILE_ACTIVE_SECONDS,
+        reconcile_settled_seconds: float = RECONCILE_SETTLED_SECONDS,
+        reconcile_parked_seconds: float = RECONCILE_PARKED_SECONDS,
+        feed_debounce_seconds: float = FEED_DEBOUNCE_SECONDS,
     ) -> None:
         self.service = service
         self.adapter = adapter
@@ -136,17 +186,50 @@ class OmnigentObserver:
         self._crashed: set[str] = set()
         self._readings: dict[str, TreeReading] = {}
         self._fingerprints: dict[str, tuple[tuple[tuple[object, ...], ...], int]] = {}
+        #: The change feed (None: timer cadence only, the pre-feed behaviour).
+        self.feed = feed
+        self.reconcile_active_seconds = reconcile_active_seconds
+        self.reconcile_settled_seconds = reconcile_settled_seconds
+        self.reconcile_parked_seconds = reconcile_parked_seconds
+        self.feed_debounce_seconds = feed_debounce_seconds
+        self._feed_trees: dict[str, _FeedTree] = {}
+        #: Each run's last known owner node of every prompt it saw (for "gone" checks).
+        self._prompt_owners: dict[str, dict[str, str]] = {}
+        #: Full scans, targeted passes and confirming passes, by reason (``status``).
+        self.passes: Counter[str] = Counter()
+        self._mode: str | None = None
+        self._coverage: dict[str, str] = {}
 
     def reading(self, session_id: str) -> TreeReading | None:
         """The latest tree scan of run ``session_id`` this process made (None: none)."""
         return self._readings.get(session_id)
 
-    def _remember(self, session_id: str, observation: TreeObservation, now: int) -> None:
+    def _remember(
+        self, session_id: str, observation: TreeObservation, now: int, fresh_for_us: int = 0
+    ) -> None:
         fingerprint = _fingerprint(observation)
         previous = self._fingerprints.get(session_id)
         since = previous[1] if previous is not None and previous[0] == fingerprint else now
         self._fingerprints[session_id] = (fingerprint, since)
-        self._readings[session_id] = TreeReading(observation, now, since)
+        self._readings[session_id] = TreeReading(observation, now, since, fresh_for_us)
+
+    def status(self) -> dict[str, object]:
+        """The observer's feed mode, per-tree coverage and request counters (``status``)."""
+        coverage = Counter(self._coverage.values())
+        rest = getattr(self.adapter, "rest", None)
+        requests = getattr(rest, "requests", None)
+        return {
+            "mode": self._mode or (TIMER if self.feed is None else "idle"),
+            "trees": {mode: coverage.get(mode, 0) for mode in (SSE, WS, TIMER)},
+            "feed": self.feed.status() if self.feed is not None else None,
+            "passes": dict(sorted(self.passes.items())),
+            "omnigent_requests": dict(sorted(requests.items())) if requests else {},
+            "reconcile_seconds": {
+                "active": self.reconcile_active_seconds,
+                "settled": self.reconcile_settled_seconds,
+                "parked": self.reconcile_parked_seconds,
+            },
+        }
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="omnigent-observer")
@@ -154,6 +237,8 @@ class OmnigentObserver:
 
     async def close(self) -> None:
         self._stop.set()
+        if self.feed is not None:
+            await self.feed.close()
         was_running = self._task is not None
         for task in (self._task, self._probe_task):
             if task is not None:
@@ -203,6 +288,8 @@ class OmnigentObserver:
             )
             if not deferred and (self._parked(parcel, session) or settled(session)):
                 continue  # a deferred permission prompt is watched for its grace
+            if not deferred and self._feed_covers(session.root_id):
+                continue  # prompt edges reach the change feed; its passes open them
             try:
                 prompts = await self.adapter.pending_prompts(session.root_id)
             except (OmnigentReadError, OSError, ValueError):
@@ -217,9 +304,14 @@ class OmnigentObserver:
                 or current.execution_closed
             ):
                 continue
+            owners = self._prompt_owners.setdefault(session.session_id, {})
+            owners.update({eid: owner for eid, (owner, _raw) in prompts.items()})
             await self._prompts(fresh, prompts, complete=False)
             probed.add(session.session_id)
         return frozenset(probed)
+
+    def _feed_covers(self, root_id: str) -> bool:
+        return self.feed is not None and self.feed.coverage(root_id)[0] != TIMER
 
     async def _run(self) -> None:
         failures = 0
@@ -240,26 +332,58 @@ class OmnigentObserver:
                         self.service.config.background_error_backoff_seconds * failures,
                     )
                 continue
+            await self._idle_wait()
+
+    async def _idle_wait(self) -> None:
+        """Until the next pass: the timer interval, or (with a feed) the first feed event
+        or (re)connect, then a short debounce so a burst costs one pass."""
+        if self.feed is None:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), self.interval_seconds)
+            return
+        wake = self.feed.wake
+        stop = asyncio.ensure_future(self._stop.wait())
+        woke = asyncio.ensure_future(wake.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {stop, woke}, timeout=self.interval_seconds, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for task in (stop, woke):
+                task.cancel()
+        if woke in done and not self._stop.is_set():
+            wake.clear()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), self.feed_debounce_seconds)
 
     async def observe_once(self) -> frozenset[str]:
         """Take one complete pass; successful roots are safe for boot re-enable checks.
 
-        Every tree due in the pass is scanned with one shared inventory refresh
-        (``observe_trees``); a failed refresh makes each scan incomplete, never idle.
+        Every tree due for a full scan in the pass is scanned with one shared inventory
+        refresh (``observe_trees``); a failed refresh makes each scan incomplete, never
+        idle. With a change feed, trees it covers are scanned only when reconciling, and
+        otherwise re-read node by node where it marked them dirty (:meth:`_refresh`).
         """
         due: list[tuple[Parcel, StageSession, str]] = []
+        keys: dict[str, tuple[str, int]] = {}
+        targeted: list[tuple[Parcel, StageSession, _FeedTree, dict[str, DirtyMark], bool]] = []
         parcels = await self._parcels()
         open_runs = {p.current_session_id for p in parcels}
         for stale in set(self._readings) - open_runs:  # closed runs: nothing watches them
             self._readings.pop(stale, None)
             self._fingerprints.pop(stale, None)
+        for stale in set(self._feed_trees) - open_runs:
+            self._feed_trees.pop(stale, None)
+            self._prompt_owners.pop(stale, None)
+        watched: dict[str, Mapping[str, str | None] | None] = {}
+        coverage: dict[str, str] = {}
         for parcel in parcels:
             session = parcel.current_session
             if session is None or session.root_id is None or run_closed(parcel, session):
                 continue
-            if self._parked(parcel, session):
+            root = session.root_id
+            parked = self._parked(parcel, session)
+            if parked:
                 interval: float | None = max(
                     self.parked_interval_seconds, self.settled_interval_seconds
                 )
@@ -267,18 +391,151 @@ class OmnigentObserver:
                 interval = self.settled_interval_seconds
             else:
                 interval = None
-            if self._due(session.session_id, interval):
-                due.append((parcel, session, session.root_id))
-        if not due:
-            return frozenset()
-        self._pass_started_us = self.clock.now_utc_us()
+            if self.feed is None:
+                if self._due(session.session_id, interval):
+                    due.append((parcel, session, root))
+                continue
+            cached = self._feed_trees.get(session.session_id)
+            if cached is not None and cached.root_id != root:
+                cached = self._feed_trees.pop(session.session_id)  # a new root: start over
+                cached = None
+            watched[root] = (
+                {nid: n.parent_id for nid, n in cached.observation.nodes.items()}
+                if cached is not None
+                else None
+            )
+            key = self.feed.coverage(root)
+            coverage[session.session_id] = key[0]
+            reason = self._full_reason(session, cached, key, interval, parked)
+            if reason is not None:
+                if reason != "timer-skip":
+                    due.append((parcel, session, root))
+                    keys[session.session_id] = key
+                    self.passes[f"full:{reason}"] += 1
+                continue
+            assert cached is not None  # noqa: S101 - no full scan means a cached tree
+            marks = self.feed.take_dirty(root, keep=self._holder(cached))
+            # Only a root stream announces spawns; on the WebSocket the tree's topology is
+            # unknown until read, so it is polled on the tree's old cadence.
+            spacing = interval if interval is not None else self.interval_seconds
+            topology = (
+                key[0] != SSE and self.clock.monotonic_us() - cached.topology_at_us >= spacing * 1e6
+            )
+            if marks or topology:
+                targeted.append((parcel, session, cached, marks, topology))
+        if self.feed is not None:
+            # Every tree keeps its root stream where the server has them (an idle stream
+            # costs the server nothing); the feed watches the rest on the WebSocket.
+            self.feed.set_targets(set(watched), watched)
+            self._note_mode(coverage)
+        observed: set[str] = set()
+        if due:
+            observed |= await self._full_pass(due, keys)
+        inventory_error: str | None = None
+        if any(t[4] for t in targeted):
+            inventory_error = await self.adapter.refresh_inventory()  # one per pass
+        for parcel, session, cached, marks, topology in targeted:
+            if await self._refresh(
+                parcel, session, cached, marks, topology=topology, inventory_error=inventory_error
+            ):
+                observed.add(session.session_id)
+        return frozenset(observed)
+
+    def _full_reason(
+        self,
+        session: StageSession,
+        cached: _FeedTree | None,
+        key: tuple[str, int],
+        interval: float | None,
+        parked: bool,
+    ) -> str | None:
+        """Why this feed-mode tree needs a full scan now (``"timer-skip"``: it is on timer
+        coverage and not due; None: no full scan, only dirty nodes are re-read)."""
+        # Feed events wake passes often; a polled tree keeps at least the old spacing.
+        spacing = interval if interval is not None else self.interval_seconds
+        if key[0] == TIMER:
+            return "timer" if self._due(session.session_id, spacing) else "timer-skip"
+        if cached is None:
+            return "initial"
+        if cached.key != key:
+            return "reconnect"
+        if not cached.observation.complete:
+            # A failed read: retried by a full scan at the old cadence (unknown meanwhile).
+            return "retry" if self._due(session.session_id, spacing) else "timer-skip"
+        if parked:
+            every = self.reconcile_parked_seconds
+        elif settled(session):
+            every = self.reconcile_settled_seconds
+        else:
+            every = self.reconcile_active_seconds
+        if self.clock.monotonic_us() - cached.full_at_us >= every * 1e6:
+            return "safety"
+        return None
+
+    def _reconcile_us(self, session: StageSession, parcel: Parcel) -> int:
+        if self._parked(parcel, session):
+            every = self.reconcile_parked_seconds
+        elif settled(session):
+            every = self.reconcile_settled_seconds
+        else:
+            every = self.reconcile_active_seconds
+        return int(every * 1_000_000)
+
+    def _holder(self, cached: _FeedTree) -> Callable[[str, DirtyMark], bool]:
+        """Marks to hold back this pass: ordinary progress on a node read within the
+        observer interval (it is re-read at most once per interval, as before)."""
+        now = self.clock.monotonic_us()
+        spacing = self.interval_seconds * 1e6
+
+        def keep(node: str, mark: DirtyMark) -> bool:
+            if mark.edge or mark.spawn or node not in cached.observation.nodes:
+                return False
+            read = cached.read_mono_us.get(node)
+            return read is not None and now - read < spacing
+
+        return keep
+
+    def _note_mode(self, coverage: Mapping[str, str]) -> None:
+        """The feed mode is the weakest coverage of any tree (logged when it changes)."""
+        self._coverage = dict(coverage)
+        modes = set(coverage.values())
+        mode = TIMER if TIMER in modes else WS if WS in modes else SSE if modes else "idle"
+        if mode != self._mode:
+            counts = Counter(coverage.values())
+            LOG.info(
+                "observer feed mode %s -> %s (trees: sse=%d ws=%d timer=%d)",
+                self._mode or "start",
+                mode,
+                counts.get(SSE, 0),
+                counts.get(WS, 0),
+                counts.get(TIMER, 0),
+            )
+            self._mode = mode
+
+    async def _full_pass(
+        self, due: list[tuple[Parcel, StageSession, str]], keys: Mapping[str, tuple[str, int]]
+    ) -> set[str]:
+        started_utc = self._pass_started_us = self.clock.now_utc_us()
+        started_mono = self.clock.monotonic_us()
         results = await self.adapter.observe_trees([root for _, _, root in due])
         observed: set[str] = set()
-        for (parcel, session, _root), result in zip(due, results, strict=True):
+        for (parcel, session, root), result in zip(due, results, strict=True):
             try:
                 try:
                     if not isinstance(result, TreeObservation):
                         raise result
+                    if self.feed is not None:
+                        key = keys.get(session.session_id, (TIMER, 0))
+                        self._feed_trees[session.session_id] = _FeedTree(
+                            root,
+                            result,
+                            key,
+                            started_mono,
+                            dict.fromkeys(result.nodes, started_utc),
+                            dict.fromkeys(result.nodes, started_mono),
+                            started_mono,
+                        )
+                        self.feed.clear_before(root, started_mono)
                     await self._observe(parcel, result)
                 except (OmnigentReadError, OSError, ValueError):
                     tracker = self._tracker(
@@ -290,9 +547,89 @@ class OmnigentObserver:
                     observed.add(session.session_id)
             except InvariantViolation:
                 await self.service.hold_observation_failure(parcel.parcel_id)
-        return frozenset(observed)
+        return observed
 
-    async def _observe(self, parcel: Parcel, observation: TreeObservation) -> None:
+    async def _refresh(
+        self,
+        parcel: Parcel,
+        session: StageSession,
+        cached: _FeedTree,
+        marks: Mapping[str, DirtyMark],
+        *,
+        topology: bool = False,
+        inventory_error: str | None = None,
+    ) -> bool:
+        """Re-read what is not proven fresh in a cached tree; confirm before idle.
+
+        Lite reads of the marked nodes (children listed for spawns and unknown nodes);
+        ``topology`` (a tree no root stream covers, on its old cadence) also re-reads the
+        root, its child list and the shared inventory refreshed for this pass, so a
+        spawned child is found. If the result is complete and idle but the last emitted
+        state was not, a confirming pass re-reads every previously busy node and the
+        root, lists their children and their parents' (task statuses) and refreshes the
+        inventory before idle is reported. Any failed read leaves the tree incomplete
+        (unknown, never idle) until a full scan.
+        """
+        started_utc = self._pass_started_us = self.clock.now_utc_us()
+        started_mono = self.clock.monotonic_us()
+        dirty = sorted(
+            n for n, m in marks.items() if m.marked_at_us >= cached.read_mono_us.get(n, -1)
+        )
+        spawned = sorted(n for n, m in marks.items() if m.spawn)
+        if not dirty and not spawned and not topology:
+            return True  # every mark predates its node's latest read
+        self.passes["topology" if topology else "targeted"] += 1
+        read: set[str] = set()
+        try:
+            if topology:
+                cached.topology_at_us = started_mono
+                first = await self.adapter.refresh_tree(
+                    cached.observation,
+                    dirty,
+                    spawned=spawned,
+                    topology=True,
+                    inventory_ready=inventory_error is None,
+                    inventory_error=inventory_error,
+                )
+            else:
+                first = await self.adapter.refresh_tree(cached.observation, dirty, spawned=spawned)
+            observation = first.observation
+            read |= first.read
+            last = self._last_tree.get(session.session_id)
+            was_quiet = last is not None and last[0] and not last[1]
+            if observation.complete and not observation.busy and not was_quiet:
+                self.passes["confirm"] += 1
+                busy_before = sorted(n.node_id for n in cached.observation.nodes.values() if n.busy)
+                second = await self.adapter.refresh_tree(
+                    observation, (), confirm=True, confirm_busy=busy_before
+                )
+                observation = second.observation
+                read |= second.read
+        except (OmnigentReadError, OSError, ValueError):
+            observation = replace(cached.observation, complete=False, errors=("refresh failed",))
+        cached.observation = observation
+        for node in read:
+            cached.read_at_us[node] = started_utc
+            cached.read_mono_us[node] = started_mono
+        if not observation.complete:
+            self.passes["targeted:incomplete"] += 1
+        try:
+            await self._observe(parcel, observation, read_at=cached.read_at_us)
+        except InvariantViolation:
+            await self.service.hold_observation_failure(parcel.parcel_id)
+            return False
+        return observation.complete
+
+    async def _observe(
+        self,
+        parcel: Parcel,
+        observation: TreeObservation,
+        *,
+        read_at: Mapping[str, int] | None = None,
+    ) -> None:
+        """Apply one tree observation. ``read_at`` (a targeted feed pass: node -> when it
+        was last read, UTC us) limits "prompt gone" to prompts whose owner was re-read
+        after the prompt opened; a full scan (None) re-read every node."""
         session = parcel.current_session
         if session is None or session.root_id is None:
             return
@@ -316,7 +653,17 @@ class OmnigentObserver:
         tracker.gap_ended()
         tracker.observe_tree(observation)
         now = self.clock.now_utc_us()
-        self._remember(session.session_id, observation, now)
+        fresh_for = 0
+        if (
+            self.feed is not None
+            and session.root_id is not None
+            and self.feed.coverage(session.root_id)[0] == SSE
+        ):
+            # Only a root stream pushes both state edges and spawns: such a tree may go
+            # unread until its reconcile. A WebSocket tree is re-read on its topology
+            # cadence (at most the old one), so the sweep's own gate applies to it.
+            fresh_for = max(_MIN_FRESH_US, 2 * self._reconcile_us(session, parcel))
+        self._remember(session.session_id, observation, now, fresh_for)
         if self._last_runtime.get(session.session_id) != observation.busy:
             await self._apply(
                 parcel,
@@ -353,9 +700,17 @@ class OmnigentObserver:
             )
             self._last_cost[session.session_id] = microdollars
             self._last_cost_at[session.session_id] = mono
-        await self._prompts(
-            parcel, observation.owned_elicitations(), scanned_at_us=self._pass_started_us
-        )
+        owned = observation.owned_elicitations()
+        owners = self._prompt_owners.setdefault(session.session_id, {})
+        gone_ok = None
+        if read_at is not None:
+
+            def gone_ok(eid: str, opened_at_us: int) -> bool:
+                owner = owners.get(eid)
+                return owner is not None and read_at.get(owner, -1) >= opened_at_us
+
+        await self._prompts(parcel, owned, scanned_at_us=self._pass_started_us, gone_ok=gone_ok)
+        owners.update({eid: owner for eid, (owner, _raw) in owned.items()})
         if (
             observation.root is not None
             and observation.root.status == "failed"
@@ -439,6 +794,7 @@ class OmnigentObserver:
         *,
         complete: bool = True,
         scanned_at_us: int | None = None,
+        gone_ok: Callable[[str, int], bool] | None = None,
     ) -> None:
         """Open new prompts, post due permission prompts and (``complete``: a full tree
         scan) close the decisions whose prompt is gone. A prompt first seen (by the probe)
@@ -470,6 +826,8 @@ class OmnigentObserver:
                 continue  # factory_ask_owner questions have no native prompt to vanish
             if scanned_at_us is not None and decision.opened_at_us > scanned_at_us:
                 continue
+            if gone_ok is not None and not gone_ok(decision.elicitation_id, decision.opened_at_us):
+                continue  # its owner was not re-read since it opened: not proof it is gone
             if decision.session_id == session.session_id and decision.elicitation_id not in present:
                 await self._apply(
                     parcel,

@@ -123,6 +123,8 @@ from omnigent_factory.omnigent.directory import (
     CredentialProvisioner,
     DispatchDirectory,
     FormValue,
+    MemoryNonceLedger,
+    NonceLedger,
     OwnItemLedger,
     OwnSend,
     StageSpec,
@@ -130,6 +132,7 @@ from omnigent_factory.omnigent.directory import (
 )
 from omnigent_factory.omnigent.inventory import SessionIndex
 from omnigent_factory.omnigent.rest import (
+    LITE_SNAPSHOT,
     OmnigentReadError,
     OmnigentRest,
     WriteClass,
@@ -141,9 +144,11 @@ from omnigent_factory.omnigent.tree import (
     DEFAULT_MAX_NODES,
     ScanWalk,
     TreeObservation,
+    TreeRefresh,
     begin_scan,
     close_over_index,
     finish_scan,
+    refresh_tree,
     root_prompts,
     scan_tree,
 )
@@ -158,6 +163,10 @@ _SCAN_LOG_INTERVAL_US = 10 * 60 * 1_000_000
 
 ELICITATION_NOT_PENDING = "elicitation-not-pending"
 NONCE_LABEL = "factory.dispatch"
+#: A nonce search whose create outcome was never learned pages roots newest first back to
+#: this long before that create was attempted (absorbs factory/server clock skew).
+NONCE_SEARCH_OVERLAP_S = 3600
+_ROOTS: Mapping[str, str] = {"kind": "default", "include_archived": "true", "visibility": "all"}
 #: Retry delay after a Git lock of the shared clone outlasted the short in-process retry.
 GIT_LOCK_RETRY_US = 5_000_000
 #: How soon a preparation waiting on the worktree prepare command looks again.
@@ -230,6 +239,20 @@ def _is_user_message(item: Mapping[str, Any]) -> bool:
     )
 
 
+def _carries(row: Mapping[str, Any], nonce: str) -> bool:
+    """A root row (list row or snapshot) labelled with ``nonce``."""
+    return (
+        as_map(row.get("labels")).get(NONCE_LABEL) == nonce
+        and row.get("parent_session_id") is None
+        and isinstance(row.get("id"), str)
+    )
+
+
+def _created_before(row: Mapping[str, Any], floor_s: int) -> bool:
+    created = row.get("created_at")
+    return isinstance(created, int) and not isinstance(created, bool) and created < floor_s
+
+
 def _json(value: object) -> JsonValue:
     if value is None or isinstance(value, str | int | bool):
         return value
@@ -258,6 +281,7 @@ class OmnigentExecutionAdapter:
         helper_command: str | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         preparer: WorktreePreparer | None = None,
+        nonces: NonceLedger | None = None,
     ) -> None:
         self.rest = rest
         self.config = config
@@ -272,6 +296,9 @@ class OmnigentExecutionAdapter:
         self._sleep = sleep
         #: The optional worktree prepare hook (``worktree_prepare``); None: not configured.
         self.preparer = preparer
+        #: Root ids created per nonce (``StoreNonceLedger`` in production); the in-memory
+        #: default never vouches for a nonce it did not see.
+        self.nonces: NonceLedger = nonces if nonces is not None else MemoryNonceLedger()
         self._known_nodes: dict[str, set[str]] = {}
         #: Archive-inclusive parent map shared by every scan (one incremental read each).
         self._index = SessionIndex(rest, clock=clock)
@@ -325,35 +352,97 @@ class OmnigentExecutionAdapter:
 
     # ================================================================ observer port
 
-    async def _nonce_rows(self, nonce: str) -> list[dict[str, Any]] | RetryableReadFailure:
-        """Raw root rows labelled with ``nonce`` (all pages, archived included).
+    async def record_create_intent(self, nonce: str) -> None:
+        """Record, BEFORE a create POST carrying ``nonce``, that one is being sent."""
+        await self.nonces.record_intent(nonce, self.clock.now_utc_us())
+
+    async def record_created_root(self, nonce: str, root_id: str) -> None:
+        await self.nonces.record_root(nonce, root_id)
+
+    async def _nonce_rows(
+        self, nonce: str, *, minted_at_us: int | None = None
+    ) -> list[dict[str, Any]] | RetryableReadFailure:
+        """Raw root rows labelled with ``nonce`` (archived included).
+
+        The server has no label filter on ``GET /v1/sessions`` (``routes_core.py:1944-1959``
+        @68bf3df7), so the ledger of creates decides what is read:
+
+        * recorded first create attempt: roots newest first, down to
+          ``NONCE_SEARCH_OVERLAP_S`` before that attempt (usually one page). It sees every
+          match since: a root an ambiguous create made, and any foreign root carrying the
+          label (never adopted). The window relies on this host's clock, so a window
+          with no match falls back to every page before absence is concluded; a recorded
+          root the search missed is read directly;
+        * no record: a nonce minted (``minted_at_us``) after recording began was never
+          sent, so nothing carries it (no request); otherwise (and for a root recorded
+          without an attempt time) every root page is read, as before the ledger existed.
 
         The full row is kept adapter-side so adoption can verify the complete recorded
         tuple (agent, host, project, workspace, branch); ``SessionMatch`` carries less.
         """
+        record = await self.nonces.lookup(nonce)
+        if record is None:
+            since = await self.nonces.since_us()
+            if since is not None and minted_at_us is not None and minted_at_us >= since:
+                return []
+        floor_s = (
+            None
+            if record is None or record.first_intent_at_us is None
+            else record.first_intent_at_us // 1_000_000 - NONCE_SEARCH_OVERLAP_S
+        )
+        found = await self._nonce_search(nonce, floor_s)
+        if isinstance(found, RetryableReadFailure) or record is None:
+            return found
+        if not found and floor_s is not None:
+            # The window rests on this host's clock against the server's created_at: a
+            # miss is not proof of absence (clock skew past the overlap). Before any
+            # caller concludes "not created" (and may create a duplicate), read every page.
+            found = await self._nonce_search(nonce, None)
+            if isinstance(found, RetryableReadFailure):
+                return found
+        rows = {str(row["id"]): row for row in found}
+        for root_id in record.root_ids:
+            if root_id in rows:
+                continue
+            try:
+                snap = await self.rest.get_json(
+                    f"/v1/sessions/{root_id}", LITE_SNAPSHOT, kind="nonce"
+                )
+            except OmnigentReadError as exc:
+                if exc.status == 404:
+                    continue  # deleted: nothing carries the nonce there any more
+                return RetryableReadFailure(
+                    f"nonce search incomplete: {exc.reason}",
+                    max(60_000_000, exc.retry_after_us or 0),
+                )
+            if _carries(snap, nonce):
+                rows[root_id] = snap
+        return list(rows.values())
+
+    async def _nonce_search(
+        self, nonce: str, floor_s: int | None
+    ) -> list[dict[str, Any]] | RetryableReadFailure:
+        """Root rows carrying ``nonce``: every page (``floor_s`` None) or newest first down
+        to roots created before ``floor_s`` (epoch seconds)."""
         try:
             # kind=default is exactly parent_session_id IS NULL (sqlalchemy_store.py:2866-2869
             # @1c0153aa): roots only, the same rows the filter below keeps.
-            rows = await self.rest.paginate(
-                "/v1/sessions",
-                {
-                    "kind": "default",
-                    "include_archived": "true",
-                    "visibility": "all",
-                    "order": "asc",
-                },
-            )
+            if floor_s is None:
+                rows = await self.rest.paginate(
+                    "/v1/sessions", {**_ROOTS, "order": "asc"}, kind="nonce"
+                )
+            else:
+                rows = await self.rest.paginate(
+                    "/v1/sessions",
+                    {**_ROOTS, "sort_by": "created_at", "order": "desc"},
+                    until=lambda row: _created_before(row, floor_s),
+                    kind="nonce",
+                )
         except OmnigentReadError as exc:
             return RetryableReadFailure(
                 f"nonce search incomplete: {exc.reason}", max(60_000_000, exc.retry_after_us or 0)
             )
-        return [
-            row
-            for row in rows
-            if as_map(row.get("labels")).get(NONCE_LABEL) == nonce
-            and row.get("parent_session_id") is None
-            and isinstance(row.get("id"), str)
-        ]
+        return [row for row in rows if _carries(row, nonce)]
 
     async def find_by_nonce(self, nonce: str) -> list[SessionMatch] | RetryableReadFailure:
         rows = await self._nonce_rows(nonce)
@@ -427,9 +516,49 @@ class OmnigentExecutionAdapter:
         return results
 
     async def pending_prompts(self, root_id: str) -> dict[str, tuple[str, Mapping[str, Any]]]:
-        """Open prompts anywhere in ``root_id``'s tree from one root snapshot read (the
-        observer's prompt probe); never evidence that a prompt is gone."""
-        return root_prompts(root_id, await self.rest.get_json(f"/v1/sessions/{root_id}"))
+        """Open prompts anywhere in ``root_id``'s tree from one lite root snapshot read
+        (the observer's prompt probe); never evidence that a prompt is gone."""
+        snap = await self.rest.get_json(f"/v1/sessions/{root_id}", LITE_SNAPSHOT, kind="probe")
+        return root_prompts(root_id, snap)
+
+    async def refresh_tree(
+        self,
+        cached: TreeObservation,
+        dirty: Sequence[str],
+        *,
+        spawned: Sequence[str] = (),
+        confirm: bool = False,
+        confirm_busy: Sequence[str] = (),
+        topology: bool = False,
+        inventory_ready: bool = False,
+        inventory_error: str | None = None,
+    ) -> TreeRefresh:
+        """Re-read what is not proven fresh in a complete cached scan (the observer's
+        change feed path, :func:`~omnigent_factory.omnigent.tree.refresh_tree`)."""
+        result = await refresh_tree(
+            self.rest,
+            cached,
+            dirty,
+            spawned=spawned,
+            confirm=confirm,
+            confirm_busy=confirm_busy,
+            topology=topology,
+            index=self._index,
+            inventory_ready=inventory_ready,
+            inventory_error=inventory_error,
+            max_nodes=self.config.max_tree_nodes,
+        )
+        self._record_scan(cached.root_id, result.observation)
+        return result
+
+    async def refresh_inventory(self) -> str | None:
+        """One shared inventory refresh for a pass's topology polls (None: ok, else why
+        it failed: every poll relying on it is then incomplete)."""
+        try:
+            await self._index.refresh()
+        except OmnigentReadError as exc:
+            return exc.reason
+        return None
 
     def _record_scan(self, root_id: str, obs: TreeObservation) -> None:
         known = self._known_nodes.setdefault(root_id, {root_id})
@@ -556,6 +685,7 @@ class OmnigentExecutionAdapter:
             body["git"] = git
         if self.config.project_id is not None:
             body["project_id"] = self.config.project_id
+        await self.record_create_intent(spec.nonce)
         resp = await self.rest.post_json("/v1/sessions", body)
         cls = classify_write(resp)
         if cls == WriteClass.DEFINITIVE:
@@ -577,6 +707,7 @@ class OmnigentExecutionAdapter:
         root = resp.body.get("id") or resp.body.get("session_id")
         if not isinstance(root, str) or not root:
             return AmbiguousWrite("create acknowledged without a session id")
+        await self.record_created_root(spec.nonce, root)
         self._known_nodes[root] = {root}
         return Ack(
             remote_id=root,

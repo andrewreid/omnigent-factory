@@ -2649,6 +2649,57 @@ class SqliteStore:
         ).fetchall()
         return frozenset(str(r["item_id"]) for r in rows)
 
+    # ---------------------------------------------------------- nonce ledger
+
+    def record_nonce_intent(self, nonce: str, at_us: int) -> None:
+        """A create carrying ``nonce`` is about to be sent (keeps the first attempt's time)."""
+        with self._txn() as conn:
+            conn.execute(
+                "INSERT INTO nonce_roots (nonce, first_intent_at_us, updated_at_us) "
+                "VALUES (?, ?, ?) ON CONFLICT(nonce) DO UPDATE SET "
+                "first_intent_at_us = COALESCE(first_intent_at_us, excluded.first_intent_at_us), "
+                "updated_at_us = excluded.updated_at_us",
+                (nonce, at_us, self._clock.now_utc_us()),
+            )
+
+    def record_nonce_root(self, nonce: str, root_id: str) -> None:
+        """``root_id`` carries ``nonce`` (created by, or found for, the factory)."""
+        with self._txn() as conn:
+            row = conn.execute(
+                "SELECT root_ids FROM nonce_roots WHERE nonce = ?", (nonce,)
+            ).fetchone()
+            ids: list[str] = json.loads(row["root_ids"]) if row is not None else []
+            if root_id not in ids:
+                ids.append(root_id)
+            conn.execute(
+                "INSERT INTO nonce_roots (nonce, root_ids, updated_at_us) "
+                "VALUES (?, ?, ?) ON CONFLICT(nonce) DO UPDATE SET "
+                "root_ids = excluded.root_ids, updated_at_us = excluded.updated_at_us",
+                (nonce, json.dumps(ids), self._clock.now_utc_us()),
+            )
+
+    def nonce_record(self, nonce: str) -> tuple[tuple[str, ...], int | None] | None:
+        """``(root_ids, first_intent_at_us)`` recorded for ``nonce`` (None: no row)."""
+        row = self._conn.execute(
+            "SELECT root_ids, first_intent_at_us FROM nonce_roots WHERE nonce = ?", (nonce,)
+        ).fetchone()
+        if row is None:
+            return None
+        ids = tuple(str(i) for i in json.loads(row["root_ids"]))
+        first = row["first_intent_at_us"]
+        return ids, int(first) if first is not None else None
+
+    def nonce_ledger_since_us(self) -> int:
+        """When nonce recording began (set to now on first use)."""
+        with self._txn() as conn:
+            conn.execute(
+                "INSERT INTO nonce_ledger_meta (id, since_us) VALUES (1, ?) "
+                "ON CONFLICT(id) DO NOTHING",
+                (self._clock.now_utc_us(),),
+            )
+            row = conn.execute("SELECT since_us FROM nonce_ledger_meta WHERE id = 1").fetchone()
+        return int(row["since_us"])
+
     # ---------------------------------------------------------- capabilities
 
     def save_capability(self, row: CapabilityRow) -> None:

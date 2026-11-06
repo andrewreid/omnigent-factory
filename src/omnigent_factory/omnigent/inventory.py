@@ -96,7 +96,9 @@ class SessionIndex:
         now = self._clock.monotonic_us()
         watermark, last_full = self._watermark, self._full_read_at_us
         if watermark is None or last_full is None or now - last_full >= self._resync_us:
-            rows = await self._rest.paginate("/v1/sessions", {**_INVENTORY, "order": "asc"})
+            rows = await self._rest.paginate(
+                "/v1/sessions", {**_INVENTORY, "order": "asc"}, kind="inventory"
+            )
             self._children = defaultdict(set)
             self._watermark = None
             self._full_read_at_us = now
@@ -106,6 +108,7 @@ class SessionIndex:
                 "/v1/sessions",
                 {**_INVENTORY, "order": "desc"},
                 until=lambda row: (created := _created(row)) is not None and created < floor,
+                kind="inventory",
             )
         for row in rows:
             sid, parent = row.get("id"), row.get("parent_session_id")

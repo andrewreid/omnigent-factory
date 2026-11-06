@@ -77,6 +77,9 @@ HOT_RELOAD_KEYS = frozenset(
         "delivery_row_retention_days",
         "idle_fallback_seconds",
         "parked_observation_interval_seconds",
+        "observer_reconcile_active_seconds",
+        "observer_reconcile_settled_seconds",
+        "observer_reconcile_parked_seconds",
         "permission_prompt_grace_seconds",
         "health_sweep",
         "health_sweep_interval_minutes",
@@ -383,6 +386,21 @@ class ServiceConfig(BaseModel):
     #: plan approval): only watched for external activity. The factory relaying an
     #: owner's move changes its state, which puts it back on the active cadence.
     parked_observation_interval_seconds: float = Field(default=300.0, gt=0)
+    #: Change-driven observation (``omnigent.feed``): each active tree's root session
+    #: stream where the server carries whole subtrees, else the session-updates
+    #: WebSocket, marks nodes dirty and only those are re-read; a tree neither covers
+    #: keeps the cadences above. False: always the cadences above (restart-only).
+    observer_change_feed: bool = True
+    #: With the change feed, a covered tree is still fully re-scanned this often (and
+    #: after every (re)connect), repairing any missed event and refreshing what is never
+    #: pushed (background tasks, pending inputs, cost). Active: 5 min bounds a missed
+    #: event well inside ``stall_nudge_minutes`` (30) and the ~5 min active-time step.
+    observer_reconcile_active_seconds: float = Field(default=300.0, ge=30)
+    #: Settled trees (quiescent, nothing of ours running) change only externally: 15 min.
+    observer_reconcile_settled_seconds: float = Field(default=900.0, ge=30)
+    #: Parked trees wait on a person, CI or the review bot, and the factory's own move
+    #: puts them back on the active cadence: 30 min.
+    observer_reconcile_parked_seconds: float = Field(default=1800.0, ge=30)
     #: A worker's harness permission prompt (a Claude/Codex/... tool gate) is commented
     #: on only once it has been open this long (most clear within seconds); it shows as
     #: Needs you on the card meanwhile. 0 = comment as soon as it is seen.
