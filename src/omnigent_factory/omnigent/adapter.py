@@ -300,6 +300,9 @@ class OmnigentExecutionAdapter:
         #: default never vouches for a nonce it did not see.
         self.nonces: NonceLedger = nonces if nonces is not None else MemoryNonceLedger()
         self._known_nodes: dict[str, set[str]] = {}
+        #: Each root's latest complete observation: a full scan reads only the nodes whose
+        #: listing row changed since (``finish_scan``'s ``cached``).
+        self._last_scan: dict[str, TreeObservation] = {}
         #: Archive-inclusive parent map shared by every scan (one incremental read each).
         self._index = SessionIndex(rest, clock=clock)
         #: Monotonic time of each root's latest scan that was not quiescent.
@@ -459,11 +462,18 @@ class OmnigentExecutionAdapter:
             for row in rows
         ]
 
+    def inventory_root(self, root_id: str) -> Mapping[str, Any] | None:
+        """``root_id``'s row in the shared session inventory (archive state and labels as
+        of its last full read; None: not listed as a root, or no full read yet)."""
+        return self._index.root_row(root_id)
+
     def set_inventory_resync(self, seconds: float) -> None:
         """Interval between full inventory reads (hot-reloadable)."""
         self._index.set_resync(seconds)
 
-    async def observe_tree(self, root_id: str) -> TreeObservation:
+    async def observe_tree(self, root_id: str, *, reuse: bool = True) -> TreeObservation:
+        """A full scan of ``root_id``'s tree; ``reuse=False`` reads every node (no cached
+        state stands in for a read, e.g. before a deletion)."""
         known = self._known_nodes.setdefault(root_id, {root_id})
         obs = await scan_tree(
             self.rest,
@@ -471,6 +481,7 @@ class OmnigentExecutionAdapter:
             known_ids=tuple(known),
             max_nodes=self.config.max_tree_nodes,
             index=self._index,
+            cached=self._last_scan.get(root_id) if reuse else None,
         )
         self._record_scan(root_id, obs)
         return obs
@@ -506,7 +517,12 @@ class OmnigentExecutionAdapter:
                 close_over_index(self._index, walk, limit, inventory_error)
                 known = self._known_nodes.setdefault(root_id, {root_id})
                 obs = await finish_scan(
-                    self.rest, root_id, walk, known_ids=tuple(known), max_nodes=limit
+                    self.rest,
+                    root_id,
+                    walk,
+                    known_ids=tuple(known),
+                    max_nodes=limit,
+                    cached=self._last_scan.get(root_id),
                 )
             except (OmnigentReadError, OSError, ValueError) as exc:
                 results.append(exc)
@@ -564,6 +580,8 @@ class OmnigentExecutionAdapter:
         known = self._known_nodes.setdefault(root_id, {root_id})
         known.update(obs.nodes)
         known.difference_update(obs.gone)  # deleted sessions: never read again
+        if obs.complete:
+            self._last_scan[root_id] = obs
         if obs.not_found:
             # Listed but not found: the inventory may still hold a deleted session. The
             # next read is full, so the next scan sees it remembered only, then gone.

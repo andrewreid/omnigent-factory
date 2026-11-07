@@ -31,7 +31,7 @@ from omnigent_factory.omnigent.adapter import OmnigentExecutionAdapter
 from omnigent_factory.omnigent.feed import SSE, TIMER, WS, ChangeFeed, DirtyMark
 from omnigent_factory.omnigent.observe import StreamNormalizer
 from omnigent_factory.omnigent.rest import OmnigentReadError
-from omnigent_factory.omnigent.tree import TreeObservation
+from omnigent_factory.omnigent.tree import TreeObservation, epoch_us
 from omnigent_factory.ports.clock import Clock
 from omnigent_factory.service.directory import ServiceDispatchDirectory
 from omnigent_factory.service.runtime import FactoryService
@@ -55,7 +55,7 @@ COST_SAMPLE_INTERVAL_US = 5 * 60 * 1_000_000
 PROMPT_PROBE_INTERVAL_SECONDS = 15.0
 #: With a change feed, a tree is reconciled with a full scan at least this often (see
 #: ``ServiceConfig.observer_reconcile_*_seconds`` for the defaults' rationale).
-RECONCILE_ACTIVE_SECONDS = 300.0
+RECONCILE_ACTIVE_SECONDS = 600.0
 RECONCILE_SETTLED_SECONDS = 900.0
 RECONCILE_PARKED_SECONDS = 1800.0
 #: After a feed event wakes the observer it waits this long, so a burst of events (a
@@ -419,7 +419,17 @@ class OmnigentObserver:
                     self.passes[f"full:{reason}"] += 1
                 continue
             assert cached is not None  # noqa: S101 - no full scan means a cached tree
-            marks = self.feed.take_dirty(root, keep=self._holder(cached))
+            marks = self.feed.take_dirty(root)
+            # Progress alone (a pushed row whose ``updated_at`` moved, nothing else) is
+            # never read: the row's time is the node's activity (stall detection).
+            progress = {
+                n: m
+                for n, m in marks.items()
+                if not m.edge and not m.spawn and n in cached.observation.nodes
+            }
+            if progress:
+                self._progress(parcel, session, cached, progress)
+                marks = {n: m for n, m in marks.items() if n not in progress}
             # Only a root stream announces spawns; on the WebSocket the tree's topology is
             # unknown until read, so it is polled on the tree's old cadence.
             spacing = interval if interval is not None else self.interval_seconds
@@ -508,19 +518,48 @@ class OmnigentObserver:
             every = self.reconcile_active_seconds
         return int(every * 1_000_000)
 
-    def _holder(self, cached: _FeedTree) -> Callable[[str, DirtyMark], bool]:
-        """Marks to hold back this pass: ordinary progress on a node read within the
-        observer interval (it is re-read at most once per interval, as before)."""
-        now = self.clock.monotonic_us()
-        spacing = self.interval_seconds * 1e6
+    def _progress(
+        self,
+        parcel: Parcel,
+        session: StageSession,
+        cached: _FeedTree,
+        marks: Mapping[str, DirtyMark],
+    ) -> None:
+        """Advance the cached nodes' activity time to their pushed rows' ``updated_at``
+        (no read: busy, idle and prompts change only on edges, which are read). The
+        reading the health sweep judges stalls by moves with it."""
+        nodes = dict(cached.observation.nodes)
+        moved = False
+        for node_id, mark in marks.items():
+            node = nodes.get(node_id)
+            updated = epoch_us(mark.updated_at)
+            if node is not None and updated > node.updated_at_us:
+                nodes[node_id] = replace(node, updated_at_us=updated)
+                moved = True
+        if not moved:
+            return
+        self.passes["progress"] += 1
+        cached.observation = replace(cached.observation, nodes=nodes)
+        if self._readings.get(session.session_id) is not None:
+            self._remember(
+                session.session_id,
+                cached.observation,
+                self.clock.now_utc_us(),
+                self._fresh_for(parcel, session),
+            )
 
-        def keep(node: str, mark: DirtyMark) -> bool:
-            if mark.edge or mark.spawn or node not in cached.observation.nodes:
-                return False
-            read = cached.read_mono_us.get(node)
-            return read is not None and now - read < spacing
-
-        return keep
+    def _fresh_for(self, parcel: Parcel, session: StageSession) -> int:
+        """How long a reading of this run stays current with no change (0: the sweep's
+        default). Only a root stream pushes both state edges and spawns: such a tree may
+        go unread until its reconcile. A WebSocket tree is re-read on its topology cadence
+        (at most the old one), so the sweep's own gate applies to it."""
+        if (
+            self.feed is not None
+            and session.root_id is not None
+            and self.feed.coverage(session.root_id)[0] == SSE
+        ):
+            return max(_MIN_FRESH_US, 2 * self._reconcile_us(session, parcel))
+        return 0
 
     def _note_mode(self, coverage: Mapping[str, str]) -> None:
         """The feed mode is the weakest coverage of any tree (logged when it changes)."""
@@ -694,17 +733,7 @@ class OmnigentObserver:
         tracker.gap_ended()
         tracker.observe_tree(observation)
         now = self.clock.now_utc_us()
-        fresh_for = 0
-        if (
-            self.feed is not None
-            and session.root_id is not None
-            and self.feed.coverage(session.root_id)[0] == SSE
-        ):
-            # Only a root stream pushes both state edges and spawns: such a tree may go
-            # unread until its reconcile. A WebSocket tree is re-read on its topology
-            # cadence (at most the old one), so the sweep's own gate applies to it.
-            fresh_for = max(_MIN_FRESH_US, 2 * self._reconcile_us(session, parcel))
-        self._remember(session.session_id, observation, now, fresh_for)
+        self._remember(session.session_id, observation, now, self._fresh_for(parcel, session))
         if self._last_runtime.get(session.session_id) != observation.busy:
             await self._apply(
                 parcel,

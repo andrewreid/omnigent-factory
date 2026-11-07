@@ -93,9 +93,12 @@ async def test_scan_cost_is_independent_of_unrelated_instance_sessions(git_env: 
     large = await _steady_scan_requests(git_env, 5_000)
     assert len(large) == len(small)
     assert large.count(LIST) == 1  # one incremental page, not ~51 inventory pages
-    # Everything else is the tree's own: child lists of the live nodes, then snapshots.
-    # inventory page + child lists of the live nodes (root, c0, c1) + five snapshots
-    assert len(large) == 1 + 3 + 5
+    # Everything else is the tree's own: one subtree listing, then snapshots of the root
+    # and of the archived nodes (no listing row); the idle children's rows are unchanged
+    # since the first scan, so their cached state stands (no read).
+    # inventory page + one subtree listing + three snapshots
+    assert len(large) == 1 + 1 + 3
+    assert ("GET", "/v1/sessions/conv_c0") not in large
 
 
 def _yielding(server: FakeOmnigentServer) -> OmnigentRest:

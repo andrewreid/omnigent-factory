@@ -2,7 +2,9 @@
 
 The observer used to re-read every node of every tree on a timer. This feed tells it
 which nodes to re-read instead. Its events only mark nodes *dirty*; the observer then
-reads those nodes (lite snapshots), so an event is never evidence of state.
+reads the nodes with a state edge (lite snapshots), so an event is never evidence of
+state. A mark for progress alone carries the pushed row's ``updated_at``: the observer
+takes it as the node's activity time and reads nothing.
 
 Two channels, chosen per tree at runtime with no configuration:
 
@@ -111,12 +113,15 @@ class DirtyMark:
     """Why a node should be re-read."""
 
     #: A state edge (status, prompt, archive, task...): read it promptly. False: ordinary
-    #: progress (e.g. only ``updated_at`` moved), read at most once per observer interval.
+    #: progress (e.g. only ``updated_at`` moved): never read for that alone; the observer
+    #: takes the node's new activity time from ``updated_at`` instead.
     edge: bool = False
     #: Its children may have changed (a spawn): list them too.
     spawn: bool = False
     #: When it was first marked (monotonic us); a full scan that started later clears it.
     marked_at_us: int = 0
+    #: The newest ``updated_at`` its pushed row carried (None: none seen): progress.
+    updated_at: object = None
 
 
 class WsConnection(Protocol):
@@ -332,7 +337,15 @@ class ChangeFeed:
 
     # ------------------------------------------------------------ marking
 
-    def _mark(self, root_id: str | None, node_id: str, *, edge: bool, spawn: bool = False) -> None:
+    def _mark(
+        self,
+        root_id: str | None,
+        node_id: str,
+        *,
+        edge: bool,
+        spawn: bool = False,
+        updated_at: object = None,
+    ) -> None:
         if root_id is None or root_id not in self._trees:
             return
         marks = self._dirty.setdefault(root_id, {})
@@ -341,10 +354,11 @@ class ChangeFeed:
             mark = marks[node_id] = DirtyMark(marked_at_us=self._clock.monotonic_us())
         mark.edge = mark.edge or edge
         mark.spawn = mark.spawn or spawn
+        if updated_at is not None:
+            mark.updated_at = updated_at
         self.counters["marks_edge" if edge else "marks_progress"] += 1
         if edge or spawn:
-            # Progress alone is read at most once per observer interval anyway: it waits
-            # for the next timed pass instead of waking one.
+            # Progress alone is never read: the next pass (timer) records its activity.
             self.wake.set()
 
     # ------------------------------------------------------------ SSE
@@ -546,7 +560,13 @@ class ChangeFeed:
                 progress = True  # a partial delta (e.g. a new message preview)
             # A full summary equal to what was seen (a reconnect's snapshot) marks nothing.
             if edge or progress or child not in self._owner:
-                self._mark(root_id, child, edge=edge, spawn=child not in self._owner)
+                self._mark(
+                    root_id,
+                    child,
+                    edge=edge,
+                    spawn=child not in self._owner,
+                    updated_at=moved if "updated_at" in summary else None,
+                )
             if isinstance(parent, str) and parent not in self._owner:
                 self._mark(root_id, parent, edge=True, spawn=True)
         elif kind == "session.created":
@@ -733,8 +753,9 @@ class ChangeFeed:
         if baseline:
             return  # first snapshot of a connection: the reconnect scan reads everything
         if previous is None:
-            self._mark(root, sid, edge=False)  # newly watched: ordinary refresh
+            # Newly watched (scanned already): its activity time only.
+            self._mark(root, sid, edge=False, updated_at=progress)
         elif previous[:-1] != fields:
-            self._mark(root, sid, edge=True)
+            self._mark(root, sid, edge=True, updated_at=progress)
         elif previous[-1] != progress:
-            self._mark(root, sid, edge=False)
+            self._mark(root, sid, edge=False, updated_at=progress)

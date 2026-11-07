@@ -12,6 +12,12 @@ deleted only when every rule holds:
   server's ``omnigent.archived_at`` label, else its last update);
 * a complete scan of its tree finds nothing running or waiting.
 
+Finished runs are not re-read to find out: the shared archive-inclusive session inventory
+the observer keeps (its full read every ``session_inventory_resync_hours``) already lists
+every root's archive state and labels, so a root it shows not archived, not the factory's
+or archived too recently is skipped with no request. Only a root it shows eligible (or
+does not list) gets a lite snapshot read to confirm, then the tree scan and the delete.
+
 ``DELETE /v1/sessions/{id}`` (pinned Omnigent server) removes the root and every
 descendant (child and worker sessions, items, labels, policies) and stops its tasks; the
 git worktree and branch stay (no ``delete_branch``). Each deletion, or a root already
@@ -53,6 +59,9 @@ MICROS_PER_DAY = 86_400_000_000
 #: can only become eligible once archived and then retained for days, so a sweep every 15
 #: minutes need not re-read every finished issue's root every time (#push-observer).
 RECHECK_US = 6 * 3_600_000_000
+#: A root whose tree was unreadable, incomplete or not idle is checked again after this
+#: long (not every sweep): it was already archived and retained for days.
+RETRY_US = 3_600_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,36 +198,63 @@ class SessionRetention:
         if held is not None and now < held[0]:
             return held[1]
         self._recheck.pop(candidate.root_id, None)
+        listed = self._inventory_row(candidate.root_id)
+        if listed is not None:
+            # The inventory's row (no request): only a root it shows eligible is read.
+            verdict = self._verdict(candidate, listed, cutoff_us, now)
+            if verdict is not None:
+                return verdict
         try:
             snap = await self.adapter.rest.get_json(
                 f"/v1/sessions/{candidate.root_id}", LITE_SNAPSHOT
             )
         except OmnigentReadError as exc:
-            return "gone" if exc.status == 404 else f"unreadable: {exc.reason}"
+            if exc.status == 404:
+                return "gone"
+            self._recheck[candidate.root_id] = (now + RETRY_US, "unreadable")
+            return f"unreadable: {exc.reason}"
+        verdict = self._verdict(candidate, snap, cutoff_us, now)
+        if verdict is not None:
+            return verdict
+        try:
+            # Every node read: a deletion never rests on a cached state or a listing row.
+            tree = await self.adapter.observe_tree(candidate.root_id, reuse=False)
+        except OmnigentReadError as exc:
+            self._recheck[candidate.root_id] = (now + RETRY_US, "tree unreadable")
+            return f"tree unreadable: {exc.reason}"
+        if not tree.complete:
+            verdict = "tree scan incomplete"
+        elif not tree.quiescent or tree.pending_waiter:
+            verdict = "a session in its tree is not idle"
+        if verdict is not None:
+            self._recheck[candidate.root_id] = (now + RETRY_US, verdict)
+        return verdict
+
+    def _inventory_row(self, root_id: str) -> Mapping[str, Any] | None:
+        lookup = getattr(self.adapter, "inventory_root", None)
+        return lookup(root_id) if lookup is not None else None
+
+    def _verdict(
+        self, candidate: Candidate, row: Mapping[str, Any], cutoff_us: int, now: int
+    ) -> str | None:
+        """Why ``row`` (a lite snapshot or the inventory's list row) keeps the root, held
+        until it could change (None: archived long enough by a root with our label)."""
         verdict: str | None = None
-        if snap.get("archived") is not True:
+        if row.get("archived") is not True:
             verdict = "not archived"
-        elif snap.get("parent_session_id") is not None:
+        elif row.get("parent_session_id") is not None:
             verdict = "not a root session"
-        elif not as_map(snap.get("labels")).get(NONCE_LABEL):
+        elif not as_map(row.get("labels")).get(NONCE_LABEL):
             verdict = "no factory label"
         if verdict is not None:
             self._recheck[candidate.root_id] = (now + RECHECK_US, verdict)
             return verdict
-        archived = archived_at_us(snap)
+        archived = archived_at_us(row)
         if archived is None or archived > cutoff_us:
             if archived is not None:
                 eligible_at = archived + (now - cutoff_us)
                 self._recheck[candidate.root_id] = (eligible_at, "archived too recently")
             return "archived too recently"
-        try:
-            tree = await self.adapter.observe_tree(candidate.root_id)
-        except OmnigentReadError as exc:
-            return f"tree unreadable: {exc.reason}"
-        if not tree.complete:
-            return "tree scan incomplete"
-        if not tree.quiescent or tree.pending_waiter:
-            return "a session in its tree is not idle"
         return None
 
     async def _delete(self, candidate: Candidate) -> str | None:

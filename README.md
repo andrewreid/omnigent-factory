@@ -1583,13 +1583,24 @@ setting). A tree the stream does not cover (no stream support, a stream down, a 
 before that proof) is watched on the `WS /v1/sessions/updates` watch-set, which reports
 state edges of known ids but never a new child: its topology (root, child list, inventory)
 is polled on the tree's old cadence (5/60/300 s). Anything no read proved fresh is unknown,
-and unknown forces a read. Feed events only mark nodes dirty: each dirty node gets one lite
-snapshot read (no items, no liveness), a spawn or unknown node also its child list, a node
-whose cached task status is live while its snapshot is idle its parent's child list, and a
-tree last seen busy is reported idle only after a confirming pass (the root and every
-previously busy node re-read, their and their parents' child lists re-read, the inventory
-refreshed). Any failed read leaves the tree unknown until a full scan. A tree is fully scanned after every (re)connect or
-channel switch, and otherwise every `observer_reconcile_active_seconds` (`300`),
+and unknown forces a read. Feed events only mark nodes dirty: a state edge (status, task,
+labels, archive, prompt, failure) gets the node one lite snapshot read (no items, no
+liveness); progress alone (a pushed row whose `updated_at` moved) is never read: that
+time becomes the node's activity time, which is what stall detection uses. Any child list
+a pass needs (a spawn or unknown node, a node whose cached task status is live while its
+snapshot is idle, a confirmation, a resume) is one
+`GET /v1/sessions/{root}/child_sessions?descendants=true` listing of the whole
+non-archived subtree, rows carrying each node's parent, task status, `updated_at`, labels,
+failure and open-prompt count; a node whose row changed since it was read is read too.
+A server without that listing (rows without `depth`, or a 400/422) is walked parent by
+parent as before, detected per listing with no setting. A tree last seen busy is reported
+idle only after a confirming pass (the root and every previously busy node re-read, the
+subtree re-listed, the inventory refreshed). Any failed read leaves the tree unknown until
+a full scan. A full scan is the subtree listing, the inventory delta, the root's lite
+snapshot and lite reads of the nodes whose row changed (or that have no row, were busy or
+hold a prompt); an idle node with an unchanged row keeps its state. A tree is fully
+scanned after every (re)connect or
+channel switch, and otherwise every `observer_reconcile_active_seconds` (`600`),
 `observer_reconcile_settled_seconds` (`900`) or `observer_reconcile_parked_seconds`
 (`1800`, all hot-reloadable), which also refreshes what is never pushed (background
 tasks, pending inputs, cost). A tree neither channel covers (both down, or past the

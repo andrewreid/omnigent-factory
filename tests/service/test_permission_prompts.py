@@ -518,7 +518,8 @@ async def test_the_probe_costs_one_request_per_active_tree() -> None:
     obs = await scan_tree(rest, "root")
     full = len(server.requests) - before
     assert "e1" in obs.owned_elicitations()
-    assert full >= 80  # child lists and a snapshot per node, plus the inventory
+    # One subtree listing, the inventory and (first sight) a snapshot per node.
+    assert full == 1 + 1 + 41
     # Every 15 s, against a full pass every 5 s plus its duration: +1 request per
     # 3 full-scan passes of ~80 requests (~0.4%).
     assert PROMPT_PROBE_INTERVAL_SECONDS == 15.0

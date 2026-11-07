@@ -4,14 +4,19 @@ A stage session is its root plus every recursive descendant. The SDK's
 ``child_sessions_tree`` is insufficient for safety (one unpaged page per parent, depth
 cap, root excluded from ``subtree_busy``, archived children hidden), so a scan:
 
-1. walks ``GET /v1/sessions/{id}/child_sessions`` for every node, all pages, with a
-   visited set (cycle guard);
+1. lists the whole (non-archived) subtree with one paged
+   ``GET /v1/sessions/{root}/child_sessions?descendants=true`` (:func:`list_subtree`);
+   a server without it answers with the root's direct children only (rows without
+   ``depth``), and then every further node's ``child_sessions`` is walked, all pages,
+   with a visited set (cycle guard), as before;
 2. supplements it with the archive-inclusive inventory of every session
    (:class:`~omnigent_factory.omnigent.inventory.SessionIndex`, refreshed incrementally
    by a read that starts after the scan does) and closes descendants over
    ``parent_session_id`` - archived intermediate parents and their children included;
 3. retains previously known node IDs even when a page omits them;
-4. reads every node's current snapshot, root included.
+4. reads the current snapshot of the root and of every node whose listing row changed
+   since it was last read (or that has no row, was busy or holds a prompt); an idle
+   node whose row is unchanged keeps its cached state (:func:`finish_scan`).
 
 Any failed read or the node ceiling makes the scan incomplete: quiescence is then
 unknown, never idle. Archived does not mean quiescent.
@@ -81,6 +86,10 @@ class NodeState:
     updated_at_us: int = 0
     #: ``last_task_error.code`` of its latest turn (e.g. ``runner_failed_to_start``).
     last_error: str | None = None
+    #: :func:`row_signature` of its child-list row when its snapshot was read after that
+    #: row (None: read without one, or the root): a later row that differs means the
+    #: node changed and is read again; an equal one lets an idle node keep this state.
+    row: tuple[object, ...] | None = None
 
     @property
     def elicitation_ids(self) -> tuple[str, ...]:
@@ -223,6 +232,70 @@ def target_session_of(event: Mapping[str, Any]) -> str | None:
     return target if isinstance(target, str) and target else None
 
 
+#: ``ChildSessionSummary`` fields that change when the session does (schemas.py:834-939
+#: @42e17e47): activity (``updated_at``), the latest task and its status, the live-loop
+#: flag, labels (archive, routing...), the failure detail and open prompts. A preview-only
+#: change (``last_message_preview``) is not a change of state.
+ROW_FIELDS = (
+    "updated_at",
+    "current_task_id",
+    "current_task_status",
+    "busy",
+    "labels",
+    "last_task_error",
+    "pending_elicitations_count",
+)
+
+
+def _frozen(value: object) -> object:
+    if isinstance(value, Mapping):
+        return tuple(sorted((str(k), _frozen(v)) for k, v in value.items()))
+    if isinstance(value, list | tuple):
+        return tuple(_frozen(v) for v in value)
+    return value
+
+
+def row_signature(row: Mapping[str, Any]) -> tuple[object, ...]:
+    """What a child-list row says about its session's state (see :data:`ROW_FIELDS`)."""
+    return tuple(_frozen(row.get(f)) for f in ROW_FIELDS)
+
+
+#: The only child-row task status that is lifecycle evidence of an idle session. The
+#: server derives ``busy``/``current_task_status`` from its process-local status cache
+#: (helpers.py:11470-11483,11577-11583 @42e17e47): ``completed`` only from a cache hit of
+#: ``idle``, with no failure label; and on a hit the lite snapshot reports that same cached
+#: status (orchestration.py:14073-14092), so reading it would prove nothing more. A cache
+#: miss gives ``busy=false`` and a null status whatever the persisted lifecycle is, and a
+#: status change does not move ``updated_at`` (sqlalchemy_store.py:4438-4443): null is
+#: unknown. ``failed`` is forced by the failure label even on a miss (a later run can be
+#: live under it), and ``in_progress`` is busy: neither certifies anything.
+IDLE_TASK_STATUS = "completed"
+
+
+def row_unchanged(previous: NodeState | None, row: Mapping[str, Any] | None) -> bool:
+    """``previous`` (a cached node) is still current by its listing ``row``: the row equals
+    the one it was read with, the row and the cached node both show an idle, completed
+    turn (:data:`IDLE_TASK_STATUS`: positive lifecycle evidence, never a cache-miss
+    false/null), and the node was neither busy nor holding or mirroring a prompt (a prompt
+    is not in the row; busy must be proven over). Anything else is unknown, and unknown
+    forces a read."""
+    return (
+        previous is not None
+        and row is not None
+        and previous.row is not None
+        and previous.row == row_signature(row)
+        and row.get("current_task_status") == IDLE_TASK_STATUS
+        and row.get("busy") is False
+        and previous.task_status == IDLE_TASK_STATUS
+        and previous.status == "idle"
+        and not previous.busy
+        and not previous.elicitations
+        and not previous.mirrored
+        and not previous.pending_inputs
+        and not row.get("pending_elicitations_count")
+    )
+
+
 def node_from_snapshot(
     node_id: str,
     parent_id: str | None,
@@ -240,9 +313,9 @@ def node_from_snapshot(
     )
     cost = snap.get("total_cost_usd")
     items = snap.get("items")
-    updated = _epoch_us(snap.get("updated_at"))
+    updated = epoch_us(snap.get("updated_at"))
     if not updated and summary is not None:
-        updated = _epoch_us(summary.get("updated_at"))
+        updated = epoch_us(summary.get("updated_at"))
     error = snap.get("last_task_error")
     code = error.get("code") if isinstance(error, dict) else None
     return NodeState(
@@ -259,6 +332,7 @@ def node_from_snapshot(
         items_hint=len(items) if isinstance(items, list) else 0,
         updated_at_us=updated,
         last_error=code if isinstance(code, str) else None,
+        row=row_signature(summary) if summary is not None else None,
     )
 
 
@@ -274,7 +348,7 @@ def root_prompts(root_id: str, snap: Mapping[str, Any]) -> dict[str, tuple[str, 
     return out
 
 
-def _epoch_us(value: object) -> int:
+def epoch_us(value: object) -> int:
     """An Omnigent timestamp (epoch seconds, possibly fractional, or ISO 8601) in UTC
     microseconds; 0 when absent or unreadable."""
     if isinstance(value, bool):
@@ -297,6 +371,72 @@ def _epoch_us(value: object) -> int:
     return 0
 
 
+#: ``max_depth`` of a ``?descendants=true`` listing: the server's cap
+#: (``_MAX_DESCENDANT_DEPTH``, routes_items.py:57-60 @42e17e47; default 3). A node at this
+#: depth may have children the listing omits: they are walked per parent.
+DESCENDANT_DEPTH = 10
+#: Rows per page of a subtree listing (the route's ``limit`` maximum).
+DESCENDANT_PAGE = 1000
+#: Statuses with which a server rejects the subtree parameters themselves (a stricter or
+#: different build): the scan then walks every parent, as against a server without them.
+_LISTING_REJECTED = frozenset({400, 422})
+
+
+@dataclass(frozen=True, slots=True)
+class Subtree:
+    """One ``child_sessions?descendants=true`` listing of a root (:func:`list_subtree`)."""
+
+    #: Every row, breadth-first: the whole non-archived subtree, or (``whole`` False) the
+    #: root's direct children only.
+    rows: tuple[Mapping[str, Any], ...]
+    #: Each listed node's parent.
+    parents: Mapping[str, str]
+    #: Nodes whose every non-archived child is in ``rows``: the root, and (``whole``) each
+    #: listed node above the depth cap. Any other node's children are listed per parent.
+    covered: frozenset[str]
+    #: The server returned the subtree (every row carries ``depth``).
+    whole: bool
+
+
+async def list_subtree(rest: OmnigentRest, root_id: str) -> Subtree:
+    """The non-archived subtree of ``root_id`` in one paged read.
+
+    ``GET /v1/sessions/{root}/child_sessions?descendants=true&max_depth=10``
+    (routes_items.py:139-310, helpers in orchestration.py:12878 @42e17e47): rows
+    breadth-first, each ``ChildSessionSummary`` with ``parent_session_id`` set to its own
+    parent and ``depth`` set; an archived node and its subtree are omitted (as from a
+    per-parent walk); ``limit``/``after`` page it. A server without the flag, or a spawn
+    tree over 2000 sub-agents, answers with the root's direct children (no ``depth``):
+    then only the root is ``covered`` and the caller walks the rest. An empty listing is
+    complete either way (the root has no non-archived child). Raises
+    :class:`OmnigentReadError`.
+    """
+    rows = await rest.paginate(
+        f"/v1/sessions/{root_id}/child_sessions",
+        {
+            "descendants": "true",
+            "max_depth": DESCENDANT_DEPTH,
+            "order": "asc",  # the one-level fallback's order (ignored for a subtree)
+            "limit": DESCENDANT_PAGE,
+        },
+    )
+    listed = [r for r in rows if isinstance(r.get("id"), str)]
+    whole = all(
+        isinstance(r.get("depth"), int)
+        and not isinstance(r.get("depth"), bool)
+        and isinstance(r.get("parent_session_id"), str)
+        for r in listed
+    )
+    parents: dict[str, str] = {}
+    for row in listed:
+        parent = row.get("parent_session_id")
+        parents[str(row["id"])] = parent if whole and isinstance(parent, str) else root_id
+    covered = {root_id}
+    if whole:
+        covered.update(str(r["id"]) for r in listed if int(r["depth"]) < DESCENDANT_DEPTH)
+    return Subtree(tuple(listed), parents, frozenset(covered), whole and bool(listed))
+
+
 @dataclass
 class ScanWalk:
     parents: dict[str, str | None] = field(default_factory=dict)
@@ -311,15 +451,20 @@ async def scan_tree(
     known_ids: Iterable[str] = (),
     max_nodes: int = DEFAULT_MAX_NODES,
     index: SessionIndex | None = None,
+    cached: TreeObservation | None = None,
 ) -> TreeObservation:
-    """Scan ``root_id``'s tree; ``index`` is shared across scans (a one-off otherwise)."""
+    """Scan ``root_id``'s tree; ``index`` is shared across scans (a one-off otherwise);
+    ``cached`` (its previous observation) spares reads of unchanged idle nodes."""
     walk = await begin_scan(rest, root_id, max_nodes=max_nodes)
     await _close_over_inventory(index or SessionIndex(rest), walk, max_nodes)
-    return await finish_scan(rest, root_id, walk, known_ids=known_ids, max_nodes=max_nodes)
+    return await finish_scan(
+        rest, root_id, walk, known_ids=known_ids, max_nodes=max_nodes, cached=cached
+    )
 
 
 async def begin_scan(rest: OmnigentRest, root_id: str, *, max_nodes: int) -> ScanWalk:
-    """Step 1 of a scan: walk the (non-archived) child lists from ``root_id``.
+    """Step 1 of a scan: list the (non-archived) subtree of ``root_id`` (one listing where
+    the server supports it, else a walk of every child list).
 
     Steps 2-3 (:func:`close_over_index`, :func:`finish_scan`) must follow with an
     inventory refreshed by a read that started after this walk: several scans may share
@@ -349,8 +494,14 @@ async def finish_scan(
     *,
     known_ids: Iterable[str] = (),
     max_nodes: int = DEFAULT_MAX_NODES,
+    cached: TreeObservation | None = None,
 ) -> TreeObservation:
-    """Step 3: read every node's current snapshot, root included.
+    """Step 3: read the current snapshot of the root and of every node not proven current.
+
+    With ``cached`` (this root's previous observation), a listed node whose row is
+    unchanged since it was read and that was idle and prompt-free keeps its cached state
+    (:func:`row_unchanged`), refreshed with the row's task status; every other node, the
+    root, nodes known only from the inventory or earlier scans (no row) included, is read.
 
     A node known only from earlier scans (absent from this walk and the inventory) whose
     snapshot is not found was deleted: it is reported ``gone``, not an error, so one
@@ -376,6 +527,17 @@ async def finish_scan(
             walk.errors.append("node-ceiling")
             break
         attempted.add(node_id)
+        summary = walk.summaries.get(node_id)
+        previous = cached.nodes.get(node_id) if cached is not None else None
+        if node_id != root_id and summary is not None and row_unchanged(previous, summary):
+            assert previous is not None  # noqa: S101 - row_unchanged proved it
+            status = summary.get("current_task_status")
+            nodes[node_id] = replace(
+                previous,
+                parent_id=parent if parent is not None else previous.parent_id,
+                task_status=status if isinstance(status, str) else None,
+            )
+            continue
         try:
             snap = await rest.get_json(f"/v1/sessions/{node_id}", snapshot_params(node_id, root_id))
         except OmnigentReadError as exc:
@@ -386,7 +548,7 @@ async def finish_scan(
                 not_found.add(node_id)
             walk.errors.append(f"snapshot {node_id}: {exc.reason}")
             continue
-        node = node_from_snapshot(node_id, parent, snap, walk.summaries.get(node_id))
+        node = node_from_snapshot(node_id, parent, snap, summary)
         nodes[node_id] = node
         # A mirrored prompt names its owning session: that is discovered tree evidence
         # (e.g. a child created after enumeration). Read it too, and close over whatever
@@ -419,8 +581,25 @@ def _unread_mirror_owners(nodes: Mapping[str, NodeState]) -> list[str]:
 
 
 async def _walk_children(rest: OmnigentRest, root_id: str, walk: ScanWalk, max_nodes: int) -> None:
+    """One subtree listing; a per-parent walk only below what it does not cover."""
     frontier = [root_id]
     visited: set[str] = set()
+    try:
+        subtree: Subtree | None = await list_subtree(rest, root_id)
+    except OmnigentReadError as exc:
+        if exc.status not in _LISTING_REJECTED:
+            walk.errors.append(f"children {root_id}: {exc.reason}")
+            return
+        subtree = None  # the parameters are refused: walk every parent
+    if subtree is not None:
+        for listed in subtree.rows:
+            node = str(listed["id"])
+            if node in walk.parents or len(walk.parents) > max_nodes:
+                continue
+            walk.parents[node] = subtree.parents[node]
+            walk.summaries[node] = listed
+        visited = set(subtree.covered)
+        frontier = [n for n in walk.parents if n not in visited]
     while frontier:
         parent = frontier.pop(0)
         if parent in visited:
@@ -574,11 +753,43 @@ async def refresh_tree(
     attempted: set[str] = set()
     #: Read nodes whose task status came from the cache, not a fresh child-list row.
     carried: set[str] = set()
+    #: Whether this refresh listed the subtree (once: it re-lists every covered parent).
+    subtree_listed = False
+    dirty_set = set(reads)
     while lists or reads:
         while lists:
             parent = lists.pop(0)
             if parent in listed:
                 continue
+            if not subtree_listed:
+                # Any child list needed: the whole subtree in one listing, which re-lists
+                # every covered parent at once; a changed row is read (it is a change).
+                subtree_listed = True
+                try:
+                    subtree: Subtree | None = await list_subtree(rest, root_id)
+                except OmnigentReadError as exc:
+                    subtree = None
+                    if exc.status not in _LISTING_REJECTED:
+                        errors.append(f"children {root_id}: {exc.reason}")
+                        listed.update(parents)  # incomplete anyway: list nothing more
+                        listed.add(parent)
+                        lists.clear()
+                        continue
+                if subtree is not None:
+                    for listed_row in subtree.rows:
+                        node_id = str(listed_row["id"])
+                        summaries[node_id] = listed_row
+                        if node_id not in parents:
+                            parents[node_id] = subtree.parents[node_id]
+                            reads.append(node_id)
+                            lists.append(node_id)
+                        elif node_id not in dirty_set and node_id not in reads:
+                            known = nodes.get(node_id)
+                            if known is None or known.row != row_signature(listed_row):
+                                reads.append(node_id)
+                    listed.update(subtree.covered)
+                    if parent in listed:
+                        continue
             listed.add(parent)
             try:
                 rows = await rest.paginate(
@@ -613,7 +824,8 @@ async def refresh_tree(
         node = node_from_snapshot(node_id, parents.get(node_id), snap, summaries.get(node_id))
         previous = nodes.get(node_id)
         if node_id not in summaries and previous is not None:
-            node = replace(node, task_status=previous.task_status)
+            # Its last row still describes it: a later equal row means no change since.
+            node = replace(node, task_status=previous.task_status, row=previous.row)
             carried.add(node_id)
             if _unresolved_task(node) and node.parent_id is not None:
                 lists.append(node.parent_id)  # unknown task status: re-list it now

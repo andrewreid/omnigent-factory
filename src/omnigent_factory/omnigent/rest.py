@@ -44,7 +44,8 @@ LITE_NODE_SNAPSHOT: Mapping[str, str] = {**LITE_SNAPSHOT, "include_usage": "fals
 def request_kind(path: str, params: Mapping[str, str | int] | None) -> str:
     """The counter a GET of ``path`` is recorded under (see ``OmnigentRest.requests``)."""
     if path.endswith("/child_sessions"):
-        return "children_page"
+        descendants = str((params or {}).get("descendants", "")).lower() == "true"
+        return "descendants" if descendants else "children_page"
     if path == "/v1/sessions":
         return "session_list"
     if path.startswith("/v1/sessions/") and path.count("/") == 3:

@@ -393,9 +393,12 @@ class ServiceConfig(BaseModel):
     observer_change_feed: bool = True
     #: With the change feed, a covered tree is still fully re-scanned this often (and
     #: after every (re)connect), repairing any missed event and refreshing what is never
-    #: pushed (background tasks, pending inputs, cost). Active: 5 min bounds a missed
-    #: event well inside ``stall_nudge_minutes`` (30) and the ~5 min active-time step.
-    observer_reconcile_active_seconds: float = Field(default=300.0, ge=30)
+    #: pushed (background tasks, pending inputs, cost). A scan is one subtree listing,
+    #: the inventory delta and lite reads of the root and of changed rows only. Active:
+    #: 10 min is a safety net only (state edges and spawns are pushed, activity comes
+    #: from pushed rows) and still bounds a missed event well inside
+    #: ``stall_nudge_minutes`` (30).
+    observer_reconcile_active_seconds: float = Field(default=600.0, ge=30)
     #: Settled trees (quiescent, nothing of ours running) change only externally: 15 min.
     observer_reconcile_settled_seconds: float = Field(default=900.0, ge=30)
     #: Parked trees wait on a person, CI or the review bot, and the factory's own move

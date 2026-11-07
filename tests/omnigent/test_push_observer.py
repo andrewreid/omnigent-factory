@@ -350,8 +350,8 @@ async def test_a_spawn_lists_the_parents_children_and_reads_the_new_node() -> No
     rest.requests.clear()
     server.add(FakeSession(id="c4", agent_id=AGENT, parent_session_id="c1", status="running"))
     result = await refresh_tree(rest, cached, [], spawned=["c1"])
-    assert rest.requests["children_page"] == 2  # c1's, then the new c4's
-    assert rest.requests["lite_read"] == 1
+    # One subtree listing (it covers c1 and the new c4), never a list per parent.
+    assert dict(rest.requests) == {"descendants": 1, "lite_read": 1}
     assert result.observation.nodes["c4"].parent_id == "c1"
     assert result.observation.busy
     await rest.aclose()
@@ -386,7 +386,7 @@ async def test_a_turn_ending_reaches_quiescence_without_waiting_for_reconcile() 
     result = await refresh_tree(rest, cached, ["c1"])
     assert result.observation.nodes["c1"].task_status == "completed"
     assert result.observation.complete and result.observation.quiescent
-    assert dict(rest.requests) == {"lite_read": 1, "children_page": 1}
+    assert dict(rest.requests) == {"lite_read": 1, "descendants": 1}
     # The confirming pass the observer then runs also ends quiescent.
     confirmed = await refresh_tree(rest, result.observation, [], confirm=True, confirm_busy=["c1"])
     assert confirmed.confirmed and confirmed.observation.quiescent
@@ -421,10 +421,10 @@ async def test_a_topology_poll_finds_a_spawned_child_with_three_requests() -> No
     rest.requests.clear()
     result = await refresh_tree(rest, cached, [], topology=True, index=index)
     assert result.observation.nodes["c9"].busy and result.observation.complete
-    # The root and the new child read lite, the root's child list, the inventory page,
-    # and the new child's (empty) child list. Never every node.
+    # The root and the new child read lite, one subtree listing, the inventory page.
+    # Never every node, never a list per parent.
     assert rest.requests["lite_read"] == 2 and rest.requests["inventory"] == 1
-    assert rest.requests["children_page"] == 2
+    assert rest.requests["descendants"] == 1 and rest.requests["children_page"] == 0
     await rest.aclose()
 
 
@@ -443,8 +443,18 @@ class FakeFeed:
     def coverage(self, root: str) -> tuple[str, int]:
         return self.cover.get(root, (TIMER, 0))
 
-    def mark(self, root: str, node: str, *, edge: bool = True, spawn: bool = False) -> None:
-        self.marks.setdefault(root, {})[node] = DirtyMark(edge, spawn, marked_at_us=10**15)
+    def mark(
+        self,
+        root: str,
+        node: str,
+        *,
+        edge: bool = True,
+        spawn: bool = False,
+        updated_at: object = None,
+    ) -> None:
+        self.marks.setdefault(root, {})[node] = DirtyMark(
+            edge, spawn, marked_at_us=10**15, updated_at=updated_at
+        )
 
     def take_dirty(
         self, root: str, keep: Callable[[str, DirtyMark], bool] | None = None
@@ -707,19 +717,40 @@ async def test_feed_mode_transitions_are_logged_and_reported(
 
 
 @pytest.mark.asyncio
-async def test_progress_marks_are_read_at_most_once_per_interval() -> None:
+async def test_progress_is_never_read_its_row_time_becomes_the_activity() -> None:
+    """No timed busy-progress reads: a pushed row whose ``updated_at`` moved (and nothing
+    else) costs no request; the node's activity time (what the health sweep's stall
+    detection judges) moves to the row's time, however often progress arrives."""
     parcel, root = _active_run()
-    adapter = WorldAdapter(_world(root, root="running"), root)
+    adapter = WorldAdapter(_world(root, root="running", w1="running"), root)
     feed = FakeFeed(cover={root: (SSE, 1)})
     clock = FakeClock()
     observer, _seen = _observer(adapter, feed, clock, parcel)
     await observer.observe_once()
+    session = parcel.current_session
+    assert session is not None
+    tree = observer._feed_trees[session.session_id]
+    observer._remember(session.session_id, tree.observation, clock.now_utc_us())
+    calls, reads = len(adapter.calls), adapter.rest.requests["lite_read"]
+    for step in range(1, 25):  # two minutes of progress, every 5 s
+        clock.advance(5_000_000)
+        feed.mark(root, "w1", edge=False, updated_at=T0 + step)
+        await observer.observe_once()
+    assert len(adapter.calls) == calls and adapter.rest.requests["lite_read"] == reads
+    assert tree.observation.nodes["w1"].updated_at_us == (T0 + 24) * 1_000_000
+    reading = observer.reading(session.session_id)
+    assert reading is not None and reading.last_activity_us == (T0 + 24) * 1_000_000
+    assert reading.read_at_us == clock.now_utc_us()
+    assert observer.passes["progress"] == 24
+    # An older or missing time never moves it back; an edge is still read at once.
+    feed.mark(root, "w1", edge=False, updated_at=T0)
     feed.mark(root, root, edge=False)
     await observer.observe_once()
-    assert len(adapter.calls) == 1  # read 0 s ago: held back
-    clock.advance(5_000_000)
+    assert tree.observation.nodes["w1"].updated_at_us == (T0 + 24) * 1_000_000
+    assert len(adapter.calls) == calls
+    feed.mark(root, "w1")
     await observer.observe_once()
-    assert adapter.calls[-1] == ("refresh", (root,))
+    assert adapter.calls[-1] == ("refresh", ("w1",))
 
 
 # ============================================================ nonce lookup
@@ -1109,7 +1140,7 @@ async def test_every_non_live_status_re_lists_a_cached_live_task(
     result = await refresh_tree(rest, cached, ["c1"])
     assert result.observation.nodes["c1"].task_status == task
     assert result.observation.complete and result.observation.quiescent
-    assert dict(rest.requests) == {"lite_read": 1, "children_page": 1}
+    assert dict(rest.requests) == {"lite_read": 1, "descendants": 1}
     await rest.aclose()
 
 
@@ -1435,7 +1466,7 @@ async def test_a_stream_reconnect_resumes_with_a_root_read_not_a_full_scan() -> 
     feed.snapshot_ok = False
     feed.cover[root] = (SSE, 3)
     await observer.observe_once()
-    assert dict(adapter.rest.requests) == {"lite_read": 1, "children_page": 1}
+    assert dict(adapter.rest.requests) == {"lite_read": 1, "descendants": 1}
     await adapter.rest.aclose()
 
 

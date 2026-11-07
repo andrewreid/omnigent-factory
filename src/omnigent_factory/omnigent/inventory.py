@@ -63,6 +63,9 @@ class SessionIndex:
         self._overlap_s = overlap_s
         self._resync_us = int(resync_s * 1_000_000)
         self._children: dict[str, set[str]] = defaultdict(set)
+        #: Every root session's list row (archive state, labels, ``updated_at``) as of the
+        #: last read that listed it: archive state is current to a full read (``resync_s``).
+        self._roots: dict[str, Mapping[str, Any]] = {}
         #: Newest ``created_at`` of every complete read so far; ``None`` forces a full read.
         self._watermark: int | None = None
         self._full_read_at_us: int | None = None
@@ -80,6 +83,17 @@ class SessionIndex:
 
     def children(self, session_id: str) -> Iterable[str]:
         return tuple(sorted(self._children.get(session_id, ())))
+
+    def root_row(self, session_id: str) -> Mapping[str, Any] | None:
+        """``session_id``'s list row if it is a root the last full read (or a later
+        incremental one) listed; None: no full read yet, the last full read is ``resync_s``
+        old or more (nobody refreshed it since), or not listed as a root. Its archive state
+        and labels are at most ``resync_s`` old."""
+        if self._full_read_at_us is None:
+            return None
+        if self._clock.monotonic_us() - self._full_read_at_us >= self._resync_us:
+            return None  # older than the resync bound: not evidence (callers read instead)
+        return self._roots.get(session_id)
 
     async def refresh(self) -> None:
         """Bring the map up to date with a read that starts after this call."""
@@ -100,6 +114,7 @@ class SessionIndex:
                 "/v1/sessions", {**_INVENTORY, "order": "asc"}, kind="inventory"
             )
             self._children = defaultdict(set)
+            self._roots = {}
             self._watermark = None
             self._full_read_at_us = now
         else:
@@ -114,6 +129,10 @@ class SessionIndex:
             sid, parent = row.get("id"), row.get("parent_session_id")
             if isinstance(sid, str) and isinstance(parent, str):
                 self._children[parent].add(sid)
+            elif isinstance(sid, str) and parent is None:
+                self._roots[sid] = {
+                    k: row.get(k) for k in ("id", "archived", "labels", "updated_at")
+                }
             created = _created(row)
             if created is not None and (self._watermark is None or created > self._watermark):
                 self._watermark = created

@@ -54,6 +54,12 @@ class FakeSession:
     title: str | None = None
     context_window: int | None = None
     last_total_tokens: int | None = None
+    #: The row's ``updated_at`` (None: ``created_at``).
+    updated_at: int | None = None
+    #: Whether the server's process-local status cache holds this session: a child row's
+    #: ``busy``/``current_task_status`` come from it (helpers.py:11470-11483,11577-11583
+    #: @42e17e47); a miss lists ``busy=false`` and a null status whatever ``status`` is.
+    status_cached: bool = True
 
     @property
     def kind(self) -> str:
@@ -103,6 +109,15 @@ class FakeSession:
             "host_id": self.host_id,
         }
 
+    def _row_task_status(self) -> str | None:
+        if self.current_task_status is not None:
+            return self.current_task_status
+        if not self.status_cached:
+            return None
+        return {"running": "in_progress", "waiting": "in_progress", "idle": "completed"}.get(
+            self.status, "failed" if self.status == "failed" else None
+        )
+
     def child_summary(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -110,10 +125,10 @@ class FakeSession:
             "parent_session_id": self.parent_session_id,
             "kind": "sub_agent",
             "created_at": self.created_at,
-            "updated_at": self.created_at,
+            "updated_at": self.updated_at or self.created_at,
             "agent_id": self.agent_id,
-            "current_task_status": self.current_task_status,
-            "busy": self.status in ("running", "waiting"),
+            "current_task_status": self._row_task_status(),
+            "busy": self.status_cached and self.status in ("running", "waiting"),
             "labels": dict(self.labels),
             "pending_elicitations_count": len(self.pending_elicitations),
         }
@@ -157,6 +172,10 @@ class FakeOmnigentServer:
         self.worktree_root = worktree_root
         self._ids = itertools.count(1)
         self.fail_paths: set[str] = set()  # GET paths that answer 503
+        #: ``child_sessions?descendants=true`` (routes_items.py:139-310 @42e17e47): the
+        #: whole non-archived subtree with ``depth``. False: a server without the flag (it
+        #: is ignored: the one-level listing).
+        self.supports_descendants = True
 
     # ------------------------------------------------------------ helpers
 
@@ -276,6 +295,9 @@ class FakeOmnigentServer:
             return httpx.Response(200, json=body)
         sub = parts[3]
         if sub == "child_sessions":
+            params = request.url.params
+            if self.supports_descendants and params.get("descendants") == "true":
+                return self._page(self._subtree(sid, int(params.get("max_depth", 3))), params)
             rows = [
                 s.child_summary()
                 for s in self.sessions.values()
@@ -291,6 +313,22 @@ class FakeOmnigentServer:
         if sub == "policies":
             return self._policies(method, session, parts, body)
         return httpx.Response(404, json={"error": {"code": "not_found", "message": "x"}})
+
+    def _subtree(self, root: str, max_depth: int) -> list[dict[str, Any]]:
+        """Breadth-first non-archived descendants (an archived node hides its subtree),
+        each row with its own ``parent_session_id`` and ``depth``."""
+        rows: list[dict[str, Any]] = []
+        frontier, depth = [root], 0
+        while frontier and depth < max_depth:
+            depth += 1
+            nxt: list[str] = []
+            for parent in frontier:
+                for child in self.sessions.values():
+                    if child.parent_session_id == parent and not child.archived:
+                        rows.append({**child.child_summary(), "depth": depth})
+                        nxt.append(child.id)
+            frontier = nxt
+        return rows
 
     def _snapshot_elicitations(self, session: FakeSession) -> list[dict[str, Any]]:
         """Own prompts first, then every descendant's prompt with
